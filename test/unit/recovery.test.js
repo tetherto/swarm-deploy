@@ -219,6 +219,41 @@ test('recovery leaves a same-content foreign final unmanaged', async (t) => {
   t.is(await pathExists(expected.staging), true)
 })
 
+test('recovery rejects a shape-valid journal fingerprint that disagrees with the session', async (t) => {
+  let layout = null
+  let armed = false
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.journals) {
+        armed = false
+        throw new Error('Injected journal parent sync failure')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, storage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const commits = new CommitStore({ layout, clock: created.clock, storage })
+
+  armed = true
+  await t.exception(() => commits.commit(created.session))
+  await fs.promises.link(expected.staging, expected.final)
+  const journal = await readJson(expected.journal)
+  journal.record.uploaderFingerprint = '0'.repeat(64)
+  await fs.promises.writeFile(expected.journal, JSON.stringify(journal))
+  await created.sessionStore.close()
+
+  const results = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+
+  t.is(results[0].status, 'CORRUPT')
+  t.is(await pathExists(expected.record), false)
+})
+
 test('recovery reports corrupt journals and continues valid journals', async (t) => {
   let layout = null
   let armed = false
@@ -260,7 +295,7 @@ test('recovery reports corrupt journals and continues valid journals', async (t)
   t.is(await pathExists(corrupt), true)
 })
 
-test('recovery delegates corrupt resumable metadata to SessionStore validation', async (t) => {
+test('recovery propagates corrupt resumable metadata from SessionStore', async (t) => {
   let layout = null
   let armed = false
   const storage = createStorage({
@@ -280,14 +315,14 @@ test('recovery delegates corrupt resumable metadata to SessionStore validation',
   await t.exception(() => commits.commit(created.session))
   await fs.promises.writeFile(expected.session, '{}')
   await created.sessionStore.close()
-  const results = await recoverStorage({
-    layout,
-    sessionStore: created.sessionStore,
-    commitStore: commits,
-    logger: { warn() {} }
-  })
-
-  t.is(results[0].status, 'CORRUPT')
+  await t.exception(() =>
+    recoverStorage({
+      layout,
+      sessionStore: created.sessionStore,
+      commitStore: commits,
+      logger: { warn() {} }
+    })
+  )
   t.is(await pathExists(expected.session), true)
   t.is(await pathExists(expected.staging), true)
   t.is(await pathExists(expected.journal), true)
