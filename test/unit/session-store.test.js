@@ -74,6 +74,24 @@ async function pathExists(filePath) {
   }
 }
 
+function createDeferred() {
+  let resolve
+  let reject
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
+
+async function lockOwner(layout) {
+  return JSON.parse(await fs.promises.readFile(path.join(layout.lock, 'owner.json'), 'utf8'))
+}
+
+function retiredLockPath(layout, token) {
+  return `${layout.lock}.retired-${token}`
+}
+
 async function createStore(t, options = {}) {
   const root = await createTempDir(t)
   const layout = initLayout(root)
@@ -168,19 +186,61 @@ test('default process liveness rejects a second storage owner', async (t) => {
   })
 })
 
-test('stale lock recovery cannot be undone by an older owner', async (t) => {
+test('storage lock publishes only after syncing its complete candidate', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const events = []
+  const storage = createStorage({
+    afterOperation(name, source, destination) {
+      if (name === 'sync') events.push(`sync:${source}`)
+      if (name === 'rename') events.push(`rename:${source}->${destination}`)
+    }
+  })
+  const release = await acquireStorageLock(layout, {
+    pid: 111,
+    isProcessAlive: () => false,
+    storage
+  })
+  t.teardown(() => release())
+
+  const owner = await lockOwner(layout)
+  const candidate = `${layout.lock}.candidate-${owner.token}`
+  t.alike(owner, {
+    pid: 111,
+    startedAt: owner.startedAt,
+    token: owner.token
+  })
+  t.ok(Number.isSafeInteger(owner.startedAt))
+  t.ok(/^[0-9a-f]{64}$/.test(owner.token))
+  t.alike(events, [
+    `sync:${path.join(candidate, 'owner.json')}`,
+    `sync:${candidate}`,
+    `sync:${layout.internal}`,
+    `rename:${candidate}->${layout.lock}`,
+    `sync:${layout.internal}`
+  ])
+})
+
+test('stale lock recovery preserves its tombstone and newer owner', async (t) => {
   const layout = initLayout(await createTempDir(t))
   const releaseOld = await acquireStorageLock(layout, {
     pid: 201,
     isProcessAlive: () => false
   })
+  const oldOwner = await lockOwner(layout)
   const releaseNew = await acquireStorageLock(layout, {
     pid: 202,
     isProcessAlive: (pid) => pid === 202
   })
   t.teardown(() => releaseNew())
 
+  t.is((await lockOwner(layout)).pid, 202)
+  const tombstone = retiredLockPath(layout, oldOwner.token)
+  const tombstoneExists = await pathExists(tombstone)
+  t.ok(tombstoneExists)
+  if (tombstoneExists) t.alike(await lockOwner({ lock: tombstone }), oldOwner)
+
   await releaseOld()
+  t.is((await lockOwner(layout)).pid, 202)
   await t.exception(
     () =>
       acquireStorageLock(layout, {
@@ -192,6 +252,174 @@ test('stale lock recovery cannot be undone by an older owner', async (t) => {
       code: ERRORS.FILE_BUSY
     }
   )
+})
+
+test("stale-lock contenders cannot retire the winner's new lock", async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const releaseStale = await acquireStorageLock(layout, {
+    pid: 301,
+    isProcessAlive: () => false
+  })
+  const bothObserved = createDeferred()
+  const allowSecondRetirement = createDeferred()
+  let observations = 0
+  let secondRetirementBlocked = false
+  let releaseWinner = null
+  let releaseLoser = null
+  t.teardown(async () => {
+    if (releaseLoser) await releaseLoser()
+    if (releaseWinner) await releaseWinner()
+    await releaseStale()
+  })
+
+  async function observeFixedOwner(name, filePath) {
+    if (
+      (name !== 'readFile' && name !== 'open') ||
+      filePath !== path.join(layout.lock, 'owner.json')
+    ) {
+      return
+    }
+    observations++
+    if (observations === 2) bothObserved.resolve()
+    if (observations <= 2) await bothObserved.promise
+  }
+
+  const winnerStorage = createStorage({ afterOperation: observeFixedOwner })
+  const loserStorage = createStorage({
+    afterOperation: observeFixedOwner,
+    async beforeOperation(name, source) {
+      if (name !== 'rename' || source !== layout.lock || secondRetirementBlocked) return
+      secondRetirementBlocked = true
+      await allowSecondRetirement.promise
+    }
+  })
+
+  const winner = acquireStorageLock(layout, {
+    pid: 302,
+    isProcessAlive: (pid) => pid === 302,
+    storage: winnerStorage
+  })
+  const loser = acquireStorageLock(layout, {
+    pid: 303,
+    isProcessAlive: (pid) => pid === 302,
+    storage: loserStorage
+  })
+
+  releaseWinner = await winner
+  t.ok(secondRetirementBlocked)
+  allowSecondRetirement.resolve()
+  await t.exception(
+    async () => {
+      releaseLoser = await loser
+    },
+    {
+      name: 'SwarmDeployError',
+      code: ERRORS.FILE_BUSY
+    }
+  )
+  t.is((await lockOwner(layout)).pid, 302)
+})
+
+test('delayed release cannot retire a newer lock', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const releaseBlocked = createDeferred()
+  const allowRelease = createDeferred()
+  let blocked = false
+  const oldStorage = createStorage({
+    async beforeOperation(name, source) {
+      if (name !== 'rename' || source !== layout.lock || blocked) return
+      blocked = true
+      releaseBlocked.resolve()
+      await allowRelease.promise
+    }
+  })
+  const releaseOld = await acquireStorageLock(layout, {
+    pid: 401,
+    isProcessAlive: () => false,
+    storage: oldStorage
+  })
+  const oldOwner = await lockOwner(layout)
+
+  const delayedRelease = releaseOld()
+  await releaseBlocked.promise
+  const releaseNew = await acquireStorageLock(layout, {
+    pid: 402,
+    isProcessAlive: (pid) => pid === 402
+  })
+  let releaseThird = null
+  t.teardown(async () => {
+    if (releaseThird) await releaseThird()
+    await releaseNew()
+  })
+
+  allowRelease.resolve()
+  await delayedRelease
+  const lockStillExists = await pathExists(layout.lock)
+  t.ok(lockStillExists)
+  if (lockStillExists) t.is((await lockOwner(layout)).pid, 402)
+  const tombstone = retiredLockPath(layout, oldOwner.token)
+  const tombstoneExists = await pathExists(tombstone)
+  t.ok(tombstoneExists)
+  if (tombstoneExists) t.alike(await lockOwner({ lock: tombstone }), oldOwner)
+  await t.exception(
+    async () => {
+      releaseThird = await acquireStorageLock(layout, {
+        pid: 403,
+        isProcessAlive: (pid) => pid === 402
+      })
+    },
+    {
+      name: 'SwarmDeployError',
+      code: ERRORS.FILE_BUSY
+    }
+  )
+})
+
+test('storage lock rejects malformed owner state without replacing it', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const ownerPath = path.join(layout.lock, 'owner.json')
+  await fs.promises.mkdir(layout.lock)
+  await fs.promises.writeFile(ownerPath, '{not-json')
+
+  await t.exception(
+    () =>
+      acquireStorageLock(layout, {
+        pid: 501,
+        isProcessAlive: () => false
+      }),
+    {
+      name: 'SwarmDeployError',
+      code: ERRORS.PROTOCOL_INVALID
+    }
+  )
+  t.is(await fs.promises.readFile(ownerPath, 'utf8'), '{not-json')
+})
+
+test('storage lock rejects a symlink owner state without replacing it', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const outside = await createTempDir(t)
+  const outsideOwner = path.join(outside, 'owner.json')
+  await fs.promises.writeFile(
+    outsideOwner,
+    JSON.stringify({ pid: 601, startedAt: 1, token: 'a'.repeat(64) })
+  )
+  await fs.promises.mkdir(layout.lock)
+  const ownerPath = path.join(layout.lock, 'owner.json')
+  await fs.promises.symlink(outsideOwner, ownerPath)
+
+  await t.exception(
+    () =>
+      acquireStorageLock(layout, {
+        pid: 602,
+        isProcessAlive: () => false
+      }),
+    {
+      name: 'SwarmDeployError',
+      code: ERRORS.PROTOCOL_INVALID
+    }
+  )
+  t.ok((await fs.promises.lstat(ownerPath)).isSymbolicLink())
+  t.is((await lockOwner({ lock: outside })).pid, 601)
 })
 
 test('offer reserves its complete logical size without double-reserving resumes', async (t) => {
