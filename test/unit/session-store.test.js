@@ -35,7 +35,7 @@ function sessionPath(layout, offer) {
 
 function makeUpload(
   owner = OWNER,
-  { name = 'artifact.bin', data = b4a.from('abcdefghijk'), chunkSize = 4 } = {}
+  { name = 'artifact.bin', data = b4a.from('abcdefghijk'), chunkSize = 1024 * 1024 } = {}
 ) {
   const chunks = []
   for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
@@ -80,7 +80,7 @@ async function createStore(t, options = {}) {
   const clock = options.clock ?? createClock()
   const store = new SessionStore({
     layout,
-    maxStagingBytes: options.maxStagingBytes ?? 1024,
+    maxStagingBytes: options.maxStagingBytes ?? 4 * 1024 * 1024,
     clock,
     checkpointChunks: options.checkpointChunks ?? 16,
     storage: options.storage
@@ -155,6 +155,17 @@ test('storage lock rejects a live owner', async (t) => {
       code: ERRORS.FILE_BUSY
     }
   )
+})
+
+test('default process liveness rejects a second storage owner', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const release = await acquireStorageLock(layout)
+  t.teardown(() => release())
+
+  await t.exception(() => acquireStorageLock(layout), {
+    name: 'SwarmDeployError',
+    code: ERRORS.FILE_BUSY
+  })
 })
 
 test('stale lock recovery cannot be undone by an older owner', async (t) => {
@@ -252,16 +263,40 @@ test('offer rejects noncanonical IDs and chunk counts', async (t) => {
   )
 })
 
+test('offer requires 1 MiB chunks and caps chunk count before allocation', async (t) => {
+  const { store } = await createStore(t, { maxStagingBytes: Number.MAX_SAFE_INTEGER })
+  const legacy = makeUpload(OWNER, { chunkSize: 4 })
+  await t.exception(() => store.offer(OWNER, legacy.offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+
+  const count = 262_145
+  const offer = {
+    version: 1,
+    name: 'oversized.bin',
+    size: count * 1024 * 1024,
+    digest: b4a.alloc(32),
+    chunkSize: 1024 * 1024,
+    chunkCount: count
+  }
+  offer.transferId = transferId({ clientPublicKey: OWNER, ...offer })
+  await t.exception(() => store.offer(OWNER, offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+})
+
 test('writeChunk writes exact offsets, verifies digests, and checkpoints metadata', async (t) => {
   const { layout, store } = await createStore(t)
-  const upload = makeUpload()
+  const upload = makeUpload(OWNER, { data: b4a.concat([b4a.alloc(1024 * 1024), b4a.from('efgh')]) })
   await store.offer(OWNER, upload.offer)
 
   const result = await store.writeChunk(upload.offer.transferId, upload.chunks[1])
   t.ok(result.verified.has(1))
   t.alike(
     await fs.promises.readFile(stagingPath(layout, upload.offer)),
-    b4a.concat([b4a.alloc(4), b4a.from('efgh')])
+    b4a.concat([b4a.alloc(1024 * 1024), b4a.from('efgh')])
   )
 
   const before = await readJson(sessionPath(layout, upload.offer))
@@ -279,7 +314,7 @@ test('chunks require exact lengths and failed writes never become verified', asy
   await store.offer(OWNER, upload.offer)
 
   await t.exception(
-    () => store.writeChunk(upload.offer.transferId, { ...upload.chunks[2], data: b4a.from('xx') }),
+    () => store.writeChunk(upload.offer.transferId, { ...upload.chunks[0], data: b4a.from('xx') }),
     { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
   )
   await t.exception(() => store.writeChunk(upload.offer.transferId, upload.chunks[0]))
@@ -302,8 +337,8 @@ test('duplicate chunk digests are idempotent but conflicting duplicates fail clo
     () =>
       store.writeChunk(upload.offer.transferId, {
         ...upload.chunks[0],
-        digest: digest(b4a.from('zzzz')),
-        data: b4a.from('zzzz')
+        digest: digest(b4a.alloc(11, 'z'.charCodeAt(0))),
+        data: b4a.alloc(11, 'z'.charCodeAt(0))
       }),
     { name: 'SwarmDeployError', code: ERRORS.CHECKSUM_MISMATCH }
   )
@@ -425,4 +460,52 @@ test('delete, deleteByOwner, and expire remove staging metadata and reservations
   t.is(await pathExists(stagingPath(layout, first.offer)), false)
   t.is(await pathExists(sessionPath(layout, first.offer)), false)
   t.is(store.reservedBytes, 0)
+})
+
+test('finish rehashes staging and deletes mismatched whole-file sessions', async (t) => {
+  const { layout, store } = await createStore(t)
+  const upload = makeUpload(OWNER, { chunkSize: 1024 * 1024 })
+  upload.offer.digest = b4a.alloc(32)
+  upload.offer.transferId = transferId({
+    clientPublicKey: OWNER,
+    name: upload.offer.name,
+    size: upload.offer.size,
+    digest: upload.offer.digest,
+    chunkSize: upload.offer.chunkSize
+  })
+  await store.offer(OWNER, upload.offer)
+  await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+
+  await t.exception(() => store.finish(upload.offer.transferId), {
+    name: 'SwarmDeployError',
+    code: ERRORS.CHECKSUM_MISMATCH
+  })
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), false)
+  t.is(store.reservedBytes, 0)
+})
+
+test('finish rejects an empty file with a mismatched offered digest', async (t) => {
+  const { layout, store } = await createStore(t)
+  const upload = makeUpload(OWNER, {
+    name: 'empty-invalid.bin',
+    data: b4a.alloc(0),
+    chunkSize: 1024 * 1024
+  })
+  upload.offer.digest = b4a.alloc(32, 1)
+  upload.offer.transferId = transferId({
+    clientPublicKey: OWNER,
+    name: upload.offer.name,
+    size: upload.offer.size,
+    digest: upload.offer.digest,
+    chunkSize: upload.offer.chunkSize
+  })
+  await store.offer(OWNER, upload.offer)
+
+  await t.exception(() => store.finish(upload.offer.transferId), {
+    name: 'SwarmDeployError',
+    code: ERRORS.CHECKSUM_MISMATCH
+  })
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), false)
 })
