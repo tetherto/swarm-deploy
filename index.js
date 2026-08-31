@@ -9,6 +9,11 @@ const {
   publicKeyFromSeed
 } = require('./lib/identity')
 const { topicFromServerPublicKey } = require('./lib/topic')
+const {
+  validateBasename,
+  selectUploadPaths,
+  buildFileManifest
+} = require('./lib/files')
 
 module.exports = {
   SwarmDeployError,
@@ -18,5 +23,8 @@ module.exports = {
   generateSeed,
   keyPairFromSeed,
   publicKeyFromSeed,
-  topicFromServerPublicKey
+  topicFromServerPublicKey,
+  validateBasename,
+  selectUploadPaths,
+  buildFileManifest
 }
