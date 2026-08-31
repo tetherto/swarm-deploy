@@ -129,14 +129,121 @@ test('selectUploadPaths selects sorted regular files and skips others', async (t
     ['a.bin', 'b.bin']
   )
   t.is(selection.skipped.length, 3)
-  t.alike(
-    selection.skipped.map((entry) => entry.name).sort(),
-    ['dir-link', 'link.bin', 'nested']
-  )
+  t.alike(selection.skipped.map((entry) => entry.name).sort(), ['dir-link', 'link.bin', 'nested'])
   for (const entry of selection.skipped) {
     t.ok(entry.path.startsWith(dir))
     t.ok(entry.reason === 'directory' || entry.reason === 'symlink')
   }
+})
+
+test('buildFileManifest rejects invalid chunkSize values', async (t) => {
+  const dir = await createTempDir(t)
+  const filePath = path.join(dir, 'chunk.bin')
+  await writeDeterministicFile(filePath, 1)
+
+  for (const chunkSize of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1, '1024']) {
+    await t.exception(
+      () => buildFileManifest(filePath, { chunkSize }),
+      {
+        name: 'SwarmDeployError',
+        code: ERRORS.PROTOCOL_INVALID
+      },
+      `chunkSize ${String(chunkSize)}`
+    )
+  }
+})
+
+test('selectUploadPaths skips regular files with invalid basenames', async (t) => {
+  const dir = await createTempDir(t)
+  await writeDeterministicFile(path.join(dir, 'good.bin'), 1)
+  await writeDeterministicFile(path.join(dir, '.hidden'), 1)
+  await writeDeterministicFile(path.join(dir, 'bad name'), 1)
+
+  const selection = await selectUploadPaths(dir)
+
+  t.alike(
+    selection.paths.map((p) => path.basename(p)),
+    ['good.bin']
+  )
+  t.is(selection.skipped.length, 2)
+  t.alike(selection.skipped.map((entry) => entry.name).sort(), ['.hidden', 'bad name'])
+  for (const entry of selection.skipped) {
+    t.is(entry.reason, 'invalid-filename')
+  }
+})
+
+test('buildFileManifest opens files with O_NOFOLLOW', async (t) => {
+  const dir = await createTempDir(t)
+  const filePath = path.join(dir, 'nofollow.bin')
+  await writeDeterministicFile(filePath, 8)
+
+  const originalOpen = fs.promises.open
+  let seenFlags = null
+  fs.promises.open = async function patchedOpen(openPath, flags, mode) {
+    seenFlags = flags
+    return originalOpen.call(this, openPath, flags, mode)
+  }
+  t.teardown(() => {
+    fs.promises.open = originalOpen
+  })
+
+  await buildFileManifest(filePath)
+
+  const O_NOFOLLOW = fs.constants?.O_NOFOLLOW ?? 0x100
+  t.ok((seenFlags & O_NOFOLLOW) !== 0, 'open flags include O_NOFOLLOW')
+})
+
+test('buildFileManifest rejects symlink swapped after lstat', async (t) => {
+  const dir = await createTempDir(t)
+  const filePath = path.join(dir, 'swap.bin')
+  const otherPath = path.join(dir, 'other.bin')
+  await writeDeterministicFile(filePath, 5)
+  await writeDeterministicFile(otherPath, 5)
+
+  const originalLstat = fs.promises.lstat
+  let lstatCalls = 0
+  fs.promises.lstat = async function patchedLstat(lstatPath, opts) {
+    const stat = await originalLstat.call(this, lstatPath, opts)
+    if (lstatPath === filePath && lstatCalls++ === 0) {
+      await fs.promises.rename(filePath, path.join(dir, 'moved.bin'))
+      await fs.promises.symlink(otherPath, filePath)
+    }
+    return stat
+  }
+  t.teardown(() => {
+    fs.promises.lstat = originalLstat
+  })
+
+  await t.exception(() => buildFileManifest(filePath), {
+    name: 'SwarmDeployError',
+    code: ERRORS.INVALID_FILENAME
+  })
+})
+
+test('buildFileManifest rejects when bytes read mismatch initial size', async (t) => {
+  const dir = await createTempDir(t)
+  const filePath = path.join(dir, 'short-read.bin')
+  await writeDeterministicFile(filePath, 10)
+
+  const originalLstat = fs.promises.lstat
+  let calls = 0
+  fs.promises.lstat = async function patchedLstat(lstatPath, opts) {
+    const stat = await originalLstat.call(this, lstatPath, opts)
+    if (lstatPath === filePath && ++calls === 1) {
+      return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+        size: stat.size + 5
+      })
+    }
+    return stat
+  }
+  t.teardown(() => {
+    fs.promises.lstat = originalLstat
+  })
+
+  await t.exception(() => buildFileManifest(filePath), {
+    name: 'SwarmDeployError',
+    code: ERRORS.FILE_BUSY
+  })
 })
 
 test('selectUploadPaths accepts a regular file and rejects a symlink input', async (t) => {

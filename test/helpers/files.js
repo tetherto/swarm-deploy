@@ -15,7 +15,10 @@ function systemTmpdir() {
 
 async function createTempDir(t) {
   const root = await fs.promises.realpath(systemTmpdir())
-  const dir = path.join(root, `swarm-deploy-test-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+  const dir = path.join(
+    root,
+    `swarm-deploy-test-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  )
   await fs.promises.mkdir(dir, { recursive: true })
   if (t) t.teardown(() => fs.promises.rm(dir, { recursive: true, force: true }))
   return dir
