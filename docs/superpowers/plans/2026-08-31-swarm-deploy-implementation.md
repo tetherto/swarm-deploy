@@ -61,6 +61,7 @@
 ### Task 1: Package Foundation, Errors, Identity, and Topic
 
 **Files:**
+
 - Create: `package.json`
 - Create: `package-lock.json`
 - Create: `.gitignore`
@@ -74,6 +75,7 @@
 - Create: `test/unit/identity.test.js`
 
 **Interfaces:**
+
 - Produces `SwarmDeployError`, `ERRORS`, `parseSeed`, `parsePublicKey`, `generateSeed`, `keyPairFromSeed`, `publicKeyFromSeed`, and `topicFromServerPublicKey`.
 - All binary-returning functions return `Buffer`-compatible b4a values.
 
@@ -269,10 +271,7 @@ const ERRORS = {
 `lib/topic.js` computes:
 
 ```js
-createHash('sha256')
-  .update('swarm-deploy/topic/v1\0')
-  .update(serverPublicKey)
-  .digest()
+createHash('sha256').update('swarm-deploy/topic/v1\0').update(serverPublicKey).digest()
 ```
 
 `index.js` exports the implemented functions and error types.
@@ -294,6 +293,7 @@ Expected: identity tests PASS and dependency listing exits 0.
 ### Task 2: Safe File Selection and Hash Manifests
 
 **Files:**
+
 - Create: `lib/files.js`
 - Create: `test/helpers/files.js`
 - Create: `test/unit/files.test.js`
@@ -301,6 +301,7 @@ Expected: identity tests PASS and dependency listing exits 0.
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces `validateBasename(name)`, `selectUploadPaths(path)`, and `buildFileManifest(path, { chunkSize })`.
 - Manifest shape is `{ path, name, size, digest, chunkDigests, chunkCount, chunkSize, stat }`.
 
@@ -368,6 +369,7 @@ Expected: identity and file tests PASS.
 ### Task 3: Bounded Wire Codecs, Bitmap Pages, and Transfer IDs
 
 **Files:**
+
 - Create: `lib/protocol/constants.js`
 - Create: `lib/protocol/codecs.js`
 - Create: `lib/protocol/transfer-id.js`
@@ -376,6 +378,7 @@ Expected: identity and file tests PASS.
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces message index constants `OFFER`, `STATUS`, `BITMAP_PAGE`, `READY`, `CHUNK`, `CHUNK_ACK`, `FINISH`, and `RESULT`.
 - Produces `encodeBounded`, `decodeBounded`, `offer`, `status`, `bitmapPage`, `chunk`, `chunkAck`, `finish`, and `result` codecs.
 - Produces `transferId({ clientPublicKey, name, size, digest, chunkSize })`.
@@ -449,6 +452,7 @@ Expected: all protocol and earlier tests PASS.
 ### Task 4: Storage Layout, Atomic Metadata, Sessions, and Reservations
 
 **Files:**
+
 - Create: `lib/storage/layout.js`
 - Create: `lib/storage/atomic-file.js`
 - Create: `lib/storage/session-store.js`
@@ -458,6 +462,7 @@ Expected: all protocol and earlier tests PASS.
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces `initLayout(storageDir)`.
 - Produces `acquireStorageLock(layout, { pid, isProcessAlive })`, returning an ownership-token-checked async release function.
 - Produces `writeAtomic(path, bytes)` and `readJson(path)`.
@@ -538,6 +543,7 @@ Expected: all session tests PASS, including restart reconstruction and reservati
 ### Task 5: No-Replace Commit, Idempotency, and Crash Recovery
 
 **Files:**
+
 - Create: `lib/storage/commit-store.js`
 - Create: `lib/storage/recovery.js`
 - Create: `test/unit/commit-store.test.js`
@@ -545,6 +551,7 @@ Expected: all session tests PASS, including restart reconstruction and reservati
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces `CommitStore.inspect(name, offer)`, `CommitStore.commit(session)`, and `CommitStore.delete(record)`.
 - Produces `recoverStorage({ layout, sessionStore, commitStore, logger })`.
 
@@ -624,6 +631,7 @@ Expected: all commit, crash, and earlier tests PASS.
 ### Task 6: Startup Scrub and Retention
 
 **Files:**
+
 - Create: `lib/storage/retention.js`
 - Create: `test/unit/retention.test.js`
 - Create: `test/unit/scrub.test.js`
@@ -631,6 +639,7 @@ Expected: all commit, crash, and earlier tests PASS.
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces `RetentionManager.run({ incomingBytes })`, `RetentionManager.expireSessions()`, and `scrubCommitted()`.
 
 - [ ] **Step 1: Write failing retention tests**
@@ -695,6 +704,7 @@ Expected: retention and scrub tests PASS.
 ### Task 7: Allowlist Reload and Authenticated Server Transport
 
 **Files:**
+
 - Create: `lib/allowlist.js`
 - Create: `lib/protocol/server-session.js`
 - Create: `lib/server.js`
@@ -706,6 +716,7 @@ Expected: retention and scrub tests PASS.
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces `parseAllowlist(text)`, `AllowlistWatcher`, and public `Server`.
 - `Server` exposes `publicKey`, `topic`, `listen()`, `reloadAllowlist(keys)`, and `close()`.
 
@@ -794,6 +805,7 @@ Expected: all server auth and state-machine tests PASS.
 ### Task 8: Pinned Client, Backpressure, Reconnect, and Resume
 
 **Files:**
+
 - Create: `lib/protocol/client-session.js`
 - Create: `lib/client.js`
 - Create: `test/unit/client-session.test.js`
@@ -803,6 +815,7 @@ Expected: all server auth and state-machine tests PASS.
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces public `Client` with `upload(path)` and `close()`.
 - `ClientSession.upload(manifest)` returns `{ status, name, size, digest, transferId }`.
 
@@ -883,6 +896,7 @@ Expected: all client and end-to-end Node tests PASS.
 ### Task 9: CLI and Seed-Safe CI Usage
 
 **Files:**
+
 - Create: `lib/cli.js`
 - Create: `bin/swarm-deploy.js`
 - Create: `test/unit/cli.test.js`
@@ -891,6 +905,7 @@ Expected: all client and end-to-end Node tests PASS.
 - Modify: `test/run.js`
 
 **Interfaces:**
+
 - Produces `main(argv, env, io)` for deterministic tests.
 - Installs the `swarm-deploy` executable.
 
@@ -969,6 +984,7 @@ Expected: CLI tests PASS, help exits 0, and no seed appears in captured logs.
 ### Task 10: Adversarial, Failure, and Bare Compatibility Tests
 
 **Files:**
+
 - Create: `test/integration/adversarial.test.js`
 - Create: `test/integration/revocation.test.js`
 - Create: `test/integration/retention.test.js`
@@ -977,6 +993,7 @@ Expected: CLI tests PASS, help exits 0, and no seed appears in captured logs.
 - Modify production modules only for defects exposed by these tests.
 
 **Interfaces:**
+
 - Consumes the complete public and internal APIs.
 - Produces evidence for protocol, storage, and cleanup invariants under both runtimes.
 
@@ -1037,6 +1054,7 @@ Expected: clean process exit with no hanging handles.
 ### Task 11: Types, Documentation, License, and CI
 
 **Files:**
+
 - Create: `index.d.ts`
 - Replace: `README.md`
 - Create: `LICENSE.md`
@@ -1046,6 +1064,7 @@ Expected: clean process exit with no hanging handles.
 - Modify: `package.json`
 
 **Interfaces:**
+
 - Documents and types every public export, option, result, event, error code, and CLI command.
 
 - [ ] **Step 1: Write declarations and validate public examples**

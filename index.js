@@ -10,6 +10,37 @@ const {
 } = require('./lib/identity')
 const { topicFromServerPublicKey } = require('./lib/topic')
 const { validateBasename, selectUploadPaths, buildFileManifest } = require('./lib/files')
+const {
+  OFFER,
+  STATUS,
+  BITMAP_PAGE,
+  READY,
+  CHUNK,
+  CHUNK_ACK,
+  FINISH,
+  RESULT,
+  STATUS_CODE,
+  PROTOCOL_VERSION,
+  DIGEST_BYTES,
+  TRANSFER_ID_BYTES,
+  MAX_CONTROL_BYTES,
+  MAX_CHUNK_BYTES,
+  MAX_BITMAP_BITS
+} = require('./lib/protocol/constants')
+const {
+  encodeBounded,
+  decodeBounded,
+  offer,
+  status,
+  bitmapPage,
+  ready,
+  chunk,
+  chunkAck,
+  finish,
+  result,
+  mergeBitmapPages
+} = require('./lib/protocol/codecs')
+const { transferId } = require('./lib/protocol/transfer-id')
 
 module.exports = {
   SwarmDeployError,
@@ -22,5 +53,32 @@ module.exports = {
   topicFromServerPublicKey,
   validateBasename,
   selectUploadPaths,
-  buildFileManifest
+  buildFileManifest,
+  OFFER,
+  STATUS,
+  BITMAP_PAGE,
+  READY,
+  CHUNK,
+  CHUNK_ACK,
+  FINISH,
+  RESULT,
+  STATUS_CODE,
+  PROTOCOL_VERSION,
+  DIGEST_BYTES,
+  TRANSFER_ID_BYTES,
+  MAX_CONTROL_BYTES,
+  MAX_CHUNK_BYTES,
+  MAX_BITMAP_BITS,
+  encodeBounded,
+  decodeBounded,
+  offer,
+  status,
+  bitmapPage,
+  ready,
+  chunk,
+  chunkAck,
+  finish,
+  result,
+  mergeBitmapPages,
+  transferId
 }
