@@ -18,6 +18,7 @@ function createStorage({
     'readFile',
     'writeFile',
     'rename',
+    'link',
     'unlink',
     'rm'
   ]) {
