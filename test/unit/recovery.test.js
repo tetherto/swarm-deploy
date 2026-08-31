@@ -95,6 +95,14 @@ async function createVerifiedSession(t, storage) {
   }
 }
 
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 for (const point of [
   'journal parent synchronized',
   'final hard link created',
@@ -326,4 +334,345 @@ test('recovery propagates corrupt resumable metadata from SessionStore', async (
   t.is(await pathExists(expected.session), true)
   t.is(await pathExists(expected.staging), true)
   t.is(await pathExists(expected.journal), true)
+})
+
+test('recoverStorage invoked twice after successful recovery preserves final and sidecar', async (t) => {
+  let layout = null
+  let armed = false
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.root) {
+        armed = false
+        throw new Error('Injected crash after final directory sync')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, storage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const commits = new CommitStore({ layout, clock: created.clock, storage })
+
+  armed = true
+  await t.exception(() => commits.commit(created.session))
+  await created.sessionStore.close()
+
+  const first = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+  const finalBytes = await fs.promises.readFile(expected.final)
+  const sidecar = await fs.promises.readFile(expected.record)
+  const second = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+
+  t.is(first.length, 1)
+  t.is(first[0].status, 'COMMITTED')
+  t.alike(second, [])
+  t.alike(await fs.promises.readFile(expected.final), finalBytes)
+  t.alike(await fs.promises.readFile(expected.record), sidecar)
+  t.is(await pathExists(expected.staging), false)
+  t.is(await pathExists(expected.session), false)
+  t.is(await pathExists(expected.journal), false)
+})
+
+test('concurrent same-transfer commits cannot let the journal loser remove the winner journal', async (t) => {
+  const created = await createVerifiedSession(t)
+  const expected = paths(created.layout, created.upload.offer)
+  const winnerAtPublication = deferred()
+  const loserAtPublication = deferred()
+  const winnerPublished = deferred()
+  const loserCleaned = deferred()
+  let winnerTemporary = null
+  let loserTemporary = null
+
+  const winnerStorage = createStorage({
+    async beforeOperation(name, source, destination) {
+      if (name !== 'link' || destination !== expected.journal) return
+      winnerTemporary = source
+      winnerAtPublication.resolve()
+      await loserAtPublication.promise
+    },
+    async afterOperation(name, source, destination) {
+      if (name !== 'link' || destination !== expected.journal) return
+      winnerPublished.resolve()
+      await loserCleaned.promise
+      throw new Error('Injected winner crash after journal publication')
+    }
+  })
+  const loserStorage = createStorage({
+    async beforeOperation(name, source, destination) {
+      if (name !== 'link' || destination !== expected.journal) return
+      loserTemporary = source
+      loserAtPublication.resolve()
+      await winnerAtPublication.promise
+      await winnerPublished.promise
+    },
+    async afterOperation(name, filePath) {
+      if (name === 'unlink' && filePath === loserTemporary) loserCleaned.resolve()
+    }
+  })
+  const winner = new CommitStore({
+    layout: created.layout,
+    clock: created.clock,
+    storage: winnerStorage
+  })
+  const loser = new CommitStore({
+    layout: created.layout,
+    clock: created.clock,
+    storage: loserStorage
+  })
+
+  const outcomes = await Promise.allSettled([
+    winner._commit(created.session),
+    loser._commit(created.session)
+  ])
+  const journal = await readJson(expected.journal)
+  const winnerAttemptId = path.basename(winnerTemporary).split('.')[2]
+
+  t.is(outcomes[0].status, 'rejected')
+  t.is(outcomes[1].status, 'rejected')
+  t.is(journal.attemptId, winnerAttemptId)
+  t.is(await pathExists(winnerTemporary), false)
+  t.is(await pathExists(loserTemporary), false)
+  t.is(await pathExists(expected.journal), true)
+
+  const results = await recoverStorage({
+    layout: created.layout,
+    sessionStore: created.sessionStore,
+    commitStore: winner,
+    logger: { warn() {} }
+  })
+  t.is(results.length, 1)
+  t.is(results[0].status, 'RESUMABLE')
+  t.is(await pathExists(expected.journal), false)
+  t.is(await pathExists(expected.staging), true)
+  t.is(await pathExists(expected.session), true)
+  t.is(await pathExists(expected.final), false)
+  await created.sessionStore.close()
+})
+
+test('recovery converges after session metadata unlink before staging cleanup', async (t) => {
+  let layout = null
+  let expected = null
+  let armed = false
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'unlink' && filePath === expected.session) {
+        armed = false
+        throw new Error('Injected crash after session metadata unlink')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, storage)
+  layout = created.layout
+  expected = paths(layout, created.upload.offer)
+  const unrelatedStaging = path.join(layout.staging, `${'f'.repeat(64)}.part`)
+  const unrelatedSession = path.join(layout.sessions, `${'f'.repeat(64)}.json`)
+  await fs.promises.writeFile(unrelatedStaging, b4a.from('unrelated staging'))
+  await fs.promises.writeFile(unrelatedSession, b4a.from('unrelated session'))
+  const commits = new CommitStore({ layout, clock: created.clock, storage })
+
+  armed = true
+  await t.exception(() => commits.commit(created.session))
+  t.is(await pathExists(expected.session), false)
+  t.is(await pathExists(expected.staging), true)
+  t.is(await pathExists(expected.journal), true)
+  await created.sessionStore.close()
+
+  const results = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+
+  t.is(results.length, 1)
+  t.is(results[0].status, 'COMMITTED')
+  t.alike(await fs.promises.readFile(expected.final), created.upload.chunk.data)
+  t.alike((await readJson(expected.record)).sha256, hex(created.upload.offer.digest))
+  t.is(await pathExists(expected.staging), false)
+  t.is(await pathExists(expected.session), false)
+  t.is(await pathExists(expected.journal), false)
+  t.alike(await fs.promises.readFile(unrelatedStaging), b4a.from('unrelated staging'))
+  t.alike(await fs.promises.readFile(unrelatedSession), b4a.from('unrelated session'))
+})
+
+test('recovery propagates cleanup directory fsync failure and a retry converges', async (t) => {
+  let layout = null
+  let crashCommit = false
+  let failCleanupSync = false
+  const cleanupFailure = new Error('Injected cleanup parent fsync failure')
+  const storage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (failCleanupSync && name === 'sync' && filePath === layout.sessions) {
+        failCleanupSync = false
+        throw cleanupFailure
+      }
+    },
+    async afterOperation(name, filePath) {
+      if (crashCommit && name === 'sync' && filePath === layout.root) {
+        crashCommit = false
+        throw new Error('Injected crash after final directory sync')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, storage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const commits = new CommitStore({ layout, clock: created.clock, storage })
+
+  crashCommit = true
+  await t.exception(() => commits.commit(created.session))
+  await created.sessionStore.close()
+
+  failCleanupSync = true
+  let caught = null
+  try {
+    await recoverStorage({
+      layout,
+      sessionStore: created.sessionStore,
+      commitStore: commits,
+      logger: { warn() {} }
+    })
+  } catch (err) {
+    caught = err
+  }
+  t.is(caught, cleanupFailure)
+  t.is(await pathExists(expected.journal), true)
+
+  const results = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+  t.is(results.length, 1)
+  t.is(results[0].status, 'COMMITTED')
+  t.alike(await fs.promises.readFile(expected.final), created.upload.chunk.data)
+  t.is(await pathExists(expected.record), true)
+  t.is(await pathExists(expected.staging), false)
+  t.is(await pathExists(expected.session), false)
+  t.is(await pathExists(expected.journal), false)
+})
+
+test('recovery aborts on journal EIO without continuing to a later valid journal', async (t) => {
+  let layout = null
+  let armed = false
+  const setupStorage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.journals) {
+        armed = false
+        throw new Error('Injected crash after journal publication')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, setupStorage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const earlierJournal = path.join(layout.journals, `${'0'.repeat(64)}.json`)
+  const eio = new Error('Injected journal read failure')
+  eio.code = 'EIO'
+  const warnings = []
+  const recoveryStorage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (name === 'read' && filePath === earlierJournal) throw eio
+    }
+  })
+
+  armed = true
+  const setupCommits = new CommitStore({ layout, clock: created.clock, storage: setupStorage })
+  await t.exception(() => setupCommits.commit(created.session))
+  await fs.promises.writeFile(earlierJournal, '{}')
+  await created.sessionStore.close()
+
+  let caught = null
+  try {
+    await recoverStorage({
+      layout,
+      sessionStore: created.sessionStore,
+      commitStore: new CommitStore({
+        layout,
+        clock: created.clock,
+        storage: recoveryStorage
+      }),
+      logger: {
+        warn(message, detail) {
+          warnings.push({ message, detail })
+        }
+      }
+    })
+  } catch (err) {
+    caught = err
+  }
+
+  t.is(caught, eio)
+  t.is(warnings.length, 0)
+  t.is(await pathExists(earlierJournal), true)
+  t.is(await pathExists(expected.journal), true)
+  t.is(await pathExists(expected.final), false)
+  t.is(await pathExists(expected.staging), true)
+  t.is(await pathExists(expected.session), true)
+})
+
+test('recovery aborts on uncoded storage-safety errors without reporting corruption', async (t) => {
+  let layout = null
+  let armed = false
+  const setupStorage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.journals) {
+        armed = false
+        throw new Error('Injected crash after journal publication')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, setupStorage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const storageSafetyFailure = new Error('Injected directory replacement safety failure')
+  const warnings = []
+  let journalStats = 0
+  const recoveryStorage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (name !== 'stat' || filePath !== expected.journal) return
+      journalStats++
+      if (journalStats === 2) throw storageSafetyFailure
+    }
+  })
+
+  armed = true
+  const setupCommits = new CommitStore({ layout, clock: created.clock, storage: setupStorage })
+  await t.exception(() => setupCommits.commit(created.session))
+  await created.sessionStore.close()
+
+  let caught = null
+  try {
+    await recoverStorage({
+      layout,
+      sessionStore: created.sessionStore,
+      commitStore: new CommitStore({
+        layout,
+        clock: created.clock,
+        storage: recoveryStorage
+      }),
+      logger: {
+        warn(message, detail) {
+          warnings.push({ message, detail })
+        }
+      }
+    })
+  } catch (err) {
+    caught = err
+  }
+
+  t.is(caught, storageSafetyFailure)
+  t.is(caught.code, undefined)
+  t.is(warnings.length, 0)
+  t.is(await pathExists(expected.journal), true)
+  t.is(await pathExists(expected.final), false)
 })
