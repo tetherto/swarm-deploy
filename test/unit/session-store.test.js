@@ -154,6 +154,94 @@ test('atomic metadata writes replace regular files and reject symlinks', async (
   t.alike(await readJson(outside), { outside: true })
 })
 
+test('metadata reads fail closed when the final component changes to a symlink', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const metadata = path.join(layout.sessions, 'atom.json')
+  const outside = path.join(root, 'outside.json')
+  await fs.promises.writeFile(metadata, '{"inside":true}')
+  await fs.promises.writeFile(outside, '{"outside":true}')
+
+  let replaced = false
+  const storage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (replaced || name !== 'open' || filePath !== metadata) return
+      replaced = true
+      await fs.promises.unlink(metadata)
+      await fs.promises.symlink(outside, metadata)
+    }
+  })
+
+  await t.exception(() => readJson(metadata, storage), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.ok(replaced)
+  t.ok((await fs.promises.lstat(metadata)).isSymbolicLink())
+  t.alike(await readJson(outside), { outside: true })
+})
+
+test('atomic metadata writes reject protected session-parent replacement', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const metadata = path.join(layout.sessions, 'atom.json')
+  let replaced = false
+  const retired = `${layout.sessions}.retired`
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (replaced || name !== 'lstat' || filePath !== layout.sessions) return
+      replaced = true
+      await fs.promises.rename(layout.sessions, retired)
+      await fs.promises.mkdir(layout.sessions, { mode: 0o700 })
+    }
+  })
+
+  await t.exception(() => writeAtomic(metadata, b4a.from('{"generation":1}'), storage), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.ok(replaced)
+  t.is(await pathExists(metadata), false)
+})
+
+test('metadata descriptors close after read, write, and sync failures', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const metadata = path.join(layout.sessions, 'atom.json')
+  await fs.promises.writeFile(metadata, '{"inside":true}')
+  let mode = 'read'
+  const events = []
+  const storage = createStorage({
+    failWriteFor: (filePath) => mode === 'write' && filePath.endsWith('.tmp'),
+    failSyncFor: (filePath) => mode === 'sync' && filePath.endsWith('.tmp'),
+    async beforeOperation(name) {
+      if (mode === 'read' && name === 'read') throw new Error('Injected read failure')
+    },
+    async afterOperation(name, filePath) {
+      if (name === 'open' || name === 'close') events.push(`${name}:${filePath}`)
+    }
+  })
+
+  await t.exception(() => readJson(metadata, storage))
+  t.alike(events, [`open:${metadata}`, `close:${metadata}`])
+
+  mode = 'write'
+  events.length = 0
+  await t.exception(() =>
+    writeAtomic(path.join(layout.sessions, 'write.json'), b4a.from('{}'), storage)
+  )
+  t.is(events.filter((event) => event.startsWith('open:')).length, 1)
+  t.is(events.filter((event) => event.startsWith('close:')).length, 1)
+
+  mode = 'sync'
+  events.length = 0
+  await t.exception(() =>
+    writeAtomic(path.join(layout.sessions, 'sync.json'), b4a.from('{}'), storage)
+  )
+  t.is(events.filter((event) => event.startsWith('open:')).length, 1)
+  t.is(events.filter((event) => event.startsWith('close:')).length, 1)
+})
+
 test('storage lock rejects a live owner', async (t) => {
   const root = await createTempDir(t)
   const release = await acquireStorageLock(initLayout(root), {
@@ -449,6 +537,68 @@ test('offer rejects a symlinked transfer-derived staging path', async (t) => {
   t.alike(await fs.promises.readFile(outside), b4a.from('safe'))
 })
 
+test('offer rejects protected staging-parent replacement', async (t) => {
+  let replaced = false
+  let layout
+  let upload
+  let retired
+  const events = []
+  const storage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (replaced || name !== 'open' || filePath !== stagingPath(layout, upload.offer)) return
+      replaced = true
+      await fs.promises.rename(layout.staging, retired)
+      await fs.promises.mkdir(layout.staging, { mode: 0o700 })
+    },
+    async afterOperation(name, filePath) {
+      if (!layout || !upload) return
+      if (filePath === stagingPath(layout, upload.offer) && (name === 'open' || name === 'close')) {
+        events.push(`${name}:${filePath}`)
+      }
+    }
+  })
+  const created = await createStore(t, { storage })
+  layout = created.layout
+  upload = makeUpload()
+  retired = `${layout.staging}.retired`
+
+  await t.exception(() => created.store.offer(OWNER, upload.offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.ok(replaced)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+  t.alike(events, [
+    `open:${stagingPath(layout, upload.offer)}`,
+    `close:${stagingPath(layout, upload.offer)}`
+  ])
+})
+
+test('staging opens require regular no-follow descriptors', async (t) => {
+  const opened = []
+  let stagingStats = 0
+  let layout
+  let upload
+  const storage = createStorage({
+    async afterOperation(name, filePath, flags) {
+      if (!layout || !upload) return
+      if (filePath !== stagingPath(layout, upload.offer)) return
+      if (name === 'open') opened.push(flags)
+      if (name === 'stat') stagingStats++
+    }
+  })
+  const created = await createStore(t, { storage, checkpointChunks: 1 })
+  layout = created.layout
+  upload = makeUpload()
+
+  await created.store.offer(OWNER, upload.offer)
+  await created.store.writeChunk(upload.offer.transferId, upload.chunks[0])
+
+  t.is(opened.length, 3)
+  t.is(stagingStats, 3)
+  for (const flags of opened) t.ok(Number.isSafeInteger(flags))
+})
+
 test('offer rejects capacity, final destinations, and conflicting session names', async (t) => {
   const { root, store } = await createStore(t, { maxStagingBytes: 12 })
   const first = makeUpload()
@@ -535,6 +685,50 @@ test('writeChunk writes exact offsets, verifies digests, and checkpoints metadat
   t.is(persisted.chunkDigests[1], b4a.toString(upload.chunks[1].digest, 'hex'))
 })
 
+test('offer syncs durable staging before publishing its session metadata', async (t) => {
+  const events = []
+  const storage = createStorage({
+    async afterOperation(name, source, destination) {
+      if (name === 'sync' || name === 'rename')
+        events.push(`${name}:${source}->${destination ?? ''}`)
+    }
+  })
+  const { layout, store } = await createStore(t, { storage })
+  const upload = makeUpload()
+
+  await store.offer(OWNER, upload.offer)
+
+  const stagingSync = `sync:${layout.staging}->`
+  const stagingSyncAt = events.indexOf(stagingSync)
+  const sessionRenameAt = events.findIndex((event) =>
+    event.endsWith(`->${sessionPath(layout, upload.offer)}`)
+  )
+  t.ok(stagingSyncAt >= 0)
+  t.ok(sessionRenameAt > stagingSyncAt)
+})
+
+test('deletion durably removes metadata before its staging name', async (t) => {
+  const events = []
+  const storage = createStorage({
+    async afterOperation(name, source) {
+      if (name === 'unlink' || name === 'sync') events.push(`${name}:${source}`)
+    }
+  })
+  const { layout, store } = await createStore(t, { storage })
+  const upload = makeUpload()
+  await store.offer(OWNER, upload.offer)
+  events.length = 0
+
+  await store.delete(upload.offer.transferId)
+
+  t.alike(events, [
+    `unlink:${sessionPath(layout, upload.offer)}`,
+    `sync:${layout.sessions}`,
+    `unlink:${stagingPath(layout, upload.offer)}`,
+    `sync:${layout.staging}`
+  ])
+})
+
 test('chunks require exact lengths and failed writes never become verified', async (t) => {
   const storage = createStorage({ failWriteFor: (filePath) => filePath.endsWith('.part') })
   const { layout, store } = await createStore(t, { storage })
@@ -551,6 +745,60 @@ test('chunks require exact lengths and failed writes never become verified', asy
   const persisted = await readJson(sessionPath(layout, upload.offer))
   t.is(persisted.bitmap, 'AA==')
   t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+})
+
+test('automatic checkpoint rolls back in-memory chunks after staging sync failure', async (t) => {
+  let failStagingSync = false
+  const storage = createStorage({
+    failSyncFor: (filePath) => failStagingSync && filePath.endsWith('.part')
+  })
+  const { layout, store } = await createStore(t, { storage, checkpointChunks: 1 })
+  const upload = makeUpload()
+  await store.offer(OWNER, upload.offer)
+  const before = await readJson(sessionPath(layout, upload.offer))
+
+  failStagingSync = true
+  await t.exception(() => store.writeChunk(upload.offer.transferId, upload.chunks[0]))
+
+  const rolledBack = await store.offer(OWNER, upload.offer)
+  t.is(rolledBack.state, 'receiving')
+  t.is(rolledBack.verified.has(0), false)
+  t.alike(await readJson(sessionPath(layout, upload.offer)), before)
+
+  if (rolledBack.verified.has(0)) {
+    await store.delete(upload.offer.transferId)
+  } else {
+    failStagingSync = false
+    const retried = await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+    t.ok(retried.verified.has(0))
+  }
+})
+
+test('automatic checkpoint rolls back in-memory chunks after metadata write failure', async (t) => {
+  let failMetadataWrite = false
+  const storage = createStorage({
+    failWriteFor: (filePath) => failMetadataWrite && filePath.includes('.json.')
+  })
+  const { layout, store } = await createStore(t, { storage, checkpointChunks: 1 })
+  const upload = makeUpload()
+  await store.offer(OWNER, upload.offer)
+  const before = await readJson(sessionPath(layout, upload.offer))
+
+  failMetadataWrite = true
+  await t.exception(() => store.writeChunk(upload.offer.transferId, upload.chunks[0]))
+
+  const rolledBack = await store.offer(OWNER, upload.offer)
+  t.is(rolledBack.state, 'receiving')
+  t.is(rolledBack.verified.has(0), false)
+  t.alike(await readJson(sessionPath(layout, upload.offer)), before)
+
+  if (rolledBack.verified.has(0)) {
+    await store.delete(upload.offer.transferId)
+  } else {
+    failMetadataWrite = false
+    const retried = await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+    t.ok(retried.verified.has(0))
+  }
 })
 
 test('duplicate chunk digests are idempotent but conflicting duplicates fail closed', async (t) => {
@@ -666,6 +914,29 @@ test('finish requires all chunks, forces a checkpoint, and supports empty files'
   const accepted = await store.offer(OWNER, empty.offer)
   t.is(accepted.verified.size, 0)
   t.is((await store.finish(empty.offer.transferId)).state, 'verified')
+})
+
+test('finish restores receiving state when verified metadata cannot persist', async (t) => {
+  let failMetadataWrite = false
+  const storage = createStorage({
+    failWriteFor: (filePath) => failMetadataWrite && filePath.includes('.json.')
+  })
+  const { layout, store } = await createStore(t, { storage, checkpointChunks: 1 })
+  const upload = makeUpload()
+  await store.offer(OWNER, upload.offer)
+  await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+  const before = await readJson(sessionPath(layout, upload.offer))
+
+  failMetadataWrite = true
+  await t.exception(() => store.finish(upload.offer.transferId))
+
+  const rolledBack = await store.offer(OWNER, upload.offer)
+  t.is(rolledBack.state, 'receiving')
+  t.is(rolledBack.verified.has(0), true)
+  t.alike(await readJson(sessionPath(layout, upload.offer)), before)
+
+  failMetadataWrite = false
+  t.is((await store.finish(upload.offer.transferId)).state, 'verified')
 })
 
 test('delete, deleteByOwner, and expire remove staging metadata and reservations', async (t) => {
