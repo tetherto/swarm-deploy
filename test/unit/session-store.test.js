@@ -729,6 +729,147 @@ test('offer syncs durable staging before publishing its session metadata', async
   t.ok(sessionRenameAt > stagingSyncAt)
 })
 
+test('offer cleans and syncs staging after its parent sync fails', async (t) => {
+  let failNextStagingSync = false
+  let layout
+  const events = []
+  const storage = createStorage({
+    failSyncFor: (filePath) => {
+      if (!failNextStagingSync || filePath !== layout.staging) return false
+      failNextStagingSync = false
+      return true
+    },
+    async beforeOperation(name, filePath) {
+      if (name === 'sync' && filePath === layout.staging) events.push(`sync-attempt:${filePath}`)
+    },
+    async afterOperation(name, filePath) {
+      if (
+        (name === 'sync' && filePath === layout.staging) ||
+        (name === 'unlink' && filePath === stagingPath(layout, upload.offer))
+      ) {
+        events.push(`${name}:${filePath}`)
+      }
+    }
+  })
+  const created = await createStore(t, { storage })
+  layout = created.layout
+  const upload = makeUpload()
+
+  failNextStagingSync = true
+  await t.exception(() => created.store.offer(OWNER, upload.offer))
+  t.alike(events, [
+    `sync-attempt:${layout.staging}`,
+    `unlink:${stagingPath(layout, upload.offer)}`,
+    `sync-attempt:${layout.staging}`,
+    `sync:${layout.staging}`
+  ])
+  t.is(await pathExists(stagingPath(layout, upload.offer)), false)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+
+  if (await pathExists(stagingPath(layout, upload.offer))) {
+    await fs.promises.unlink(stagingPath(layout, upload.offer))
+  } else {
+    await created.store.offer(OWNER, upload.offer)
+    await created.store.close()
+    const reopened = new SessionStore({ layout, maxStagingBytes: 1024, storage })
+    await reopened.init()
+    t.teardown(() => reopened.close())
+    t.ok((await reopened.offer(OWNER, upload.offer)).resumed)
+  }
+})
+
+test('offer removes staging after metadata fails before rename', async (t) => {
+  let failMetadataWrite = false
+  const events = []
+  const storage = createStorage({
+    failWriteFor: (filePath) => failMetadataWrite && filePath.includes('.json.'),
+    async afterOperation(name, filePath) {
+      if (
+        (name === 'sync' &&
+          (filePath === layout.staging || filePath === stagingPath(layout, upload.offer))) ||
+        (name === 'unlink' && filePath === stagingPath(layout, upload.offer))
+      ) {
+        events.push(`${name}:${filePath}`)
+      }
+    }
+  })
+  const { layout, store } = await createStore(t, { storage })
+  const upload = makeUpload()
+  events.length = 0
+
+  failMetadataWrite = true
+  await t.exception(() => store.offer(OWNER, upload.offer))
+  t.alike(events, [
+    `sync:${stagingPath(layout, upload.offer)}`,
+    `sync:${layout.staging}`,
+    `unlink:${stagingPath(layout, upload.offer)}`,
+    `sync:${layout.staging}`
+  ])
+  t.is(await pathExists(stagingPath(layout, upload.offer)), false)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+  t.is(store.reservedBytes, 0)
+
+  failMetadataWrite = false
+  await store.offer(OWNER, upload.offer)
+  await store.close()
+  const reopened = new SessionStore({ layout, maxStagingBytes: 1024, storage })
+  await reopened.init()
+  t.teardown(() => reopened.close())
+  t.ok((await reopened.offer(OWNER, upload.offer)).resumed)
+})
+
+test('offer preserves renamed metadata after its parent sync fails', async (t) => {
+  let failNextSessionSync = false
+  let layout
+  const storage = createStorage({
+    failSyncFor: (filePath) => {
+      if (!failNextSessionSync || filePath !== layout.sessions) return false
+      failNextSessionSync = false
+      return true
+    }
+  })
+  const created = await createStore(t, { storage })
+  layout = created.layout
+  const upload = makeUpload()
+
+  failNextSessionSync = true
+  await t.exception(() => created.store.offer(OWNER, upload.offer))
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), true)
+  t.is(created.store.reservedBytes, upload.offer.size)
+  t.ok((await created.store.offer(OWNER, upload.offer)).resumed)
+
+  await created.store.close()
+  const reopened = new SessionStore({ layout, maxStagingBytes: 1024, storage })
+  await reopened.init()
+  t.teardown(() => reopened.close())
+  t.ok((await reopened.offer(OWNER, upload.offer)).resumed)
+})
+
+test('offer preserves primary and cleanup failures', async (t) => {
+  let failStagingParentSync = false
+  let layout
+  const storage = createStorage({
+    failSyncFor: (filePath) => failStagingParentSync && filePath === layout.staging
+  })
+  const created = await createStore(t, { storage })
+  layout = created.layout
+  const upload = makeUpload()
+
+  failStagingParentSync = true
+  let failure = null
+  try {
+    await created.store.offer(OWNER, upload.offer)
+  } catch (err) {
+    failure = err
+  }
+  t.is(failure?.name, 'SwarmDeployError')
+  t.is(failure?.code, ERRORS.PROTOCOL_INVALID)
+  t.ok(failure?.cause)
+  t.ok(failure?.cleanupCause)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+})
+
 test('deletion durably removes metadata before its staging name', async (t) => {
   const events = []
   const storage = createStorage({
