@@ -172,28 +172,20 @@ test('selectUploadPaths skips regular files with invalid basenames', async (t) =
   }
 })
 
-test('buildFileManifest opens files with O_NOFOLLOW', async (t) => {
+test('buildFileManifest rejects symlink via no-follow open', async (t) => {
   const dir = await createTempDir(t)
-  const filePath = path.join(dir, 'nofollow.bin')
-  await writeDeterministicFile(filePath, 8)
+  const targetPath = path.join(dir, 'target.bin')
+  const linkPath = path.join(dir, 'link.bin')
+  await writeDeterministicFile(targetPath, 4)
+  await fs.promises.symlink(targetPath, linkPath)
 
-  const originalOpen = fs.promises.open
-  let seenFlags = null
-  fs.promises.open = async function patchedOpen(openPath, flags, mode) {
-    seenFlags = flags
-    return originalOpen.call(this, openPath, flags, mode)
-  }
-  t.teardown(() => {
-    fs.promises.open = originalOpen
+  await t.exception(() => buildFileManifest(linkPath), {
+    name: 'SwarmDeployError',
+    code: ERRORS.INVALID_FILENAME
   })
-
-  await buildFileManifest(filePath)
-
-  const O_NOFOLLOW = fs.constants?.O_NOFOLLOW ?? 0x100
-  t.ok((seenFlags & O_NOFOLLOW) !== 0, 'open flags include O_NOFOLLOW')
 })
 
-test('buildFileManifest rejects symlink swapped after lstat', async (t) => {
+test('buildFileManifest maps ELOOP from no-follow open to INVALID_FILENAME', async (t) => {
   const dir = await createTempDir(t)
   const filePath = path.join(dir, 'swap.bin')
   const otherPath = path.join(dir, 'other.bin')
@@ -225,19 +217,24 @@ test('buildFileManifest rejects when bytes read mismatch initial size', async (t
   const filePath = path.join(dir, 'short-read.bin')
   await writeDeterministicFile(filePath, 10)
 
-  const originalLstat = fs.promises.lstat
-  let calls = 0
-  fs.promises.lstat = async function patchedLstat(lstatPath, opts) {
-    const stat = await originalLstat.call(this, lstatPath, opts)
-    if (lstatPath === filePath && ++calls === 1) {
-      return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
-        size: stat.size + 5
-      })
+  const original = fs.createReadStream
+  fs.createReadStream = function patchedCreateReadStream(p, opts = {}) {
+    const stream = original.call(fs, p, opts)
+    const origOn = stream.on.bind(stream)
+    stream.on = function (event, listener) {
+      if (event === 'data') {
+        return origOn(event, (chunk) => {
+          listener(chunk.subarray(0, 5))
+          stream.destroy()
+          stream.emit('end')
+        })
+      }
+      return origOn(event, listener)
     }
-    return stat
+    return stream
   }
   t.teardown(() => {
-    fs.promises.lstat = originalLstat
+    fs.createReadStream = original
   })
 
   await t.exception(() => buildFileManifest(filePath), {
@@ -257,6 +254,7 @@ test('selectUploadPaths accepts a regular file and rejects a symlink input', asy
 
   await fs.promises.symlink(filePath, path.join(dir, 'solo-link'))
   await t.exception(() => selectUploadPaths(path.join(dir, 'solo-link')), {
-    name: 'SwarmDeployError'
+    name: 'SwarmDeployError',
+    code: ERRORS.INVALID_FILENAME
   })
 })
