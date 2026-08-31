@@ -25,6 +25,7 @@ const {
   TRANSFER_ID_BYTES,
   MAX_CONTROL_BYTES,
   MAX_CHUNK_BYTES,
+  MAX_CHUNK_FRAME_BYTES,
   MAX_BITMAP_BITS
 } = require('./lib/protocol/constants')
 const {
@@ -40,7 +41,7 @@ const {
   result,
   mergeBitmapPages
 } = require('./lib/protocol/codecs')
-const { transferId } = require('./lib/protocol/transfer-id')
+const { transferId, encodeTransferIdCanonical } = require('./lib/protocol/transfer-id')
 
 module.exports = {
   SwarmDeployError,
@@ -68,6 +69,7 @@ module.exports = {
   TRANSFER_ID_BYTES,
   MAX_CONTROL_BYTES,
   MAX_CHUNK_BYTES,
+  MAX_CHUNK_FRAME_BYTES,
   MAX_BITMAP_BITS,
   encodeBounded,
   decodeBounded,
@@ -80,5 +82,6 @@ module.exports = {
   finish,
   result,
   mergeBitmapPages,
-  transferId
+  transferId,
+  encodeTransferIdCanonical
 }

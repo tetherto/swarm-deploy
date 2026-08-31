@@ -2,7 +2,6 @@
 
 const test = require('brittle')
 const b4a = require('b4a')
-const c = require('compact-encoding')
 const {
   SwarmDeployError,
   ERRORS,
@@ -17,6 +16,7 @@ const {
   STATUS_CODE,
   MAX_CONTROL_BYTES,
   MAX_CHUNK_BYTES,
+  MAX_CHUNK_FRAME_BYTES,
   MAX_BITMAP_BITS,
   encodeBounded,
   decodeBounded,
@@ -29,6 +29,7 @@ const {
   finish,
   result,
   transferId,
+  encodeTransferIdCanonical,
   mergeBitmapPages
 } = require('../..')
 const { CHUNK_SIZE, digestBuffer } = require('../helpers/files')
@@ -37,6 +38,22 @@ const { keyPairFromSeed, publicKeyFromSeed } = require('../..')
 const KEY = publicKeyFromSeed(b4a.alloc(32, 7))
 const DIGEST = digestBuffer(b4a.alloc(32, 9))
 const NAME = 'artifact-linux-x64.tar.gz'
+
+const TRANSFER_ID_VECTOR = {
+  clientPublicKey: b4a.alloc(32, 0x07),
+  name: 'artifact-linux-x64.tar.gz',
+  size: 123,
+  digest: b4a.alloc(32, 0x09),
+  chunkSize: CHUNK_SIZE
+}
+const TRANSFER_ID_VECTOR_ENCODED = b4a.from(
+  '18737761726d2d6465706c6f792f7472616e736665722f763107070707070707070707070707070707070707070707070707070707070707071961727469666163742d6c696e75782d7836342e7461722e677a7b0909090909090909090909090909090909090909090909090909090909090909fe00001000',
+  'hex'
+)
+const TRANSFER_ID_VECTOR_HASH = b4a.from(
+  '90c2bfe9c303fbf7b755b97e0da646d99afdfe406d8dcce2ec814305b8da7ee4',
+  'hex'
+)
 
 function sampleOffer(overrides = {}) {
   const size = overrides.size ?? CHUNK_SIZE + 17
@@ -62,6 +79,12 @@ function sampleOffer(overrides = {}) {
   }
 }
 
+function snapshotValue(value) {
+  const copy = { ...value }
+  if (b4a.isBuffer(value.transferId)) copy.transferId = b4a.from(value.transferId)
+  return copy
+}
+
 test('message index constants follow wire order', (t) => {
   t.is(OFFER, 0)
   t.is(STATUS, 1)
@@ -85,7 +108,7 @@ test('status codec round-trips representative data', (t) => {
     code: STATUS_CODE.ACCEPT
   }
   const decoded = decodeBounded(status, encodeBounded(status, value))
-  t.alike(decoded, value)
+  t.alike(decoded, { ...value, reason: '' })
 })
 
 test('status codec round-trips rejected responses with reason', (t) => {
@@ -98,10 +121,30 @@ test('status codec round-trips rejected responses with reason', (t) => {
   t.alike(decoded, value)
 })
 
+test('status and result encoders do not mutate caller values', (t) => {
+  const statusValue = {
+    transferId: sampleOffer().transferId,
+    code: STATUS_CODE.ACCEPT
+  }
+  const statusSnapshot = snapshotValue(statusValue)
+  encodeBounded(status, statusValue)
+  t.alike(statusValue, statusSnapshot)
+  t.is(statusValue.reason, undefined)
+
+  const resultValue = {
+    transferId: sampleOffer().transferId,
+    code: 0
+  }
+  const resultSnapshot = snapshotValue(resultValue)
+  encodeBounded(result, resultValue)
+  t.alike(resultValue, resultSnapshot)
+  t.is(resultValue.reason, undefined)
+})
+
 test('bitmap page codec round-trips representative data', (t) => {
   const bits = b4a.alloc(2)
   bits[0] = 0b00000101
-  bits[1] = 0b10000000
+  bits[1] = 0b00000011
   const value = {
     transferId: sampleOffer().transferId,
     start: 10,
@@ -116,22 +159,45 @@ test('ready, finish, and result codecs round-trip', (t) => {
   const id = sampleOffer().transferId
   t.alike(decodeBounded(ready, encodeBounded(ready, { transferId: id })), { transferId: id })
   t.alike(decodeBounded(finish, encodeBounded(finish, { transferId: id })), { transferId: id })
-  t.alike(
-    decodeBounded(result, encodeBounded(result, { transferId: id, code: 0, reason: '' })),
-    { transferId: id, code: 0, reason: '' }
-  )
+  t.alike(decodeBounded(result, encodeBounded(result, { transferId: id, code: 0, reason: '' })), {
+    transferId: id,
+    code: 0,
+    reason: ''
+  })
 })
 
-test('chunk codec round-trips representative data with separate bound', (t) => {
-  const data = b4a.alloc(1024, 3)
+test('chunk frame bound includes header overhead for full 1 MiB payload', (t) => {
+  const data = b4a.alloc(MAX_CHUNK_BYTES, 3)
   const value = {
     transferId: sampleOffer().transferId,
-    index: 2,
+    index: 0,
     digest: digestBuffer(data),
     data
   }
-  const decoded = decodeBounded(chunk, encodeBounded(chunk, value, MAX_CHUNK_BYTES), MAX_CHUNK_BYTES)
-  t.alike(decoded, value)
+  const encoded = encodeBounded(chunk, value, MAX_CHUNK_FRAME_BYTES)
+  t.ok(encoded.byteLength <= MAX_CHUNK_FRAME_BYTES)
+  t.alike(decodeBounded(chunk, encoded, MAX_CHUNK_FRAME_BYTES), value)
+
+  const worstCase = {
+    transferId: b4a.alloc(32),
+    index: Number.MAX_SAFE_INTEGER,
+    digest: b4a.alloc(32),
+    data: b4a.alloc(MAX_CHUNK_BYTES)
+  }
+  t.is(encodeBounded(chunk, worstCase, MAX_CHUNK_FRAME_BYTES).byteLength, MAX_CHUNK_FRAME_BYTES)
+})
+
+test('chunk codec rejects data larger than 1 MiB', (t) => {
+  const value = {
+    transferId: sampleOffer().transferId,
+    index: 0,
+    digest: DIGEST,
+    data: b4a.alloc(MAX_CHUNK_BYTES + 1)
+  }
+  t.exception(() => encodeBounded(chunk, value, MAX_CHUNK_FRAME_BYTES), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
 })
 
 test('chunkAck codec round-trips representative data', (t) => {
@@ -143,16 +209,20 @@ test('chunkAck codec round-trips representative data', (t) => {
   t.alike(decoded, value)
 })
 
-test('fixed-width fields must be exactly 32 bytes', (t) => {
-  const bad = sampleOffer({ transferId: b4a.alloc(31) })
-  t.exception(() => encodeBounded(offer, bad), {
+test('fixed32 semantic validation rejects short transfer ID fields on decode', (t) => {
+  const encoded = encodeBounded(chunkAck, {
+    transferId: sampleOffer().transferId,
+    index: 0
+  })
+  t.exception(() => decodeBounded(chunkAck, encoded.subarray(0, 31)), {
     name: 'SwarmDeployError',
     code: ERRORS.PROTOCOL_INVALID
   })
+})
 
-  const encoded = encodeBounded(offer, sampleOffer())
-  encoded[encoded.byteLength - 1] ^= 0xff
-  t.exception(() => decodeBounded(offer, encoded), {
+test('fixed-width fields must be exactly 32 bytes on encode', (t) => {
+  const bad = sampleOffer({ transferId: b4a.alloc(31) })
+  t.exception(() => encodeBounded(offer, bad), {
     name: 'SwarmDeployError',
     code: ERRORS.PROTOCOL_INVALID
   })
@@ -166,25 +236,16 @@ test('control messages larger than 16 KiB are rejected', (t) => {
   })
 })
 
-test('chunk messages larger than 1 MiB are rejected', (t) => {
-  const value = {
-    transferId: sampleOffer().transferId,
-    index: 0,
-    digest: DIGEST,
-    data: b4a.alloc(MAX_CHUNK_BYTES + 1)
-  }
-  t.exception(() => encodeBounded(chunk, value, MAX_CHUNK_BYTES), {
-    name: 'SwarmDeployError',
-    code: ERRORS.PROTOCOL_INVALID
-  })
-})
-
 test('file size and chunk indexes must be safe non-negative integers', (t) => {
   for (const size of [-1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
-    t.exception(() => encodeBounded(offer, sampleOffer({ size })), {
-      name: 'SwarmDeployError',
-      code: ERRORS.PROTOCOL_INVALID
-    }, `size ${String(size)}`)
+    t.exception(
+      () => encodeBounded(offer, sampleOffer({ size })),
+      {
+        name: 'SwarmDeployError',
+        code: ERRORS.PROTOCOL_INVALID
+      },
+      `size ${String(size)}`
+    )
   }
 
   for (const index of [-1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
@@ -203,13 +264,34 @@ test('file size and chunk indexes must be safe non-negative integers', (t) => {
   }
 })
 
-test('chunkSize must be a positive safe integer', (t) => {
-  for (const chunkSize of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
-    t.exception(() => encodeBounded(offer, sampleOffer({ chunkSize })), {
+test('chunkSize must be a positive safe integer bounded by MAX_CHUNK_BYTES', (t) => {
+  for (const chunkSize of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1, MAX_CHUNK_BYTES + 1]) {
+    t.exception(
+      () => encodeBounded(offer, sampleOffer({ chunkSize })),
+      {
+        name: 'SwarmDeployError',
+        code: ERRORS.PROTOCOL_INVALID
+      },
+      `chunkSize ${String(chunkSize)}`
+    )
+  }
+})
+
+test('transferId rejects chunkSize above MAX_CHUNK_BYTES', (t) => {
+  t.exception(
+    () =>
+      transferId({
+        clientPublicKey: KEY,
+        name: NAME,
+        size: 1,
+        digest: DIGEST,
+        chunkSize: MAX_CHUNK_BYTES + 1
+      }),
+    {
       name: 'SwarmDeployError',
       code: ERRORS.PROTOCOL_INVALID
-    }, `chunkSize ${String(chunkSize)}`)
-  }
+    }
+  )
 })
 
 test('bitmap pages cover at most 65536 chunk bits', (t) => {
@@ -265,6 +347,22 @@ test('bitmap pages reject malformed bit lengths and out-of-range spans', (t) => 
   )
 })
 
+test('bitmap pages reject nonzero unused padding bits', (t) => {
+  t.exception(
+    () =>
+      encodeBounded(bitmapPage, {
+        transferId: sampleOffer().transferId,
+        start: 0,
+        count: 10,
+        bits: b4a.from([0b00000101, 0b10000000])
+      }),
+    {
+      name: 'SwarmDeployError',
+      code: ERRORS.PROTOCOL_INVALID
+    }
+  )
+})
+
 test('bitmap pages reconstruct arbitrarily fragmented state', (t) => {
   const id = sampleOffer().transferId
   const pages = [
@@ -302,6 +400,32 @@ test('bitmap pages reject overlapping ranges', (t) => {
           { transferId: id, start: 2, count: 2, bits: b4a.from([0b11]) }
         ],
         8
+      ),
+    {
+      name: 'SwarmDeployError',
+      code: ERRORS.PROTOCOL_INVALID
+    }
+  )
+})
+
+test('mergeBitmapPages rejects mixed transfer IDs', (t) => {
+  const id1 = sampleOffer().transferId
+  const id2 = transferId({
+    clientPublicKey: keyPairFromSeed(b4a.alloc(32, 8)).publicKey,
+    name: NAME,
+    size: 123,
+    digest: DIGEST,
+    chunkSize: CHUNK_SIZE
+  })
+
+  t.exception(
+    () =>
+      mergeBitmapPages(
+        [
+          { transferId: id1, start: 0, count: 2, bits: b4a.from([0b11]) },
+          { transferId: id2, start: 2, count: 2, bits: b4a.from([0b11]) }
+        ],
+        4
       ),
     {
       name: 'SwarmDeployError',
@@ -350,22 +474,21 @@ test('decodeBounded rejects inputs larger than bound before decoding', (t) => {
   })
 })
 
-test('transfer IDs are 32-byte digests of canonical compact encoding', (t) => {
-  const base = {
-    clientPublicKey: KEY,
-    name: NAME,
-    size: 123,
-    digest: DIGEST,
-    chunkSize: CHUNK_SIZE
-  }
-  const id = transferId(base)
-  t.is(id.byteLength, 32)
+test('transfer ID canonical encoding matches pinned known vector', (t) => {
+  t.alike(encodeTransferIdCanonical(TRANSFER_ID_VECTOR), TRANSFER_ID_VECTOR_ENCODED)
+  t.alike(transferId(TRANSFER_ID_VECTOR), TRANSFER_ID_VECTOR_HASH)
+})
 
-  const tuple = c.encode(
-    c.array(c.any),
-    ['swarm-deploy/transfer/v1', base.clientPublicKey, base.name, base.size, base.digest, base.chunkSize]
-  )
-  t.alike(id, digestBuffer(tuple))
+test('transfer ID canonical encoding accepts Uint8Array fixed fields', (t) => {
+  const input = {
+    clientPublicKey: new Uint8Array(b4a.alloc(32, 0x07)),
+    name: TRANSFER_ID_VECTOR.name,
+    size: TRANSFER_ID_VECTOR.size,
+    digest: new Uint8Array(b4a.alloc(32, 0x09)),
+    chunkSize: TRANSFER_ID_VECTOR.chunkSize
+  }
+  t.alike(encodeTransferIdCanonical(input), TRANSFER_ID_VECTOR_ENCODED)
+  t.alike(transferId(input), TRANSFER_ID_VECTOR_HASH)
 })
 
 test('transfer IDs change when identity, name, size, digest, or chunk size changes', (t) => {
