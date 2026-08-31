@@ -22,6 +22,9 @@
 - Never execute, unpack, install, or serve uploaded files.
 - Generate all binary test data in temporary directories; commit no binary fixtures.
 - Do not create git commits unless the user separately authorizes them.
+- The server OS account and protected storage root are trusted against concurrent local tampering;
+  existing or detected symlinks and parent-directory identity changes fail closed; native
+  `openat`-style hardening against a malicious local writer is out of version 1 scope.
 
 ---
 

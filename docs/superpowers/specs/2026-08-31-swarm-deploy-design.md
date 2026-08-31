@@ -36,6 +36,9 @@ Version 1 does not provide:
 ## Security Model
 
 Swarm Deploy assumes unauthenticated peers are hostile and an allowlisted client may be compromised.
+The server OS account and protected storage root are trusted against concurrent local tampering.
+Existing or detected symlinks and parent-directory identity changes fail closed. Native
+`openat`-style hardening against a malicious local writer is out of version 1 scope.
 
 The system guarantees:
 

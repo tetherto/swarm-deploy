@@ -16,6 +16,7 @@ const { createStorage } = require('../helpers/storage')
 
 const OWNER = b4a.alloc(32, 7)
 const OTHER_OWNER = b4a.alloc(32, 8)
+const MAX_SESSION_METADATA_BYTES = 32 * 1024 * 1024
 
 function digest(bytes) {
   return crypto.createHash('sha256').update(bytes).digest()
@@ -240,6 +241,27 @@ test('metadata descriptors close after read, write, and sync failures', async (t
   )
   t.is(events.filter((event) => event.startsWith('open:')).length, 1)
   t.is(events.filter((event) => event.startsWith('close:')).length, 1)
+})
+
+test('metadata reads reject sparse session-sized files before allocating or reading', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const metadata = path.join(layout.sessions, 'oversized.json')
+  const handle = await fs.promises.open(metadata, 'w')
+  await handle.truncate(MAX_SESSION_METADATA_BYTES + 1)
+  await handle.close()
+
+  let readAttempted = false
+  const storage = createStorage({
+    async beforeOperation(name) {
+      if (name === 'read') readAttempted = true
+    }
+  })
+  await t.exception(() => readJson(metadata, storage), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.is(readAttempted, false)
 })
 
 test('storage lock rejects a live owner', async (t) => {
@@ -801,6 +823,27 @@ test('automatic checkpoint rolls back in-memory chunks after metadata write fail
   }
 })
 
+test('automatic checkpoint keeps renamed metadata after session-parent sync failure', async (t) => {
+  let failSessionSync = false
+  let layout
+  const storage = createStorage({
+    failSyncFor: (filePath) => failSessionSync && filePath === layout.sessions
+  })
+  const created = await createStore(t, { storage, checkpointChunks: 1 })
+  layout = created.layout
+  const upload = makeUpload()
+  await created.store.offer(OWNER, upload.offer)
+
+  failSessionSync = true
+  await t.exception(() => created.store.writeChunk(upload.offer.transferId, upload.chunks[0]))
+
+  const resumed = await created.store.offer(OWNER, upload.offer)
+  t.is(resumed.state, 'receiving')
+  t.is(resumed.verified.has(0), true)
+  t.is((await readJson(sessionPath(layout, upload.offer))).bitmap, 'AQ==')
+  failSessionSync = false
+})
+
 test('duplicate chunk digests are idempotent but conflicting duplicates fail closed', async (t) => {
   const { layout, store } = await createStore(t)
   const upload = makeUpload()
@@ -856,6 +899,45 @@ test('checkpointed sessions reconstruct reservations and verified chunks after r
   t.ok(resumed.resumed)
   t.ok(resumed.verified.has(0))
   t.is(reopened.reservedBytes, upload.offer.size)
+})
+
+test('init rejects receiving staging with trailing bytes', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const upload = makeUpload()
+  const first = new SessionStore({ layout, maxStagingBytes: 1024, checkpointChunks: 1 })
+  await first.init()
+  await first.offer(OWNER, upload.offer)
+  await first.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await first.close()
+  await fs.promises.appendFile(stagingPath(layout, upload.offer), b4a.from('trailing'))
+
+  const reopened = new SessionStore({ layout, maxStagingBytes: 1024 })
+  await t.exception(() => reopened.init(), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+})
+
+test('init requires exact staging length for verified sessions', async (t) => {
+  for (const size of [10, 12]) {
+    const root = await createTempDir(t)
+    const layout = initLayout(root)
+    const upload = makeUpload()
+    const first = new SessionStore({ layout, maxStagingBytes: 1024, checkpointChunks: 1 })
+    await first.init()
+    await first.offer(OWNER, upload.offer)
+    await first.writeChunk(upload.offer.transferId, upload.chunks[0])
+    await first.finish(upload.offer.transferId)
+    await first.close()
+    await fs.promises.truncate(stagingPath(layout, upload.offer), size)
+
+    const reopened = new SessionStore({ layout, maxStagingBytes: 1024 })
+    await t.exception(() => reopened.init(), {
+      name: 'SwarmDeployError',
+      code: ERRORS.PROTOCOL_INVALID
+    })
+  }
 })
 
 test('init fails closed on malformed session metadata and symlinked session files', async (t) => {
@@ -937,6 +1019,27 @@ test('finish restores receiving state when verified metadata cannot persist', as
 
   failMetadataWrite = false
   t.is((await store.finish(upload.offer.transferId)).state, 'verified')
+})
+
+test('finish keeps renamed verified metadata after session-parent sync failure', async (t) => {
+  let failSessionSync = false
+  let layout
+  const storage = createStorage({
+    failSyncFor: (filePath) => failSessionSync && filePath === layout.sessions
+  })
+  const created = await createStore(t, { storage, checkpointChunks: 1 })
+  layout = created.layout
+  const upload = makeUpload()
+  await created.store.offer(OWNER, upload.offer)
+  await created.store.writeChunk(upload.offer.transferId, upload.chunks[0])
+
+  failSessionSync = true
+  await t.exception(() => created.store.finish(upload.offer.transferId))
+
+  const resumed = await created.store.offer(OWNER, upload.offer)
+  t.is(resumed.state, 'verified')
+  t.is((await readJson(sessionPath(layout, upload.offer))).state, 'verified')
+  failSessionSync = false
 })
 
 test('delete, deleteByOwner, and expire remove staging metadata and reservations', async (t) => {
