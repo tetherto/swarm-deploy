@@ -1,0 +1,68 @@
+{
+  "name": "@tetherto/swarm-deploy",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Secure resumable artifact uploads over Hyperswarm",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "swarm-deploy": "bin/swarm-deploy.js"
+  },
+  "scripts": {
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "lint": "prettier . --check && lunte && tsc --noEmit --strict index.d.ts",
+    "test:node": "brittle-node test/run.js",
+    "test:bare": "brittle-bare test/run.js",
+    "test": "npm run test:node && npm run test:bare"
+  },
+  "imports": {
+    "#crypto": {
+      "bare": "bare-crypto",
+      "default": "./lib/crypto-node.js"
+    },
+    "#events": {
+      "bare": "bare-events",
+      "default": "events"
+    },
+    "#fs": {
+      "bare": "bare-fs",
+      "default": "fs"
+    },
+    "#path": {
+      "bare": "bare-path",
+      "default": "path"
+    }
+  },
+  "files": [
+    "bin",
+    "lib",
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE.md",
+    "NOTICE.md",
+    "SECURITY.md"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "b4a": "^1.8.1",
+    "bare-crypto": "^1.15.3",
+    "bare-events": "^2.9.2",
+    "bare-fs": "^4.8.1",
+    "bare-path": "^3.1.1",
+    "compact-encoding": "^3.3.2",
+    "hyperdht": "^6.33.2",
+    "hyperswarm": "^4.17.0",
+    "protomux": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "bare-runtime": "^1.31.0",
+    "brittle": "^4.1.0",
+    "lunte": "^1.8.4",
+    "prettier": "^3.9.6",
+    "prettier-config-holepunch": "^2.0.0",
+    "typescript": "^7.0.2"
+  }
+}
