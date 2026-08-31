@@ -96,10 +96,10 @@ async function createVerifiedSession(t, storage) {
 }
 
 for (const point of [
-  'journal persisted',
+  'journal parent synchronized',
   'final hard link created',
   'storage directory synchronized',
-  'commit sidecar persisted',
+  'commit sidecar parent synchronized',
   'staging link removed',
   'journal removed'
 ]) {
@@ -111,15 +111,17 @@ for (const point of [
       if (!armed || !layout || !upload) return
       const expected = paths(layout, upload.offer)
       const crash =
-        (point === 'journal persisted' && name === 'rename' && destination === expected.journal) ||
+        (point === 'journal parent synchronized' &&
+          name === 'sync' &&
+          source === layout.journals) ||
         (point === 'final hard link created' &&
           name === 'link' &&
           source === expected.staging &&
           destination === expected.final) ||
         (point === 'storage directory synchronized' && name === 'sync' && source === layout.root) ||
-        (point === 'commit sidecar persisted' &&
-          name === 'rename' &&
-          destination === expected.record) ||
+        (point === 'commit sidecar parent synchronized' &&
+          name === 'sync' &&
+          source === layout.commits) ||
         (point === 'staging link removed' && name === 'unlink' && source === expected.staging) ||
         (point === 'journal removed' && name === 'unlink' && source === expected.journal)
       if (crash) {
@@ -158,7 +160,7 @@ for (const point of [
     await restarted.init()
     t.teardown(() => restarted.close())
 
-    if (point === 'journal persisted') {
+    if (point === 'journal parent synchronized') {
       t.is(await pathExists(expected.final), false)
       t.is(await pathExists(expected.record), false)
       t.is(await pathExists(expected.staging), true)
@@ -182,3 +184,111 @@ for (const point of [
     t.is(restarted.sessions.size, 0)
   })
 }
+
+test('recovery leaves a same-content foreign final unmanaged', async (t) => {
+  let layout = null
+  let armed = false
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.journals) {
+        armed = false
+        throw new Error('Injected journal parent sync failure')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, storage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const commits = new CommitStore({ layout, clock: created.clock, storage })
+
+  armed = true
+  await t.exception(() => commits.commit(created.session))
+  await fs.promises.copyFile(expected.staging, expected.final)
+  await created.sessionStore.close()
+
+  const results = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+
+  t.is(results[0].status, 'FILE_EXISTS')
+  t.is(await pathExists(expected.record), false)
+  t.alike(await fs.promises.readFile(expected.final), created.upload.chunk.data)
+  t.is(await pathExists(expected.staging), true)
+})
+
+test('recovery reports corrupt journals and continues valid journals', async (t) => {
+  let layout = null
+  let armed = false
+  const warnings = []
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.journals) {
+        armed = false
+        throw new Error('Injected journal parent sync failure')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, storage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const corrupt = path.join(layout.journals, `${'0'.repeat(64)}.json`)
+  await fs.promises.writeFile(corrupt, '{bad journal')
+  const commits = new CommitStore({ layout, clock: created.clock, storage })
+
+  armed = true
+  await t.exception(() => commits.commit(created.session))
+  await created.sessionStore.close()
+  const results = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: {
+      warn(message, detail) {
+        warnings.push({ message, detail })
+      }
+    }
+  })
+
+  t.is(results.length, 2)
+  t.is(results[0].status, 'CORRUPT')
+  t.is(results[1].status, 'RESUMABLE')
+  t.is(warnings.length, 1)
+  t.is(await pathExists(expected.journal), false)
+  t.is(await pathExists(corrupt), true)
+})
+
+test('recovery delegates corrupt resumable metadata to SessionStore validation', async (t) => {
+  let layout = null
+  let armed = false
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.journals) {
+        armed = false
+        throw new Error('Injected journal parent sync failure')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, storage)
+  layout = created.layout
+  const expected = paths(layout, created.upload.offer)
+  const commits = new CommitStore({ layout, clock: created.clock, storage })
+
+  armed = true
+  await t.exception(() => commits.commit(created.session))
+  await fs.promises.writeFile(expected.session, '{}')
+  await created.sessionStore.close()
+  const results = await recoverStorage({
+    layout,
+    sessionStore: created.sessionStore,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+
+  t.is(results[0].status, 'CORRUPT')
+  t.is(await pathExists(expected.session), true)
+  t.is(await pathExists(expected.staging), true)
+  t.is(await pathExists(expected.journal), true)
+})

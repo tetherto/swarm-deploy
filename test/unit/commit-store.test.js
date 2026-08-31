@@ -191,6 +191,34 @@ test('link failure preserves verified session state without a final file', async
   t.is(await pathExists(journalPath(layout, upload.offer)), false)
 })
 
+test('commit durably journals a unique attempt and staging inode before linking', async (t) => {
+  let layout = null
+  let armed = false
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (armed && name === 'sync' && filePath === layout.journals) {
+        armed = false
+        throw new Error('Injected journal parent sync failure')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, { storage })
+  layout = created.layout
+  const staging = await fs.promises.lstat(stagingPath(layout, created.upload.offer))
+  const commits = new CommitStore({ layout, storage })
+
+  armed = true
+  await t.exception(() => commits.commit(created.session))
+  const journal = await readJson(journalPath(layout, created.upload.offer))
+
+  t.ok(/^[0-9a-f]{64}$/.test(journal.attemptId))
+  t.alike(journal.sourceStagingIdentity, {
+    dev: String(staging.dev),
+    ino: String(staging.ino)
+  })
+  t.is(await pathExists(path.join(layout.root, created.upload.offer.name)), false)
+})
+
 test('delete removes only its managed object and durably removes its sidecar', async (t) => {
   const events = []
   const storage = createStorage({
