@@ -23,15 +23,15 @@
     },
     "#events": {
       "bare": "bare-events",
-      "default": "events"
+      "default": "./lib/events-node.js"
     },
     "#fs": {
       "bare": "bare-fs",
-      "default": "fs"
+      "default": "./lib/fs-node.js"
     },
     "#path": {
       "bare": "bare-path",
-      "default": "path"
+      "default": "./lib/path-node.js"
     }
   },
   "files": [
