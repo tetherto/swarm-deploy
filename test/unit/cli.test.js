@@ -492,6 +492,16 @@ test('server config failures exit 2 and listen failures exit 1', async (t) => {
   t.is(ListenFail.last.closeCount, 1)
   assertNoSecret(t, listen.text('stdout') + listen.text('stderr'), SEED_A)
   t.absent(listen.text('stdout').includes('ready'))
+
+  class ProtocolListenFail extends FakeServer {
+    async listen() {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Malformed runtime frame')
+    }
+  }
+  const protocol = createIo({ Server: ProtocolListenFail })
+  t.is(await main(['server', ...args], {}, protocol), 1)
+  t.is(ProtocolListenFail.last.closeCount, 1)
+  assertNoSecret(t, protocol.text('stdout') + protocol.text('stderr'), SEED_A)
 })
 
 test('SIGINT and SIGTERM close the server once and remain idempotent', async (t) => {
@@ -716,6 +726,20 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
     ),
     1
   )
+
+  FakeClient.uploadImpl = async () => {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Malformed server frame')
+  }
+  const malformed = createIo({ Client: FakeClient })
+  t.is(
+    await main(
+      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
+      {},
+      malformed
+    ),
+    1
+  )
+  assertNoSecret(t, malformed.text('stdout') + malformed.text('stderr'), SEED_A)
 
   FakeClient.uploadImpl = null
   const mismatch = createIo()

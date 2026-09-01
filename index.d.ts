@@ -303,31 +303,128 @@ export interface FingerprintEvent {
   fingerprint: string
 }
 
+export interface AuthenticationEvent extends FingerprintEvent {
+  status: 'accepted' | 'rejected'
+  reason?: ErrorCode
+}
+
 export interface ServerConnectionEvent extends FingerprintEvent {
   connections: number
 }
+
+export type ConnectionOpenEvent = ServerConnectionEvent
+export type ConnectionCloseEvent = ServerConnectionEvent
 
 export interface ServerListeningEvent {
   /** The server public-key fingerprint, despite this historical property name. */
   publicKey: string
 }
 
-export type ServerEvent = ServerConnectionEvent | FingerprintEvent | ServerListeningEvent
-export type ServerEventName = 'connection' | 'revoked' | 'listening'
+export interface TransferEvent {
+  /** A 12-character SHA-256 fingerprint of the transfer ID. */
+  transfer: string
+  name: string
+  size: number
+}
+
+export interface ServerOfferEvent extends TransferEvent, FingerprintEvent {
+  status: 'accepted' | 'resumed' | 'rejected' | 'already-committed'
+  resumed?: boolean
+  reason?: string
+}
+
+export interface ServerProgressEvent extends TransferEvent, FingerprintEvent {
+  chunkIndex: number
+  chunksReceived: number
+  totalChunks: number
+  bytesReceived: number
+  totalBytes: number
+}
+
+export interface TransferLifecycleEvent extends TransferEvent {
+  status: 'started' | 'succeeded' | 'failed'
+  reason?: string
+}
+
+export type ServerTransferLifecycleEvent = TransferLifecycleEvent & FingerprintEvent
+
+export interface RecoveryEvent {
+  status: 'started' | 'completed' | string
+  transfer?: string
+  journals?: number
+  purgedSessions?: number
+}
+
+export interface ScrubEvent {
+  status: 'completed'
+  deleted: number
+  unknownCount: number
+}
+
+export interface RetentionEvent {
+  trigger: 'startup' | 'scheduled' | 'manual' | 'commit' | 'post-commit'
+  status: 'completed' | 'deferred' | 'failed'
+  reason?: string
+  expiredSessions?: number
+  scrubbed?: number
+  ageDeleted?: number
+  storageDeleted?: number
+}
+
+export interface CleanupEvent {
+  transfer: string
+  name: string
+  reason: 'delete' | 'revocation' | 'offline-revocation' | 'expiry' | 'checksum' | 'recovery'
+}
+
+export interface ServerCloseEvent {
+  status: 'closed' | 'failed'
+}
+
+export interface ServerEventMap {
+  authentication: AuthenticationEvent
+  connection: ServerConnectionEvent
+  'connection-open': ConnectionOpenEvent
+  'connection-close': ConnectionCloseEvent
+  offer: ServerOfferEvent
+  progress: ServerProgressEvent
+  verification: ServerTransferLifecycleEvent
+  commit: ServerTransferLifecycleEvent
+  recovery: RecoveryEvent
+  scrub: ScrubEvent
+  retention: RetentionEvent
+  cleanup: CleanupEvent
+  revocation: FingerprintEvent
+  revoked: FingerprintEvent
+  listening: ServerListeningEvent
+  close: ServerCloseEvent
+}
+
+export type ServerEventName = keyof ServerEventMap
+export type ServerEvent = ServerEventMap[ServerEventName]
 
 export interface ClientSuccessEvent {
   name: string
   status: UploadStatus
   reason?: undefined
+  final: boolean
 }
 
 export interface ClientFailureEvent {
   name: string
   status: ErrorCode
   reason?: string
+  final: boolean
 }
 
-export type ClientResultEvent = ClientSuccessEvent | ClientFailureEvent
+export interface ClientBatchResultEvent {
+  status: 'COMMITTED' | 'FAILED'
+  final: true
+  files: number
+  reason?: undefined
+}
+
+export type ClientResultEvent = ClientSuccessEvent | ClientFailureEvent | ClientBatchResultEvent
 
 /** Emitted for a skipped direct child during a directory upload. */
 export interface ClientSkippedEvent {
@@ -335,11 +432,43 @@ export interface ClientSkippedEvent {
   reason: SkippedUploadReason
 }
 
+export interface ClientOfferEvent extends TransferEvent {
+  status: 'offered' | 'accepted' | 'resumed' | 'rejected' | 'already-committed'
+  resumedChunks?: number
+  totalChunks?: number
+  reason?: ErrorCode
+}
+
+export interface ClientProgressEvent extends TransferEvent {
+  chunkIndex: number
+  chunksSent: number
+  totalChunks: number
+  bytesSent: number
+  totalBytes: number
+}
+
+export interface ClientCommitEvent extends TransferLifecycleEvent {
+  result?: UploadStatus
+}
+
+export interface ClientCloseEvent {
+  status: 'closed'
+  reason?: undefined
+}
+
 export interface ClientEventMap {
+  authentication: AuthenticationEvent
   connection: FingerprintEvent
+  'connection-open': FingerprintEvent
+  'connection-close': FingerprintEvent
   'rejected-peer': FingerprintEvent
+  offer: ClientOfferEvent
+  progress: ClientProgressEvent
+  verification: TransferLifecycleEvent
+  commit: ClientCommitEvent
   result: ClientResultEvent
   skipped: ClientSkippedEvent
+  close: ClientCloseEvent
 }
 
 export type ClientEventName = keyof ClientEventMap
@@ -390,13 +519,15 @@ export class Server extends EventEmitter {
    */
   close(): Promise<void>
 
-  on(event: 'connection', listener: (event: ServerConnectionEvent) => void): this
-  on(event: 'revoked', listener: (event: FingerprintEvent) => void): this
-  on(event: 'listening', listener: (event: ServerListeningEvent) => void): this
+  on<EventName extends ServerEventName>(
+    event: EventName,
+    listener: (event: ServerEventMap[EventName]) => void
+  ): this
   on(event: string | symbol, listener: (...args: any[]) => void): this
-  once(event: 'connection', listener: (event: ServerConnectionEvent) => void): this
-  once(event: 'revoked', listener: (event: FingerprintEvent) => void): this
-  once(event: 'listening', listener: (event: ServerListeningEvent) => void): this
+  once<EventName extends ServerEventName>(
+    event: EventName,
+    listener: (event: ServerEventMap[EventName]) => void
+  ): this
   once(event: string | symbol, listener: (...args: any[]) => void): this
 }
 

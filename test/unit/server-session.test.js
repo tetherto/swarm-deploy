@@ -5,6 +5,7 @@ const b4a = require('b4a')
 const crypto = require('#crypto')
 const Protomux = require('protomux')
 const { Duplex } = require('streamx')
+const { SwarmDeployError, ERRORS } = require('../../lib/errors')
 const { ServerSession, UPLOAD_PROTOCOL } = require('../../lib/protocol/server-session')
 const { OFFER, CHUNK, FINISH, STATUS_CODE } = require('../../lib/protocol/constants')
 const {
@@ -281,6 +282,37 @@ test('server session returns terminal statuses for unavailable or capacity-rejec
   pair.messages[OFFER].send(upload.offer)
   await waitFor(() => pair.received.status.length === 1)
   t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
+})
+
+test('server session runs non-destructive retention admission before staging offer', async (t) => {
+  for (const code of [ERRORS.FILE_TOO_LARGE, ERRORS.CLEANUP_FAILED]) {
+    let offered = 0
+    const sessionStore = createSessionStore()
+    const originalOffer = sessionStore.offer
+    sessionStore.offer = async (...args) => {
+      offered++
+      return originalOffer(...args)
+    }
+    const pair = createClientServer({
+      sessionStore,
+      commitStore: createCommitStore(),
+      retentionManager: {
+        async admit() {
+          throw new SwarmDeployError(code, 'Rejected before receiving bytes')
+        }
+      },
+      maxFileBytes: 1024 * 1024
+    })
+    const upload = makeUpload({ name: `${code}.bin` })
+
+    pair.messages[OFFER].send(upload.offer)
+    await waitFor(() => pair.received.status.length === 1)
+
+    t.is(pair.received.status[0].code, STATUS_CODE.REJECTED, code)
+    t.is(pair.received.status[0].reason, code, code)
+    t.is(offered, 0, `${code} allocated no staging session`)
+    t.is(pair.received.chunkAck.length, 0, `${code} received zero bytes`)
+  }
 })
 
 test('server session fails closed when an OFFER transfer ID is noncanonical', async (t) => {

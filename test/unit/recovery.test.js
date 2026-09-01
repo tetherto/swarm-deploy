@@ -302,7 +302,12 @@ test('recovery reports corrupt journals and continues valid journals', async (t)
   t.is(results[1].status, 'RESUMABLE')
   t.is(warnings.length, 1)
   t.is(await pathExists(expected.journal), false)
-  t.is(await pathExists(corrupt), true)
+  t.is(await pathExists(corrupt), false)
+  t.ok(
+    (await fs.promises.readdir(layout.journals)).some((name) =>
+      name.startsWith(`.${'0'.repeat(64)}.corrupt-`)
+    )
+  )
 })
 
 test('recovery propagates corrupt resumable metadata from SessionStore', async (t) => {

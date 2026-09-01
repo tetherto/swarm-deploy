@@ -82,7 +82,7 @@ Defaults:
 - 15-minute cleanup interval.
 - 7-day resumable-upload lifetime.
 
-At startup the server recovers commit journals and fully re-hashes managed committed files. Scheduled cleanup checks metadata and size, removes expired resumable uploads, applies age retention, then deletes oldest committed files until under the storage limit.
+At startup the server recovers commit journals, purges resumable state owned by keys absent from the effective allowlist, and fully re-hashes managed committed files. Re-adding a key cannot resurrect a partial upload removed while it was offline. Scheduled cleanup checks metadata and size, removes expired resumable uploads, applies age retention, then deletes oldest committed files until under the storage limit. Age and quota deletion is deferred while an upload is receiving chunks; verified commit-time capacity eviction is still allowed.
 
 The server prints its full public key, a topic fingerprint, and `ready` only after recovery, retention initialization, and Hyperswarm announcement complete.
 
@@ -158,11 +158,39 @@ await server.close()
 
 The CommonJS entrypoint also exports identity/topic helpers, file-selection/manifest helpers, bounded protocol codecs/constants, `AllowlistWatcher`, `SwarmDeployError`, and `ERRORS`. See `index.d.ts` for the complete API.
 
+## Events and logging
+
+`Server` and `Client` are event emitters. Event payloads use 12-character SHA-256 fingerprints for peer and transfer correlation; they never contain seeds or full public keys. Exceptions thrown by event listeners or logger methods are contained and cannot change upload, cleanup, or lifecycle correctness.
+
+Server events:
+
+- `authentication`: accepted or rejected peer fingerprint and a reason for rejection.
+- `connection-open` and `connection-close`: authenticated transport lifecycle. The legacy `connection` event remains available.
+- `offer`: accepted, resumed, rejected, or already-committed offers with safe name, size, and transfer fingerprint.
+- `progress`: verified chunk index plus cumulative chunk and byte counts.
+- `verification` and `commit`: started, succeeded, or failed outcomes.
+- `recovery`, `scrub`, `retention`, and `cleanup`: startup and storage lifecycle outcomes. Scheduled retention reports `deferred` while a receive is active.
+- `revocation`: completed owner cleanup. The legacy `revoked` event remains available.
+- `listening` and `close`: server lifecycle completion.
+
+Client events:
+
+- `authentication`, `connection-open`, `connection-close`, and `rejected-peer`: pinning and transport lifecycle.
+- `offer`: offered, accepted, resumed, rejected, or already-committed state.
+- `progress`: acknowledged chunk and cumulative byte counts, including resumed verified bytes.
+- `verification` and `commit`: transfer completion phases.
+- `result`: every per-file outcome and one final direct-file or batch result.
+- `skipped` and `close`: directory selection and lifecycle completion.
+
+The exact discriminated payload types are `ServerEventMap` and `ClientEventMap` in `index.d.ts`.
+
 ## CLI exit codes
 
 - `0`: every selected file was committed or already committed.
 - `1`: transfer, discovery, runtime, or cleanup failure.
 - `2`: usage or configuration error.
+
+Parsing, configuration, and object-construction failures exit `2`. Once `server.listen()` or `client.upload()` begins, malformed protocol frames, `PROTOCOL_INVALID`, network, storage, and other runtime failures exit `1`.
 
 ## Test
 

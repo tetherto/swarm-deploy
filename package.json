@@ -30,6 +30,10 @@
       "bare": "bare-fs",
       "default": "./lib/fs-node.js"
     },
+    "#os": {
+      "bare": "bare-os",
+      "default": "./lib/os-node.js"
+    },
     "#path": {
       "bare": "bare-path",
       "default": "./lib/path-node.js"
@@ -55,6 +59,7 @@
     "bare-crypto": "^1.15.3",
     "bare-events": "^2.9.2",
     "bare-fs": "^4.8.1",
+    "bare-os": "^3.9.3",
     "bare-path": "^3.1.1",
     "bare-process": "^4.5.1",
     "compact-encoding": "^3.3.2",

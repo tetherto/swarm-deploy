@@ -5,7 +5,22 @@ const { EventEmitter } = require('#events')
 const fs = require('#fs')
 const path = require('#path')
 const b4a = require('b4a')
-const { parseSeed, publicKeyFromSeed } = require('../..')
+const Hyperswarm = require('hyperswarm')
+const Protomux = require('protomux')
+const {
+  parseSeed,
+  publicKeyFromSeed,
+  keyPairFromSeed,
+  READY,
+  offer,
+  status,
+  bitmapPage,
+  ready,
+  chunk,
+  chunkAck,
+  finish,
+  result
+} = require('../..')
 const { createTempDir } = require('../helpers/files')
 const { createLocalTestnet } = require('../helpers/testnet')
 const { fingerprint } = require('../../lib/server')
@@ -199,6 +214,70 @@ test('upload discovery errors exit 1 without leaking the client seed', async (t)
     ),
     1
   )
+  assertNoSecret(t, io.text('stdout') + io.text('stderr'), clientSeed)
+})
+
+test('CLI classifies a malformed server frame as runtime exit 1', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const dir = await createTempDir(t)
+  const clientSeedPath = path.join(dir, 'client.seed')
+  const artifact = path.join(dir, 'malformed.bin')
+  await fs.promises.writeFile(clientSeedPath, `${'91'.repeat(32)}\n`, { mode: 0o600 })
+  await fs.promises.writeFile(artifact, 'runtime protocol failure')
+  const clientSeed = (await fs.promises.readFile(clientSeedPath, 'utf8')).trim()
+  const serverSeed = b4a.alloc(32, 0x92)
+  const serverKey = publicKeyFromSeed(serverSeed)
+  const swarm = new Hyperswarm({
+    dht: testnet.createNode(),
+    keyPair: keyPairFromSeed(serverSeed)
+  })
+  t.teardown(() => swarm.destroy())
+  swarm.on('connection', (socket) => {
+    socket.on('error', () => {})
+    const mux = Protomux.from(socket)
+    mux.pair({ protocol: 'swarm-deploy/upload/1' }, (id) => {
+      const channel = mux.createChannel({ protocol: 'swarm-deploy/upload/1', id })
+      const messages = [
+        channel.addMessage({
+          encoding: offer,
+          onmessage(value) {
+            messages[READY].send({ transferId: value.transferId })
+          }
+        }),
+        channel.addMessage({ encoding: status }),
+        channel.addMessage({ encoding: bitmapPage }),
+        channel.addMessage({ encoding: ready }),
+        channel.addMessage({ encoding: chunk }),
+        channel.addMessage({ encoding: chunkAck }),
+        channel.addMessage({ encoding: finish }),
+        channel.addMessage({ encoding: result })
+      ]
+      channel.open()
+    })
+  })
+  const discovery = swarm.join(topicFromServerPublicKey(serverKey), {
+    server: true,
+    client: false
+  })
+  await discovery.flushed()
+
+  const io = createIo({ dht: testnet.createNode(), connectTimeout: 5_000, idleTimeout: 5_000 })
+  t.is(
+    await main(
+      [
+        'upload',
+        '--seed-file',
+        clientSeedPath,
+        '--server-key',
+        b4a.toString(serverKey, 'hex'),
+        artifact
+      ],
+      {},
+      io
+    ),
+    1
+  )
+  t.ok(io.text('stderr').includes('Unexpected'))
   assertNoSecret(t, io.text('stdout') + io.text('stderr'), clientSeed)
 })
 

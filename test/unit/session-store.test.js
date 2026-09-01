@@ -871,7 +871,7 @@ test('offer preserves primary and cleanup failures', async (t) => {
   t.is(await pathExists(sessionPath(layout, upload.offer)), false)
 })
 
-test('deletion durably removes metadata before its staging name', async (t) => {
+test('deletion persists intent before removing staging and metadata names', async (t) => {
   const events = []
   const storage = createStorage({
     async afterOperation(name, source) {
@@ -885,11 +885,14 @@ test('deletion durably removes metadata before its staging name', async (t) => {
 
   await store.delete(upload.offer.transferId)
 
-  t.alike(events, [
-    `unlink:${sessionPath(layout, upload.offer)}`,
+  t.is(events.length, 6)
+  t.ok(events[0].startsWith(`sync:${layout.sessions}/.`))
+  t.alike(events.slice(1), [
     `sync:${layout.sessions}`,
     `unlink:${stagingPath(layout, upload.offer)}`,
-    `sync:${layout.staging}`
+    `sync:${layout.staging}`,
+    `unlink:${sessionPath(layout, upload.offer)}`,
+    `sync:${layout.sessions}`
   ])
 })
 

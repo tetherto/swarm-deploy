@@ -5,7 +5,7 @@ const b4a = require('b4a')
 const crypto = require('#crypto')
 const fs = require('#fs')
 const path = require('#path')
-const { ERRORS } = require('../../lib/errors')
+const { SwarmDeployError, ERRORS } = require('../../lib/errors')
 const { transferId } = require('../../lib/protocol/transfer-id')
 const { initLayout } = require('../../lib/storage/layout')
 const { SessionStore } = require('../../lib/storage/session-store')
@@ -333,6 +333,28 @@ test('retention rejects a too-large incoming commit without evicting', async (t)
   t.is(await pathExists(existing.finalPath), true)
 })
 
+test('retention admission is non-destructive and blocks unhealthy capacity', async (t) => {
+  const stores = await createStores(t, { retention: { maxStorageBytes: 3 } })
+  const existing = await commit(t, stores, 'existing.bin', b4a.from('aaa'))
+
+  t.is(await stores.manager.admit(3), true)
+  t.is(await pathExists(existing.finalPath), true)
+  await t.exception(() => stores.manager.admit(4), {
+    name: 'SwarmDeployError',
+    code: ERRORS.FILE_TOO_LARGE
+  })
+
+  stores.manager.cleanupFailure = new SwarmDeployError(
+    ERRORS.CLEANUP_FAILED,
+    'pending scheduled cleanup'
+  )
+  await t.exception(() => stores.manager.admit(1), {
+    name: 'SwarmDeployError',
+    code: ERRORS.CLEANUP_FAILED
+  })
+  t.is(await pathExists(existing.finalPath), true)
+})
+
 test('retention propagates deletion failure before accepting capacity-dependent commit', async (t) => {
   let failDelete = false
   let protectedPath = null
@@ -359,6 +381,57 @@ test('retention propagates deletion failure before accepting capacity-dependent 
   t.is(caught.cause.message, 'Injected retention deletion failure')
   t.is(await pathExists(existing.finalPath), true)
   t.alike(await stores.commitStore.list(), [existing.record])
+})
+
+test('scheduled age retention defers until a receiving upload finishes', async (t) => {
+  const scheduler = createScheduler()
+  let activeId = null
+  const stores = await createStores(t, {
+    retention: { maxAge: 10, scheduler },
+    isSessionActive: (session) => session.id === activeId
+  })
+  t.teardown(() => stores.manager.stop())
+  await stores.manager.start()
+  const existing = await commit(t, stores, 'age-deferred.bin', b4a.from('old'))
+  const active = makeUpload('receiving-age.bin', b4a.from('new'))
+  await stores.sessionStore.offer(OWNER, active.offer)
+  activeId = hex(active.offer.transferId)
+  stores.clock.advance(10)
+
+  scheduler.tick()
+  await stores.manager.tickPromise
+  t.is(await pathExists(existing.finalPath), true)
+
+  await stores.sessionStore.writeChunk(active.offer.transferId, active.chunk)
+  await stores.sessionStore.finish(active.offer.transferId)
+  scheduler.tick()
+  await stores.manager.tickPromise
+  t.is(await pathExists(existing.finalPath), false)
+})
+
+test('scheduled quota retention defers until a receiving upload finishes', async (t) => {
+  const scheduler = createScheduler()
+  let activeId = null
+  const stores = await createStores(t, {
+    retention: { maxStorageBytes: 2, scheduler },
+    isSessionActive: (session) => session.id === activeId
+  })
+  t.teardown(() => stores.manager.stop())
+  await stores.manager.start()
+  const existing = await commit(t, stores, 'quota-deferred.bin', b4a.from('old'))
+  const active = makeUpload('receiving-quota.bin', b4a.from('new'))
+  await stores.sessionStore.offer(OWNER, active.offer)
+  activeId = hex(active.offer.transferId)
+
+  scheduler.tick()
+  await stores.manager.tickPromise
+  t.is(await pathExists(existing.finalPath), true)
+
+  await stores.sessionStore.writeChunk(active.offer.transferId, active.chunk)
+  await stores.sessionStore.finish(active.offer.transferId)
+  scheduler.tick()
+  await stores.manager.tickPromise
+  t.is(await pathExists(existing.finalPath), false)
 })
 
 test('retention preserves unknown files and active staging', async (t) => {

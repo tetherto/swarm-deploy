@@ -186,6 +186,8 @@ void [
 
 server.on('connection', (event: ServerConnectionEvent) => void event.connections)
 server.once('listening', (event) => void event.publicKey)
+server.on('progress', (event) => void [event.transfer, event.bytesReceived, event.totalBytes])
+server.on('retention', (event) => void [event.trigger, event.status, event.storageDeleted])
 client.on('result', (event: ClientResultEvent) => {
   const reason: string | undefined = event.reason
   void [event.status, reason]
@@ -196,11 +198,12 @@ client.on('skipped', (event: ClientSkippedEvent) => {
   void event.path
 })
 client.once('rejected-peer', (event) => void event.fingerprint)
+client.on('progress', (event) => void [event.transfer, event.bytesSent, event.totalBytes])
 
 function describeClientEvent(event: ClientEvent): string {
   if ('fingerprint' in event) return event.fingerprint
   if ('status' in event) return event.reason ?? event.status
-  return event.reason
+  return event.name
 }
 
 async function exerciseStorageAdapter() {

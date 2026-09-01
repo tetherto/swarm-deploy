@@ -40,6 +40,14 @@ function fingerprint(key) {
   return b4a.toString(sha256(key), 'hex').slice(0, 12)
 }
 
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 function uploadFor(ownerKey) {
   const data = b4a.from('authenticated upload')
   const digest = sha256(data)
@@ -180,12 +188,20 @@ test('Server firewalls unknown keys before protocol and allows authenticated upl
   })
   t.teardown(() => server.close())
   server.on('connection', (event) => events.push(event))
+  const firewallAttempt = deferred()
+  const originalFirewall = server._firewall.bind(server)
+  server._firewall = (key) => {
+    if (b4a.equals(key, unknownKey)) firewallAttempt.resolve()
+    return originalFirewall(key)
+  }
   await server.listen()
 
   const unknown = createClient(t, testnet, UNKNOWN_SEED)
   unknown.join(server.topic, { server: false, client: true })
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await firewallAttempt.promise
   t.is(events.length, 0)
+  t.is(server._connections.size, 0)
+  t.is(server._sessions.size, 0)
   t.is(server.sessionStore.sessions.size, 0)
 
   const allowed = createClient(t, testnet, ALLOWED_SEED)
