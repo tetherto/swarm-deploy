@@ -56,3 +56,23 @@ test('allowlist watcher emits fingerprint-only removal events', async (t) => {
 
   t.alike(removed, [{ removed: 1 }])
 })
+
+test('allowlist watcher retries unchanged applied cleanup failures', async (t) => {
+  let attempts = 0
+  const watcher = new AllowlistWatcher({
+    filePath: 'allowed.txt',
+    storage: { readFile: async () => `${KEY_A}\n` },
+    onReload: async () => {
+      if (++attempts === 1) {
+        const error = new AggregateError([new Error('cleanup failed')])
+        error.allowlistApplied = true
+        throw error
+      }
+    }
+  })
+
+  await t.exception(() => watcher.poll(), { name: 'AggregateError' })
+  t.alike(watcher.keys, new Set([KEY_A]))
+  await watcher.poll()
+  t.is(attempts, 2)
+})

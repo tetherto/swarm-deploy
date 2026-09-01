@@ -38,10 +38,12 @@ function sha256(bytes) {
 
 function deferred() {
   let resolve
-  const promise = new Promise((done) => {
+  let reject
+  const promise = new Promise((done, fail) => {
     resolve = done
+    reject = fail
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }
 
 function waitFor(predicate) {
@@ -405,4 +407,33 @@ test('server session revocation prevents queued finish commit', async (t) => {
 
   t.is(finished, 0)
   t.is(committed, 0)
+})
+
+test('server session settlement retains cleanup errors raised after revocation', async (t) => {
+  const started = deferred()
+  const commit = deferred()
+  const sessionStore = createSessionStore()
+  sessionStore.finish = async (transferId) => {
+    sessionStore.sessions.get(b4a.toString(transferId, 'hex')).state = 'verified'
+  }
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore({
+      commit: async () => {
+        started.resolve()
+        return commit.promise
+      }
+    }),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+  await started.promise
+
+  pair.serverSession.revoke()
+  commit.reject(new AggregateError([new Error('rollback failed')], 'cleanup failed'))
+
+  await t.exception(() => pair.serverSession.settle(), { name: 'AggregateError' })
 })
