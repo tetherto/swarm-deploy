@@ -278,3 +278,37 @@ test('commit removes its publication when revoked during final link', async (t) 
   t.is(await pathExists(stagingPath(layout, upload.offer)), true)
   t.is(await pathExists(journalPath(layout, upload.offer)), false)
 })
+
+test('retryAbortedAttempt removes only a failed revoked attempt before owner deletion', async (t) => {
+  const signal = { aborted: false }
+  let staging = null
+  let finalPath = null
+  let failRollback = true
+  const storage = createStorage({
+    async afterOperation(name, sourcePath) {
+      if (name === 'link' && sourcePath === staging) signal.aborted = true
+    },
+    async beforeOperation(name, filePath) {
+      if (failRollback && name === 'unlink' && filePath === finalPath) {
+        throw new Error('Injected rollback failure')
+      }
+    }
+  })
+  const created = await createVerifiedSession(t, { storage })
+  const { layout, upload, session, sessionStore } = created
+  staging = stagingPath(layout, upload.offer)
+  finalPath = path.join(layout.root, upload.offer.name)
+  const commits = new CommitStore({ layout, storage })
+
+  await t.exception(() => commits.commit(session, { signal }), { name: 'AggregateError' })
+  t.is(await pathExists(finalPath), true)
+  t.is(await pathExists(journalPath(layout, upload.offer)), true)
+  t.is(await pathExists(staging), true)
+
+  failRollback = false
+  await commits.retryAbortedAttempt(upload.offer.transferId, sessionStore)
+  t.is(await pathExists(finalPath), false)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+  await sessionStore.delete(upload.offer.transferId)
+  t.is(await pathExists(staging), false)
+})
