@@ -97,7 +97,7 @@ function assertProtocolInvalid(t, operation, message) {
   t.exception(operation, { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }, message)
 }
 
-function createProtocolSession() {
+function createProtocolSession(t) {
   const messages = []
   const destroyed = []
   let offerCalls = 0
@@ -137,6 +137,7 @@ function createProtocolSession() {
       destroyed.push(error)
     }
   })
+  t.teardown(() => session.close())
   return {
     channel,
     messages,
@@ -147,6 +148,13 @@ function createProtocolSession() {
       return offerCalls
     }
   }
+}
+
+async function closeProtocolSession(t, created, label) {
+  await created.session.close()
+  await created.session.settle()
+  t.is(created.session.timer, null, `${label} timer cleared`)
+  t.is(created.session.drainWaiters.length, 0, `${label} drain waiters cleared`)
 }
 
 test('every codec rejects truncation at every byte offset with a typed error', (t) => {
@@ -357,18 +365,22 @@ test('huge tiny declarations fail before reaching storage-backed state', async (
   ]
 
   for (const entry of cases) {
-    const created = createProtocolSession()
-    t.ok(entry.encoded.byteLength < 128, `${entry.name} input remains tiny`)
-    let decodingError = null
+    const created = createProtocolSession(t)
     try {
-      decodeBounded(entry.codec, entry.encoded, MAX_CHUNK_FRAME_BYTES)
-    } catch (err) {
-      decodingError = err
+      t.ok(entry.encoded.byteLength < 128, `${entry.name} input remains tiny`)
+      let decodingError = null
+      try {
+        decodeBounded(entry.codec, entry.encoded, MAX_CHUNK_FRAME_BYTES)
+      } catch (err) {
+        decodingError = err
+      }
+      t.is(decodingError.code, ERRORS.PROTOCOL_INVALID, entry.name)
+      t.is(created.destroyed.length, 0, `${entry.name} rejected before session dispatch`)
+      t.is(created.offerCalls, 0, `${entry.name} bypasses SessionStore.offer`)
+      t.is(created.sessionStore.sessions.size, 0, `${entry.name} creates no session state`)
+    } finally {
+      await closeProtocolSession(t, created, entry.name)
     }
-    t.is(decodingError.code, ERRORS.PROTOCOL_INVALID, entry.name)
-    t.is(created.destroyed.length, 0, `${entry.name} rejected before session construction`)
-    t.is(created.offerCalls, 0, `${entry.name} bypasses SessionStore.offer`)
-    t.is(created.sessionStore.sessions.size, 0, `${entry.name} creates no session state`)
   }
 })
 
@@ -376,54 +388,70 @@ test('one-bit digest mutation reaches real session validation and tears down typ
   const offered = sampleOffer()
   const mutatedDigest = b4a.from(offered.digest)
   mutatedDigest[0] ^= 1
-  const created = createProtocolSession()
-  await created.messages[OFFER].onmessage(
-    decodeBounded(offer, encodeBounded(offer, { ...offered, digest: mutatedDigest }))
-  )
-  await created.session.settle()
-  t.is(created.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
-  t.is(created.offerCalls, 0)
-  t.is(created.sessionStore.sessions.size, 0)
+  const created = createProtocolSession(t)
+  try {
+    await created.messages[OFFER].onmessage(
+      decodeBounded(offer, encodeBounded(offer, { ...offered, digest: mutatedDigest }))
+    )
+    await created.session.settle()
+    t.is(created.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+    t.is(created.offerCalls, 0)
+    t.is(created.sessionStore.sessions.size, 0)
+  } finally {
+    await closeProtocolSession(t, created, 'digest mutation')
+  }
 })
 
 test('reordered, repeated, direction-invalid, and unknown messages tear down deterministically', async (t) => {
   const offered = sampleOffer()
-  const reordered = createProtocolSession()
-  await reordered.messages[CHUNK].onmessage({
-    transferId: offered.transferId,
-    index: 0,
-    digest: sha256(DATA),
-    data: DATA
-  })
-  t.is(reordered.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
-
-  const repeated = createProtocolSession()
-  const first = repeated.messages[OFFER].onmessage(offered)
-  await repeated.messages[OFFER].onmessage(offered)
-  await first
-  await repeated.session.settle()
-  t.is(repeated.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
-
-  const inbound = [
-    [STATUS, { transferId: offered.transferId, code: STATUS_CODE.ACCEPT }],
-    [BITMAP_PAGE, { transferId: offered.transferId, start: 0, count: 1, bits: b4a.from([0]) }],
-    [READY, { transferId: offered.transferId }],
-    [CHUNK_ACK, { transferId: offered.transferId, index: 0 }],
-    [RESULT, { transferId: offered.transferId, code: 0 }]
-  ]
-  for (const [type, value] of inbound) {
-    const invalid = createProtocolSession()
-    await invalid.messages[type].onmessage(value)
-    t.is(invalid.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  const created = []
+  const makeSession = () => {
+    const session = createProtocolSession(t)
+    created.push(session)
+    return session
   }
+  try {
+    const reordered = makeSession()
+    await reordered.messages[CHUNK].onmessage({
+      transferId: offered.transferId,
+      index: 0,
+      digest: sha256(DATA),
+      data: DATA
+    })
+    t.is(reordered.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
 
-  const finishBeforeOffer = createProtocolSession()
-  await finishBeforeOffer.messages[FINISH].onmessage({
-    transferId: offered.transferId
-  })
-  t.is(finishBeforeOffer.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+    const repeated = makeSession()
+    const first = repeated.messages[OFFER].onmessage(offered)
+    await repeated.messages[OFFER].onmessage(offered)
+    await first
+    await repeated.session.settle()
+    t.is(repeated.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
 
-  const unknown = createProtocolSession()
-  await unknown.channel._recv(255, {})
-  t.is(unknown.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+    const inbound = [
+      [STATUS, { transferId: offered.transferId, code: STATUS_CODE.ACCEPT }],
+      [BITMAP_PAGE, { transferId: offered.transferId, start: 0, count: 1, bits: b4a.from([0]) }],
+      [READY, { transferId: offered.transferId }],
+      [CHUNK_ACK, { transferId: offered.transferId, index: 0 }],
+      [RESULT, { transferId: offered.transferId, code: 0 }]
+    ]
+    for (const [type, value] of inbound) {
+      const invalid = makeSession()
+      await invalid.messages[type].onmessage(value)
+      t.is(invalid.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+    }
+
+    const finishBeforeOffer = makeSession()
+    await finishBeforeOffer.messages[FINISH].onmessage({
+      transferId: offered.transferId
+    })
+    t.is(finishBeforeOffer.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+
+    const unknown = makeSession()
+    await unknown.channel._recv(255, {})
+    t.is(unknown.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  } finally {
+    for (let index = 0; index < created.length; index++) {
+      await closeProtocolSession(t, created[index], `state session ${index}`)
+    }
+  }
 })

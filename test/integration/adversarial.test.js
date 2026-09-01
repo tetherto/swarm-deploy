@@ -146,14 +146,14 @@ async function verify(store, ownerKey, upload) {
   return store.sessions.get(hex(upload.offer.transferId))
 }
 
-async function createSessionUnlinkCrash(t, name) {
+async function createSessionUnlinkFailure(t, name) {
   let armed = false
   let sessionPath = null
   const storage = createStorage({
     async afterOperation(operation, filePath) {
       if (!armed || operation !== 'unlink' || filePath !== sessionPath) return
       armed = false
-      throw new Error('Injected crash after session unlink')
+      throw new Error('Injected cleanup failure after session unlink')
     }
   })
   const root = await createTempDir(t)
@@ -163,7 +163,7 @@ async function createSessionUnlinkCrash(t, name) {
   const id = hex(upload.offer.transferId)
   sessionPath = path.join(created.layout.sessions, `${id}.json`)
   armed = true
-  await t.exception(() => new CommitStore({ layout: created.layout, storage }).commit(session))
+  await new CommitStore({ layout: created.layout, storage }).commit(session)
   await created.store.close()
   return {
     ...created,
@@ -790,7 +790,7 @@ test('coded ENOSPC at staging and publication boundaries preserves safe state', 
 })
 
 test('restart converges after session unlink without exposing partial content', async (t) => {
-  const created = await createSessionUnlinkCrash(t, 'restart.bin')
+  const created = await createSessionUnlinkFailure(t, 'restart.bin')
 
   const restarted = new SessionStore({
     layout: created.layout,
@@ -867,7 +867,7 @@ test('orphan staging requires a bounded canonical same-inode journal', async (t)
   ]
 
   for (const entry of cases) {
-    const created = await createSessionUnlinkCrash(t, `${entry.name.replaceAll(' ', '-')}.bin`)
+    const created = await createSessionUnlinkFailure(t, `${entry.name.replaceAll(' ', '-')}.bin`)
     await entry.mutate(created)
     const restarted = new SessionStore({
       layout: created.layout,

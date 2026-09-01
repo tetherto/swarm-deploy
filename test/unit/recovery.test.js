@@ -147,7 +147,9 @@ for (const point of [
     await fs.promises.writeFile(unknown, b4a.from('do not modify'))
     const commits = new CommitStore({ layout, clock: created.clock, storage })
 
-    await t.exception(() => commits.commit(created.session))
+    const linearized = point === 'staging link removed' || point === 'journal removed'
+    if (linearized) await commits.commit(created.session)
+    else await t.exception(() => commits.commit(created.session))
     await created.sessionStore.close()
     await recoverStorage({
       layout,
@@ -168,7 +170,7 @@ for (const point of [
     await restarted.init()
     t.teardown(() => restarted.close())
 
-    if (point === 'journal parent synchronized') {
+    if (!linearized) {
       t.is(await pathExists(expected.final), false)
       t.is(await pathExists(expected.record), false)
       t.is(await pathExists(expected.staging), true)
@@ -336,14 +338,14 @@ test('recovery propagates corrupt resumable metadata from SessionStore', async (
   t.is(await pathExists(expected.journal), true)
 })
 
-test('recoverStorage invoked twice after successful recovery preserves final and sidecar', async (t) => {
+test('recoverStorage invoked twice after cleanup-pending commit preserves final and sidecar', async (t) => {
   let layout = null
   let armed = false
   const storage = createStorage({
     async afterOperation(name, filePath) {
-      if (armed && name === 'sync' && filePath === layout.root) {
+      if (armed && name === 'unlink' && filePath === expected.session) {
         armed = false
-        throw new Error('Injected crash after final directory sync')
+        throw new Error('Injected cleanup failure after commit linearization')
       }
     }
   })
@@ -353,7 +355,7 @@ test('recoverStorage invoked twice after successful recovery preserves final and
   const commits = new CommitStore({ layout, clock: created.clock, storage })
 
   armed = true
-  await t.exception(() => commits.commit(created.session))
+  await commits.commit(created.session)
   await created.sessionStore.close()
 
   const first = await recoverStorage({
@@ -479,7 +481,7 @@ test('recovery converges after session metadata unlink before staging cleanup', 
   const commits = new CommitStore({ layout, clock: created.clock, storage })
 
   armed = true
-  await t.exception(() => commits.commit(created.session))
+  await commits.commit(created.session)
   t.is(await pathExists(expected.session), false)
   t.is(await pathExists(expected.staging), true)
   t.is(await pathExists(expected.journal), true)
@@ -510,15 +512,13 @@ test('recovery propagates cleanup directory fsync failure and a retry converges'
   const cleanupFailure = new Error('Injected cleanup parent fsync failure')
   const storage = createStorage({
     async beforeOperation(name, filePath) {
+      if (crashCommit && name === 'unlink' && filePath === expected.session) {
+        crashCommit = false
+        throw new Error('Injected cleanup failure after commit linearization')
+      }
       if (failCleanupSync && name === 'sync' && filePath === layout.sessions) {
         failCleanupSync = false
         throw cleanupFailure
-      }
-    },
-    async afterOperation(name, filePath) {
-      if (crashCommit && name === 'sync' && filePath === layout.root) {
-        crashCommit = false
-        throw new Error('Injected crash after final directory sync')
       }
     }
   })
@@ -528,7 +528,7 @@ test('recovery propagates cleanup directory fsync failure and a retry converges'
   const commits = new CommitStore({ layout, clock: created.clock, storage })
 
   crashCommit = true
-  await t.exception(() => commits.commit(created.session))
+  await commits.commit(created.session)
   await created.sessionStore.close()
 
   failCleanupSync = true

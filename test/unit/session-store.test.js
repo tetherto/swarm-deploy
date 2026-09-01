@@ -1120,6 +1120,28 @@ test('init rejects a verified session that does not contain every chunk', async 
   })
 })
 
+test('init rejects unknown persisted session state without admission', async (t) => {
+  const { layout, store } = await createStore(t)
+  const upload = makeUpload()
+  await store.offer(OWNER, upload.offer)
+  await store.close()
+
+  const metadataPath = sessionPath(layout, upload.offer)
+  const metadata = await readJson(metadataPath)
+  metadata.state = 'publishing'
+  await fs.promises.writeFile(metadataPath, JSON.stringify(metadata))
+
+  const reopened = new SessionStore({ layout, maxStagingBytes: 1024 })
+  await t.exception(() => reopened.init(), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.is(reopened.initialized, false)
+  t.is(reopened.sessions.size, 0)
+  t.is(reopened.reservedBytes, 0)
+  await reopened.close()
+})
+
 test('finish requires all chunks, forces a checkpoint, and supports empty files', async (t) => {
   const { layout, store } = await createStore(t)
   const upload = makeUpload()

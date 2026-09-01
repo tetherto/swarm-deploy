@@ -11,6 +11,7 @@ const { initLayout } = require('../../lib/storage/layout')
 const { readJson } = require('../../lib/storage/atomic-file')
 const { SessionStore } = require('../../lib/storage/session-store')
 const { CommitStore } = require('../../lib/storage/commit-store')
+const { recoverStorage } = require('../../lib/storage/recovery')
 const { createClock } = require('../helpers/clock')
 const { createTempDir } = require('../helpers/files')
 const { createStorage } = require('../helpers/storage')
@@ -46,6 +47,12 @@ function makeUpload({ name = 'artifact.bin', data = b4a.from('verified artifact'
     offer,
     chunk: { index: 0, data, digest: sha256(data) }
   }
+}
+
+function noSpace(message) {
+  const error = new Error(message)
+  error.code = 'ENOSPC'
+  return error
 }
 
 function stagingPath(layout, offer) {
@@ -189,6 +196,174 @@ test('link failure preserves verified session state without a final file', async
   t.is(await pathExists(stagingPath(layout, upload.offer)), true)
   t.is(await pathExists(sessionPath(layout, upload.offer)), true)
   t.is(await pathExists(journalPath(layout, upload.offer)), false)
+})
+
+test('sidecar persistence failures roll back before commit linearization', async (t) => {
+  for (const boundary of ['temp-open', 'write', 'rename', 'parent-sync']) {
+    let armed = false
+    let layout = null
+    let record = null
+    const storage = createStorage({
+      async beforeOperation(name, source, destination) {
+        if (!armed) return
+        const temporary =
+          typeof source === 'string' &&
+          source.startsWith(`${layout.commits}${path.sep}.`) &&
+          source.endsWith('.tmp')
+        const fail =
+          (boundary === 'temp-open' && name === 'open' && temporary) ||
+          (boundary === 'write' && name === 'write' && temporary) ||
+          (boundary === 'rename' && name === 'rename' && destination === record) ||
+          (boundary === 'parent-sync' && name === 'sync' && source === layout.commits)
+        if (!fail) return
+        armed = false
+        throw noSpace(`No space at sidecar ${boundary}`)
+      }
+    })
+    const created = await createVerifiedSession(t, { storage })
+    layout = created.layout
+    record = recordPath(layout, created.upload.offer)
+    const commits = new CommitStore({ layout, storage })
+    armed = true
+
+    await t.exception(() => commits.commit(created.session), { code: 'ENOSPC' }, boundary)
+    t.is(await pathExists(path.join(layout.root, created.upload.offer.name)), false, boundary)
+    t.is(await pathExists(record), false, boundary)
+    t.is(await pathExists(stagingPath(layout, created.upload.offer)), true, boundary)
+    t.is(await pathExists(sessionPath(layout, created.upload.offer)), true, boundary)
+    t.is(await pathExists(journalPath(layout, created.upload.offer)), false, boundary)
+  }
+})
+
+test('post-linearization cleanup failures return success and recover leftovers', async (t) => {
+  for (const boundary of [
+    'session-unlink',
+    'session-sync',
+    'staging-unlink',
+    'staging-sync',
+    'journal-unlink',
+    'journal-sync'
+  ]) {
+    let armed = false
+    let layout = null
+    let expected = null
+    let sidecarDurable = false
+    const warnings = []
+    const storage = createStorage({
+      async beforeOperation(name, source) {
+        if (!armed) return
+        const fail =
+          (boundary === 'session-unlink' && name === 'unlink' && source === expected.session) ||
+          (boundary === 'session-sync' && name === 'sync' && source === layout.sessions) ||
+          (boundary === 'staging-unlink' && name === 'unlink' && source === expected.staging) ||
+          (boundary === 'staging-sync' && name === 'sync' && source === layout.staging) ||
+          (sidecarDurable &&
+            boundary === 'journal-unlink' &&
+            name === 'unlink' &&
+            source === expected.journal) ||
+          (sidecarDurable &&
+            boundary === 'journal-sync' &&
+            name === 'sync' &&
+            source === layout.journals)
+        if (!fail) return
+        armed = false
+        throw noSpace(`No space at cleanup ${boundary}`)
+      },
+      async afterOperation(name, source) {
+        if (armed && name === 'sync' && source === layout.commits) sidecarDurable = true
+      }
+    })
+    const created = await createVerifiedSession(t, { storage })
+    layout = created.layout
+    expected = {
+      final: path.join(layout.root, created.upload.offer.name),
+      record: recordPath(layout, created.upload.offer),
+      staging: stagingPath(layout, created.upload.offer),
+      session: sessionPath(layout, created.upload.offer),
+      journal: journalPath(layout, created.upload.offer)
+    }
+    const commits = new CommitStore({
+      layout,
+      storage,
+      logger: {
+        warn(message, details) {
+          warnings.push({ message, details })
+        }
+      }
+    })
+    armed = true
+
+    const record = await commits.commit(created.session)
+    const before = await fs.promises.lstat(expected.final)
+    t.is(record.transferId, hex(created.upload.offer.transferId), `${boundary} committed`)
+    t.alike(await fs.promises.readFile(expected.final), created.upload.chunk.data, boundary)
+    t.alike(await readJson(expected.record), record, boundary)
+    t.is(warnings.length, 1, `${boundary} diagnostic`)
+
+    await created.sessionStore.close()
+    const restarted = new SessionStore({
+      layout,
+      maxStagingBytes: CHUNK_SIZE,
+      storage
+    })
+    await restarted.init()
+    t.teardown(() => restarted.close())
+    await recoverStorage({
+      layout,
+      sessionStore: restarted,
+      commitStore: commits,
+      logger: { warn() {} }
+    })
+
+    const after = await fs.promises.lstat(expected.final)
+    t.is(after.dev, before.dev, `${boundary} final device preserved`)
+    t.is(after.ino, before.ino, `${boundary} final inode preserved`)
+    t.alike(await readJson(expected.record), record, `${boundary} sidecar preserved`)
+    t.is(await pathExists(expected.staging), false, `${boundary} staging cleaned`)
+    t.is(await pathExists(expected.session), false, `${boundary} session cleaned`)
+    t.is(await pathExists(expected.journal), false, `${boundary} journal cleaned`)
+    t.is(restarted.sessions.size, 0, `${boundary} no resumed session`)
+    t.is(restarted.reservedBytes, 0, `${boundary} no reservation`)
+  }
+})
+
+test('revocation after sidecar durability preserves committed publication', async (t) => {
+  const signal = { aborted: false }
+  const warnings = []
+  let armed = false
+  let layout = null
+  const storage = createStorage({
+    async afterOperation(name, filePath) {
+      if (!armed || name !== 'sync' || filePath !== layout.commits) return
+      armed = false
+      signal.aborted = true
+    }
+  })
+  const created = await createVerifiedSession(t, { storage })
+  layout = created.layout
+  const commits = new CommitStore({
+    layout,
+    storage,
+    logger: {
+      warn(message, details) {
+        warnings.push({ message, details })
+      }
+    }
+  })
+  armed = true
+
+  const record = await commits.commit(created.session, { signal })
+
+  t.is(record.transferId, hex(created.upload.offer.transferId))
+  t.alike(
+    await fs.promises.readFile(path.join(layout.root, created.upload.offer.name)),
+    created.upload.chunk.data
+  )
+  t.alike(await readJson(recordPath(layout, created.upload.offer)), record)
+  t.is(await pathExists(journalPath(layout, created.upload.offer)), true)
+  t.is(await pathExists(stagingPath(layout, created.upload.offer)), true)
+  t.is(await pathExists(sessionPath(layout, created.upload.offer)), true)
+  t.is(warnings.length, 1)
 })
 
 test('commit durably journals a unique attempt and staging inode before linking', async (t) => {
