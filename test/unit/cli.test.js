@@ -147,7 +147,9 @@ test('main never calls process.exit and --help exits 0', async (t) => {
   t.ok(help.includes('server'))
   t.ok(help.includes('upload'))
   t.ok(help.includes('--seed-file'))
-  t.absent(/\s--seed\s/.test(help))
+  t.absent(help.includes('SWARM_DEPLOY_SERVER_SEED'))
+  t.absent(help.includes('SWARM_DEPLOY_CLIENT_SEED'))
+  t.absent(/(^|\s)--seed(\s|=|$)/.test(help))
 })
 
 test('unknown commands, unknown options, and raw --seed fail with usage', async (t) => {
@@ -767,4 +769,241 @@ test('client-only env is ignored by server and server-only env is ignored by upl
     0
   )
   t.alike(FakeClient.last.options.seed, parseSeed(SEED_A))
+})
+
+test('parser errors stay generic and never echo unique raw seed tokens', async (t) => {
+  const dir = await createTempDir(t)
+  const seedEquals = 'e1'.repeat(32)
+  const seedCommand = 'c2'.repeat(32)
+  const seedOption = 'd3'.repeat(32)
+  const seedPath = 'f4'.repeat(32)
+
+  const equals = createIo()
+  t.is(await main(['keygen', `--seed=${seedEquals}`], {}, equals), 2)
+  assertNoSecret(t, equals.text('stdout') + equals.text('stderr'), seedEquals)
+  t.ok((equals.text('stdout') + equals.text('stderr')).includes('Raw seeds are not accepted'))
+
+  const command = createIo()
+  t.is(await main([seedCommand], {}, command), 2)
+  assertNoSecret(t, command.text('stdout') + command.text('stderr'), seedCommand)
+  t.ok((command.text('stdout') + command.text('stderr')).includes('Raw seeds are not accepted'))
+
+  const unknown = createIo()
+  t.is(await main(['keygen', `--verbose=${seedOption}`], {}, unknown), 2)
+  assertNoSecret(t, unknown.text('stdout') + unknown.text('stderr'), seedOption)
+  t.absent((unknown.text('stdout') + unknown.text('stderr')).includes('--verbose'))
+
+  const missing = createIo()
+  t.is(
+    await main(
+      ['public-key', '--seed-file', path.join(dir, seedPath, 'missing.seed')],
+      {},
+      missing
+    ),
+    2
+  )
+  assertNoSecret(t, missing.text('stdout') + missing.text('stderr'), seedPath)
+})
+
+test('wrong-role env alone is a missing seed source', async (t) => {
+  const dir = await createTempDir(t)
+  const allowlist = path.join(dir, 'allowlist')
+  const storage = path.join(dir, 'storage')
+  const artifact = path.join(dir, 'artifact.bin')
+  const wrongServer = 'a7'.repeat(32)
+  const wrongClient = 'b8'.repeat(32)
+  await writeAllowlist(allowlist, [PUBLIC_A])
+  await fs.promises.mkdir(storage)
+  await fs.promises.writeFile(artifact, 'bytes')
+
+  const server = createIo({ Server: FakeServer })
+  t.is(
+    await main(
+      [
+        'server',
+        '--storage',
+        storage,
+        '--allowlist',
+        allowlist,
+        '--max-file-bytes',
+        '1024',
+        '--max-staging-bytes',
+        '2048'
+      ],
+      { SWARM_DEPLOY_CLIENT_SEED: wrongServer },
+      server
+    ),
+    2
+  )
+  assertNoSecret(t, server.text('stdout') + server.text('stderr'), wrongServer)
+
+  const upload = createIo({ Client: FakeClient })
+  t.is(
+    await main(
+      ['upload', '--server-key', PUBLIC_A, artifact],
+      { SWARM_DEPLOY_SERVER_SEED: wrongClient },
+      upload
+    ),
+    2
+  )
+  assertNoSecret(t, upload.text('stdout') + upload.text('stderr'), wrongClient)
+})
+
+test('failed keygen unlinks only its own exclusive inode', async (t) => {
+  const dir = await createTempDir(t)
+  const out = path.join(dir, 'race.seed')
+  const replacement = '99'.repeat(32)
+  const originalOpen = fs.promises.open
+  const originalUnlink = fs.promises.unlink
+  let unlinked = false
+
+  fs.promises.open = async function patchedOpen(filePath, flags, mode) {
+    const handle = await originalOpen.call(this, filePath, flags, mode)
+    if (filePath !== out) return handle
+    return {
+      fd: handle.fd,
+      chmod: (...args) => handle.chmod(...args),
+      stat: (...args) => handle.stat(...args),
+      write: () => Promise.reject(new Error('injected write failure')),
+      sync: (...args) => handle.sync(...args),
+      close: async () => {
+        await handle.close()
+        await originalUnlink(out)
+        await fs.promises.writeFile(out, `${replacement}\n`, { flag: 'wx', mode: 0o600 })
+      }
+    }
+  }
+  fs.promises.unlink = function patchedUnlink(filePath) {
+    if (filePath === out) unlinked = true
+    return originalUnlink(filePath)
+  }
+  t.teardown(() => {
+    fs.promises.open = originalOpen
+    fs.promises.unlink = originalUnlink
+  })
+
+  const io = createIo()
+  t.is(await main(['keygen', '--out', out], {}, io), 2)
+  t.absent(unlinked)
+  let remaining = null
+  try {
+    remaining = await fs.promises.readFile(out, 'utf8')
+  } catch {
+    t.fail('replacement seed file was removed')
+  }
+  t.is(remaining, `${replacement}\n`)
+  assertNoSecret(t, io.text('stdout') + io.text('stderr'), replacement)
+})
+
+test('server close failure after ready exits 1 with generic cleanup output', async (t) => {
+  const dir = await createTempDir(t)
+  const seedPath = path.join(dir, 'server.seed')
+  const allowlist = path.join(dir, 'allowlist')
+  const storage = path.join(dir, 'storage')
+  const leaked = 'c4'.repeat(32)
+  await writeSeedFile(seedPath, SEED_A)
+  await writeAllowlist(allowlist, [PUBLIC_A])
+  await fs.promises.mkdir(storage)
+
+  class CloseFailServer extends FakeServer {
+    close() {
+      this.closeCount++
+      this.closed = true
+      return Promise.reject(new Error(`close leaked ${leaked}`))
+    }
+  }
+
+  const result = await runServerCommand(
+    [
+      '--seed-file',
+      seedPath,
+      '--storage',
+      storage,
+      '--allowlist',
+      allowlist,
+      '--max-file-bytes',
+      '1024',
+      '--max-staging-bytes',
+      '2048'
+    ],
+    {},
+    { Server: CloseFailServer }
+  )
+  t.is(result.code, 1)
+  t.is(result.server.closeCount, 1)
+  t.ok(result.io.text('stderr').includes('Cleanup failed'))
+  t.absent(result.io.text('stderr').includes('close leaked'))
+  assertNoSecret(t, result.io.text('stdout') + result.io.text('stderr'), leaked)
+  assertNoSecret(t, result.io.text('stdout') + result.io.text('stderr'), SEED_A)
+})
+
+test('listen failure still exits 1 when a signal arrives first', async (t) => {
+  const dir = await createTempDir(t)
+  const seedPath = path.join(dir, 'server.seed')
+  const allowlist = path.join(dir, 'allowlist')
+  const storage = path.join(dir, 'storage')
+  await writeSeedFile(seedPath, SEED_A)
+  await writeAllowlist(allowlist, [PUBLIC_A])
+  await fs.promises.mkdir(storage)
+
+  class DelayedListenFail extends FakeServer {
+    async listen() {
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      throw new Error('swarm bind failed')
+    }
+  }
+
+  const proc = new EventEmitter()
+  const io = createIo({ process: proc, Server: DelayedListenFail })
+  const running = main(
+    [
+      'server',
+      '--seed-file',
+      seedPath,
+      '--storage',
+      storage,
+      '--allowlist',
+      allowlist,
+      '--max-file-bytes',
+      '1024',
+      '--max-staging-bytes',
+      '2048'
+    ],
+    {},
+    io
+  )
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  proc.emit('SIGINT')
+  t.is(await running, 1)
+  t.is(DelayedListenFail.last.closeCount, 1)
+  t.absent(io.text('stdout').includes('ready'))
+})
+
+test('upload success with a rejecting client close exits 1', async (t) => {
+  const dir = await createTempDir(t)
+  const seedPath = path.join(dir, 'client.seed')
+  const artifact = path.join(dir, 'artifact.bin')
+  const leaked = 'e5'.repeat(32)
+  await writeSeedFile(seedPath, SEED_A)
+  await fs.promises.writeFile(artifact, 'bytes')
+
+  class CloseFailClient extends FakeClient {
+    close() {
+      this.closeCount++
+      this.closed = true
+      return Promise.reject(new Error(`close leaked ${leaked}`))
+    }
+  }
+
+  const io = createIo({ Client: CloseFailClient })
+  t.is(
+    await main(['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact], {}, io),
+    1
+  )
+  t.is(CloseFailClient.last.closeCount, 1)
+  t.ok(io.text('stdout').includes('artifact.bin COMMITTED'))
+  t.ok(io.text('stderr').includes('Cleanup failed'))
+  t.absent(io.text('stderr').includes('close leaked'))
+  assertNoSecret(t, io.text('stdout') + io.text('stderr'), leaked)
+  assertNoSecret(t, io.text('stdout') + io.text('stderr'), SEED_A)
 })

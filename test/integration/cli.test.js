@@ -210,9 +210,9 @@ if (spawnSync) {
     t.is(result.status, 0)
     t.ok(result.stdout.includes('keygen'))
     t.ok(result.stdout.includes('upload'))
-    t.absent(
-      result.stdout.includes('SWARM_DEPLOY_SERVER_SEED') && result.stdout.includes('--seed ')
-    )
+    t.absent(result.stdout.includes('SWARM_DEPLOY_SERVER_SEED'))
+    t.absent(result.stdout.includes('SWARM_DEPLOY_CLIENT_SEED'))
+    t.absent(/(^|\s)--seed(\s|=|$)/.test(result.stdout))
   })
 
   test('spawned Node and Bare CLI keygen refuse overwrite and hide the seed', async (t) => {
