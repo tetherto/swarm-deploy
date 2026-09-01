@@ -26,6 +26,7 @@ const {
   result
 } = require('../..')
 const { createTempDir } = require('../helpers/files')
+const { createStorage } = require('../helpers/storage')
 const { createLocalTestnet, waitFor } = require('../helpers/testnet')
 
 const SERVER_SEED = b4a.alloc(32, 1)
@@ -322,6 +323,124 @@ test('Server starts recovery and retention before networking and rechecks revoke
     ['swarm', 'join', 'flushed', 'destroy']
   )
   t.is(scheduler.intervals.size, 0)
+})
+
+test('Server reports live allowlist read and parse failures then applies the next valid poll', async (t) => {
+  const allowedKey = keyPairFromSeed(ALLOWED_SEED).publicKey
+  const nextKey = keyPairFromSeed(UNKNOWN_SEED).publicKey
+  const allowlistDir = await createTempDir(t)
+  const allowlistPath = path.join(allowlistDir, 'private-customer-allowlist')
+  await fs.promises.writeFile(allowlistPath, `${b4a.toString(allowedKey, 'hex')}\n`)
+  const scheduler = createScheduler()
+  let unreadable = false
+  const storage = createStorage({
+    beforeOperation(name, filePath) {
+      if (unreadable && name === 'readFile' && filePath === allowlistPath) {
+        const error = new Error(`cannot read ${allowlistPath}`)
+        error.code = 'EACCES'
+        throw error
+      }
+    }
+  })
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: await createTempDir(t),
+    allowedKeys: [allowedKey],
+    allowlistPath,
+    maxFileBytes: 1024 * 1024,
+    maxStagingBytes: 2 * 1024 * 1024,
+    minFreeBytes: 0,
+    scheduler,
+    storage,
+    swarmFactory: () => createStubSwarm([]),
+    logger: {
+      warn() {
+        throw new Error('throwing server logger')
+      }
+    }
+  })
+  const events = []
+  server.on('allowlist', (event) => events.push(event))
+  server.on('allowlist', () => {
+    throw new Error('throwing server listener')
+  })
+  await server.listen()
+  events.length = 0
+
+  await fs.promises.writeFile(allowlistPath, 'PRIVATE-CONTENT\n')
+  await server.allowlistWatcher.timer.callback()
+  t.is(server._firewall(allowedKey), false)
+  t.alike(server.allowedKeys, new Set([b4a.toString(allowedKey, 'hex')]))
+  t.alike(server.allowlistWatcher.keys, new Set([b4a.toString(allowedKey, 'hex')]))
+
+  unreadable = true
+  await server.allowlistWatcher.timer.callback()
+  t.is(server._firewall(allowedKey), false)
+
+  unreadable = false
+  await fs.promises.writeFile(allowlistPath, `${b4a.toString(nextKey, 'hex')}\n`)
+  await server.allowlistWatcher.timer.callback()
+  t.is(server._firewall(allowedKey), true)
+  t.is(server._firewall(nextKey), false)
+  t.alike(events, [
+    {
+      status: 'failed',
+      appliedCount: 1,
+      pendingCount: 0,
+      reason: 'INVALID_PUBLIC_KEY'
+    },
+    { status: 'failed', appliedCount: 1, pendingCount: 0, reason: 'EACCES' },
+    { status: 'completed', appliedCount: 1, pendingCount: 0 }
+  ])
+  const serialized = JSON.stringify(events)
+  t.absent(serialized.includes(b4a.toString(allowedKey, 'hex')))
+  t.absent(serialized.includes(b4a.toString(nextKey, 'hex')))
+  t.absent(serialized.includes('private-customer-allowlist'))
+  t.absent(serialized.includes('PRIVATE-CONTENT'))
+  await server.close()
+})
+
+test('Server initial allowlist failure emits safely and remains startup-fatal', async (t) => {
+  const allowedKey = keyPairFromSeed(ALLOWED_SEED).publicKey
+  const allowlistDir = await createTempDir(t)
+  const allowlistPath = path.join(allowlistDir, 'private-initial-allowlist')
+  await fs.promises.writeFile(allowlistPath, 'PRIVATE-INITIAL-CONTENT\n')
+  let swarmCreations = 0
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: await createTempDir(t),
+    allowedKeys: [allowedKey],
+    allowlistPath,
+    maxFileBytes: 1024 * 1024,
+    maxStagingBytes: 2 * 1024 * 1024,
+    minFreeBytes: 0,
+    swarmFactory() {
+      swarmCreations++
+      return createStubSwarm([])
+    }
+  })
+  const events = []
+  server.on('allowlist', (event) => events.push(event))
+  server.on('allowlist', () => {
+    throw new Error('throwing initial failure listener')
+  })
+
+  await t.exception(() => server.listen(), {
+    name: 'SwarmDeployError',
+    code: 'INVALID_PUBLIC_KEY'
+  })
+  t.is(swarmCreations, 0)
+  t.alike(events, [
+    {
+      status: 'failed',
+      appliedCount: 1,
+      pendingCount: 0,
+      reason: 'INVALID_PUBLIC_KEY'
+    }
+  ])
+  const serialized = JSON.stringify(events)
+  t.absent(serialized.includes('private-initial-allowlist'))
+  t.absent(serialized.includes('PRIVATE-INITIAL-CONTENT'))
 })
 
 test('Server startup failure releases the storage lock', async (t) => {

@@ -169,7 +169,7 @@ Server events:
 - `offer`: accepted, resumed, rejected, or already-committed offers with safe name, size, and transfer fingerprint.
 - `progress`: verified chunk index plus cumulative chunk and byte counts.
 - `verification` and `commit`: started, succeeded, or failed outcomes.
-- `allowlist`: reload `completed` or `failed`, with `appliedCount`, `pendingCount`, and a safe failure code when applicable.
+- `allowlist`: reload `completed` or `failed`, with `appliedCount`, `pendingCount`, and a safe failure code when applicable. Live read/safety/parse failures retain the prior effective snapshot and continue polling; initial-load failures remain startup-fatal.
 - `recovery`: startup `started`/`completed`, per-journal outcomes, and structured `failed` outcomes with a safe phase, optional transfer fingerprint, and reason code.
 - `scrub`: startup `started`, `completed` counts, or a structured `failed` reason emitted before startup rejects.
 - `retention` and `cleanup`: storage lifecycle outcomes. Scheduled retention reports `deferred` while a receive is active; corrupt-journal cleanup uses a transfer fingerprint and a null name.

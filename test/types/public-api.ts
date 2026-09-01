@@ -26,6 +26,7 @@ import {
   type ReadyInput,
   type Result,
   type ResultInput,
+  type RecoveryEvent,
   type ServerConnectionEvent,
   type ServerOptions,
   Server,
@@ -166,6 +167,14 @@ const clientOptions: ClientOptions = {
 
 const server = new Server(serverOptions)
 const client = new Client(clientOptions)
+const recoveryFileExists: RecoveryEvent['status'] = 'FILE_EXISTS'
+const allowlistWatcher = new AllowlistWatcher({
+  filePath: '/var/lib/swarm-deploy/allowlist',
+  storage,
+  onReload: (keys) => void keys,
+  onFailure: (event) => void event.reason
+})
+allowlistWatcher.on('failure', (event) => void event.reason)
 const listening: Promise<Server> = server.listen()
 const reloaded: Promise<Set<string>> = server.reloadAllowlist([binaryInput])
 const closedServer: Promise<void> = server.close()
@@ -181,7 +190,9 @@ void [
   binaryKeyPair,
   binaryPublicKey,
   binaryTopic,
-  clientEventName
+  clientEventName,
+  recoveryFileExists,
+  allowlistWatcher
 ]
 
 server.on('connection', (event: ServerConnectionEvent) => void event.connections)

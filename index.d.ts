@@ -358,6 +358,7 @@ export interface RecoveryEvent {
     | 'ABORTED'
     | 'RESUMABLE'
     | 'MISSING'
+    | 'FILE_EXISTS'
   transfer?: string
   phase?: 'classification' | 'sessions' | 'journal'
   reason?: string
@@ -602,6 +603,7 @@ export interface AllowlistWatcherOptions {
   filePath: string
   storage?: Pick<StorageAdapter, 'readFile'>
   onReload(keys: Set<string>): void | Promise<void>
+  onFailure?(event: AllowlistFailureEvent): void
   pollInterval?: number
   scheduler?: Pick<ServerScheduler, 'setInterval' | 'clearInterval'>
   logger?: Logger | null
@@ -613,6 +615,10 @@ export interface AllowlistReloadedEvent {
 
 export interface AllowlistRemovedEvent {
   removed: number
+}
+
+export interface AllowlistFailureEvent {
+  reason: string
 }
 
 export class AllowlistWatcher extends EventEmitter {
@@ -631,9 +637,11 @@ export class AllowlistWatcher extends EventEmitter {
 
   on(event: 'reloaded', listener: (event: AllowlistReloadedEvent) => void): this
   on(event: 'removed', listener: (event: AllowlistRemovedEvent) => void): this
+  on(event: 'failure', listener: (event: AllowlistFailureEvent) => void): this
   on(event: string | symbol, listener: (...args: any[]) => void): this
   once(event: 'reloaded', listener: (event: AllowlistReloadedEvent) => void): this
   once(event: 'removed', listener: (event: AllowlistRemovedEvent) => void): this
+  once(event: 'failure', listener: (event: AllowlistFailureEvent) => void): this
   once(event: string | symbol, listener: (...args: any[]) => void): this
 }
 

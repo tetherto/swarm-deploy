@@ -76,3 +76,72 @@ test('allowlist watcher retries unchanged applied cleanup failures', async (t) =
   await watcher.poll()
   t.is(attempts, 2)
 })
+
+test('live poll failures are contained, retain snapshot, and recover on next valid file', async (t) => {
+  let source = `${KEY_A}\n`
+  let readError = null
+  let timer = null
+  const applied = []
+  const failures = []
+  const emitted = []
+  const watcher = new AllowlistWatcher({
+    filePath: 'secret-customer-allowlist.txt',
+    storage: {
+      readFile: () => {
+        if (readError) throw readError
+        return source
+      }
+    },
+    onReload: (keys) => applied.push(new Set(keys)),
+    onFailure(details) {
+      failures.push(details)
+      throw new Error('throwing failure callback')
+    },
+    scheduler: {
+      setInterval(callback) {
+        timer = { callback, unref() {} }
+        return timer
+      },
+      clearInterval() {}
+    },
+    logger: {
+      warn() {
+        throw new Error('throwing logger')
+      }
+    }
+  })
+  watcher.on('failure', (details) => emitted.push(details))
+  watcher.on('failure', () => {
+    throw new Error('throwing failure listener')
+  })
+
+  await watcher.load()
+  watcher.startPolling()
+  source = `${KEY_A}\nPRIVATE-CONTENT\n`
+  const invalidPoll = timer.callback()
+  t.ok(invalidPoll && typeof invalidPoll.then === 'function')
+  await invalidPoll
+  t.alike(watcher.keys, new Set([KEY_A]))
+
+  readError = new Error('cannot read /private/customer/secret-customer-allowlist.txt')
+  readError.code = 'EACCES'
+  await timer.callback()
+  t.alike(watcher.keys, new Set([KEY_A]))
+
+  readError = new Error('symbolic allowlist rejected by no-follow safety')
+  readError.code = 'ELOOP'
+  await timer.callback()
+  t.alike(watcher.keys, new Set([KEY_A]))
+
+  readError = null
+  source = `${KEY_B}\n`
+  await timer.callback()
+  t.alike(watcher.keys, new Set([KEY_B]))
+  t.alike(applied, [new Set([KEY_A]), new Set([KEY_B])])
+  t.alike(failures, [{ reason: 'INVALID_PUBLIC_KEY' }, { reason: 'EACCES' }, { reason: 'ELOOP' }])
+  t.alike(emitted, failures)
+  const serialized = JSON.stringify({ failures, emitted })
+  t.absent(serialized.includes('secret-customer-allowlist'))
+  t.absent(serialized.includes('PRIVATE-CONTENT'))
+  await watcher.close()
+})
