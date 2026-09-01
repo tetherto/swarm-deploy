@@ -303,6 +303,7 @@ test('retryAbortedAttempt removes only a failed revoked attempt before owner del
   await t.exception(() => commits.commit(session, { signal }), { name: 'AggregateError' })
   t.is(await pathExists(finalPath), true)
   t.is(await pathExists(journalPath(layout, upload.offer)), true)
+  t.is((await readJson(journalPath(layout, upload.offer))).state, 'aborting')
   t.is(await pathExists(staging), true)
 
   failRollback = false
