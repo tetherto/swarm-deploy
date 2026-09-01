@@ -84,6 +84,24 @@ function snapshotValue(value) {
   return copy
 }
 
+function assertCanonicalBuffer(t, value, label) {
+  if (typeof Bare === 'undefined') {
+    t.ok(Buffer.isBuffer(value), label)
+    return
+  }
+  t.is(value.constructor, b4a.alloc(0).constructor, label)
+}
+
+function decodePlainBytes(t, codec, value, max) {
+  const encoded = encodeBounded(codec, value, max)
+  const plain = new Uint8Array(encoded.byteLength)
+  plain.set(encoded)
+  const snapshot = new Uint8Array(plain)
+  const decoded = decodeBounded(codec, plain, max)
+  t.alike(plain, snapshot, 'plain encoded input remains unchanged')
+  return decoded
+}
+
 test('message index constants follow wire order', (t) => {
   t.is(OFFER, 0)
   t.is(STATUS, 1)
@@ -216,6 +234,43 @@ test('chunkAck codec round-trips representative data', (t) => {
   }
   const decoded = decodeBounded(chunkAck, encodeBounded(chunkAck, value))
   t.alike(decoded, value)
+})
+
+test('decodeBounded canonicalizes plain Uint8Array codec outputs', (t) => {
+  const id = b4a.alloc(32, 1)
+  const digest = b4a.alloc(32, 2)
+  const decodedOffer = decodePlainBytes(t, offer, sampleOffer({ transferId: id, digest }))
+  assertCanonicalBuffer(t, decodedOffer.transferId, 'offer transfer ID')
+  assertCanonicalBuffer(t, decodedOffer.digest, 'offer digest')
+
+  const decodedBitmapPage = decodePlainBytes(t, bitmapPage, {
+    transferId: id,
+    start: 0,
+    count: 1,
+    bits: b4a.from([1])
+  })
+  assertCanonicalBuffer(t, decodedBitmapPage.transferId, 'bitmap transfer ID')
+  assertCanonicalBuffer(t, decodedBitmapPage.bits, 'bitmap bits')
+
+  const decodedChunk = decodePlainBytes(t, chunk, {
+    transferId: id,
+    index: 0,
+    digest,
+    data: b4a.from([1, 2, 3])
+  })
+  assertCanonicalBuffer(t, decodedChunk.transferId, 'chunk transfer ID')
+  assertCanonicalBuffer(t, decodedChunk.digest, 'chunk digest')
+  assertCanonicalBuffer(t, decodedChunk.data, 'chunk data')
+
+  const decodedAck = decodePlainBytes(t, chunkAck, { transferId: id, index: 0 })
+  const decodedFinish = decodePlainBytes(t, finish, { transferId: id })
+  const decodedResult = decodePlainBytes(t, result, {
+    transferId: id,
+    code: RESULT_CODE.COMMITTED
+  })
+  assertCanonicalBuffer(t, decodedAck.transferId, 'ACK transfer ID')
+  assertCanonicalBuffer(t, decodedFinish.transferId, 'finish transfer ID')
+  assertCanonicalBuffer(t, decodedResult.transferId, 'result transfer ID')
 })
 
 test('fixed32 semantic validation rejects short transfer ID fields on decode', (t) => {
