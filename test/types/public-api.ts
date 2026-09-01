@@ -4,7 +4,11 @@ import {
   type BatchUploadResult,
   type Binary,
   type BitmapPage,
+  type BitmapPageInput,
   type Chunk,
+  type ChunkAck,
+  type ChunkAckInput,
+  type ChunkInput,
   type ClientEvent,
   type ClientEventName,
   type ClientOptions,
@@ -13,9 +17,15 @@ import {
   Client,
   type Codec,
   type FileManifest,
+  type Finish,
+  type FinishInput,
   type Logger,
   type Offer,
+  type OfferInput,
+  type Ready,
+  type ReadyInput,
   type Result,
+  type ResultInput,
   type ServerConnectionEvent,
   type ServerOptions,
   Server,
@@ -23,10 +33,14 @@ import {
   type StorageFileHandle,
   type StorageStats,
   type Status,
+  type StatusInput,
   type UploadResult,
   AllowlistWatcher,
+  bitmapPage,
   CHUNK,
   CHUNK_ACK,
+  chunk,
+  chunkAck,
   decodeBounded,
   DIGEST_BYTES,
   encodeBounded,
@@ -211,41 +225,102 @@ async function exerciseStorageAdapter() {
 void [describeClientEvent, exerciseStorageAdapter]
 
 const transfer = transferId({
-  clientPublicKey: clientKey,
+  clientPublicKey: binaryInput,
   name: validateBasename('artifact.bin'),
   size: 0,
-  digest: Buffer.alloc(DIGEST_BYTES),
+  digest: binaryInput,
   chunkSize: MAX_CHUNK_BYTES
 })
 const canonical = encodeTransferIdCanonical({
-  clientPublicKey: clientKey,
+  clientPublicKey: binaryInput,
   name: 'artifact.bin',
   size: 0,
-  digest: Buffer.alloc(DIGEST_BYTES),
+  digest: binaryInput,
   chunkSize: MAX_CHUNK_BYTES
 })
-const request: Offer = {
+const request: OfferInput = {
   version: PROTOCOL_VERSION,
-  transferId: transfer,
+  transferId: binaryInput,
   name: 'artifact.bin',
   size: 0,
-  digest: Buffer.alloc(DIGEST_BYTES),
+  digest: binaryInput,
   chunkSize: MAX_CHUNK_BYTES,
   chunkCount: 0
 }
 const encoded = encodeBounded(offer, request, MAX_CONTROL_BYTES)
-const decoded: Offer = decodeBounded(offer, encoded, MAX_CONTROL_BYTES)
-const pages: BitmapPage[] = [{ transferId: transfer, start: 0, count: 1, bits: Buffer.from([0]) }]
+const decoded: Offer = decodeBounded(offer, new Uint8Array(encoded), MAX_CONTROL_BYTES)
+const pages: BitmapPageInput[] = [
+  { transferId: binaryInput, start: 0, count: 1, bits: new Uint8Array([0]) }
+]
 const verified: Set<number> = mergeBitmapPages(pages, 1)
-const protocolResult: Result = { transferId: transfer, code: RESULT_CODE.COMMITTED }
-const protocolStatus: Status = { transferId: transfer, code: STATUS_CODE.ACCEPT }
-const protocolChunk: Chunk = {
-  transferId: transfer,
+const protocolResult: ResultInput = { transferId: binaryInput, code: RESULT_CODE.COMMITTED }
+const protocolStatus: StatusInput = { transferId: binaryInput, code: STATUS_CODE.ACCEPT }
+const protocolChunk: ChunkInput = {
+  transferId: binaryInput,
   index: 0,
-  digest: Buffer.alloc(DIGEST_BYTES),
-  data: Buffer.alloc(0)
+  digest: binaryInput,
+  data: new Uint8Array()
 }
-const completionCodec: Codec<Result> = result
+const protocolReady: ReadyInput = { transferId: binaryInput }
+const protocolChunkAck: ChunkAckInput = { transferId: binaryInput, index: 0 }
+const protocolFinish: FinishInput = { transferId: binaryInput }
+const decodedBitmapPage: BitmapPage = decodeBounded(
+  bitmapPage,
+  new Uint8Array(encodeBounded(bitmapPage, pages[0])),
+  MAX_CONTROL_BYTES
+)
+const decodedStatus: Status = decodeBounded(
+  status,
+  new Uint8Array(encodeBounded(status, protocolStatus)),
+  MAX_CONTROL_BYTES
+)
+const decodedReady: Ready = decodeBounded(
+  ready,
+  new Uint8Array(encodeBounded(ready, protocolReady)),
+  MAX_CONTROL_BYTES
+)
+const decodedChunk: Chunk = decodeBounded(
+  chunk,
+  new Uint8Array(encodeBounded(chunk, protocolChunk)),
+  MAX_CONTROL_BYTES
+)
+const decodedChunkAck: ChunkAck = decodeBounded(
+  chunkAck,
+  new Uint8Array(encodeBounded(chunkAck, protocolChunkAck)),
+  MAX_CONTROL_BYTES
+)
+const decodedFinish: Finish = decodeBounded(
+  finish,
+  new Uint8Array(encodeBounded(finish, protocolFinish)),
+  MAX_CONTROL_BYTES
+)
+const decodedResult: Result = decodeBounded(
+  result,
+  new Uint8Array(encodeBounded(result, protocolResult)),
+  MAX_CONTROL_BYTES
+)
+const decodedBuffers: Buffer[] = [
+  decoded.transferId,
+  decoded.digest,
+  decodedBitmapPage.transferId,
+  decodedBitmapPage.bits,
+  decodedStatus.transferId,
+  decodedReady.transferId,
+  decodedChunk.transferId,
+  decodedChunk.digest,
+  decodedChunk.data,
+  decodedChunkAck.transferId,
+  decodedFinish.transferId,
+  decodedResult.transferId
+]
+const offerCodec: Codec<OfferInput, Offer> = offer
+const statusCodec: Codec<StatusInput, Status> = status
+const bitmapPageCodec: Codec<BitmapPageInput, BitmapPage> = bitmapPage
+const readyCodec: Codec<ReadyInput, Ready> = ready
+const chunkCodec: Codec<ChunkInput, Chunk> = chunk
+const chunkAckCodec: Codec<ChunkAckInput, ChunkAck> = chunkAck
+const finishCodec: Codec<FinishInput, Finish> = finish
+const resultCodec: Codec<ResultInput, Result> = result
 
 void [
   AllowlistWatcher,
@@ -253,28 +328,40 @@ void [
   CHUNK_ACK,
   canonical,
   decoded,
+  decodedBuffers,
   ERRORS,
   FINISH,
   finish,
+  finishCodec,
   keyPair,
   MAX_BITMAP_BITS,
   MAX_CHUNK_FRAME_BYTES,
   OFFER,
+  offerCodec,
   parseAllowlist(''),
   parsePublicKey(serverKey.toString('hex')),
   parseSeed(seed.toString('hex')),
+  protocolChunkAck,
+  protocolFinish,
+  protocolReady,
   protocolChunk,
   protocolResult,
   protocolStatus,
   READY,
   ready,
+  readyCodec,
   RESULT,
+  resultCodec,
   STATUS,
   status,
+  statusCodec,
   topicFromServerPublicKey(serverKey),
+  transfer,
   TRANSFER_ID_BYTES,
   verified,
-  completionCodec,
+  bitmapPageCodec,
+  chunkCodec,
+  chunkAckCodec,
   new SwarmDeployError(ERRORS.ABORTED, 'aborted')
 ]
 

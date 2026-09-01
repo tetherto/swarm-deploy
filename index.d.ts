@@ -477,7 +477,7 @@ export class AllowlistWatcher extends EventEmitter {
   once(event: string | symbol, listener: (...args: any[]) => void): this
 }
 
-export interface Offer {
+export interface OfferInput {
   version: number
   transferId: Fixed32
   name: string
@@ -487,41 +487,90 @@ export interface Offer {
   chunkCount: number
 }
 
-export interface Status {
+export interface Offer {
+  version: number
+  transferId: TransferId
+  name: string
+  size: number
+  digest: Digest
+  chunkSize: number
+  chunkCount: number
+}
+
+export interface StatusInput {
   transferId: Fixed32
   code: StatusCode
   reason?: string
 }
 
-export interface BitmapPage {
+export interface Status {
+  transferId: TransferId
+  code: StatusCode
+  reason?: string
+}
+
+export interface BitmapPageInput {
   transferId: Fixed32
+  start: number
+  count: number
+  bits: BinaryInput
+}
+
+export interface BitmapPage {
+  transferId: TransferId
   start: number
   count: number
   bits: Binary
 }
 
-export interface Ready {
+export interface ReadyInput {
   transferId: Fixed32
 }
 
-export interface Chunk {
+export interface Ready {
+  transferId: TransferId
+}
+
+export interface ChunkInput {
   transferId: Fixed32
   index: number
   digest: Fixed32
+  data: BinaryInput
+}
+
+export interface Chunk {
+  transferId: TransferId
+  index: number
+  digest: Digest
   data: Binary
 }
 
-export interface ChunkAck {
+export interface ChunkAckInput {
   transferId: Fixed32
   index: number
 }
 
-export interface Finish {
+export interface ChunkAck {
+  transferId: TransferId
+  index: number
+}
+
+export interface FinishInput {
   transferId: Fixed32
 }
 
-export interface Result {
+export interface Finish {
+  transferId: TransferId
+}
+
+export interface ResultInput {
   transferId: Fixed32
+  code: ResultCode
+  reason?: string
+}
+
+export interface Result {
+  transferId: TransferId
   code: ResultCode
   reason?: string
 }
@@ -532,10 +581,10 @@ export interface EncodingState {
   buffer: Binary
 }
 
-export interface Codec<T> {
-  preencode(state: EncodingState, value: T): void
-  encode(state: EncodingState, value: T): void
-  decode(state: EncodingState): T
+export interface Codec<Input, Output = Input> {
+  preencode(state: EncodingState, value: Input): void
+  encode(state: EncodingState, value: Input): void
+  decode(state: EncodingState): Output
 }
 
 export interface TransferIdInput {
@@ -636,17 +685,25 @@ export function buildFileManifest(
   options?: BuildFileManifestOptions
 ): Promise<FileManifest>
 
-export function encodeBounded<T>(codec: Codec<T>, value: T, max?: number): Binary
-export function decodeBounded<T>(codec: Codec<T>, buffer: Binary, max?: number): T
-export const offer: Codec<Offer>
-export const status: Codec<Status>
-export const bitmapPage: Codec<BitmapPage>
-export const ready: Codec<Ready>
-export const chunk: Codec<Chunk>
-export const chunkAck: Codec<ChunkAck>
-export const finish: Codec<Finish>
-export const result: Codec<Result>
-export function mergeBitmapPages(pages: Iterable<BitmapPage>, chunkCount: number): Set<number>
+export function encodeBounded<Input, Output>(
+  codec: Codec<Input, Output>,
+  value: Input,
+  max?: number
+): Binary
+export function decodeBounded<Input, Output>(
+  codec: Codec<Input, Output>,
+  buffer: BinaryInput,
+  max?: number
+): Output
+export const offer: Codec<OfferInput, Offer>
+export const status: Codec<StatusInput, Status>
+export const bitmapPage: Codec<BitmapPageInput, BitmapPage>
+export const ready: Codec<ReadyInput, Ready>
+export const chunk: Codec<ChunkInput, Chunk>
+export const chunkAck: Codec<ChunkAckInput, ChunkAck>
+export const finish: Codec<FinishInput, Finish>
+export const result: Codec<ResultInput, Result>
+export function mergeBitmapPages(pages: Iterable<BitmapPageInput>, chunkCount: number): Set<number>
 
 export function transferId(input: TransferIdInput): TransferId
 export function encodeTransferIdCanonical(input: TransferIdInput): Binary
