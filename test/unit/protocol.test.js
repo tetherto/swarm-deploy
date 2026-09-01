@@ -3,7 +3,6 @@
 const test = require('brittle')
 const b4a = require('b4a')
 const {
-  SwarmDeployError,
   ERRORS,
   OFFER,
   STATUS,
@@ -14,7 +13,7 @@ const {
   FINISH,
   RESULT,
   STATUS_CODE,
-  MAX_CONTROL_BYTES,
+  RESULT_CODE,
   MAX_CHUNK_BYTES,
   MAX_CHUNK_FRAME_BYTES,
   MAX_BITMAP_BITS,
@@ -133,7 +132,7 @@ test('status and result encoders do not mutate caller values', (t) => {
 
   const resultValue = {
     transferId: sampleOffer().transferId,
-    code: 0
+    code: RESULT_CODE.COMMITTED
   }
   const resultSnapshot = snapshotValue(resultValue)
   encodeBounded(result, resultValue)
@@ -159,10 +158,20 @@ test('ready, finish, and result codecs round-trip', (t) => {
   const id = sampleOffer().transferId
   t.alike(decodeBounded(ready, encodeBounded(ready, { transferId: id })), { transferId: id })
   t.alike(decodeBounded(finish, encodeBounded(finish, { transferId: id })), { transferId: id })
-  t.alike(decodeBounded(result, encodeBounded(result, { transferId: id, code: 0, reason: '' })), {
-    transferId: id,
-    code: 0,
-    reason: ''
+  t.alike(
+    decodeBounded(
+      result,
+      encodeBounded(result, { transferId: id, code: RESULT_CODE.COMMITTED, reason: '' })
+    ),
+    {
+      transferId: id,
+      code: RESULT_CODE.COMMITTED,
+      reason: ''
+    }
+  )
+  t.exception(() => encodeBounded(result, { transferId: id, code: 2 }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
   })
 })
 

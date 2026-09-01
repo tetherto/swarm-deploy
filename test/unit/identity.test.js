@@ -3,7 +3,6 @@
 const test = require('brittle')
 const b4a = require('b4a')
 const {
-  SwarmDeployError,
   ERRORS,
   parseSeed,
   parsePublicKey,

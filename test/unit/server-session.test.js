@@ -6,17 +6,7 @@ const crypto = require('#crypto')
 const Protomux = require('protomux')
 const { Duplex } = require('streamx')
 const { ServerSession, UPLOAD_PROTOCOL } = require('../../lib/protocol/server-session')
-const {
-  OFFER,
-  STATUS,
-  BITMAP_PAGE,
-  READY,
-  CHUNK,
-  CHUNK_ACK,
-  FINISH,
-  RESULT,
-  STATUS_CODE
-} = require('../../lib/protocol/constants')
+const { OFFER, CHUNK, FINISH, STATUS_CODE } = require('../../lib/protocol/constants')
 const {
   offer,
   status,
@@ -28,7 +18,6 @@ const {
   result
 } = require('../../lib/protocol/codecs')
 const { transferId } = require('../../lib/protocol/transfer-id')
-const { SwarmDeployError, ERRORS } = require('../../lib/errors')
 
 const OWNER = b4a.alloc(32, 7)
 

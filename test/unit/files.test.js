@@ -3,13 +3,7 @@
 const test = require('brittle')
 const fs = require('#fs')
 const path = require('#path')
-const {
-  SwarmDeployError,
-  ERRORS,
-  validateBasename,
-  selectUploadPaths,
-  buildFileManifest
-} = require('../..')
+const { ERRORS, validateBasename, selectUploadPaths, buildFileManifest } = require('../..')
 const { createAbortController } = require('../../lib/abort')
 const {
   CHUNK_SIZE,
@@ -174,7 +168,7 @@ test('selectUploadPaths skips regular files with invalid basenames', async (t) =
   }
 })
 
-test('buildFileManifest rejects symlink via no-follow open', async (t) => {
+test('buildFileManifest rejects an initial symlink before opening', async (t) => {
   const dir = await createTempDir(t)
   const targetPath = path.join(dir, 'target.bin')
   const linkPath = path.join(dir, 'link.bin')

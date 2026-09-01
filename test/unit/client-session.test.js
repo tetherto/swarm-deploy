@@ -51,8 +51,9 @@ function waitFor(predicate, timeout = 500) {
     const started = Date.now()
     const check = () => {
       if (predicate()) return resolve()
-      if (Date.now() - started >= timeout)
+      if (Date.now() - started >= timeout) {
         return reject(new Error('Timed out waiting for protocol progress'))
+      }
       setTimeout(check, 1)
     }
     check()

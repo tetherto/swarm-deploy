@@ -11,7 +11,8 @@
   "scripts": {
     "format": "prettier . --write",
     "format:check": "prettier . --check",
-    "lint": "prettier . --check && lunte && tsc --noEmit --strict index.d.ts",
+    "lint": "prettier . --check && lunte && npm run test:types",
+    "test:types": "tsc --noEmit --strict --module node16 --moduleResolution node16 --types node test/types/public-api.ts",
     "test:node": "brittle-node test/run.js",
     "test:bare": "brittle-bare test/run.js",
     "test": "npm run test:node && npm run test:bare"

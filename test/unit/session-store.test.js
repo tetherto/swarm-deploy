@@ -711,8 +711,9 @@ test('offer syncs durable staging before publishing its session metadata', async
   const events = []
   const storage = createStorage({
     async afterOperation(name, source, destination) {
-      if (name === 'sync' || name === 'rename')
+      if (name === 'sync' || name === 'rename') {
         events.push(`${name}:${source}->${destination ?? ''}`)
+      }
     }
   })
   const { layout, store } = await createStore(t, { storage })
