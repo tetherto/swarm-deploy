@@ -340,3 +340,69 @@ test('server session closes an idle connection after the default timeout', async
   timer.callback()
   await waitFor(() => pair.right.destroyed)
 })
+
+test('server session revocation prevents queued chunk writes', async (t) => {
+  const started = deferred()
+  const release = deferred()
+  let writes = 0
+  const sessionStore = createSessionStore({
+    writeChunk: async () => {
+      writes++
+      started.resolve()
+      await release.promise
+    }
+  })
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  pair.messages[CHUNK].send(upload.chunk)
+  await started.promise
+  pair.messages[CHUNK].send(upload.chunk)
+
+  pair.serverSession.revoke()
+  release.resolve()
+  await pair.serverSession.settle()
+
+  t.is(writes, 1)
+})
+
+test('server session revocation prevents queued finish commit', async (t) => {
+  const started = deferred()
+  const release = deferred()
+  let finished = 0
+  let committed = 0
+  const sessionStore = createSessionStore({
+    writeChunk: async () => {
+      started.resolve()
+      await release.promise
+    }
+  })
+  sessionStore.finish = async (transferId) => {
+    finished++
+    const session = sessionStore.sessions.get(b4a.toString(transferId, 'hex'))
+    session.state = 'verified'
+  }
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore({ commit: async () => committed++ }),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  pair.messages[CHUNK].send(upload.chunk)
+  await started.promise
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+
+  pair.serverSession.revoke()
+  release.resolve()
+  await pair.serverSession.settle()
+
+  t.is(finished, 0)
+  t.is(committed, 0)
+})

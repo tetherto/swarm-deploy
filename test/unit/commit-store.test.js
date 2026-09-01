@@ -241,3 +241,17 @@ test('delete removes only its managed object and durably removes its sidecar', a
     `sync:${layout.commits}`
   ])
 })
+
+test('commit abort signal prevents final publication before linking', async (t) => {
+  const { layout, upload, session } = await createVerifiedSession(t)
+  const commits = new CommitStore({ layout })
+  const signal = { aborted: true }
+
+  await t.exception(() => commits.commit(session, { signal }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.REVOKED
+  })
+
+  t.is(await pathExists(path.join(layout.root, upload.offer.name)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+})

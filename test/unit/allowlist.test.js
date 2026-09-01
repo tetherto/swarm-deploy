@@ -39,7 +39,7 @@ test('allowlist watcher applies a valid replacement atomically', async (t) => {
   t.alike(applied, [new Set([KEY_A, KEY_B])])
 })
 
-test('allowlist watcher emits each removed key once', async (t) => {
+test('allowlist watcher emits fingerprint-only removal events', async (t) => {
   let source = `${KEY_A}\n${KEY_B}\n`
   const watcher = new AllowlistWatcher({
     filePath: 'allowed.txt',
@@ -47,12 +47,12 @@ test('allowlist watcher emits each removed key once', async (t) => {
     onReload: async () => {}
   })
   const removed = []
-  watcher.on('removed', (key) => removed.push(key))
+  watcher.on('removed', (details) => removed.push(details))
 
   await watcher.poll()
   source = `${KEY_A}\n`
   await watcher.poll()
   await watcher.poll()
 
-  t.alike(removed, [KEY_B])
+  t.alike(removed, [{ removed: 1 }])
 })
