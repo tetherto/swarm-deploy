@@ -17,6 +17,7 @@ const {
   expectedManifest,
   writeDeterministicFile
 } = require('../helpers/files')
+const { blockManifestAfterFirstRead, settlePromptly } = require('../helpers/cancellation')
 
 test('validateBasename accepts safe names and rejects unsafe names', (t) => {
   t.is(validateBasename('artifact-linux-x64.tar.gz'), 'artifact-linux-x64.tar.gz')
@@ -302,4 +303,25 @@ test('file selection and hashing abort with a typed error', async (t) => {
     name: 'SwarmDeployError',
     code: 'ABORTED'
   })
+})
+
+test('buildFileManifest aborts an active hash and closes its stream and descriptor', async (t) => {
+  const dir = await createTempDir(t)
+  const filePath = path.join(dir, 'active-abort.bin')
+  await writeDeterministicFile(filePath, 4 * CHUNK_SIZE)
+  const blocked = blockManifestAfterFirstRead(t, filePath)
+  const controller = createAbortController()
+  const hashing = buildFileManifest(filePath, { signal: controller.signal })
+
+  await blocked.started
+  t.is(blocked.state.reads, 1)
+  controller.abort()
+
+  const [hashResult] = await settlePromptly([hashing, blocked.streamClosed])
+  t.is(hashResult.status, 'rejected')
+  t.is(hashResult.reason.name, 'SwarmDeployError')
+  t.is(hashResult.reason.code, ERRORS.ABORTED)
+  t.ok(blocked.state.streamClosed)
+  t.ok(blocked.state.descriptorCloseAttempted)
+  await t.exception(() => blocked.state.descriptor.stat(), { code: 'EBADF' })
 })
