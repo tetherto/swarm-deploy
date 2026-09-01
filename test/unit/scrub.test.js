@@ -59,7 +59,23 @@ async function pathExists(filePath) {
   }
 }
 
-async function createStores(t, { storage } = {}) {
+async function createFifo(filePath) {
+  let execFile
+  try {
+    ;({ execFile } = require('child_process'))
+  } catch {
+    return false
+  }
+  await new Promise((resolve, reject) => {
+    execFile('mkfifo', [filePath], (err) => {
+      if (err) reject(err)
+      else resolve()
+    })
+  })
+  return true
+}
+
+async function createStores(t, { storage, isSessionActive = () => false, logger } = {}) {
   const layout = initLayout(await createTempDir(t))
   const clock = createClock()
   const sessionStore = new SessionStore({
@@ -76,7 +92,9 @@ async function createStores(t, { storage } = {}) {
     sessionStore,
     commitStore,
     clock,
-    storage
+    storage,
+    isSessionActive,
+    logger
   })
   t.teardown(() => sessionStore.close())
   return { layout, clock, sessionStore, commitStore, manager }
@@ -151,6 +169,59 @@ test('startup scrub removes missing, truncated, symlinked, and digest-invalid ma
   t.is(await pathExists(symlinked.finalPath), false)
   t.is(await pathExists(changed.finalPath), false)
   t.alike(await fs.promises.readFile(foreignTarget), b4a.from('foreign'))
+})
+
+test('startup scrub removes managed FIFOs where supported', async (t) => {
+  const stores = await createStores(t)
+  const fifo = await commit(t, stores, 'managed.fifo', b4a.from('fifo'))
+  await fs.promises.unlink(fifo.finalPath)
+  if (!(await createFifo(fifo.finalPath))) {
+    t.ok(true)
+    return
+  }
+
+  const result = await stores.manager.scrubCommitted()
+
+  t.is(result.deleted, 1)
+  t.is(await pathExists(fifo.finalPath), false)
+  t.alike(await stores.commitStore.list(), [])
+})
+
+test('startup scrub removes empty managed directories and preserves non-empty ones', async (t) => {
+  const warnings = []
+  const stores = await createStores(t, {
+    logger: {
+      warn(message, details) {
+        warnings.push({ message, details })
+      }
+    }
+  })
+  const empty = await commit(t, stores, 'empty-directory.bin', b4a.from('empty'))
+  const nonempty = await commit(t, stores, 'nonempty-directory.bin', b4a.from('full'))
+  const valid = await commit(t, stores, 'valid.bin', b4a.from('valid'))
+  await fs.promises.unlink(empty.finalPath)
+  await fs.promises.mkdir(empty.finalPath)
+  await fs.promises.unlink(nonempty.finalPath)
+  await fs.promises.mkdir(nonempty.finalPath)
+  const operatorFile = path.join(nonempty.finalPath, 'operator-note.txt')
+  await fs.promises.writeFile(operatorFile, b4a.from('preserve me'))
+
+  const result = await stores.manager.scrubCommitted()
+
+  t.is(result.deleted, 2)
+  t.alike(result.unknown, ['nonempty-directory.bin'])
+  t.is(await pathExists(empty.finalPath), false)
+  t.alike(await fs.promises.readFile(operatorFile), b4a.from('preserve me'))
+  t.alike(await stores.commitStore.list(), [valid.record])
+  t.alike(
+    warnings.filter((warning) => warning.message === 'Preserving non-empty managed directory'),
+    [
+      {
+        message: 'Preserving non-empty managed directory',
+        details: { name: 'nonempty-directory.bin' }
+      }
+    ]
+  )
 })
 
 test('startup scrub fails closed when the storage root changes during hashing', async (t) => {

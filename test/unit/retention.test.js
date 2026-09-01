@@ -58,7 +58,22 @@ async function pathExists(filePath) {
   }
 }
 
-async function createStores(t, { storage, retention = {}, isSessionActive } = {}) {
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+async function createStores(
+  t,
+  { storage, retention = {}, isSessionActive = () => false, logger } = {}
+) {
   const layout = initLayout(await createTempDir(t))
   const clock = createClock()
   const sessionStore = new SessionStore({
@@ -77,6 +92,7 @@ async function createStores(t, { storage, retention = {}, isSessionActive } = {}
     clock,
     storage,
     isSessionActive,
+    logger,
     ...retention
   })
   t.teardown(() => sessionStore.close())
@@ -147,6 +163,125 @@ test('commit reserves retention capacity before final publication', async (t) =>
 
   t.is(await pathExists(existing.finalPath), false)
   t.is(await pathExists(incoming.finalPath), true)
+})
+
+test('commits serialize different names through capacity reservation', async (t) => {
+  let alphaFinal = null
+  let bravoFinal = null
+  let alphaLinked = false
+  let bravoLinked = false
+  let alphaRemovedBeforeBravo = false
+  const alphaAtPublication = deferred()
+  const allowAlphaPublication = deferred()
+  const storage = createStorage({
+    async beforeOperation(name, source, destination) {
+      if (name === 'unlink' && source === alphaFinal && !bravoLinked) {
+        alphaRemovedBeforeBravo = true
+      }
+      if (name !== 'link' || destination !== alphaFinal || alphaLinked) return
+      alphaLinked = true
+      alphaAtPublication.resolve()
+      await allowAlphaPublication.promise
+    },
+    async afterOperation(name, source, destination) {
+      if (name === 'link' && destination === bravoFinal) bravoLinked = true
+    }
+  })
+  const stores = await createStores(t, { storage, retention: { maxStorageBytes: 5 } })
+  const alpha = await verify(stores, 'alpha.bin', b4a.from('aaa'))
+  const bravo = await verify(stores, 'bravo.bin', b4a.from('bbb'))
+  alphaFinal = alpha.finalPath
+  bravoFinal = bravo.finalPath
+
+  const first = stores.commitStore.commit(alpha.session, { retentionManager: stores.manager })
+  await alphaAtPublication.promise
+  const second = stores.commitStore.commit(bravo.session, { retentionManager: stores.manager })
+  allowAlphaPublication.resolve()
+  await Promise.all([first, second])
+
+  t.is(alphaRemovedBeforeBravo, true)
+  t.is(await pathExists(alpha.finalPath), false)
+  t.is(await pathExists(bravo.finalPath), true)
+})
+
+test('commit validates corrupt staging before retention evicts managed commits', async (t) => {
+  const stores = await createStores(t, { retention: { maxStorageBytes: 3 } })
+  const existing = await commit(t, stores, 'existing.bin', b4a.from('aaa'))
+  const incoming = await verify(stores, 'incoming.bin', b4a.from('bbb'))
+  await fs.promises.writeFile(
+    path.join(stores.layout.staging, `${hex(incoming.upload.offer.transferId)}.part`),
+    b4a.from('bad')
+  )
+
+  await t.exception(
+    () => stores.commitStore.commit(incoming.session, { retentionManager: stores.manager }),
+    {
+      name: 'SwarmDeployError',
+      code: ERRORS.CHECKSUM_MISMATCH
+    }
+  )
+
+  t.is(await pathExists(existing.finalPath), true)
+  t.alike(await stores.commitStore.list(), [existing.record])
+})
+
+test('commit succeeds when post-commit cleanup fails and retries cleanup later', async (t) => {
+  const cleanupFailure = new Error('Injected post-commit cleanup failure')
+  let firstFinal = null
+  let secondFinal = null
+  let advanceAfterPublication = false
+  let failCleanup = false
+  const errors = []
+  let stores = null
+  const storage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (failCleanup && name === 'unlink' && filePath === firstFinal) throw cleanupFailure
+    },
+    async afterOperation(name, source, destination) {
+      if (!advanceAfterPublication || name !== 'link' || destination !== secondFinal) return
+      advanceAfterPublication = false
+      stores.clock.advance(11)
+    }
+  })
+  stores = await createStores(t, {
+    storage,
+    retention: { maxAge: 10, maxStorageBytes: 9 },
+    logger: {
+      error(message, details) {
+        errors.push({ message, details })
+      }
+    }
+  })
+  const first = await commit(t, stores, 'first.bin', b4a.from('one'))
+  firstFinal = first.finalPath
+  const incoming = await verify(stores, 'second.bin', b4a.from('two'))
+  secondFinal = incoming.finalPath
+  advanceAfterPublication = true
+  failCleanup = true
+
+  const record = await stores.commitStore.commit(incoming.session, {
+    retentionManager: stores.manager
+  })
+
+  t.is(record.name, 'second.bin')
+  t.is(await pathExists(first.finalPath), true)
+  t.is(await pathExists(incoming.finalPath), true)
+  t.is(stores.manager.cleanupFailure.code, ERRORS.CLEANUP_FAILED)
+  t.alike(errors, [
+    {
+      message: 'Post-commit retention failed',
+      details: { message: 'Unable to remove managed commit' }
+    }
+  ])
+
+  await t.exception(() => stores.manager.run({ incomingBytes: 3 }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.CLEANUP_FAILED
+  })
+  failCleanup = false
+  await stores.manager.run({ incomingBytes: 3 })
+
+  t.is(stores.manager.cleanupFailure, null)
 })
 
 test('retention removes expired commits before rotating for size', async (t) => {
@@ -228,10 +363,14 @@ test('retention expires only disconnected sessions past the default TTL', async 
   await stores.sessionStore.offer(OWNER, inactive.offer)
   await stores.sessionStore.offer(OWNER, active.offer)
   activeId = hex(active.offer.transferId)
-  stores.clock.advance(DEFAULT_RESUME_TTL + 1)
+  stores.clock.advance(DEFAULT_RESUME_TTL)
 
   await stores.manager.expireSessions()
 
+  t.is(stores.sessionStore.sessions.has(hex(inactive.offer.transferId)), true)
+  t.is(stores.sessionStore.sessions.has(activeId), true)
+  stores.clock.advance(1)
+  await stores.manager.expireSessions()
   t.is(stores.sessionStore.sessions.has(hex(inactive.offer.transferId)), false)
   t.is(stores.sessionStore.sessions.has(activeId), true)
 })
@@ -246,7 +385,8 @@ test('retention validates numeric limits and durations', async (t) => {
           layout: stores.layout,
           sessionStore: stores.sessionStore,
           commitStore: stores.commitStore,
-          maxAge: -1
+          maxAge: -1,
+          isSessionActive: () => false
         })
       ),
     { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
@@ -258,7 +398,8 @@ test('retention validates numeric limits and durations', async (t) => {
           layout: stores.layout,
           sessionStore: stores.sessionStore,
           commitStore: stores.commitStore,
-          maxStorageBytes: Number.MAX_SAFE_INTEGER + 1
+          maxStorageBytes: Number.MAX_SAFE_INTEGER + 1,
+          isSessionActive: () => false
         })
       ),
     { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
@@ -270,11 +411,78 @@ test('retention validates numeric limits and durations', async (t) => {
           layout: stores.layout,
           sessionStore: stores.sessionStore,
           commitStore: stores.commitStore,
-          resumeTtl: 0
+          resumeTtl: 0,
+          isSessionActive: () => false
         })
       ),
     { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
   )
+  await t.exception(
+    () =>
+      Promise.resolve(
+        new RetentionManager({
+          layout: stores.layout,
+          sessionStore: stores.sessionStore,
+          commitStore: stores.commitStore,
+          cleanupInterval: 2 ** 31,
+          isSessionActive: () => false
+        })
+      ),
+    { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
+  )
+})
+
+test('retention requires an explicit session activity predicate', async (t) => {
+  const stores = await createStores(t)
+
+  await t.exception(
+    () =>
+      Promise.resolve(
+        new RetentionManager({
+          layout: stores.layout,
+          sessionStore: stores.sessionStore,
+          commitStore: stores.commitStore
+        })
+      ),
+    { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
+  )
+})
+
+test('retention serializes overlapping scheduled and manual runs', async (t) => {
+  let stores = null
+  let hold = false
+  let running = 0
+  let maximumRunning = 0
+  let calls = 0
+  const entered = deferred()
+  const release = deferred()
+  const storage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (!hold || name !== 'readdir' || filePath !== stores.layout.commits) return
+      calls++
+      running++
+      maximumRunning = Math.max(maximumRunning, running)
+      if (calls === 1) entered.resolve()
+      await release.promise
+      running--
+    }
+  })
+  stores = await createStores(t, { storage, retention: { cleanupInterval: 1 } })
+  t.teardown(() => stores.manager.stop())
+  await stores.manager.start()
+  hold = true
+  const manual = stores.manager.run()
+  await entered.promise
+  await delay(20)
+
+  t.is(maximumRunning, 1)
+  release.resolve()
+  await manual
+  await delay(20)
+  stores.manager.stop()
+
+  t.ok(calls >= 2)
+  t.is(maximumRunning, 1)
 })
 
 test('retention rejects a managed record that disappears during enumeration', async (t) => {

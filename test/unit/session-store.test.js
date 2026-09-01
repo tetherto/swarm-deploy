@@ -1199,6 +1199,9 @@ test('delete, deleteByOwner, and expire remove staging metadata and reservations
 
   await store.offer(OWNER, first.offer)
   clock.advance(1_000)
+  t.is(await store.expire(1_000), 0)
+  t.is(await pathExists(stagingPath(layout, first.offer)), true)
+  clock.advance(1)
   t.is(await store.expire(1_000), 1)
   t.is(await pathExists(stagingPath(layout, first.offer)), false)
   t.is(await pathExists(sessionPath(layout, first.offer)), false)

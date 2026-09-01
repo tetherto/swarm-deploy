@@ -20,6 +20,7 @@ function createStorage({
     'rename',
     'link',
     'unlink',
+    'rmdir',
     'rm'
   ]) {
     storage[name] = async function storageOperation(...args) {
