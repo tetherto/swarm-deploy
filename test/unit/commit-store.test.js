@@ -255,3 +255,26 @@ test('commit abort signal prevents final publication before linking', async (t) 
   t.is(await pathExists(path.join(layout.root, upload.offer.name)), false)
   t.is(await pathExists(stagingPath(layout, upload.offer)), true)
 })
+
+test('commit removes its publication when revoked during final link', async (t) => {
+  const signal = { aborted: false }
+  let staging = null
+  const storage = createStorage({
+    async afterOperation(name, sourcePath) {
+      if (name === 'link' && sourcePath === staging) signal.aborted = true
+    }
+  })
+  const { layout, upload, session } = await createVerifiedSession(t, { storage })
+  staging = stagingPath(layout, upload.offer)
+  const commits = new CommitStore({ layout, storage })
+
+  await t.exception(() => commits.commit(session, { signal }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.REVOKED
+  })
+
+  t.is(await pathExists(path.join(layout.root, upload.offer.name)), false)
+  t.is(await pathExists(recordPath(layout, upload.offer)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+  t.is(await pathExists(journalPath(layout, upload.offer)), true)
+})
