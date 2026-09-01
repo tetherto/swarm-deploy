@@ -305,6 +305,27 @@ test('client session fails closed on invalid server transfer IDs and states', as
   await t.exception(() => retry, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
 })
 
+test('client session fails closed on every forbidden server message direction', async (t) => {
+  const manifest = createManifest(1)
+  for (const type of [OFFER, CHUNK, FINISH]) {
+    const pair = createPair({ manifest })
+    const { uploading } = await openAndOffer(pair, manifest)
+    const id = pair.received.offer[0].transferId
+    if (type === OFFER) pair.serverMessages[type].send(pair.received.offer[0])
+    if (type === CHUNK) {
+      pair.serverMessages[type].send({
+        transferId: id,
+        index: 0,
+        digest: manifest.chunkDigests[0],
+        data: manifest.chunks[0]
+      })
+    }
+    if (type === FINISH) pair.serverMessages[type].send({ transferId: id })
+    await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
+    t.ok(pair.channel._mux.stream.destroyed)
+  }
+})
+
 test('client session rejects duplicate, out-of-range, and mismatched acknowledgements', async (t) => {
   const manifest = createManifest(1)
   const pair = createPair({ manifest })

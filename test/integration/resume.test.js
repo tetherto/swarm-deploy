@@ -85,3 +85,40 @@ test('Client resolves a lost final result through ALREADY_COMMITTED', async (t) 
     b4a.from('durably committed before result loss')
   )
 })
+
+test('Client starts a fresh reconnect window after an active transport loss', async (t) => {
+  let now = 0
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    clock: { now: () => now }
+  })
+  const deadlines = []
+  const socket = {}
+  client._ensureStarted = async () => client
+  client._delay = async () => true
+  client._waitForSocket = async (deadline) => {
+    deadlines.push(deadline)
+    if (deadlines.length === 1) return socket
+    now = deadline
+    throw new (require('../../lib/errors').SwarmDeployError)(
+      require('../../lib/errors').ERRORS.UPLOAD_IDLE_TIMEOUT,
+      'unavailable'
+    )
+  }
+  client._startSession = async () => {
+    now = 60_000
+    const error = new (require('../../lib/errors').SwarmDeployError)(
+      require('../../lib/errors').ERRORS.PROTOCOL_INVALID,
+      'lost'
+    )
+    error.transport = true
+    throw error
+  }
+
+  await t.exception(() => client._uploadManifest({}), {
+    name: 'SwarmDeployError',
+    code: 'UPLOAD_IDLE_TIMEOUT'
+  })
+  t.alike(deadlines, [30_000, 90_000])
+})

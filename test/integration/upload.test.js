@@ -83,7 +83,7 @@ test('Client close aborts pending discovery promptly', async (t) => {
   await waitFor(() => client.swarm !== null)
   await client.close()
 
-  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
+  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'ABORTED' })
 })
 
 test('Client uploads empty and multi-chunk files with exact bytes and sidecars', async (t) => {
@@ -124,6 +124,8 @@ test('Client processes directory entries sequentially, preserves skips, and cont
   const testnet = await createLocalTestnet(t)
   const server = await setupServer(t, testnet, [CLIENT_A_SEED])
   const client = createClient(t, testnet, server, CLIENT_A_SEED)
+  let connections = 0
+  server.on('connection', () => connections++)
   const source = await createTempDir(t)
   const blocked = path.join(source, 'a-blocked.bin')
   const accepted = path.join(source, 'b-accepted.bin')
@@ -149,6 +151,7 @@ test('Client processes directory entries sequentially, preserves skips, and cont
     await fs.promises.readFile(path.join(server.layout.root, 'b-accepted.bin')),
     b4a.from('accepted bytes')
   )
+  t.is(connections, 1)
 })
 
 test('Client pins the expected server before Protomux metadata and continues past rogue peers', async (t) => {

@@ -10,6 +10,7 @@ const {
   selectUploadPaths,
   buildFileManifest
 } = require('../..')
+const { createAbortController } = require('../../lib/abort')
 const {
   CHUNK_SIZE,
   createTempDir,
@@ -256,5 +257,49 @@ test('selectUploadPaths accepts a regular file and rejects a symlink input', asy
   await t.exception(() => selectUploadPaths(path.join(dir, 'solo-link')), {
     name: 'SwarmDeployError',
     code: ERRORS.INVALID_FILENAME
+  })
+})
+
+test('selectUploadPaths records unreadable directory entries and continues lexically', async (t) => {
+  const dir = await createTempDir(t)
+  const blocked = path.join(dir, 'a-blocked.bin')
+  const good = path.join(dir, 'b-good.bin')
+  await writeDeterministicFile(blocked, 1)
+  await writeDeterministicFile(good, 1)
+  const original = fs.promises.lstat
+  fs.promises.lstat = async function patchedLstat(entryPath, opts) {
+    if (entryPath === blocked) {
+      const error = new Error('denied')
+      error.code = 'EACCES'
+      throw error
+    }
+    return original.call(this, entryPath, opts)
+  }
+  t.teardown(() => {
+    fs.promises.lstat = original
+  })
+
+  const selection = await selectUploadPaths(dir)
+  t.alike(selection.paths, [good])
+  t.alike(
+    selection.failed.map((entry) => [entry.name, entry.reason, entry.code]),
+    [['a-blocked.bin', 'unreadable', 'EACCES']]
+  )
+})
+
+test('file selection and hashing abort with a typed error', async (t) => {
+  const dir = await createTempDir(t)
+  const filePath = path.join(dir, 'abort.bin')
+  await writeDeterministicFile(filePath, 1024)
+  const controller = createAbortController()
+  controller.abort()
+
+  await t.exception(() => selectUploadPaths(dir, { signal: controller.signal }), {
+    name: 'SwarmDeployError',
+    code: 'ABORTED'
+  })
+  await t.exception(() => buildFileManifest(filePath, { signal: controller.signal }), {
+    name: 'SwarmDeployError',
+    code: 'ABORTED'
   })
 })
