@@ -326,7 +326,31 @@ test('client session fails closed on every forbidden server message direction', 
   }
 })
 
-test('client session rejects duplicate, out-of-range, and mismatched acknowledgements', async (t) => {
+test('client session rejects duplicate acknowledgements', async (t) => {
+  const manifest = createManifest(1)
+  const pair = createPair({ manifest })
+  const { uploading } = await openAndOffer(pair, manifest)
+  const id = pair.received.offer[0].transferId
+
+  pair.accept()
+  await waitFor(() => pair.received.chunk.length === 1)
+  pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 0 })
+  pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 0 })
+  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
+})
+
+test('client session rejects acknowledgements with a mismatched transfer ID', async (t) => {
+  const manifest = createManifest(1)
+  const pair = createPair({ manifest })
+  const { uploading } = await openAndOffer(pair, manifest)
+
+  pair.accept()
+  await waitFor(() => pair.received.chunk.length === 1)
+  pair.serverMessages[CHUNK_ACK].send({ transferId: b4a.alloc(32), index: 0 })
+  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
+})
+
+test('client session rejects acknowledgements with an out-of-range index', async (t) => {
   const manifest = createManifest(1)
   const pair = createPair({ manifest })
   const { uploading } = await openAndOffer(pair, manifest)
