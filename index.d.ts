@@ -349,16 +349,27 @@ export interface TransferLifecycleEvent extends TransferEvent {
 export type ServerTransferLifecycleEvent = TransferLifecycleEvent & FingerprintEvent
 
 export interface RecoveryEvent {
-  status: 'started' | 'completed' | string
+  status:
+    | 'started'
+    | 'completed'
+    | 'failed'
+    | 'CORRUPT'
+    | 'COMMITTED'
+    | 'ABORTED'
+    | 'RESUMABLE'
+    | 'MISSING'
   transfer?: string
+  phase?: 'classification' | 'sessions' | 'journal'
+  reason?: string
   journals?: number
   purgedSessions?: number
 }
 
 export interface ScrubEvent {
-  status: 'completed'
-  deleted: number
-  unknownCount: number
+  status: 'started' | 'completed' | 'failed'
+  reason?: string
+  deleted?: number
+  unknownCount?: number
 }
 
 export interface RetentionEvent {
@@ -373,8 +384,22 @@ export interface RetentionEvent {
 
 export interface CleanupEvent {
   transfer: string
-  name: string
-  reason: 'delete' | 'revocation' | 'offline-revocation' | 'expiry' | 'checksum' | 'recovery'
+  name: string | null
+  reason:
+    | 'delete'
+    | 'revocation'
+    | 'offline-revocation'
+    | 'expiry'
+    | 'checksum'
+    | 'recovery'
+    | 'corrupt-journal'
+}
+
+export interface AllowlistEvent {
+  status: 'completed' | 'failed'
+  appliedCount: number
+  pendingCount: number
+  reason?: string
 }
 
 export interface ServerCloseEvent {
@@ -394,6 +419,7 @@ export interface ServerEventMap {
   scrub: ScrubEvent
   retention: RetentionEvent
   cleanup: CleanupEvent
+  allowlist: AllowlistEvent
   revocation: FingerprintEvent
   revoked: FingerprintEvent
   listening: ServerListeningEvent
@@ -421,6 +447,9 @@ export interface ClientBatchResultEvent {
   status: 'COMMITTED' | 'FAILED'
   final: true
   files: number
+  committed: number
+  failed: number
+  skipped: number
   reason?: undefined
 }
 

@@ -584,6 +584,7 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
   const eio = new Error('Injected journal read failure')
   eio.code = 'EIO'
   const warnings = []
+  const events = []
   const recoveryStorage = createStorage({
     async beforeOperation(name, filePath) {
       if (name === 'read' && filePath === earlierJournal) throw eio
@@ -610,6 +611,10 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
         warn(message, detail) {
           warnings.push({ message, detail })
         }
+      },
+      onEvent(event) {
+        events.push(event)
+        if (event.status === 'failed') throw new Error('throwing recovery listener')
       }
     })
   } catch (err) {
@@ -618,11 +623,61 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
 
   t.is(caught, eio)
   t.is(warnings.length, 0)
+  t.alike(events, [
+    {
+      type: 'recovery',
+      status: 'failed',
+      phase: 'journal',
+      transfer: '66687aadf862',
+      reason: 'EIO'
+    }
+  ])
   t.is(await pathExists(earlierJournal), true)
   t.is(await pathExists(expected.journal), true)
   t.is(await pathExists(expected.final), false)
   t.is(await pathExists(expected.staging), true)
   t.is(await pathExists(expected.session), true)
+})
+
+test('startup scrub emits a contained structured failure before rejecting', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const scrubFailure = new Error('Injected scrub failure with private local path')
+  scrubFailure.code = 'EIO'
+  const storage = createStorage({
+    beforeOperation(name, filePath) {
+      if (name === 'readdir' && filePath === layout.commits) throw scrubFailure
+    }
+  })
+  const sessionStore = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    storage
+  })
+  await sessionStore.init()
+  const events = []
+  let caught = null
+  try {
+    await recoverStorage({
+      layout,
+      sessionStore,
+      commitStore: new CommitStore({ layout, storage }),
+      onEvent(event) {
+        events.push(event)
+        if (event.status === 'failed') throw new Error('throwing scrub listener')
+      }
+    })
+  } catch (err) {
+    caught = err
+  }
+
+  t.is(caught, scrubFailure)
+  t.alike(events, [
+    { type: 'scrub', status: 'started' },
+    { type: 'scrub', status: 'failed', reason: 'EIO' }
+  ])
+  t.absent(JSON.stringify(events).includes(root))
+  await sessionStore.close()
 })
 
 test('recovery aborts on uncoded storage-safety errors without reporting corruption', async (t) => {

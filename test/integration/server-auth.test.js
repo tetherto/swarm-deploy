@@ -285,6 +285,11 @@ test('Server starts recovery and retention before networking and rechecks revoke
     }
   })
   t.teardown(() => server.close())
+  const allowlistEvents = []
+  server.on('allowlist', (event) => allowlistEvents.push(event))
+  server.on('allowlist', () => {
+    throw new Error('throwing allowlist listener')
+  })
 
   await server.listen()
   t.is(server._firewall(unknownKey), true)
@@ -292,6 +297,15 @@ test('Server starts recovery and retention before networking and rechecks revoke
   await t.exception(() => server.reloadAllowlist(['not-a-public-key']))
   t.alike(server.allowedKeys, new Set([b4a.toString(allowedKey, 'hex')]))
   await server.reloadAllowlist([])
+  t.alike(allowlistEvents, [
+    {
+      status: 'failed',
+      appliedCount: 1,
+      pendingCount: 0,
+      reason: 'PROTOCOL_INVALID'
+    },
+    { status: 'completed', appliedCount: 0, pendingCount: 0 }
+  ])
 
   let destroyed = null
   server._onConnection({

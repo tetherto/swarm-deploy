@@ -169,7 +169,10 @@ Server events:
 - `offer`: accepted, resumed, rejected, or already-committed offers with safe name, size, and transfer fingerprint.
 - `progress`: verified chunk index plus cumulative chunk and byte counts.
 - `verification` and `commit`: started, succeeded, or failed outcomes.
-- `recovery`, `scrub`, `retention`, and `cleanup`: startup and storage lifecycle outcomes. Scheduled retention reports `deferred` while a receive is active.
+- `allowlist`: reload `completed` or `failed`, with `appliedCount`, `pendingCount`, and a safe failure code when applicable.
+- `recovery`: startup `started`/`completed`, per-journal outcomes, and structured `failed` outcomes with a safe phase, optional transfer fingerprint, and reason code.
+- `scrub`: startup `started`, `completed` counts, or a structured `failed` reason emitted before startup rejects.
+- `retention` and `cleanup`: storage lifecycle outcomes. Scheduled retention reports `deferred` while a receive is active; corrupt-journal cleanup uses a transfer fingerprint and a null name.
 - `revocation`: completed owner cleanup. The legacy `revoked` event remains available.
 - `listening` and `close`: server lifecycle completion.
 
@@ -179,7 +182,7 @@ Client events:
 - `offer`: offered, accepted, resumed, rejected, or already-committed state.
 - `progress`: acknowledged chunk and cumulative byte counts, including resumed verified bytes.
 - `verification` and `commit`: transfer completion phases.
-- `result`: every per-file outcome and one final direct-file or batch result.
+- `result`: directory member outcomes always have `final: false`; only a direct-file result or one aggregate batch result has `final: true`. Batch aggregates include `files`, `committed`, `failed`, and `skipped` counts.
 - `skipped` and `close`: directory selection and lifecycle completion.
 
 The exact discriminated payload types are `ServerEventMap` and `ClientEventMap` in `index.d.ts`.

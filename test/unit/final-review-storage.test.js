@@ -11,7 +11,7 @@ const { initLayout } = require('../../lib/storage/layout')
 const { readJson } = require('../../lib/storage/atomic-file')
 const { SessionStore } = require('../../lib/storage/session-store')
 const { CommitStore } = require('../../lib/storage/commit-store')
-const { recoverStorage } = require('../../lib/storage/recovery')
+const { prepareStorageRecovery, recoverStorage } = require('../../lib/storage/recovery')
 const { createClock } = require('../helpers/clock')
 const { createTempDir } = require('../helpers/files')
 const { createStorage } = require('../helpers/storage')
@@ -145,6 +145,65 @@ test('deleting state recovers expiry revocation and checksum cleanup crashes', a
   }
 })
 
+test('deletion never unlinks staging before deleting metadata is durably synchronized', async (t) => {
+  let layout
+  let metadataPath
+  let armAfterDeletingRename = false
+  let failSessionSyncs = 0
+  const storage = createStorage({
+    failSyncFor: (filePath) => {
+      if (path.basename(filePath) !== 'sessions' || failSessionSyncs === 0) return false
+      failSessionSyncs--
+      return true
+    },
+    afterOperation(name, source, destination) {
+      if (
+        armAfterDeletingRename &&
+        name === 'rename' &&
+        path.basename(destination) === path.basename(metadataPath)
+      ) {
+        armAfterDeletingRename = false
+        failSessionSyncs = 1
+      }
+    }
+  })
+  layout = initLayout(await createTempDir(t))
+  const store = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    checkpointChunks: 1,
+    storage
+  })
+  await store.init()
+  const upload = makeUpload('durable-delete-order.bin')
+  await store.offer(OWNER, upload.offer)
+  const id = hex(upload.offer.transferId)
+  metadataPath = path.join(layout.sessions, `${id}.json`)
+  const stagingPath = path.join(layout.staging, `${id}.part`)
+
+  armAfterDeletingRename = true
+  await t.exception(() => store.delete(upload.offer.transferId))
+  t.is((await readJson(metadataPath)).state, 'deleting')
+  t.is(await exists(stagingPath), true, 'post-rename sync failure preserves staging')
+
+  failSessionSyncs = 1
+  await t.exception(() => store.delete(upload.offer.transferId))
+  t.is((await readJson(metadataPath)).state, 'deleting')
+  t.is(await exists(stagingPath), true, 'failed retry sync still preserves staging')
+  await store.close()
+
+  const reopened = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    checkpointChunks: 1
+  })
+  await reopened.init()
+  t.is(reopened.sessions.size, 0)
+  t.is(await exists(metadataPath), false)
+  t.is(await exists(stagingPath), false)
+  await reopened.close()
+})
+
 test('commit retries its canonical journal after journal-directory sync failure', async (t) => {
   let layout
   let failJournalSync = false
@@ -212,6 +271,78 @@ test('restart retires a corrupt matching journal and preserves resumable transfe
   t.is(created.sessionStore.sessions.has(id), true)
   const record = await commitStore.commit(created.session)
   t.is(record.transferId, id)
+})
+
+test('startup classifies a corrupt journal before removing its orphan staging', async (t) => {
+  let layout
+  let orphanSessionPath
+  let crashAfterSessionUnlink = false
+  const storage = createStorage({
+    afterOperation(name, filePath) {
+      if (crashAfterSessionUnlink && name === 'unlink' && filePath === orphanSessionPath) {
+        crashAfterSessionUnlink = false
+        throw new Error('Injected crash after commit sidecar and session unlink')
+      }
+    }
+  })
+  const created = await verifiedStore(t, storage, 'corrupt-orphan.bin')
+  layout = created.layout
+  const valid = makeUpload('later-valid-session.bin')
+  await created.sessionStore.offer(OWNER, valid.offer)
+  const orphanId = hex(created.upload.offer.transferId)
+  const validId = hex(valid.offer.transferId)
+  const orphanFingerprint = hex(sha256(created.upload.offer.transferId)).slice(0, 12)
+  orphanSessionPath = path.join(layout.sessions, `${orphanId}.json`)
+  const orphanStagingPath = path.join(layout.staging, `${orphanId}.part`)
+  const orphanJournalPath = path.join(layout.journals, `${orphanId}.json`)
+  const commitStore = new CommitStore({ layout, clock: created.clock, storage })
+
+  crashAfterSessionUnlink = true
+  await commitStore.commit(created.session)
+  await fs.promises.writeFile(orphanJournalPath, '{corrupt')
+  await created.sessionStore.close()
+
+  const events = []
+  await prepareStorageRecovery({
+    layout,
+    commitStore,
+    onEvent(event) {
+      events.push(event)
+    }
+  })
+  const reopened = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    checkpointChunks: 1,
+    storage
+  })
+  await reopened.init()
+  await recoverStorage({ layout, sessionStore: reopened, commitStore })
+
+  t.is(await exists(orphanJournalPath), false)
+  t.is(await exists(orphanStagingPath), false)
+  t.ok(
+    (await fs.promises.readdir(layout.journals)).some((name) =>
+      name.startsWith(`.${orphanId}.corrupt-`)
+    )
+  )
+  t.is(reopened.sessions.has(validId), true)
+  t.is(await exists(path.join(layout.staging, `${validId}.part`)), true)
+  t.alike(events, [
+    {
+      type: 'recovery',
+      status: 'CORRUPT',
+      phase: 'classification',
+      transfer: orphanFingerprint
+    },
+    {
+      type: 'cleanup',
+      transfer: orphanFingerprint,
+      name: null,
+      reason: 'corrupt-journal'
+    }
+  ])
+  await reopened.close()
 })
 
 test('a valid foreign journal is not adopted or removed by commit retry', async (t) => {

@@ -124,6 +124,8 @@ test('Client processes directory entries sequentially, preserves skips, and cont
   const testnet = await createLocalTestnet(t)
   const server = await setupServer(t, testnet, [CLIENT_A_SEED])
   const client = createClient(t, testnet, server, CLIENT_A_SEED)
+  const resultEvents = []
+  client.on('result', (event) => resultEvents.push(event))
   let connections = 0
   server.on('connection', () => connections++)
   const source = await createTempDir(t)
@@ -151,7 +153,93 @@ test('Client processes directory entries sequentially, preserves skips, and cont
     await fs.promises.readFile(path.join(server.layout.root, 'b-accepted.bin')),
     b4a.from('accepted bytes')
   )
+  t.alike(
+    resultEvents.map((event) => [event.name || null, event.status, event.final]),
+    [
+      ['a-blocked.bin', 'FILE_EXISTS', false],
+      ['b-accepted.bin', 'COMMITTED', false],
+      [null, 'FAILED', true]
+    ]
+  )
+  t.alike(resultEvents[2], {
+    status: 'FAILED',
+    final: true,
+    files: 2,
+    committed: 1,
+    failed: 1,
+    skipped: 1
+  })
   t.is(connections, 1)
+})
+
+test('Client directory results have one accurate final aggregate for success and selection failure', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const server = await setupServer(t, testnet, [CLIENT_A_SEED])
+
+  const successfulSource = await createTempDir(t)
+  await fs.promises.writeFile(path.join(successfulSource, 'a.bin'), b4a.from('a'))
+  await fs.promises.writeFile(path.join(successfulSource, 'b.bin'), b4a.from('b'))
+  const successful = createClient(t, testnet, server, CLIENT_A_SEED)
+  const successfulEvents = []
+  successful.on('result', (event) => successfulEvents.push(event))
+  const successfulBatch = await successful.upload(successfulSource)
+
+  t.is(successfulBatch.status, 'COMMITTED')
+  t.alike(
+    successfulEvents.map((event) => [event.name || null, event.status, event.final]),
+    [
+      ['a.bin', 'COMMITTED', false],
+      ['b.bin', 'COMMITTED', false],
+      [null, 'COMMITTED', true]
+    ]
+  )
+  t.alike(successfulEvents[2], {
+    status: 'COMMITTED',
+    final: true,
+    files: 2,
+    committed: 2,
+    failed: 0,
+    skipped: 0
+  })
+
+  const failedSource = await createTempDir(t)
+  const missing = path.join(failedSource, 'a-missing.bin')
+  await fs.promises.writeFile(missing, b4a.from('vanish during selection'))
+  const selectionFailure = createClient(t, testnet, server, CLIENT_A_SEED)
+  const failureEvents = []
+  selectionFailure.on('result', (event) => failureEvents.push(event))
+  const originalLstat = fs.promises.lstat
+  fs.promises.lstat = (filePath) => {
+    if (filePath === missing) {
+      const error = new Error('Injected selection failure')
+      error.code = 'ENOENT'
+      throw error
+    }
+    return originalLstat(filePath)
+  }
+  let failedBatch
+  try {
+    failedBatch = await selectionFailure.upload(failedSource)
+  } finally {
+    fs.promises.lstat = originalLstat
+  }
+
+  t.is(failedBatch.status, 'FAILED')
+  t.alike(
+    failureEvents.map((event) => [event.name || null, event.status, event.final]),
+    [
+      ['a-missing.bin', 'PROTOCOL_INVALID', false],
+      [null, 'FAILED', true]
+    ]
+  )
+  t.alike(failureEvents[1], {
+    status: 'FAILED',
+    final: true,
+    files: 1,
+    committed: 0,
+    failed: 1,
+    skipped: 0
+  })
 })
 
 test('Client pins the expected server before Protomux metadata and continues past rogue peers', async (t) => {

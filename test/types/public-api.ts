@@ -188,9 +188,12 @@ server.on('connection', (event: ServerConnectionEvent) => void event.connections
 server.once('listening', (event) => void event.publicKey)
 server.on('progress', (event) => void [event.transfer, event.bytesReceived, event.totalBytes])
 server.on('retention', (event) => void [event.trigger, event.status, event.storageDeleted])
+server.on('allowlist', (event) => void [event.status, event.appliedCount, event.pendingCount])
+server.on('recovery', (event) => void [event.status, event.phase, event.reason])
 client.on('result', (event: ClientResultEvent) => {
   const reason: string | undefined = event.reason
-  void [event.status, reason]
+  if ('files' in event) void [event.files, event.committed, event.failed, event.skipped]
+  void [event.status, reason, event.final]
 })
 client.on('skipped', (event: ClientSkippedEvent) => {
   void [event.name, event.reason]
