@@ -7,10 +7,17 @@ import { EventEmitter } from 'node:events'
  */
 export type Binary = Buffer
 
+/** Byte input accepted by APIs that normalize values to a b4a/Node Buffer. */
+export type BinaryInput = Uint8Array
+
 /** A 32-byte seed used to derive a Hyperswarm/HyperDHT identity. */
 export type Seed = Binary
+/** A 32-byte seed accepted by identity and constructor APIs. */
+export type SeedInput = BinaryInput
 /** A 32-byte HyperDHT public key. */
 export type PublicKey = Binary
+/** A 32-byte public key accepted by identity, constructor, and allowlist APIs. */
+export type PublicKeyInput = BinaryInput
 /** A SHA-256-derived 32-byte discovery topic. */
 export type Topic = Binary
 /** A SHA-256 digest. */
@@ -18,7 +25,7 @@ export type Digest = Binary
 /** A SHA-256-derived transfer identifier. */
 export type TransferId = Binary
 /** A fixed-width 32-byte value accepted by protocol transfer-ID helpers. */
-export type Fixed32 = Binary | Uint8Array
+export type Fixed32 = BinaryInput
 
 export interface KeyPair {
   publicKey: PublicKey
@@ -71,19 +78,80 @@ export type SwarmFactory = (options: SwarmFactoryOptions) => Swarm
  * The filesystem subset needed by a Server. The default is `fs.promises`;
  * adapters are primarily intended for controlled test environments.
  */
+export interface StorageStats {
+  size: number
+  dev: number | bigint
+  ino: number | bigint
+  isDirectory(): boolean
+  isFile(): boolean
+  isSymbolicLink(): boolean
+}
+
+export interface StorageReadResult {
+  bytesRead: number
+}
+
+export interface StorageWriteResult {
+  bytesWritten: number
+}
+
+export interface StorageFileHandle {
+  stat(): Promise<StorageStats>
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null
+  ): Promise<number | StorageReadResult>
+  write(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null
+  ): Promise<number | StorageWriteResult>
+  sync(): Promise<void>
+  close(): Promise<void>
+}
+
+export interface StorageMkdirOptions {
+  mode?: number
+}
+
+export interface StorageRmOptions {
+  recursive: boolean
+  force: boolean
+}
+
+export interface StorageStatFs {
+  bavail: number | bigint
+  bsize: number | bigint
+}
+
 export interface StorageAdapter {
-  open(...args: any[]): Promise<any>
-  lstat(path: string): Promise<any>
+  open(path: string, flags: string | number, mode?: number): Promise<StorageFileHandle>
+  lstat(path: string): Promise<StorageStats>
   readdir(path: string): Promise<string[]>
-  [key: string]: unknown
+  mkdir(path: string, options: StorageMkdirOptions): Promise<string | undefined>
+  rm(path: string, options: StorageRmOptions): Promise<void>
+  rename(oldPath: string, newPath: string): Promise<void>
+  link(existingPath: string, newPath: string): Promise<void>
+  unlink(path: string): Promise<void>
+  rmdir(path: string): Promise<void>
+  readFile(path: string, encoding: 'utf8'): Promise<string | Binary>
+  /**
+   * Required whenever `ServerOptions.minFreeBytes` is greater than zero.
+   * It may be omitted only when `minFreeBytes` is set to `0`, which disables
+   * the free-disk reserve check.
+   */
+  statfs?(path: string): Promise<StorageStatFs>
 }
 
 /** A public key accepted in an allowlist: a 32-byte buffer or canonical lowercase hex. */
-export type AllowlistKey = PublicKey | string
+export type AllowlistKey = PublicKeyInput | string
 
 export interface ServerOptions {
   /** Required 32-byte persistent server seed. */
-  seed: Seed
+  seed: SeedInput
   /** Trusted local directory in which final artifacts and internal state live. */
   storageDir: string
   /** Required uploader allowlist. Entries are 32-byte keys or canonical lowercase hex. */
@@ -124,9 +192,9 @@ export interface ServerOptions {
 
 export interface ClientOptions {
   /** Required 32-byte persistent client seed. */
-  seed: Seed
+  seed: SeedInput
   /** Required, pinned 32-byte server public key. It must differ from the client public key. */
-  serverPublicKey: PublicKey
+  serverPublicKey: PublicKeyInput
   /** Discovery/reconnect window in milliseconds; defaults to 30,000 and is at most 30,000. */
   connectTimeout?: number
   /** Per-upload idle timeout in milliseconds; defaults to 60,000. */
@@ -216,10 +284,12 @@ export interface BatchUploadFailure {
   reason?: string
 }
 
+export type SkippedUploadReason = 'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename'
+
 export interface SkippedUploadEntry {
   name: string
   path: string
-  reason: 'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename'
+  reason: SkippedUploadReason
 }
 
 export interface BatchUploadResult {
@@ -245,13 +315,36 @@ export interface ServerListeningEvent {
 export type ServerEvent = ServerConnectionEvent | FingerprintEvent | ServerListeningEvent
 export type ServerEventName = 'connection' | 'revoked' | 'listening'
 
-export interface ClientResultEvent {
+export interface ClientSuccessEvent {
   name: string
-  status: UploadStatus | ErrorCode
+  status: UploadStatus
+  reason?: undefined
 }
 
-export type ClientEvent = FingerprintEvent
-export type ClientEventName = 'connection' | 'rejected-peer' | 'result' | 'skipped'
+export interface ClientFailureEvent {
+  name: string
+  status: ErrorCode
+  reason?: string
+}
+
+export type ClientResultEvent = ClientSuccessEvent | ClientFailureEvent
+
+/** Emitted for a skipped direct child during a directory upload. */
+export interface ClientSkippedEvent {
+  name: string
+  reason: SkippedUploadReason
+}
+
+export interface ClientEventMap {
+  connection: FingerprintEvent
+  'rejected-peer': FingerprintEvent
+  result: ClientResultEvent
+  skipped: ClientSkippedEvent
+}
+
+export type ClientEventName = keyof ClientEventMap
+/** A payload emitted by any Client event. Use ClientEventMap for event-name narrowing. */
+export type ClientEvent = ClientEventMap[ClientEventName]
 
 export class Server extends EventEmitter {
   constructor(options: ServerOptions)
@@ -333,19 +426,21 @@ export class Client extends EventEmitter {
    */
   close(): Promise<void>
 
-  on(event: 'connection' | 'rejected-peer', listener: (event: ClientEvent) => void): this
-  on(event: 'result', listener: (event: ClientResultEvent) => void): this
-  on(event: 'skipped', listener: (event: SkippedUploadEntry) => void): this
+  on<EventName extends ClientEventName>(
+    event: EventName,
+    listener: (event: ClientEventMap[EventName]) => void
+  ): this
   on(event: string | symbol, listener: (...args: any[]) => void): this
-  once(event: 'connection' | 'rejected-peer', listener: (event: ClientEvent) => void): this
-  once(event: 'result', listener: (event: ClientResultEvent) => void): this
-  once(event: 'skipped', listener: (event: SkippedUploadEntry) => void): this
+  once<EventName extends ClientEventName>(
+    event: EventName,
+    listener: (event: ClientEventMap[EventName]) => void
+  ): this
   once(event: string | symbol, listener: (...args: any[]) => void): this
 }
 
 export interface AllowlistWatcherOptions {
   filePath: string
-  storage?: { readFile(path: string, encoding: string): Promise<string | Binary> }
+  storage?: Pick<StorageAdapter, 'readFile'>
   onReload(keys: Set<string>): void | Promise<void>
   pollInterval?: number
   scheduler?: Pick<ServerScheduler, 'setInterval' | 'clearInterval'>
@@ -522,11 +617,11 @@ export function parsePublicKey(value: string): PublicKey
 /** Generates a cryptographically random 32-byte seed. */
 export function generateSeed(): Seed
 /** Derives the HyperDHT key pair for a 32-byte seed. */
-export function keyPairFromSeed(seed: Seed): KeyPair
+export function keyPairFromSeed(seed: SeedInput): KeyPair
 /** Derives the 32-byte HyperDHT public key for a 32-byte seed. */
-export function publicKeyFromSeed(seed: Seed): PublicKey
+export function publicKeyFromSeed(seed: SeedInput): PublicKey
 /** Derives the SHA-256 discovery topic for a pinned server public key. */
-export function topicFromServerPublicKey(serverPublicKey: PublicKey): Topic
+export function topicFromServerPublicKey(serverPublicKey: PublicKeyInput): Topic
 
 /** Returns a valid artifact basename or throws INVALID_FILENAME. */
 export function validateBasename(name: string): string
