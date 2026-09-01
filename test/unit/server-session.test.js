@@ -1,0 +1,342 @@
+'use strict'
+
+const test = require('brittle')
+const b4a = require('b4a')
+const crypto = require('#crypto')
+const Protomux = require('protomux')
+const { Duplex } = require('streamx')
+const { ServerSession, UPLOAD_PROTOCOL } = require('../../lib/protocol/server-session')
+const {
+  OFFER,
+  STATUS,
+  BITMAP_PAGE,
+  READY,
+  CHUNK,
+  CHUNK_ACK,
+  FINISH,
+  RESULT,
+  STATUS_CODE
+} = require('../../lib/protocol/constants')
+const {
+  offer,
+  status,
+  bitmapPage,
+  ready,
+  chunk,
+  chunkAck,
+  finish,
+  result
+} = require('../../lib/protocol/codecs')
+const { transferId } = require('../../lib/protocol/transfer-id')
+const { SwarmDeployError, ERRORS } = require('../../lib/errors')
+
+const OWNER = b4a.alloc(32, 7)
+
+function sha256(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest()
+}
+
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+function waitFor(predicate) {
+  return new Promise((resolve, reject) => {
+    let attempts = 0
+    const check = () => {
+      if (predicate()) return resolve()
+      if (++attempts === 100) return reject(new Error('Timed out waiting for protocol progress'))
+      setTimeout(check, 1)
+    }
+    check()
+  })
+}
+
+function createDuplexPair() {
+  let left = null
+  let right = null
+  left = new Duplex({
+    write(data, callback) {
+      right.push(data)
+      callback(null)
+    }
+  })
+  right = new Duplex({
+    write(data, callback) {
+      left.push(data)
+      callback(null)
+    }
+  })
+  left.on('error', () => {})
+  right.on('error', () => {})
+  return { left, right }
+}
+
+function makeUpload({ name = 'artifact.bin', data = b4a.from('payload') } = {}) {
+  const digest = sha256(data)
+  const upload = {
+    version: 1,
+    name,
+    size: data.byteLength,
+    digest,
+    chunkSize: 1024 * 1024,
+    chunkCount: data.byteLength === 0 ? 0 : 1
+  }
+  upload.transferId = transferId({
+    clientPublicKey: OWNER,
+    name,
+    size: upload.size,
+    digest,
+    chunkSize: upload.chunkSize
+  })
+  return {
+    offer: upload,
+    chunk: { transferId: upload.transferId, index: 0, digest, data }
+  }
+}
+
+function createClientServer(sessionOptions) {
+  const { left, right } = createDuplexPair()
+  const clientMux = Protomux.from(left)
+  const serverMux = Protomux.from(right)
+  const received = { status: [], bitmapPage: [], ready: [], chunkAck: [], result: [] }
+  let serverSession = null
+
+  serverMux.pair({ protocol: UPLOAD_PROTOCOL }, (id) => {
+    const channel = serverMux.createChannel({ protocol: UPLOAD_PROTOCOL, id })
+    serverSession = new ServerSession({
+      channel,
+      ownerKey: OWNER,
+      destroy: () => right.destroy(),
+      ...sessionOptions
+    })
+  })
+
+  const channel = clientMux.createChannel({ protocol: UPLOAD_PROTOCOL, id: b4a.from('transfer') })
+  const messages = [
+    channel.addMessage({ encoding: offer }),
+    channel.addMessage({ encoding: status, onmessage: (value) => received.status.push(value) }),
+    channel.addMessage({
+      encoding: bitmapPage,
+      onmessage: (value) => received.bitmapPage.push(value)
+    }),
+    channel.addMessage({ encoding: ready, onmessage: (value) => received.ready.push(value) }),
+    channel.addMessage({ encoding: chunk }),
+    channel.addMessage({
+      encoding: chunkAck,
+      onmessage: (value) => received.chunkAck.push(value)
+    }),
+    channel.addMessage({ encoding: finish }),
+    channel.addMessage({ encoding: result, onmessage: (value) => received.result.push(value) })
+  ]
+  channel.open()
+
+  return {
+    left,
+    right,
+    channel,
+    messages,
+    received,
+    get serverSession() {
+      return serverSession
+    }
+  }
+}
+
+function createSessionStore({ writeChunk = async () => {}, inspect = null } = {}) {
+  const sessions = new Map()
+  return {
+    sessions,
+    async offer(ownerKey, value) {
+      const session = {
+        id: b4a.toString(value.transferId, 'hex'),
+        transferId: value.transferId,
+        ownerKey,
+        name: value.name,
+        size: value.size,
+        digest: value.digest,
+        chunkSize: value.chunkSize,
+        chunkCount: value.chunkCount,
+        state: 'receiving'
+      }
+      sessions.set(session.id, session)
+      return { verified: new Set(), state: 'receiving' }
+    },
+    async writeChunk(transferId, value) {
+      await writeChunk(transferId, value)
+      return { verified: new Set([value.index]) }
+    },
+    async finish(transferId) {
+      const session = sessions.get(b4a.toString(transferId, 'hex'))
+      session.state = 'verified'
+      return { state: 'verified' }
+    },
+    async retireCommitted(transferId) {
+      return sessions.delete(b4a.toString(transferId, 'hex'))
+    },
+    inspect
+  }
+}
+
+function createCommitStore({
+  inspect = async () => ({ status: 'AVAILABLE' }),
+  commit = async () => {}
+} = {}) {
+  return { inspect, commit }
+}
+
+function createTimeoutScheduler() {
+  const timers = new Map()
+  return {
+    timers,
+    setTimeout(callback, timeout) {
+      const timer = { callback, timeout }
+      timers.set(timer, timer)
+      return timer
+    },
+    clearTimeout(timer) {
+      timers.delete(timer)
+    }
+  }
+}
+
+test('server session writes sequential chunks before acknowledging and retires committed sessions', async (t) => {
+  const wrote = deferred()
+  const releaseWrite = deferred()
+  const sessionStore = createSessionStore({
+    writeChunk: async () => {
+      wrote.resolve()
+      await releaseWrite.promise
+    }
+  })
+  const committed = []
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore({
+      async commit(session, options) {
+        committed.push({ session, options })
+        return { name: session.name }
+      }
+    }),
+    retentionManager: { marker: 'retention' },
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  t.is(pair.received.status[0].code, STATUS_CODE.ACCEPT)
+  t.is(pair.received.bitmapPage.length, 1)
+
+  pair.messages[CHUNK].send(upload.chunk)
+  await wrote.promise
+  t.is(pair.received.chunkAck.length, 0)
+  releaseWrite.resolve()
+  await waitFor(() => pair.received.chunkAck.length === 1)
+  t.alike(pair.received.chunkAck[0], { transferId: upload.offer.transferId, index: 0 })
+
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+  await waitFor(() => pair.received.result.length === 1)
+  t.is(pair.received.result[0].code, 0)
+  t.is(committed.length, 1)
+  t.is(committed[0].options.retentionManager.marker, 'retention')
+  t.is(sessionStore.sessions.size, 0)
+})
+
+test('server session rejects chunks before READY by destroying the connection', async (t) => {
+  const sessionStore = createSessionStore()
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+
+  pair.messages[CHUNK].send(upload.chunk)
+  await waitFor(() => pair.right.destroyed)
+
+  t.is(sessionStore.sessions.size, 0)
+})
+
+test('server session returns terminal statuses for unavailable or capacity-rejected offers', async (t) => {
+  const cases = [
+    ['ALREADY_COMMITTED', STATUS_CODE.ALREADY_COMMITTED],
+    ['FILE_EXISTS', STATUS_CODE.FILE_EXISTS],
+    ['FILE_BUSY', STATUS_CODE.FILE_BUSY]
+  ]
+
+  for (const [inspectStatus, expected] of cases) {
+    const pair = createClientServer({
+      sessionStore: createSessionStore(),
+      commitStore: createCommitStore({ inspect: async () => ({ status: inspectStatus }) }),
+      maxFileBytes: 1024 * 1024
+    })
+    const upload = makeUpload({ name: `${inspectStatus}.bin` })
+    pair.messages[OFFER].send(upload.offer)
+    await waitFor(() => pair.received.status.length === 1)
+    t.is(pair.received.status[0].code, expected)
+  }
+
+  const pair = createClientServer({
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    maxFileBytes: 1
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.status.length === 1)
+  t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
+})
+
+test('server session fails closed when an OFFER transfer ID is noncanonical', async (t) => {
+  const pair = createClientServer({
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+
+  pair.messages[OFFER].send({ ...upload.offer, transferId: b4a.alloc(32) })
+  await waitFor(() => pair.right.destroyed)
+
+  t.absent(pair.serverSession?.transferId)
+})
+
+test('server session limits queued chunks before storage work', async (t) => {
+  const writing = deferred()
+  const sessionStore = createSessionStore({ writeChunk: async () => writing.promise })
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+
+  for (let index = 0; index < 5; index++) pair.messages[CHUNK].send(upload.chunk)
+  await waitFor(() => pair.right.destroyed)
+  writing.resolve()
+
+  t.is(sessionStore.sessions.size, 1)
+})
+
+test('server session closes an idle connection after the default timeout', async (t) => {
+  const scheduler = createTimeoutScheduler()
+  const pair = createClientServer({
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024,
+    scheduler
+  })
+  await waitFor(() => pair.serverSession !== null)
+
+  const [timer] = scheduler.timers.values()
+  t.is(timer.timeout, 60_000)
+  timer.callback()
+  await waitFor(() => pair.right.destroyed)
+})

@@ -1255,3 +1255,18 @@ test('finish rejects an empty file with a mismatched offered digest', async (t) 
   t.is(await pathExists(sessionPath(layout, upload.offer)), false)
   t.is(await pathExists(stagingPath(layout, upload.offer)), false)
 })
+
+test('retireCommitted releases only the in-memory session reservation', async (t) => {
+  const { layout, store } = await createStore(t)
+  const upload = makeUpload()
+  await store.offer(OWNER, upload.offer)
+  await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await store.finish(upload.offer.transferId)
+
+  t.is(await store.retireCommitted(upload.offer.transferId), true)
+
+  t.is(store.sessions.has(transferHex(upload.offer)), false)
+  t.is(store.reservedBytes, 0)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), true)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+})

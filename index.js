@@ -42,6 +42,8 @@ const {
   mergeBitmapPages
 } = require('./lib/protocol/codecs')
 const { transferId, encodeTransferIdCanonical } = require('./lib/protocol/transfer-id')
+const { parseAllowlist, AllowlistWatcher } = require('./lib/allowlist')
+const { Server } = require('./lib/server')
 
 module.exports = {
   SwarmDeployError,
@@ -83,5 +85,8 @@ module.exports = {
   result,
   mergeBitmapPages,
   transferId,
-  encodeTransferIdCanonical
+  encodeTransferIdCanonical,
+  parseAllowlist,
+  AllowlistWatcher,
+  Server
 }
