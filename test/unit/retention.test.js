@@ -70,6 +70,31 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
+function createScheduler() {
+  const timers = new Set()
+  let installs = 0
+  return {
+    setInterval(callback) {
+      const timer = { callback }
+      timers.add(timer)
+      installs++
+      return timer
+    },
+    clearInterval(timer) {
+      timers.delete(timer)
+    },
+    tick() {
+      for (const timer of timers) timer.callback()
+    },
+    get installs() {
+      return installs
+    },
+    get size() {
+      return timers.size
+    }
+  }
+}
+
 async function createStores(
   t,
   { storage, retention = {}, isSessionActive = () => false, logger } = {}
@@ -458,7 +483,7 @@ test('retention serializes overlapping scheduled and manual runs', async (t) => 
   const release = deferred()
   const storage = createStorage({
     async beforeOperation(name, filePath) {
-      if (!hold || name !== 'readdir' || filePath !== stores.layout.commits) return
+      if (!stores || !hold || name !== 'readdir' || filePath !== stores.layout.commits) return
       calls++
       running++
       maximumRunning = Math.max(maximumRunning, running)
@@ -483,6 +508,61 @@ test('retention serializes overlapping scheduled and manual runs', async (t) => 
 
   t.ok(calls >= 2)
   t.is(maximumRunning, 1)
+})
+
+test('retention start shares startup, coalesces ticks, and stops safely', async (t) => {
+  const scheduler = createScheduler()
+  let stores = null
+  let hold = true
+  const entered = deferred()
+  const release = deferred()
+  const storage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (!stores || !hold || name !== 'readdir' || filePath !== stores.layout.commits) return
+      entered.resolve()
+      await release.promise
+    }
+  })
+  stores = await createStores(t, { storage, retention: { scheduler } })
+  const first = stores.manager.start()
+  const second = stores.manager.start()
+  t.is(first, second)
+  await entered.promise
+  const stopping = stores.manager.stop()
+  release.resolve()
+  await Promise.all([first, second, stopping])
+  t.is(scheduler.size, 0)
+
+  hold = false
+  await stores.manager.start()
+  t.is(scheduler.installs, 1)
+  scheduler.tick()
+  scheduler.tick()
+  scheduler.tick()
+  await stores.manager.stop()
+  t.is(scheduler.size, 0)
+
+  await stores.manager.start()
+  t.is(scheduler.installs, 2)
+  await stores.manager.stop()
+})
+
+test('throwing retention loggers do not escape cleanup handling', async (t) => {
+  const stores = await createStores(t, {
+    logger: {
+      warn() {
+        throw new Error('logger failure')
+      },
+      error() {
+        throw new Error('logger failure')
+      }
+    }
+  })
+  await fs.promises.writeFile(path.join(stores.layout.root, 'unknown.txt'), b4a.from('unknown'))
+
+  await stores.manager.run()
+
+  t.is(await pathExists(path.join(stores.layout.root, 'unknown.txt')), true)
 })
 
 test('retention rejects a managed record that disappears during enumeration', async (t) => {
