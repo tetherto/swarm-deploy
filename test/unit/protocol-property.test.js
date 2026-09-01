@@ -100,6 +100,7 @@ function assertProtocolInvalid(t, operation, message) {
 function createProtocolSession() {
   const messages = []
   const destroyed = []
+  let offerCalls = 0
   const channel = {
     drained: true,
     _recv() {},
@@ -114,6 +115,7 @@ function createProtocolSession() {
   const sessionStore = {
     sessions: new Map(),
     async offer() {
+      offerCalls++
       return { verified: new Set() }
     },
     async writeChunk() {},
@@ -135,7 +137,16 @@ function createProtocolSession() {
       destroyed.push(error)
     }
   })
-  return { channel, messages, destroyed, session }
+  return {
+    channel,
+    messages,
+    destroyed,
+    session,
+    sessionStore,
+    get offerCalls() {
+      return offerCalls
+    }
+  }
 }
 
 test('every codec rejects truncation at every byte offset with a typed error', (t) => {
@@ -297,19 +308,82 @@ test('unknown status and invalid bitmap padding, overlap, and ranges are typed',
   )
 })
 
-test('one-bit digest changes remain bounded but invalidate canonical transfer identity', (t) => {
+test('huge tiny declarations fail before reaching storage-backed state', async (t) => {
+  const offered = sampleOffer()
+  const huge = Number.MAX_SAFE_INTEGER
+  const cases = [
+    {
+      name: 'offer name length',
+      index: OFFER,
+      codec: offer,
+      encoded: b4a.concat([c.encode(c.uint, 1), offered.transferId, c.encode(c.uint, huge)])
+    },
+    {
+      name: 'offer chunk count',
+      index: OFFER,
+      codec: offer,
+      encoded: b4a.concat([
+        c.encode(c.uint, 1),
+        offered.transferId,
+        c.encode(c.string, offered.name),
+        c.encode(c.uint, offered.size),
+        offered.digest,
+        c.encode(c.uint, offered.chunkSize),
+        c.encode(c.uint, huge)
+      ])
+    },
+    {
+      name: 'bitmap declared count',
+      index: BITMAP_PAGE,
+      codec: bitmapPage,
+      encoded: b4a.concat([
+        offered.transferId,
+        c.encode(c.uint, 0),
+        c.encode(c.uint, huge),
+        c.encode(c.uint, 0)
+      ])
+    },
+    {
+      name: 'chunk data length',
+      index: CHUNK,
+      codec: chunk,
+      encoded: b4a.concat([
+        offered.transferId,
+        c.encode(c.uint, 0),
+        sha256(DATA),
+        c.encode(c.uint, huge)
+      ])
+    }
+  ]
+
+  for (const entry of cases) {
+    const created = createProtocolSession()
+    t.ok(entry.encoded.byteLength < 128, `${entry.name} input remains tiny`)
+    let decodingError = null
+    try {
+      decodeBounded(entry.codec, entry.encoded, MAX_CHUNK_FRAME_BYTES)
+    } catch (err) {
+      decodingError = err
+    }
+    t.is(decodingError.code, ERRORS.PROTOCOL_INVALID, entry.name)
+    t.is(created.destroyed.length, 0, `${entry.name} rejected before session construction`)
+    t.is(created.offerCalls, 0, `${entry.name} bypasses SessionStore.offer`)
+    t.is(created.sessionStore.sessions.size, 0, `${entry.name} creates no session state`)
+  }
+})
+
+test('one-bit digest mutation reaches real session validation and tears down typed', async (t) => {
   const offered = sampleOffer()
   const mutatedDigest = b4a.from(offered.digest)
   mutatedDigest[0] ^= 1
-  const decoded = decodeBounded(offer, encodeBounded(offer, { ...offered, digest: mutatedDigest }))
-  const canonical = transferId({
-    clientPublicKey: OWNER,
-    name: decoded.name,
-    size: decoded.size,
-    digest: decoded.digest,
-    chunkSize: decoded.chunkSize
-  })
-  t.unlike(canonical, decoded.transferId)
+  const created = createProtocolSession()
+  await created.messages[OFFER].onmessage(
+    decodeBounded(offer, encodeBounded(offer, { ...offered, digest: mutatedDigest }))
+  )
+  await created.session.settle()
+  t.is(created.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  t.is(created.offerCalls, 0)
+  t.is(created.sessionStore.sessions.size, 0)
 })
 
 test('reordered, repeated, direction-invalid, and unknown messages tear down deterministically', async (t) => {

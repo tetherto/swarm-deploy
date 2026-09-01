@@ -7,6 +7,7 @@ const fs = require('#fs')
 const path = require('#path')
 const createTestnet = require('hyperdht/testnet')
 const { Client, Server, keyPairFromSeed, transferId } = require('../..')
+const { ClientSession } = require('../../lib/protocol/client-session')
 const { initLayout } = require('../../lib/storage/layout')
 const { SessionStore } = require('../../lib/storage/session-store')
 const { CommitStore } = require('../../lib/storage/commit-store')
@@ -163,6 +164,12 @@ test('Node and Bare lifecycle closes swarms, timers, descriptors, and testnet', 
   let retention = null
   let serverSwarm = null
   let clientSwarm = null
+  let sourceHandle = null
+  const originalOpenSource = ClientSession.prototype._openSource
+  ClientSession.prototype._openSource = async function () {
+    await originalOpenSource.call(this)
+    if (this.file) sourceHandle = this.file
+  }
   try {
     const ownerKey = keyPairFromSeed(CLIENT_SEED).publicKey
     const root = await createTempDir(t)
@@ -175,6 +182,7 @@ test('Node and Bare lifecycle closes swarms, timers, descriptors, and testnet', 
       allowlistPath: allowlist,
       maxFileBytes: CHUNK_SIZE,
       maxStagingBytes: CHUNK_SIZE,
+      minFreeBytes: 0,
       cleanupInterval: 60_000,
       dht: testnet.createNode()
     })
@@ -198,12 +206,13 @@ test('Node and Bare lifecycle closes swarms, timers, descriptors, and testnet', 
 
     await client.close()
     await server.close()
-    await testnet.destroy()
 
     t.is(client.swarm, null)
     t.is(client.discovery, null)
     t.is(client.sessions.size, 0)
     t.is(client.sockets.size, 0)
+    t.is(client.socketWaiters.length, 0)
+    t.is(client.delayWaiters.length, 0)
     t.is(server.swarm, null)
     t.is(server.sessionStore, null)
     t.is(server._connections.size, 0)
@@ -212,10 +221,12 @@ test('Node and Bare lifecycle closes swarms, timers, descriptors, and testnet', 
     t.is(retention.timer, null)
     t.ok(serverSwarm.destroyed)
     t.ok(clientSwarm.destroyed)
+    await t.exception(() => sourceHandle.stat(), { code: 'EBADF' })
+    await t.exception(() => sourceHandle.read(b4a.alloc(1), 0, 1, 0), { code: 'EBADF' })
 
-    await fs.promises.rename(source, `${source}.closed`)
-    t.is(await pathExists(source), false)
+    await testnet.destroy()
   } finally {
+    ClientSession.prototype._openSource = originalOpenSource
     await Promise.allSettled([client?.close(), server?.close()])
     await testnet.destroy().catch(() => {})
   }

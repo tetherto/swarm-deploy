@@ -35,6 +35,16 @@ function deferred() {
   return { promise, resolve }
 }
 
+function diagnosticTimeout(promise, label, timeout = 1_000) {
+  let timer
+  return Promise.race([
+    promise,
+    new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out at ${label}`)), timeout)
+    })
+  ]).finally(() => clearTimeout(timer))
+}
+
 function makeUpload(ownerKey = OWNER, name = 'revoked.bin') {
   const data = b4a.from('revocation barrier payload')
   const digest = sha256(data)
@@ -141,7 +151,7 @@ test('revocation stops an active write and its queued successor without acknowle
   await offerReady(created, upload)
 
   const active = created.messages[CHUNK].onmessage(upload.chunk)
-  await writeStarted.promise
+  await diagnosticTimeout(writeStarted.promise, 'active staging write barrier')
   const queued = created.messages[CHUNK].onmessage(upload.chunk)
   created.session.revoke()
   releaseWrite.resolve()
@@ -178,7 +188,7 @@ test('revocation at the publication link rolls back final and sidecar', async (t
   const finishing = created.messages[FINISH].onmessage({
     transferId: upload.offer.transferId
   })
-  await linkStarted.promise
+  await diagnosticTimeout(linkStarted.promise, 'commit publication link barrier')
   created.session.revoke()
   releaseLink.resolve()
   await finishing
@@ -227,6 +237,7 @@ test('an unchanged allowlist reload retries failed revocation cleanup', async (t
     allowedKeys: [ownerKey],
     maxFileBytes: CHUNK_SIZE,
     maxStagingBytes: CHUNK_SIZE,
+    minFreeBytes: 0,
     storage,
     swarmFactory: createStubSwarm
   })
