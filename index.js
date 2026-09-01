@@ -44,6 +44,7 @@ const {
 const { transferId, encodeTransferIdCanonical } = require('./lib/protocol/transfer-id')
 const { parseAllowlist, AllowlistWatcher } = require('./lib/allowlist')
 const { Server } = require('./lib/server')
+const { Client } = require('./lib/client')
 
 module.exports = {
   SwarmDeployError,
@@ -88,5 +89,6 @@ module.exports = {
   encodeTransferIdCanonical,
   parseAllowlist,
   AllowlistWatcher,
-  Server
+  Server,
+  Client
 }

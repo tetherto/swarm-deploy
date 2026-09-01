@@ -1,0 +1,226 @@
+'use strict'
+
+const test = require('brittle')
+const b4a = require('b4a')
+const crypto = require('#crypto')
+const fs = require('#fs')
+const path = require('#path')
+const Hyperswarm = require('hyperswarm')
+const { Client, Server, keyPairFromSeed, topicFromServerPublicKey } = require('../..')
+const { createTempDir, writeDeterministicFile, CHUNK_SIZE } = require('../helpers/files')
+const { createLocalTestnet, waitFor } = require('../helpers/testnet')
+
+const SERVER_SEED = b4a.alloc(32, 21)
+const CLIENT_A_SEED = b4a.alloc(32, 22)
+const CLIENT_B_SEED = b4a.alloc(32, 23)
+const ROGUE_SEED = b4a.alloc(32, 24)
+
+function sha256(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest()
+}
+
+async function setupServer(t, testnet, allowedSeeds) {
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: await createTempDir(t),
+    allowedKeys: allowedSeeds.map((seed) => keyPairFromSeed(seed).publicKey),
+    maxFileBytes: 8 * CHUNK_SIZE,
+    maxStagingBytes: 16 * CHUNK_SIZE,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => server.close())
+  await server.listen()
+  return server
+}
+
+function createClient(t, testnet, server, seed) {
+  const client = new Client({
+    seed,
+    serverPublicKey: server.publicKey,
+    dht: testnet.createNode(),
+    connectTimeout: 5_000,
+    idleTimeout: 10_000
+  })
+  t.teardown(() => client.close())
+  return client
+}
+
+test('Client validates identities and bounded timeouts before networking', (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const options = {
+    seed: CLIENT_A_SEED,
+    serverPublicKey: serverKey,
+    connectTimeout: 5_000,
+    idleTimeout: 10_000,
+    swarmFactory() {
+      throw new Error('network construction must not run during validation')
+    }
+  }
+
+  for (const invalid of [
+    { ...options, seed: b4a.alloc(31) },
+    { ...options, serverPublicKey: b4a.alloc(31) },
+    { ...options, seed: SERVER_SEED },
+    { ...options, connectTimeout: 0 },
+    { ...options, connectTimeout: 30_001 },
+    { ...options, idleTimeout: 0 }
+  ]) {
+    t.exception(() => new Client(invalid), { name: 'SwarmDeployError' })
+  }
+})
+
+test('Client close aborts pending discovery promptly', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const source = path.join(await createTempDir(t), 'pending.bin')
+  await fs.promises.writeFile(source, b4a.from('wait for an unavailable server'))
+  const client = new Client({
+    seed: CLIENT_A_SEED,
+    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    dht: testnet.createNode(),
+    connectTimeout: 30_000
+  })
+  const uploading = client.upload(source)
+  await waitFor(() => client.swarm !== null)
+  await client.close()
+
+  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
+})
+
+test('Client uploads empty and multi-chunk files with exact bytes and sidecars', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const server = await setupServer(t, testnet, [CLIENT_A_SEED])
+  const client = createClient(t, testnet, server, CLIENT_A_SEED)
+  let connections = 0
+  server.on('connection', () => connections++)
+  const source = await createTempDir(t)
+  const empty = path.join(source, 'empty.bin')
+  const multi = path.join(source, 'multi.bin')
+  await fs.promises.writeFile(empty, b4a.alloc(0))
+  await writeDeterministicFile(multi, 2 * CHUNK_SIZE + 31)
+
+  const emptyResult = await client.upload(empty)
+  const multiResult = await client.upload(multi)
+  t.is(emptyResult.status, 'COMMITTED')
+  t.is(multiResult.status, 'COMMITTED')
+  t.alike(await fs.promises.readFile(path.join(server.layout.root, 'empty.bin')), b4a.alloc(0))
+  t.alike(
+    await fs.promises.readFile(path.join(server.layout.root, 'multi.bin')),
+    await fs.promises.readFile(multi)
+  )
+
+  const record = JSON.parse(
+    await fs.promises.readFile(
+      path.join(server.layout.commits, `${b4a.toString(multiResult.transferId, 'hex')}.json`),
+      'utf8'
+    )
+  )
+  t.is(record.sha256, b4a.toString(sha256(await fs.promises.readFile(multi)), 'hex'))
+  t.alike(await fs.promises.readdir(server.layout.staging), [])
+  t.alike(await fs.promises.readdir(server.layout.sessions), [])
+  t.is(connections, 1)
+})
+
+test('Client processes directory entries sequentially, preserves skips, and continues failures', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const server = await setupServer(t, testnet, [CLIENT_A_SEED])
+  const client = createClient(t, testnet, server, CLIENT_A_SEED)
+  const source = await createTempDir(t)
+  const blocked = path.join(source, 'a-blocked.bin')
+  const accepted = path.join(source, 'b-accepted.bin')
+  await fs.promises.writeFile(blocked, b4a.from('new bytes'))
+  await fs.promises.writeFile(accepted, b4a.from('accepted bytes'))
+  await fs.promises.mkdir(path.join(source, 'ignored-directory'))
+  await fs.promises.writeFile(path.join(server.layout.root, 'a-blocked.bin'), b4a.from('foreign'))
+
+  const batch = await client.upload(source)
+  t.is(batch.status, 'FAILED')
+  t.alike(
+    batch.results.map((entry) => [entry.name, entry.status]),
+    [
+      ['a-blocked.bin', 'FILE_EXISTS'],
+      ['b-accepted.bin', 'COMMITTED']
+    ]
+  )
+  t.alike(
+    batch.skipped.map((entry) => [entry.name, entry.reason]),
+    [['ignored-directory', 'directory']]
+  )
+  t.alike(
+    await fs.promises.readFile(path.join(server.layout.root, 'b-accepted.bin')),
+    b4a.from('accepted bytes')
+  )
+})
+
+test('Client pins the expected server before Protomux metadata and continues past rogue peers', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const server = await setupServer(t, testnet, [CLIENT_A_SEED])
+  const client = createClient(t, testnet, server, CLIENT_A_SEED)
+  const rogue = new Hyperswarm({
+    dht: testnet.createNode(),
+    keyPair: keyPairFromSeed(ROGUE_SEED),
+    maxClientConnections: 0
+  })
+  const roguePayloads = []
+  let rogueConnections = 0
+  rogue.on('connection', (socket) => {
+    rogueConnections++
+    socket.on('data', (data) => roguePayloads.push(b4a.from(data)))
+    socket.on('error', () => {})
+  })
+  t.teardown(() => rogue.destroy())
+  const discovery = rogue.join(topicFromServerPublicKey(server.publicKey), {
+    server: true,
+    client: false
+  })
+  await discovery.flushed()
+  await client._ensureStarted()
+  client.swarm.joinPeer(rogue.keyPair.publicKey)
+  await waitFor(() => rogueConnections === 1)
+
+  const source = path.join(await createTempDir(t), 'pinned.bin')
+  await fs.promises.writeFile(source, b4a.from('pinned-server'))
+  const result = await client.upload(source)
+
+  t.is(result.status, 'COMMITTED')
+  t.is(roguePayloads.length, 0)
+})
+
+test('two different client identities upload concurrently', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const server = await setupServer(t, testnet, [CLIENT_A_SEED, CLIENT_B_SEED])
+  const first = createClient(t, testnet, server, CLIENT_A_SEED)
+  const second = createClient(t, testnet, server, CLIENT_B_SEED)
+  const source = await createTempDir(t)
+  const firstPath = path.join(source, 'first.bin')
+  const secondPath = path.join(source, 'second.bin')
+  await writeDeterministicFile(firstPath, CHUNK_SIZE + 5)
+  await writeDeterministicFile(secondPath, CHUNK_SIZE + 7)
+
+  const [firstResult, secondResult] = await Promise.all([
+    first.upload(firstPath),
+    second.upload(secondPath)
+  ])
+  t.is(firstResult.status, 'COMMITTED')
+  t.is(secondResult.status, 'COMMITTED')
+  t.alike(
+    await fs.promises.readFile(path.join(server.layout.root, 'first.bin')),
+    await fs.promises.readFile(firstPath)
+  )
+  t.alike(
+    await fs.promises.readFile(path.join(server.layout.root, 'second.bin')),
+    await fs.promises.readFile(secondPath)
+  )
+})
+
+test('shared client identities retain one Hyperswarm transport deterministically', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const server = await setupServer(t, testnet, [CLIENT_A_SEED])
+  const first = createClient(t, testnet, server, CLIENT_A_SEED)
+  const second = createClient(t, testnet, server, CLIENT_A_SEED)
+
+  await Promise.all([first._ensureStarted(), second._ensureStarted()])
+  await waitFor(() => server._connections.size === 1)
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  t.alike(first.publicKey, second.publicKey)
+  t.is(server._connections.size, 1)
+})
