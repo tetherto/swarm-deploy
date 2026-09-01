@@ -488,3 +488,92 @@ test('retryAbortedAttempt removes only a failed revoked attempt before owner del
   await sessionStore.delete(upload.offer.transferId)
   t.is(await pathExists(staging), false)
 })
+
+test('retryAbortedAttempt cleans a linearized commit without a live session', async (t) => {
+  let failCleanup = false
+  let sessionMetadata = null
+  const storage = createStorage({
+    async beforeOperation(name, filePath) {
+      if (!failCleanup || name !== 'unlink' || filePath !== sessionMetadata) return
+      failCleanup = false
+      throw new Error('Injected post-linearization cleanup failure')
+    }
+  })
+  const created = await createVerifiedSession(t, { storage })
+  const { layout, upload, session, sessionStore } = created
+  const finalPath = path.join(layout.root, upload.offer.name)
+  const sidecarPath = recordPath(layout, upload.offer)
+  sessionMetadata = sessionPath(layout, upload.offer)
+  const commits = new CommitStore({ layout, storage })
+  failCleanup = true
+  const record = await commits.commit(session)
+  await sessionStore.retireCommitted(upload.offer.transferId)
+  const before = await fs.promises.lstat(finalPath)
+
+  const result = await commits.retryAbortedAttempt(upload.offer.transferId, sessionStore)
+
+  t.is(result.status, 'COMMITTED')
+  t.alike(result.record, record)
+  t.is(sessionStore.sessions.size, 0)
+  t.is(sessionStore.reservedBytes, 0)
+  t.alike(await fs.promises.readFile(finalPath), upload.chunk.data)
+  t.alike(await readJson(sidecarPath), record)
+  const after = await fs.promises.lstat(finalPath)
+  t.is(after.dev, before.dev)
+  t.is(after.ino, before.ino)
+  t.is(await pathExists(sessionMetadata), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), false)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+})
+
+test('retryAbortedAttempt leaves foreign final and sidecar state untouched', async (t) => {
+  for (const boundary of ['final', 'sidecar']) {
+    let failCleanup = false
+    let sessionMetadata = null
+    const storage = createStorage({
+      async beforeOperation(name, filePath) {
+        if (!failCleanup || name !== 'unlink' || filePath !== sessionMetadata) return
+        failCleanup = false
+        throw new Error('Injected post-linearization cleanup failure')
+      }
+    })
+    const created = await createVerifiedSession(t, {
+      storage,
+      upload: makeUpload({ name: `foreign-${boundary}.bin` })
+    })
+    const { layout, upload, session, sessionStore } = created
+    const finalPath = path.join(layout.root, upload.offer.name)
+    const sidecarPath = recordPath(layout, upload.offer)
+    sessionMetadata = sessionPath(layout, upload.offer)
+    const commits = new CommitStore({ layout, storage })
+    failCleanup = true
+    await commits.commit(session)
+
+    let expectedFinal = upload.chunk.data
+    let expectedSidecar = await readJson(sidecarPath)
+    if (boundary === 'final') {
+      expectedFinal = b4a.from('foreign final')
+      await fs.promises.unlink(finalPath)
+      await fs.promises.writeFile(finalPath, expectedFinal)
+    } else {
+      expectedSidecar = { ...expectedSidecar, committedAt: expectedSidecar.committedAt + 1 }
+      await fs.promises.writeFile(sidecarPath, JSON.stringify(expectedSidecar))
+    }
+    const journalBefore = await readJson(journalPath(layout, upload.offer))
+
+    await t.exception(
+      () => commits.retryAbortedAttempt(upload.offer.transferId, sessionStore),
+      { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID },
+      boundary
+    )
+    t.alike(await fs.promises.readFile(finalPath), expectedFinal, `${boundary} final preserved`)
+    t.alike(await readJson(sidecarPath), expectedSidecar, `${boundary} sidecar preserved`)
+    t.alike(
+      await readJson(journalPath(layout, upload.offer)),
+      journalBefore,
+      `${boundary} journal unchanged`
+    )
+    t.is(await pathExists(stagingPath(layout, upload.offer)), true, `${boundary} staging retained`)
+    t.is(await pathExists(sessionMetadata), true, `${boundary} session retained`)
+  }
+})
