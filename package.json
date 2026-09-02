@@ -3,51 +3,57 @@
   "version": "0.0.0",
   "private": true,
   "description": "Secure resumable artifact uploads over Hyperswarm",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "bin": {
-    "swarm-deploy": "bin/swarm-deploy.js"
+    "swarm-deploy": "./dist/bin/swarm-deploy.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js"
+    }
   },
   "scripts": {
     "format": "prettier . --write",
     "format:check": "prettier . --check",
     "lint": "prettier . --check && lunte && npm run test:types",
-    "test:types": "tsc --noEmit --strict --module node16 --moduleResolution node16 --types node test/types/public-api.ts",
-    "test:node": "brittle-node test/run.js",
-    "test:bare": "brittle-bare test/run.js",
-    "test": "npm run test:node && npm run test:bare"
+    "build": "tsc -p tsconfig.json && cp lib/*-node.js dist/ && cp index.d.ts dist/index.d.ts",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test:types": "tsc --ignoreConfig --noEmit --strict --module node16 --moduleResolution node16 --types node test/types/public-api.ts",
+    "test:node": "npm run build && npm run build:test && brittle-node .test-dist/run.js",
+    "test:bare": "npm run build && npm run build:test && brittle-bare .test-dist/run.js",
+    "test": "npm run test:node && npm run test:bare",
+    "prepack": "npm run build && npm run test:types && npm pack --dry-run"
   },
   "imports": {
     "#crypto": {
       "bare": "bare-crypto",
-      "default": "./lib/crypto-node.js"
+      "default": "./dist/crypto-node.js"
     },
     "#events": {
       "bare": "bare-events",
-      "default": "./lib/events-node.js"
+      "default": "./dist/events-node.js"
     },
     "#fs": {
       "bare": "bare-fs",
-      "default": "./lib/fs-node.js"
+      "default": "./dist/fs-node.js"
     },
     "#os": {
       "bare": "bare-os",
-      "default": "./lib/os-node.js"
+      "default": "./dist/os-node.js"
     },
     "#path": {
       "bare": "bare-path",
-      "default": "./lib/path-node.js"
+      "default": "./dist/path-node.js"
     },
     "#process": {
       "bare": "bare-process",
-      "default": "./lib/process-node.js"
+      "default": "./dist/process-node.js"
     }
   },
   "files": [
-    "bin",
-    "lib",
-    "index.js",
-    "index.d.ts",
+    "dist",
     "README.md",
     "LICENSE.md",
     "NOTICE.md",

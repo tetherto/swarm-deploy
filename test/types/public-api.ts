@@ -76,7 +76,7 @@ import {
   TRANSFER_ID_BYTES,
   transferId,
   validateBasename
-} from '../../index.js'
+} from '../../dist/index.js'
 
 const binaryInput = new Uint8Array(32)
 const seed: Binary = generateSeed()
