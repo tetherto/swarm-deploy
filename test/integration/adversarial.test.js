@@ -18,12 +18,12 @@ const {
   BITMAP_PAGE,
   FINISH
 } = require('../..')
-const { ClientSession } = require('../../lib/protocol/client-session')
-const { ServerSession } = require('../../lib/protocol/server-session')
-const { initLayout } = require('../../lib/storage/layout')
-const { SessionStore } = require('../../lib/storage/session-store')
-const { CommitStore } = require('../../lib/storage/commit-store')
-const { recoverStorage } = require('../../lib/storage/recovery')
+const { ClientSession } = require('../../dist/protocol/client-session')
+const { ServerSession } = require('../../dist/protocol/server-session')
+const { initLayout } = require('../../dist/storage/layout')
+const { SessionStore } = require('../../dist/storage/session-store')
+const { CommitStore } = require('../../dist/storage/commit-store')
+const { recoverStorage } = require('../../dist/storage/recovery')
 const { createTempDir } = require('../helpers/files')
 const { createStorage } = require('../helpers/storage')
 const { createLocalTestnet } = require('../helpers/testnet')

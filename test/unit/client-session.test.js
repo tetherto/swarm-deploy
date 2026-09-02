@@ -13,7 +13,7 @@ const {
   UPLOAD_PROTOCOL,
   MAX_IN_FLIGHT,
   boundedEncoding
-} = require('../../lib/protocol/client-session')
+} = require('../../dist/protocol/client-session')
 const {
   OFFER,
   STATUS,
@@ -25,7 +25,7 @@ const {
   RESULT,
   STATUS_CODE,
   MAX_CONTROL_BYTES
-} = require('../../lib/protocol/constants')
+} = require('../../dist/protocol/constants')
 const {
   offer,
   status,
@@ -35,9 +35,9 @@ const {
   chunkAck,
   finish,
   result
-} = require('../../lib/protocol/codecs')
-const { transferId } = require('../../lib/protocol/transfer-id')
-const { buildFileManifest } = require('../../lib/files')
+} = require('../../dist/protocol/codecs')
+const { transferId } = require('../../dist/protocol/transfer-id')
+const { buildFileManifest } = require('../../dist/files')
 const { createTempDir } = require('../helpers/files')
 
 const CLIENT_KEY = b4a.alloc(32, 9)

@@ -23,9 +23,9 @@ const {
 } = require('../..')
 const { createTempDir } = require('../helpers/files')
 const { createLocalTestnet } = require('../helpers/testnet')
-const { fingerprint } = require('../../lib/server')
-const { topicFromServerPublicKey } = require('../../lib/topic')
-const { main } = require('../../lib/cli')
+const { fingerprint } = require('../../dist/server')
+const { topicFromServerPublicKey } = require('../../dist/topic')
+const { main } = require('../../dist/cli')
 
 const HEX64 = /^[0-9a-f]{64}$/
 
@@ -76,7 +76,7 @@ function trySpawnSync() {
 }
 
 function cliBin() {
-  return path.join(__dirname, '../../bin/swarm-deploy.js')
+  return path.join(__dirname, '../../dist/bin/swarm-deploy.js')
 }
 
 function bareBin() {

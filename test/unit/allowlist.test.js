@@ -1,7 +1,7 @@
 'use strict'
 
 const test = require('brittle')
-const { parseAllowlist, AllowlistWatcher } = require('../../lib/allowlist')
+const { parseAllowlist, AllowlistWatcher } = require('../../dist/allowlist')
 
 const KEY_A = 'a'.repeat(64)
 const KEY_B = 'b'.repeat(64)

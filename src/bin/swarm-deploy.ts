@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-'use strict'
 
-const process = require('#process')
-const { main } = require('../../lib/cli.js')
+import process from '#process'
+import { main } from '../cli.js'
 
 function reportFatal(err: unknown) {
   try {

@@ -31,7 +31,7 @@ const {
   transferId,
   mergeBitmapPages
 } = require('../..')
-const { ServerSession } = require('../../lib/protocol/server-session')
+const { ServerSession } = require('../../dist/protocol/server-session')
 
 const OWNER = b4a.alloc(32, 0x31)
 const DATA = b4a.from('deterministic protocol property payload')

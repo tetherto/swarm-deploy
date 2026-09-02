@@ -7,9 +7,9 @@ const path = require('#path')
 const b4a = require('b4a')
 const { SwarmDeployError, ERRORS, parseSeed, publicKeyFromSeed } = require('../..')
 const { createTempDir } = require('../helpers/files')
-const { fingerprint } = require('../../lib/server')
-const { topicFromServerPublicKey } = require('../../lib/topic')
-const { main } = require('../../lib/cli')
+const { fingerprint } = require('../../dist/server')
+const { topicFromServerPublicKey } = require('../../dist/topic')
+const { main } = require('../../dist/cli')
 
 const HEX64 = /^[0-9a-f]{64}$/
 const SEED_A = 'ab'.repeat(32)

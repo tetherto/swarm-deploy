@@ -101,15 +101,15 @@ test('Client starts a fresh reconnect window after an active transport loss', as
     deadlines.push(deadline)
     if (deadlines.length === 1) return socket
     now = deadline
-    throw new (require('../../lib/errors').SwarmDeployError)(
-      require('../../lib/errors').ERRORS.UPLOAD_IDLE_TIMEOUT,
+    throw new (require('../../dist/errors').SwarmDeployError)(
+      require('../../dist/errors').ERRORS.UPLOAD_IDLE_TIMEOUT,
       'unavailable'
     )
   }
   client._startSession = async () => {
     now = 60_000
-    const error = new (require('../../lib/errors').SwarmDeployError)(
-      require('../../lib/errors').ERRORS.PROTOCOL_INVALID,
+    const error = new (require('../../dist/errors').SwarmDeployError)(
+      require('../../dist/errors').ERRORS.PROTOCOL_INVALID,
       'lost'
     )
     error.transport = true

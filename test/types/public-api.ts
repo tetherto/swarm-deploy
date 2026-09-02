@@ -156,6 +156,7 @@ const serverOptions: ServerOptions = {
   allowedKeys: [binaryInput, clientKey.toString('hex') as AllowlistKey],
   maxFileBytes: MAX_CHUNK_BYTES,
   maxStagingBytes: MAX_CHUNK_BYTES * 2,
+  replaceNames: ['release.tar.gz'] as Iterable<string>,
   storage,
   logger
 }
@@ -316,7 +317,7 @@ const decodedResult: Result = decodeBounded(
   new Uint8Array(encodeBounded(result, protocolResult)),
   MAX_CONTROL_BYTES
 )
-const decodedBuffers: Buffer[] = [
+const decodedBuffers: Uint8Array[] = [
   decoded.transferId,
   decoded.digest,
   decodedBitmapPage.transferId,

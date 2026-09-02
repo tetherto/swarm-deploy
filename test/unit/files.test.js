@@ -4,7 +4,7 @@ const test = require('brittle')
 const fs = require('#fs')
 const path = require('#path')
 const { ERRORS, validateBasename, selectUploadPaths, buildFileManifest } = require('../..')
-const { createAbortController } = require('../../lib/abort')
+const { createAbortController } = require('../../dist/abort')
 const {
   CHUNK_SIZE,
   createTempDir,
