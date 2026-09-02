@@ -1,5 +1,10 @@
+/// <reference path="./types/brittle.d.ts" />
+
 require('../test/unit/identity.test.js')
 require('./unit/imports.test.js')
+if (typeof Bare === 'undefined') {
+  require('./unit/imports-node.test.js')
+}
 require('../test/unit/files.test.js')
 require('../test/unit/protocol.test.js')
 require('../test/unit/protocol-property.test.js')

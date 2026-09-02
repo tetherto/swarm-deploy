@@ -10,9 +10,7 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "sourceMap": true,
-    "types": ["node"],
-    "skipLibCheck": true,
-    "noImplicitAny": false
+    "types": ["node"]
   },
-  "include": ["test/run.ts", "test/unit/imports.test.ts"]
+  "include": ["test/run.ts", "test/unit/imports.test.ts", "test/unit/imports-node.test.ts"]
 }
