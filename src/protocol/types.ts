@@ -1,90 +1,149 @@
-import type { Encoder, State } from 'compact-encoding'
+import type { ResultCode, StatusCode } from './constants.js'
+import type { FileManifest, FileSnapshot } from '../files.js'
+import type { Binary, BinaryInput, Digest, Fixed32, Scheduler, TransferId } from '../types.js'
 
-export type ProtocolState = State<Uint8Array>
+export type { Binary, BinaryInput, Digest, Fixed32, TransferId }
 
-export interface Codec<Input, Output = Input> extends Encoder<Input, Output> {}
+export interface EncodingState {
+  start: number
+  end: number
+  buffer: Binary
+}
+
+export interface Codec<Input, Output = Input> {
+  preencode(state: EncodingState, value: Input): void
+  encode(state: EncodingState, value: Input): void
+  decode(state: EncodingState): Output
+}
 
 export interface TransferIdInput {
-  clientPublicKey: Uint8Array
+  clientPublicKey: Fixed32
   name: string
   size: number
-  digest: Uint8Array
+  digest: Fixed32
   chunkSize: number
 }
 
-export interface Offer {
+export interface OfferInput {
   version: number
-  transferId: Uint8Array
+  transferId: Fixed32
   name: string
   size: number
-  digest: Uint8Array
+  digest: Fixed32
   chunkSize: number
   chunkCount: number
 }
 
-export interface Status {
-  transferId: Uint8Array
-  code: number
+export interface Offer {
+  version: number
+  transferId: TransferId
+  name: string
+  size: number
+  digest: Digest
+  chunkSize: number
+  chunkCount: number
+}
+
+export interface StatusInput {
+  transferId: Fixed32
+  code: StatusCode
   reason?: string
 }
 
-export interface BitmapPage {
-  transferId: Uint8Array
+export interface Status {
+  transferId: TransferId
+  code: StatusCode
+  reason?: string
+}
+
+export interface BitmapPageInput {
+  transferId: Fixed32
   start: number
   count: number
-  bits: Uint8Array
+  bits: BinaryInput
 }
 
-export interface TransferMessage {
-  transferId: Uint8Array
+export interface BitmapPage {
+  transferId: TransferId
+  start: number
+  count: number
+  bits: Binary
 }
 
-export interface Chunk extends TransferMessage {
+export interface ReadyInput {
+  transferId: Fixed32
+}
+
+export interface Ready {
+  transferId: TransferId
+}
+
+/** A message carrying only a transfer identifier: READY and FINISH. */
+export interface TransferMessage extends Ready {}
+
+export interface ChunkInput {
+  transferId: Fixed32
   index: number
-  digest: Uint8Array
-  data: Uint8Array
+  digest: Fixed32
+  data: BinaryInput
 }
 
-export interface ChunkAck extends TransferMessage {
+export interface Chunk {
+  transferId: TransferId
+  index: number
+  digest: Digest
+  data: Binary
+}
+
+export interface ChunkAckInput {
+  transferId: Fixed32
   index: number
 }
 
-export interface Result extends Status {}
+export interface ChunkAck {
+  transferId: TransferId
+  index: number
+}
+
+export interface FinishInput {
+  transferId: Fixed32
+}
+
+export interface Finish {
+  transferId: TransferId
+}
+
+export interface ResultInput {
+  transferId: Fixed32
+  code: ResultCode
+  reason?: string
+}
+
+export interface Result {
+  transferId: TransferId
+  code: ResultCode
+  reason?: string
+}
 
 export interface ProtocolMessage {
   send(value: unknown): boolean | void
 }
 
 export interface ProtocolChannel {
-  addMessage<T>(options: { encoding: Codec<T>; onmessage: (value: T) => void }): ProtocolMessage
+  addMessage<Input, Output>(options: {
+    encoding: Codec<Input, Output>
+    onmessage: (value: Output) => void
+  }): ProtocolMessage
   fullyOpened(): Promise<boolean>
   open(): void
   close(): void
   drained: boolean
   ondrain: () => void
   onclose: (isRemote: boolean) => void
-  _recv(type: number, state: ProtocolState): unknown
+  _recv(type: number, state: EncodingState): unknown
   _mux: { stream: { destroy(error: unknown): void } }
 }
 
-export interface SessionScheduler {
-  setTimeout(callback: () => void, delay: number): unknown
-  clearTimeout(timer: unknown): void
-}
+export type SessionScheduler = Scheduler
 
-export interface FileSnapshot {
-  size: number
-  mtimeMs: number
-  ino: number | bigint
-}
-
-export interface FileManifest {
-  path: string
-  name: string
-  size: number
-  digest: Uint8Array
-  chunkSize: number
-  chunkCount: number
-  chunkDigests: Uint8Array[]
-  stat?: FileSnapshot
-}
+export type { FileManifest, FileSnapshot }

@@ -16,7 +16,6 @@ import {
   MAX_BITMAP_BITS
 } from './constants.js'
 import { bitmapPage, chunk, chunkAck, finish, offer, ready, result, status } from './codecs.js'
-import { boundedEncoding } from './client-session.js'
 import type { RetentionManager as StorageRetentionManager } from '../storage/retention.js'
 import type {
   Chunk,
@@ -24,7 +23,7 @@ import type {
   Offer,
   ProtocolChannel,
   ProtocolMessage,
-  ProtocolState,
+  EncodingState,
   SessionScheduler,
   TransferMessage
 } from './types.js'
@@ -53,6 +52,31 @@ function isBenignRevocation(error: unknown): boolean {
     !(error instanceof AggregateError) &&
     !(typeof error === 'object' && error !== null && 'cleanupCause' in error && error.cleanupCause)
   )
+}
+
+export function boundedEncoding<Input, Output>(
+  codec: Codec<Input, Output>,
+  maximum: number
+): Codec<Input, Output> {
+  return {
+    preencode(state: EncodingState, value: Input): void {
+      const start = state.end
+      codec.preencode(state, value)
+      if (state.end - start > maximum) throw protocolError('Message too large')
+    },
+    encode(state: EncodingState, value: Input): void {
+      const start = state.start
+      codec.encode(state, value)
+      if (state.start - start > maximum) throw protocolError('Message too large')
+    },
+    decode(state: EncodingState): Output {
+      const start = state.start
+      if (state.end - start > maximum) throw protocolError('Message too large')
+      const value = codec.decode(state)
+      if (state.start !== state.end) throw protocolError('Invalid framed message')
+      return value
+    }
+  }
 }
 
 function assertDuration(value: unknown, name: string): asserts value is number {
@@ -312,7 +336,7 @@ export class ServerSession {
       })
     ]
     const receive = channel._recv
-    channel._recv = (type: number, state: ProtocolState) => {
+    channel._recv = (type: number, state: EncodingState) => {
       if (type >= this.messages.length) {
         return this._failClosed(protocolError('Unknown protocol message'))
       }

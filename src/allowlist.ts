@@ -1,31 +1,37 @@
 import EventEmitter from '#events'
 import fs from '#fs'
 import { parsePublicKey } from './identity.js'
+import type { StorageAdapter } from './storage/types.js'
+import type { Logger, ServerScheduler } from './types.js'
 
 const DEFAULT_POLL_INTERVAL = 5_000
 const MAX_POLL_INTERVAL = 0x7fffffff
 
-export interface AllowlistStorage {
-  readFile(path: string, encoding: 'utf8'): Promise<string | Uint8Array> | string | Uint8Array
+export type AllowlistStorage = Pick<StorageAdapter, 'readFile'>
+export type AllowlistScheduler = Pick<ServerScheduler, 'setInterval' | 'clearInterval'>
+export type AllowlistLogger = Logger
+
+export interface AllowlistReloadedEvent {
+  count: number
 }
 
-export interface AllowlistScheduler {
-  setInterval(callback: () => void, delay: number): unknown
-  clearInterval(timer: unknown): void
+export interface AllowlistRemovedEvent {
+  removed: number
 }
 
-export interface AllowlistLogger {
-  warn?(message: string, details: { reason: string }): void
+export interface AllowlistFailureEvent {
+  reason: string
 }
 
 export interface AllowlistWatcherOptions {
   filePath: string
   storage?: AllowlistStorage
-  onReload: (keys: Set<string>) => void | Promise<void>
-  onFailure?: ((details: { reason: string }) => void) | null
+  onReload(keys: Set<string>): void | Promise<void>
+  /** `null` is accepted and treated as "no handler". */
+  onFailure?: ((event: AllowlistFailureEvent) => void) | null
   pollInterval?: number
   scheduler?: AllowlistScheduler
-  logger?: AllowlistLogger | null
+  logger?: Logger | null
 }
 
 function errorCode(error: unknown): string | null {
@@ -67,18 +73,29 @@ export function parseAllowlist(text: string): Set<string> {
   return keys
 }
 
+export interface AllowlistWatcher {
+  on(event: 'reloaded', listener: (event: AllowlistReloadedEvent) => void): this
+  on(event: 'removed', listener: (event: AllowlistRemovedEvent) => void): this
+  on(event: 'failure', listener: (event: AllowlistFailureEvent) => void): this
+  on(event: string | symbol, listener: (...args: unknown[]) => void): this
+  once(event: 'reloaded', listener: (event: AllowlistReloadedEvent) => void): this
+  once(event: 'removed', listener: (event: AllowlistRemovedEvent) => void): this
+  once(event: 'failure', listener: (event: AllowlistFailureEvent) => void): this
+  once(event: string | symbol, listener: (...args: unknown[]) => void): this
+}
+
 export class AllowlistWatcher extends EventEmitter {
-  filePath: string
-  storage: AllowlistStorage
-  onReload: (keys: Set<string>) => void | Promise<void>
-  onFailure: ((details: { reason: string }) => void) | null
-  pollInterval: number
-  scheduler: AllowlistScheduler
-  logger: AllowlistLogger | null
+  readonly filePath: string
+  readonly pollInterval: number
   keys: Set<string>
-  timer: unknown | null
   closed: boolean
-  pending: Promise<void>
+  private storage: AllowlistStorage
+  private onReload: (keys: Set<string>) => void | Promise<void>
+  private onFailure: ((event: AllowlistFailureEvent) => void) | null
+  private scheduler: AllowlistScheduler
+  private logger: Logger | null
+  private timer: unknown | null
+  private pending: Promise<void>
 
   constructor({
     filePath,
@@ -122,14 +139,14 @@ export class AllowlistWatcher extends EventEmitter {
     this.pending = Promise.resolve()
   }
 
-  _report(level: keyof AllowlistLogger, message: string, details: { reason: string }): void {
+  private _report(level: keyof Logger, message: string, details: Record<string, unknown>): void {
     if (!this.logger || typeof this.logger[level] !== 'function') return
     try {
       this.logger[level](message, details)
     } catch {}
   }
 
-  _notifyFailure(err: unknown): { reason: string } {
+  private _notifyFailure(err: unknown): AllowlistFailureEvent {
     const details = {
       reason: errorCode(err) ?? 'PROTOCOL_INVALID'
     }
@@ -154,7 +171,7 @@ export class AllowlistWatcher extends EventEmitter {
     return run
   }
 
-  async _poll(): Promise<boolean> {
+  private async _poll(): Promise<boolean> {
     if (this.closed) return false
     let next
     try {
@@ -175,7 +192,7 @@ export class AllowlistWatcher extends EventEmitter {
     return true
   }
 
-  _applySnapshot(next: Set<string>): void {
+  private _applySnapshot(next: Set<string>): void {
     const previous = this.keys
     this.keys = next
     let removed = 0

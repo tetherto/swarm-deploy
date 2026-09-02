@@ -557,7 +557,7 @@ class CommitStore {
     record: CommitRecord,
     expectedIdentity: FileIdentity,
     attemptId: string,
-    revoked: SwarmDeployError
+    revoked: unknown
   ): Promise<never> {
     try {
       await this._markAttemptAborting(record.transferId, attemptId)
@@ -711,7 +711,7 @@ class CommitStore {
 
   async retryAbortedAttempt(
     transferId: Uint8Array,
-    sessionStore: SessionStore
+    sessionStore: SessionStore | null
   ): Promise<false | { status: 'COMMITTED' | 'ABORTED'; record: CommitRecord }> {
     assertFixed32(transferId, 'revoked transfer ID')
     if (!sessionStore || typeof sessionStore.readVerified !== 'function') {
@@ -825,7 +825,7 @@ class CommitStore {
         this._reportCleanupPending(record, err)
         return record
       }
-      if (errorCode(err) === ERRORS.REVOKED && err instanceof SwarmDeployError) {
+      if (errorCode(err) === ERRORS.REVOKED) {
         return this._abortAttempt(record, stagingDigest.identity, journalAttemptId, err)
       }
       if (!linked && errorCode(err) !== 'EEXIST') {

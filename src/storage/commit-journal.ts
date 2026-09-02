@@ -74,28 +74,26 @@ export interface CommitRecord {
   transferId: string
 }
 
-export function assertCommitRecord(record: unknown): CommitRecord {
-  if (!record || typeof record !== 'object' || Array.isArray(record)) {
-    throw storageError('Invalid commit record')
-  }
-  const candidate = record as Record<string, unknown>
+function isRecordLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function assertCommitRecordShape(record: unknown): asserts record is CommitRecord {
+  if (!isRecordLike(record)) throw storageError('Invalid commit record')
+  const candidate = record
   if (candidate.version !== COMMIT_VERSION) throw storageError('Invalid commit record version')
-  const name = typeof candidate.name === 'string' ? candidate.name : ''
-  validateBasename(name)
+  validateBasename(typeof candidate.name === 'string' ? candidate.name : '')
   assertSafeUint(candidate.size, 'commit size')
   if (!isHex(candidate.sha256)) throw storageError('Invalid commit digest')
   assertSafeUint(candidate.committedAt, 'commit timestamp')
   if (!isHex(candidate.uploaderFingerprint)) throw storageError('Invalid uploader fingerprint')
   if (!isHex(candidate.transferId)) throw storageError('Invalid commit transfer ID')
-  return {
-    version: COMMIT_VERSION,
-    name,
-    size: candidate.size,
-    sha256: candidate.sha256,
-    committedAt: candidate.committedAt,
-    uploaderFingerprint: candidate.uploaderFingerprint,
-    transferId: candidate.transferId
-  }
+}
+
+/** Validates in place so unknown persisted fields survive a read/write round-trip. */
+export function assertCommitRecord(record: unknown): CommitRecord {
+  assertCommitRecordShape(record)
+  return record
 }
 
 export interface CommitJournal {

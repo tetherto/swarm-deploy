@@ -25,7 +25,8 @@ import type {
   Offer,
   ProtocolChannel,
   ProtocolMessage,
-  ProtocolState,
+  Codec,
+  EncodingState,
   Result,
   SessionScheduler,
   Status,
@@ -70,22 +71,22 @@ function assertDuration(value: unknown, name: string): asserts value is number {
   }
 }
 
-export function boundedEncoding<T>(
-  codec: import('./types.js').Codec<T>,
+export function boundedEncoding<Input, Output>(
+  codec: Codec<Input, Output>,
   maximum: number
-): import('./types.js').Codec<T> {
+): Codec<Input, Output> {
   return {
-    preencode(state: ProtocolState, value: T): void {
+    preencode(state: EncodingState, value: Input): void {
       const start = state.end
       codec.preencode(state, value)
       if (state.end - start > maximum) throw protocolError('Message too large')
     },
-    encode(state: ProtocolState, value: T): void {
+    encode(state: EncodingState, value: Input): void {
       const start = state.start
       codec.encode(state, value)
       if (state.start - start > maximum) throw protocolError('Message too large')
     },
-    decode(state: ProtocolState): T {
+    decode(state: EncodingState): Output {
       const start = state.start
       if (state.end - start > maximum) throw protocolError('Message too large')
       const value = codec.decode(state)
@@ -297,7 +298,7 @@ export class ClientSession {
     ]
 
     const receive = channel._recv
-    channel._recv = (type: number, state: ProtocolState) => {
+    channel._recv = (type: number, state: EncodingState) => {
       if (type >= this.messages.length) {
         this._fail(protocolError('Unknown protocol message'))
         return null

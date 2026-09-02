@@ -472,6 +472,31 @@ test('Server startup failure releases the storage lock', async (t) => {
   t.ok(recovered.listening)
 })
 
+test('Server reloadAllowlist revokes removed keys before listen', async (t) => {
+  const allowedKey = keyPairFromSeed(ALLOWED_SEED).publicKey
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: await createTempDir(t),
+    allowedKeys: [allowedKey],
+    maxFileBytes: 1024 * 1024,
+    maxStagingBytes: 2 * 1024 * 1024,
+    swarmFactory() {
+      return createStubSwarm([])
+    }
+  })
+  t.teardown(() => server.close())
+
+  const events = []
+  server.on('allowlist', (event) => events.push(event))
+
+  const reloaded = await server.reloadAllowlist([])
+
+  t.alike(reloaded, new Set())
+  t.alike(server.allowedKeys, new Set())
+  t.alike(events, [{ status: 'completed', appliedCount: 0, pendingCount: 0 }])
+  t.is(server.pendingRevocations.size, 0)
+})
+
 test('Server contains logger failures', async (t) => {
   const server = new Server({
     seed: SERVER_SEED,

@@ -1,6 +1,11 @@
 import { Buffer } from 'node:buffer'
 import {
+  type AllowlistEvent,
+  type AllowlistFailureEvent,
   type AllowlistKey,
+  type AllowlistReloadedEvent,
+  type AllowlistRemovedEvent,
+  type AuthenticationEvent,
   type BatchUploadResult,
   type Binary,
   type BitmapPage,
@@ -9,14 +14,27 @@ import {
   type ChunkAck,
   type ChunkAckInput,
   type ChunkInput,
+  type CleanupEvent,
+  type ClientBatchResultEvent,
+  type ClientCloseEvent,
+  type ClientCommitEvent,
   type ClientEvent,
   type ClientEventName,
+  type ClientFailureEvent,
+  type ClientOfferEvent,
   type ClientOptions,
+  type ClientProgressEvent,
   type ClientResultEvent,
   type ClientSkippedEvent,
+  type ClientSuccessEvent,
   Client,
   type Codec,
+  type ConnectionCloseEvent,
+  type ConnectionOpenEvent,
+  type EncodingState,
+  type FailedUploadPath,
   type FileManifest,
+  type FingerprintEvent,
   type Finish,
   type FinishInput,
   type Logger,
@@ -25,16 +43,32 @@ import {
   type Ready,
   type ReadyInput,
   type Result,
+  type ResultCode,
   type ResultInput,
   type RecoveryEvent,
+  type RetentionEvent,
+  type ScrubEvent,
+  type SelectedUploadPath,
+  type ServerCloseEvent,
   type ServerConnectionEvent,
+  type ServerEventMap,
+  type ServerEventName,
+  type ServerListeningEvent,
+  type ServerOfferEvent,
   type ServerOptions,
+  type ServerProgressEvent,
+  type ServerTransferLifecycleEvent,
   Server,
+  type SkippedUploadPath,
+  type SkippedUploadReason,
+  type StatusCode,
   type StorageAdapter,
   type StorageFileHandle,
   type StorageStats,
   type Status,
   type StatusInput,
+  type TransferLifecycleEvent,
+  type UploadPathEntry,
   type UploadResult,
   AllowlistWatcher,
   bitmapPage,
@@ -317,7 +351,7 @@ const decodedResult: Result = decodeBounded(
   new Uint8Array(encodeBounded(result, protocolResult)),
   MAX_CONTROL_BYTES
 )
-const decodedBuffers: Uint8Array[] = [
+const decodedBuffers: Binary[] = [
   decoded.transferId,
   decoded.digest,
   decodedBitmapPage.transferId,
@@ -394,3 +428,212 @@ const manifest: FileManifest = {
   stat: { size: 0, mtimeMs: 0, ino: 0 }
 }
 void manifest
+
+/*
+ * Listener and declaration exactness checks. `Equals` is invariant, so these
+ * fail whenever an event payload silently widens to `any`, `unknown`, or a
+ * reshaped structural approximation.
+ */
+type Equals<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false
+type Expect<T extends true> = T
+type IsAny<T> = 0 extends 1 & T ? true : false
+
+type NoImplicitAnyListeners = [
+  Expect<Equals<IsAny<Parameters<Parameters<Server['on']>[1]>[0]>, false>>,
+  Expect<Equals<IsAny<Parameters<Parameters<Client['on']>[1]>[0]>, false>>,
+  Expect<Equals<IsAny<Parameters<Parameters<AllowlistWatcher['on']>[1]>[0]>, false>>
+]
+
+type ServerEventNameCoverage = Expect<
+  Equals<
+    ServerEventName,
+    | 'authentication'
+    | 'connection'
+    | 'connection-open'
+    | 'connection-close'
+    | 'offer'
+    | 'progress'
+    | 'verification'
+    | 'commit'
+    | 'recovery'
+    | 'scrub'
+    | 'retention'
+    | 'cleanup'
+    | 'allowlist'
+    | 'revocation'
+    | 'revoked'
+    | 'listening'
+    | 'close'
+  >
+>
+
+type ClientEventNameCoverage = Expect<
+  Equals<
+    ClientEventName,
+    | 'authentication'
+    | 'connection'
+    | 'connection-open'
+    | 'connection-close'
+    | 'rejected-peer'
+    | 'offer'
+    | 'progress'
+    | 'verification'
+    | 'commit'
+    | 'result'
+    | 'skipped'
+    | 'close'
+  >
+>
+
+type ServerEventMapShapes = [
+  Expect<Equals<ServerEventMap['authentication'], AuthenticationEvent>>,
+  Expect<Equals<ServerEventMap['connection'], ServerConnectionEvent>>,
+  Expect<Equals<ServerEventMap['connection-open'], ConnectionOpenEvent>>,
+  Expect<Equals<ServerEventMap['connection-close'], ConnectionCloseEvent>>,
+  Expect<Equals<ServerEventMap['offer'], ServerOfferEvent>>,
+  Expect<Equals<ServerEventMap['progress'], ServerProgressEvent>>,
+  Expect<Equals<ServerEventMap['verification'], ServerTransferLifecycleEvent>>,
+  Expect<Equals<ServerEventMap['commit'], ServerTransferLifecycleEvent>>,
+  Expect<Equals<ServerEventMap['recovery'], RecoveryEvent>>,
+  Expect<Equals<ServerEventMap['scrub'], ScrubEvent>>,
+  Expect<Equals<ServerEventMap['retention'], RetentionEvent>>,
+  Expect<Equals<ServerEventMap['cleanup'], CleanupEvent>>,
+  Expect<Equals<ServerEventMap['allowlist'], AllowlistEvent>>,
+  Expect<Equals<ServerEventMap['revocation'], FingerprintEvent>>,
+  Expect<Equals<ServerEventMap['revoked'], FingerprintEvent>>,
+  Expect<Equals<ServerEventMap['listening'], ServerListeningEvent>>,
+  Expect<Equals<ServerEventMap['close'], ServerCloseEvent>>
+]
+
+type RecoveryContract = [
+  Expect<
+    Equals<
+      RecoveryEvent['status'],
+      | 'started'
+      | 'completed'
+      | 'failed'
+      | 'CORRUPT'
+      | 'COMMITTED'
+      | 'ABORTED'
+      | 'RESUMABLE'
+      | 'MISSING'
+      | 'FILE_EXISTS'
+    >
+  >,
+  Expect<Equals<RecoveryEvent['phase'], 'classification' | 'sessions' | 'journal' | undefined>>
+]
+
+type ProtocolCodeContract = [
+  Expect<Equals<StatusCode, 0 | 1 | 2 | 3 | 4>>,
+  Expect<Equals<ResultCode, 0 | 1>>,
+  Expect<Equals<EncodingState['buffer'], Binary>>,
+  Expect<Equals<Offer['transferId'], Binary>>,
+  Expect<Equals<OfferInput['transferId'], Uint8Array>>,
+  Expect<Equals<Chunk['data'], Binary>>,
+  Expect<Equals<ChunkInput['data'], Uint8Array>>,
+  Expect<Equals<Status['code'], StatusCode>>,
+  Expect<Equals<Result['code'], ResultCode>>
+]
+
+type LoggerContract = [
+  Expect<Equals<Parameters<NonNullable<Logger['info']>>, [string, Record<string, unknown>?]>>,
+  Expect<Equals<Parameters<NonNullable<Logger['warn']>>, [string, Record<string, unknown>?]>>,
+  Expect<Equals<Parameters<NonNullable<Logger['error']>>, [string, Record<string, unknown>?]>>
+]
+
+type UploadUnionContract = [
+  Expect<Equals<UploadPathEntry, SelectedUploadPath | SkippedUploadPath | FailedUploadPath>>,
+  Expect<
+    Equals<SkippedUploadReason, 'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename'>
+  >,
+  Expect<Equals<ClientSuccessEvent['reason'], undefined>>,
+  Expect<Equals<ClientBatchResultEvent['reason'], undefined>>,
+  Expect<Equals<ClientCloseEvent['reason'], undefined>>,
+  Expect<Equals<ClientFailureEvent['reason'], string | undefined>>
+]
+
+void [
+  null as unknown as NoImplicitAnyListeners,
+  null as unknown as ServerEventNameCoverage,
+  null as unknown as ClientEventNameCoverage,
+  null as unknown as ServerEventMapShapes,
+  null as unknown as RecoveryContract,
+  null as unknown as ProtocolCodeContract,
+  null as unknown as LoggerContract,
+  null as unknown as UploadUnionContract
+]
+
+server.on('authentication', (event) => {
+  const check: Expect<Equals<typeof event, AuthenticationEvent>> = true
+  void [check, event.fingerprint, event.status, event.reason]
+})
+server.on('offer', (event) => {
+  const check: Expect<Equals<typeof event, ServerOfferEvent>> = true
+  void [check, event.fingerprint, event.transfer, event.status, event.resumed, event.reason]
+})
+server.on('verification', (event) => {
+  const check: Expect<Equals<typeof event, ServerTransferLifecycleEvent>> = true
+  void [check, event.fingerprint, event.status, event.name, event.size]
+})
+server.once('commit', (event) => {
+  const check: Expect<Equals<typeof event, ServerTransferLifecycleEvent>> = true
+  void [check, event.transfer, event.status]
+})
+server.on('scrub', (event) => {
+  const check: Expect<Equals<typeof event, ScrubEvent>> = true
+  void [check, event.status, event.deleted, event.unknownCount]
+})
+server.on('cleanup', (event) => {
+  const check: Expect<Equals<typeof event, CleanupEvent>> = true
+  void [check, event.transfer, event.name, event.reason]
+})
+server.on('revoked', (event) => {
+  const check: Expect<Equals<typeof event, FingerprintEvent>> = true
+  void [check, event.fingerprint]
+})
+server.on('close', (event) => {
+  const check: Expect<Equals<typeof event, ServerCloseEvent>> = true
+  void [check, event.status]
+})
+
+client.on('offer', (event) => {
+  const check: Expect<Equals<typeof event, ClientOfferEvent>> = true
+  void [check, event.status, event.resumedChunks, event.totalChunks, event.reason]
+})
+client.on('progress', (event) => {
+  const check: Expect<Equals<typeof event, ClientProgressEvent>> = true
+  void [check, event.chunksSent, event.bytesSent]
+})
+client.on('verification', (event) => {
+  const check: Expect<Equals<typeof event, TransferLifecycleEvent>> = true
+  void [check, event.status]
+})
+client.once('commit', (event) => {
+  const check: Expect<Equals<typeof event, ClientCommitEvent>> = true
+  void [check, event.result, event.status]
+})
+client.on('close', (event) => {
+  const check: Expect<Equals<typeof event, ClientCloseEvent>> = true
+  void [check, event.status]
+})
+
+allowlistWatcher.on('reloaded', (event) => {
+  const check: Expect<Equals<typeof event, AllowlistReloadedEvent>> = true
+  void [check, event.count]
+})
+allowlistWatcher.on('removed', (event) => {
+  const check: Expect<Equals<typeof event, AllowlistRemovedEvent>> = true
+  void [check, event.removed]
+})
+allowlistWatcher.once('failure', (event) => {
+  const check: Expect<Equals<typeof event, AllowlistFailureEvent>> = true
+  void [check, event.reason]
+})
+
+function describeUploadEntry(entry: UploadPathEntry): string {
+  if (entry.kind === 'selected') return entry.path
+  if (entry.kind === 'skipped') return entry.reason
+  return entry.code ?? entry.reason
+}
+void describeUploadEntry

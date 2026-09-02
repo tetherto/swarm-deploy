@@ -11,6 +11,7 @@ const { initLayout } = require('../../dist/storage/layout')
 const { readJson } = require('../../dist/storage/atomic-file')
 const { SessionStore } = require('../../dist/storage/session-store')
 const { CommitStore } = require('../../dist/storage/commit-store')
+const { assertCommitRecord } = require('../../dist/storage/commit-journal')
 const { recoverStorage } = require('../../dist/storage/recovery')
 const { createClock } = require('../helpers/clock')
 const { createTempDir } = require('../helpers/files')
@@ -445,6 +446,50 @@ test('commit removes its publication when revoked during final link', async (t) 
 
   await t.exception(() => commits.commit(session, { signal }), {
     name: 'SwarmDeployError',
+    code: ERRORS.REVOKED
+  })
+
+  t.is(await pathExists(path.join(layout.root, upload.offer.name)), false)
+  t.is(await pathExists(recordPath(layout, upload.offer)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+})
+
+test('assertCommitRecord preserves unknown persisted fields', (t) => {
+  const record = {
+    version: 1,
+    name: 'artifact.bin',
+    size: 17,
+    sha256: hex(sha256(b4a.from('verified artifact'))),
+    committedAt: 1,
+    uploaderFingerprint: hex(sha256(OWNER)),
+    transferId: hex(makeUpload().offer.transferId),
+    replacedAt: 42
+  }
+
+  const validated = assertCommitRecord(record)
+
+  t.is(validated.replacedAt, 42)
+  t.alike(validated, record)
+})
+
+test('commit routes plain revoked errors through revoked cleanup', async (t) => {
+  let staging = null
+  const storage = createStorage({
+    async beforeOperation(name, sourcePath) {
+      if (name === 'link' && sourcePath === staging) {
+        const error = new Error('Uploader access revoked')
+        error.code = ERRORS.REVOKED
+        throw error
+      }
+    }
+  })
+  const { layout, upload, session } = await createVerifiedSession(t, { storage })
+  staging = stagingPath(layout, upload.offer)
+  const commits = new CommitStore({ layout, storage })
+
+  await t.exception(() => commits.commit(session), {
+    name: 'Error',
     code: ERRORS.REVOKED
   })
 

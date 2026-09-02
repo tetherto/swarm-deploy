@@ -2,8 +2,9 @@ import b4a from 'b4a'
 import * as c from 'compact-encoding'
 import crypto from '#crypto'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { encodeToBinary } from './codecs.js'
 import { assertBoundedChunkSize, assertFixed32, assertSafeUint, isFixed32 } from './validation.js'
-import type { Codec, ProtocolState, TransferIdInput } from './types.js'
+import type { Binary, Codec, EncodingState, Fixed32, TransferIdInput } from './types.js'
 
 export const TRANSFER_DOMAIN = 'swarm-deploy/transfer/v1'
 
@@ -11,24 +12,28 @@ interface CanonicalTransferId extends TransferIdInput {
   domain: string
 }
 
-const fixed32Bytes: Codec<Uint8Array, Buffer> = {
-  preencode(state: ProtocolState, value: Uint8Array): void {
+interface DecodedTransferId extends CanonicalTransferId {
+  clientPublicKey: Binary
+  digest: Binary
+}
+
+const fixed32Bytes: Codec<Fixed32, Binary> = {
+  preencode(state: EncodingState, value: Fixed32): void {
     if (!isFixed32(value)) throw new Error('Incorrect buffer size')
     state.end += 32
   },
-  encode(state: ProtocolState, value: Uint8Array): void {
-    if (state.buffer === null) throw new Error('Missing buffer')
+  encode(state: EncodingState, value: Fixed32): void {
     state.buffer.set(b4a.from(value), state.start)
     state.start += 32
   },
-  decode(state: ProtocolState): Buffer {
-    if (state.end - state.start < 32 || state.buffer === null) throw new Error('Out of bounds')
-    return b4a.from(state.buffer.subarray(state.start, (state.start += 32)))
+  decode(state: EncodingState): Binary {
+    if (state.end - state.start < 32) throw new Error('Out of bounds')
+    return state.buffer.subarray(state.start, (state.start += 32))
   }
 }
 
-export const transferIdCanonical: Codec<CanonicalTransferId> = {
-  preencode(state: ProtocolState, value: CanonicalTransferId): void {
+export const transferIdCanonical: Codec<CanonicalTransferId, DecodedTransferId> = {
+  preencode(state: EncodingState, value: CanonicalTransferId): void {
     c.string.preencode(state, value.domain)
     fixed32Bytes.preencode(state, value.clientPublicKey)
     c.string.preencode(state, value.name)
@@ -36,7 +41,7 @@ export const transferIdCanonical: Codec<CanonicalTransferId> = {
     fixed32Bytes.preencode(state, value.digest)
     c.uint.preencode(state, value.chunkSize)
   },
-  encode(state: ProtocolState, value: CanonicalTransferId): void {
+  encode(state: EncodingState, value: CanonicalTransferId): void {
     c.string.encode(state, value.domain)
     fixed32Bytes.encode(state, value.clientPublicKey)
     c.string.encode(state, value.name)
@@ -44,7 +49,7 @@ export const transferIdCanonical: Codec<CanonicalTransferId> = {
     fixed32Bytes.encode(state, value.digest)
     c.uint.encode(state, value.chunkSize)
   },
-  decode(state: ProtocolState): CanonicalTransferId {
+  decode(state: EncodingState): DecodedTransferId {
     return {
       domain: c.string.decode(state),
       clientPublicKey: fixed32Bytes.decode(state),
@@ -56,7 +61,7 @@ export const transferIdCanonical: Codec<CanonicalTransferId> = {
   }
 }
 
-export function encodeTransferIdCanonical(input: TransferIdInput): Uint8Array {
+export function encodeTransferIdCanonical(input: TransferIdInput): Binary {
   assertFixed32(input.clientPublicKey, 'clientPublicKey')
   assertFixed32(input.digest, 'digest')
   assertSafeUint(input.size, 'size')
@@ -65,7 +70,7 @@ export function encodeTransferIdCanonical(input: TransferIdInput): Uint8Array {
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid name')
   }
 
-  return c.encode(transferIdCanonical, {
+  return encodeToBinary(transferIdCanonical, {
     domain: TRANSFER_DOMAIN,
     clientPublicKey: input.clientPublicKey,
     name: input.name,
@@ -81,7 +86,7 @@ export function transferId({
   size,
   digest,
   chunkSize
-}: TransferIdInput): Buffer {
+}: TransferIdInput): Binary {
   return crypto
     .createHash('sha256')
     .update(

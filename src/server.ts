@@ -12,11 +12,30 @@ import {
   createAbortController,
   type AbortSignalLike
 } from './abort.js'
-import { keyPairFromSeed, type KeyPair } from './identity.js'
+import { keyPairFromSeed } from './identity.js'
 import { topicFromServerPublicKey } from './topic.js'
 import { AllowlistWatcher } from './allowlist.js'
 import { ServerSession, UPLOAD_PROTOCOL, DEFAULT_IDLE_TIMEOUT } from './protocol/server-session.js'
-import type { ProtocolChannel, SessionScheduler } from './protocol/types.js'
+import type { ProtocolChannel } from './protocol/types.js'
+import type {
+  AuthenticationEvent,
+  FingerprintEvent,
+  KeyPair,
+  Logger,
+  PublicKey,
+  PublicKeyInput,
+  SeedInput,
+  ServerScheduler,
+  Swarm,
+  SwarmDiscovery,
+  SwarmFactory,
+  SwarmFactoryOptions,
+  SwarmPeerInfo,
+  SwarmSocket,
+  Topic,
+  TransferEvent,
+  TransferLifecycleEvent
+} from './types.js'
 import { initLayout, acquireStorageLock } from './storage/layout.js'
 import { SessionStore } from './storage/session-store.js'
 import { CommitStore } from './storage/commit-store.js'
@@ -38,105 +57,174 @@ const MAX_CONNECTIONS = 1024
 const MAX_ACTIVE_UPLOADS = 1024
 const FINGERPRINT_LENGTH = 12
 
-export interface ServerLogger {
-  info?(message: string, details: Record<string, unknown>): void
-  warn?(message: string, details: Record<string, unknown>): void
-  error?(message: string, details: Record<string, unknown>): void
-}
+export type { AuthenticationEvent, FingerprintEvent, TransferEvent, TransferLifecycleEvent }
 
-export interface ServerScheduler extends SessionScheduler {
-  setInterval(callback: () => void, delay: number): { unref?: () => unknown }
-  clearInterval(timer: unknown): void
-}
+export type ServerLogger = Logger
+export type ServerSocket = SwarmSocket
+export type ServerPeerInfo = SwarmPeerInfo
+export type ServerDiscovery = SwarmDiscovery
+export type ServerSwarm = Swarm
+export type ServerSwarmOptions = SwarmFactoryOptions
+export type ServerSwarmFactory = SwarmFactory
+export type { ServerScheduler }
 
-export interface ServerSocket {
-  destroyed?: boolean
-  remotePublicKey?: Uint8Array
-  on(event: 'error', listener: (error: Error) => void): this
-  once(event: 'close', listener: () => void): this
-  destroy(error?: unknown): void
-}
-
-export interface ServerPeerInfo {
-  publicKey?: Uint8Array
-}
-
-export interface ServerDiscovery {
-  flushed(): Promise<void>
-  destroy?(): void | Promise<void>
-}
-
-export interface ServerSwarm {
-  on(event: 'connection', listener: (socket: ServerSocket, peerInfo?: ServerPeerInfo) => void): this
-  join(topic: Uint8Array, options: { server: boolean; client: boolean }): ServerDiscovery
-  destroy(): void | Promise<void>
-}
-
-export interface ServerSwarmOptions {
-  keyPair: KeyPair
-  dht?: unknown
-  maxPeers: number
-  maxClientConnections: number
-  maxServerConnections: number
-  firewall: (key: Uint8Array) => boolean
-}
-
-export type ServerSwarmFactory = (options: ServerSwarmOptions) => ServerSwarm
-export type AllowlistKey = Uint8Array | string
+/** A public key accepted in an allowlist: a 32-byte buffer or canonical lowercase hex. */
+export type AllowlistKey = PublicKeyInput | string
 
 export interface ServerOptions {
-  seed: Uint8Array
+  /** Required 32-byte persistent server seed. */
+  seed: SeedInput
+  /** Trusted local directory in which final artifacts and internal state live. */
   storageDir: string
+  /** Required uploader allowlist. Entries are 32-byte keys or canonical lowercase hex. */
   allowedKeys: Iterable<AllowlistKey>
+  /** Required positive maximum uploaded artifact size, in bytes. */
   maxFileBytes: number
+  /** Required positive aggregate resumable staging allocation, in bytes. */
   maxStagingBytes: number
+  /** Maximum authenticated transport connections; defaults to 64 and is at most 1024. */
   maxConnections?: number
+  /** Maximum active uploads; defaults to 8, is at most 1024, and cannot exceed maxConnections. */
   maxActiveUploads?: number
+  /** Per-transport and upload idle timeout in milliseconds; defaults to 60,000. */
   idleTimeout?: number
+  /** Retention cleanup interval in milliseconds; defaults to 900,000. */
   cleanupInterval?: number
+  /** Partial-upload expiration in milliseconds; defaults to seven days. */
   resumeTtl?: number
+  /** Bytes which must remain free before accepting a staged upload; defaults to 1 GiB. */
   minFreeBytes?: number
+  /** Optional maximum age, in milliseconds, for committed managed artifacts. */
   maxAge?: number
+  /** Optional aggregate committed managed-artifact limit, in bytes. */
   maxStorageBytes?: number
+  /** Optional HyperDHT instance passed to Hyperswarm. */
   dht?: unknown
+  /** Optional trusted filesystem adapter; defaults to fs.promises. */
   storage?: StorageAdapter
+  /** Optional timer adapter; defaults to global timers. */
   scheduler?: ServerScheduler
-  swarmFactory?: ServerSwarmFactory
+  /** Optional Hyperswarm constructor seam; defaults to Hyperswarm. */
+  swarmFactory?: SwarmFactory
+  /** Optional allowlist text file to load at start and poll for revocations. */
   allowlistPath?: string
-  logger?: ServerLogger | null
+  /** Optional diagnostic sink. Logger failures are ignored. */
+  logger?: Logger | null
+  /** Names whose committed artifacts may be replaced by a subsequent upload. */
   replaceNames?: Iterable<string>
 }
 
-export interface ServerConnectionEvent {
-  fingerprint: string
+export interface ServerConnectionEvent extends FingerprintEvent {
   connections: number
 }
 
+export type ConnectionOpenEvent = ServerConnectionEvent
+export type ConnectionCloseEvent = ServerConnectionEvent
+
+export interface ServerListeningEvent {
+  /** The server public-key fingerprint, despite this historical property name. */
+  publicKey: string
+}
+
+export interface ServerOfferEvent extends TransferEvent, FingerprintEvent {
+  status: 'accepted' | 'resumed' | 'rejected' | 'already-committed'
+  resumed?: boolean
+  reason?: string
+}
+
+export interface ServerProgressEvent extends TransferEvent, FingerprintEvent {
+  chunkIndex: number
+  chunksReceived: number
+  totalChunks: number
+  bytesReceived: number
+  totalBytes: number
+}
+
+export type ServerTransferLifecycleEvent = TransferLifecycleEvent & FingerprintEvent
+
+export interface RecoveryEvent {
+  status:
+    | 'started'
+    | 'completed'
+    | 'failed'
+    | 'CORRUPT'
+    | 'COMMITTED'
+    | 'ABORTED'
+    | 'RESUMABLE'
+    | 'MISSING'
+    | 'FILE_EXISTS'
+  transfer?: string
+  phase?: 'classification' | 'sessions' | 'journal'
+  reason?: string
+  journals?: number
+  purgedSessions?: number
+}
+
+export interface ScrubEvent {
+  status: 'started' | 'completed' | 'failed'
+  reason?: string
+  deleted?: number
+  unknownCount?: number
+}
+
+export interface RetentionEvent {
+  trigger: 'startup' | 'scheduled' | 'manual' | 'commit' | 'post-commit'
+  status: 'completed' | 'deferred' | 'failed'
+  reason?: string
+  expiredSessions?: number
+  scrubbed?: number
+  ageDeleted?: number
+  storageDeleted?: number
+}
+
+export interface CleanupEvent {
+  transfer: string
+  name: string | null
+  reason:
+    | 'delete'
+    | 'revocation'
+    | 'offline-revocation'
+    | 'expiry'
+    | 'checksum'
+    | 'recovery'
+    | 'corrupt-journal'
+}
+
+export interface AllowlistEvent {
+  status: 'completed' | 'failed'
+  appliedCount: number
+  pendingCount: number
+  reason?: string
+}
+
+export interface ServerCloseEvent {
+  status: 'closed' | 'failed'
+}
+
 export interface ServerEventMap {
-  authentication: { status: 'accepted' | 'rejected'; fingerprint: string; reason?: ErrorCode }
+  authentication: AuthenticationEvent
   connection: ServerConnectionEvent
-  'connection-open': ServerConnectionEvent
-  'connection-close': ServerConnectionEvent
-  allowlist: {
-    status: 'completed' | 'failed'
-    appliedCount: number
-    pendingCount: number
-    reason?: string
-  }
-  revoked: { fingerprint: string }
-  revocation: { fingerprint: string }
-  listening: { publicKey: string }
-  close: { status: 'closed' | 'failed' }
+  'connection-open': ConnectionOpenEvent
+  'connection-close': ConnectionCloseEvent
+  offer: ServerOfferEvent
+  progress: ServerProgressEvent
+  verification: ServerTransferLifecycleEvent
+  commit: ServerTransferLifecycleEvent
+  recovery: RecoveryEvent
+  scrub: ScrubEvent
+  retention: RetentionEvent
+  cleanup: CleanupEvent
+  allowlist: AllowlistEvent
+  revocation: FingerprintEvent
+  revoked: FingerprintEvent
+  listening: ServerListeningEvent
+  close: ServerCloseEvent
 }
 
 export type ServerEventName = keyof ServerEventMap
 export type ServerEvent = ServerEventMap[ServerEventName]
 
-interface SafeLogger {
-  info(message: string, details: Record<string, unknown>): void
-  warn(message: string, details: Record<string, unknown>): void
-  error(message: string, details: Record<string, unknown>): void
-}
+type SafeLogger = Required<Logger>
 
 interface UploadReservation {
   id: string
@@ -283,10 +371,23 @@ function isProtocolChannel(value: unknown): value is ProtocolChannel {
   )
 }
 
+export interface Server {
+  on<EventName extends ServerEventName>(
+    event: EventName,
+    listener: (event: ServerEventMap[EventName]) => void
+  ): this
+  on(event: string | symbol, listener: (...args: unknown[]) => void): this
+  once<EventName extends ServerEventName>(
+    event: EventName,
+    listener: (event: ServerEventMap[EventName]) => void
+  ): this
+  once(event: string | symbol, listener: (...args: unknown[]) => void): this
+}
+
 export class Server extends EventEmitter {
-  readonly _keyPair: KeyPair
-  readonly publicKey: Buffer
-  readonly topic: Buffer
+  private readonly _keyPair: KeyPair
+  readonly publicKey: PublicKey
+  readonly topic: Topic
   readonly storageDir: string
   readonly maxFileBytes: number
   readonly maxStagingBytes: number
@@ -301,33 +402,33 @@ export class Server extends EventEmitter {
   readonly dht: unknown
   readonly storage: StorageAdapter
   readonly scheduler: ServerScheduler
-  readonly swarmFactory: ServerSwarmFactory
+  readonly swarmFactory: SwarmFactory
   readonly allowlistPath: string | undefined
-  readonly logger: SafeLogger
-  _allowlist: Set<string>
-  _connections: Map<ServerSocket, Connection>
-  _sockets: Map<string, Set<ServerSocket>>
-  _sessions: Set<ServerSession>
-  _activeUploads: Map<string, { references: number }>
-  layout: StorageLayout | null
-  sessionStore: SessionStore | null
-  commitStore: CommitStore | null
-  retentionManager: RetentionManager | null
-  allowlistWatcher: AllowlistWatcher | null
-  swarm: ServerSwarm | null
-  discovery: ServerDiscovery | null
-  releaseStorageLock: (() => Promise<void>) | null
+  readonly logger: Required<Logger>
   listening: boolean
   closed: boolean
-  listenPromise: Promise<this> | null
-  closePromise: Promise<void> | null
-  reloadPromise: Promise<unknown>
-  pendingRevocations: Map<string, PendingRevocation>
-  readonly abortController: ReturnType<typeof createAbortController>
-  readonly signal: AbortSignalLike
-  abortDisposals: Promise<void>[]
-  abortErrors: unknown[]
-  disposePromise: Promise<void> | null
+  private _allowlist: Set<string>
+  private _connections: Map<SwarmSocket, Connection>
+  private _sockets: Map<string, Set<SwarmSocket>>
+  private _sessions: Set<ServerSession>
+  private _activeUploads: Map<string, { references: number }>
+  private layout: StorageLayout | null
+  private sessionStore: SessionStore | null
+  private commitStore: CommitStore | null
+  private retentionManager: RetentionManager | null
+  private allowlistWatcher: AllowlistWatcher | null
+  private swarm: Swarm | null
+  private discovery: SwarmDiscovery | null
+  private releaseStorageLock: (() => Promise<void>) | null
+  private listenPromise: Promise<this> | null
+  private closePromise: Promise<void> | null
+  private reloadPromise: Promise<unknown>
+  private pendingRevocations: Map<string, PendingRevocation>
+  private readonly abortController: ReturnType<typeof createAbortController>
+  private readonly signal: AbortSignalLike
+  private abortDisposals: Promise<void>[]
+  private abortErrors: unknown[]
+  private disposePromise: Promise<void> | null
 
   constructor(options: ServerOptions) {
     super()
@@ -431,22 +532,22 @@ export class Server extends EventEmitter {
     return new Set(this._allowlist)
   }
 
-  _isAllowed(key: unknown): key is Uint8Array {
+  private _isAllowed(key: unknown): key is Uint8Array {
     return b4a.isBuffer(key) && key.byteLength === 32 && this._allowlist.has(keyHex(key))
   }
 
-  _emitSafe(event: string, details: Record<string, unknown>): void {
+  private _emitSafe(event: string, details: Record<string, unknown>): void {
     try {
       this.emit(event, details)
     } catch {}
   }
 
-  _assertStarting() {
+  private _assertStarting() {
     if (this.closed) throw abortError()
     throwIfAborted(this.signal)
   }
 
-  _firewall(key: unknown): boolean {
+  private _firewall(key: unknown): boolean {
     const rejected = !this._isAllowed(key)
     if (rejected) {
       const details = {
@@ -460,7 +561,7 @@ export class Server extends EventEmitter {
     return rejected
   }
 
-  _reserveUpload(transferId: Uint8Array): UploadReservation | null {
+  private _reserveUpload(transferId: Uint8Array): UploadReservation | null {
     const id = keyHex(transferId)
     if (this._activeUploads.has(id)) return null
     if (this._activeUploads.size >= this.maxActiveUploads) return null
@@ -468,7 +569,7 @@ export class Server extends EventEmitter {
     return { id }
   }
 
-  _releaseUpload(reservation: unknown): void {
+  private _releaseUpload(reservation: unknown): void {
     if (
       typeof reservation !== 'object' ||
       reservation === null ||
@@ -483,7 +584,7 @@ export class Server extends EventEmitter {
     if (active.references <= 0) this._activeUploads.delete(reservation.id)
   }
 
-  _isSessionActive(session: unknown): boolean {
+  private _isSessionActive(session: unknown): boolean {
     return (
       typeof session === 'object' &&
       session !== null &&
@@ -493,13 +594,13 @@ export class Server extends EventEmitter {
     )
   }
 
-  _destroySocket(socket: ServerSocket, error?: unknown): void {
+  private _destroySocket(socket: SwarmSocket, error?: unknown): void {
     try {
       socket.destroy(error)
     } catch {}
   }
 
-  _removeConnection(socket: ServerSocket, connection: Connection): void {
+  private _removeConnection(socket: SwarmSocket, connection: Connection): void {
     if (connection.transportTimer) this.scheduler.clearTimeout(connection.transportTimer)
     this._connections.delete(socket)
     const sockets = this._sockets.get(connection.owner)
@@ -508,12 +609,12 @@ export class Server extends EventEmitter {
     if (sockets.size === 0) this._sockets.delete(connection.owner)
   }
 
-  _onSessionTerminal(session: ServerSession, connection: Connection): void {
+  private _onSessionTerminal(session: ServerSession, connection: Connection): void {
     connection.sessions.delete(session)
     this._sessions.delete(session)
   }
 
-  _onPair(
+  private _onPair(
     mux: { createChannel(options: { protocol: string; id: Uint8Array }): unknown },
     socket: ServerSocket,
     connection: Connection,
@@ -562,7 +663,7 @@ export class Server extends EventEmitter {
     this._sessions.add(session)
   }
 
-  _onConnection(socket: ServerSocket, peerInfo: ServerPeerInfo | null = null): void {
+  private _onConnection(socket: SwarmSocket, peerInfo: SwarmPeerInfo | null = null): void {
     if (socket && typeof socket.on === 'function') socket.on('error', () => {})
     const ownerKey = socket?.remotePublicKey || peerInfo?.publicKey
     if (this.closed || !this._isAllowed(ownerKey)) {
@@ -662,7 +763,7 @@ export class Server extends EventEmitter {
     return run
   }
 
-  async _applyAllowlist(next: Set<string>): Promise<Set<string>> {
+  private async _applyAllowlist(next: Set<string>): Promise<Set<string>> {
     let swapped = false
     try {
       for (const key of this.pendingRevocations.keys()) {
@@ -694,7 +795,7 @@ export class Server extends EventEmitter {
     return new Set(this._allowlist)
   }
 
-  async _revokeOwner(key: string): Promise<void> {
+  private async _revokeOwner(key: string): Promise<void> {
     let pending = this.pendingRevocations.get(key)
     if (!pending) {
       pending = { transferIds: new Set() }
@@ -727,21 +828,21 @@ export class Server extends EventEmitter {
     const settled = await Promise.allSettled([...sessions].map((session) => session.settle()))
     for (const result of settled) if (result.status === 'rejected') errors.push(result.reason)
     if (errors.length) throw new AggregateError(errors, 'Uploader revocation cleanup failed')
-    const commitStore = this.commitStore
-    const sessionStore = this.sessionStore
-    if (!commitStore || !sessionStore) {
-      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Server storage is not ready')
-    }
     for (const id of pending.transferIds) {
       try {
-        await commitStore.retryAbortedAttempt(b4a.from(id, 'hex'), sessionStore)
+        const commitStore = this.commitStore
+        if (!commitStore) {
+          throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Server storage is not ready')
+        }
+        await commitStore.retryAbortedAttempt(b4a.from(id, 'hex'), this.sessionStore)
       } catch (err) {
         errors.push(err)
       }
     }
     if (errors.length) throw new AggregateError(errors, 'Uploader revocation cleanup failed')
     try {
-      await sessionStore.deleteByOwner(b4a.from(key, 'hex'))
+      const sessionStore = this.sessionStore
+      if (sessionStore) await sessionStore.deleteByOwner(b4a.from(key, 'hex'))
     } catch (err) {
       errors.push(err)
     }
@@ -753,7 +854,7 @@ export class Server extends EventEmitter {
     this._emitSafe('revocation', details)
   }
 
-  async _start(): Promise<this> {
+  private async _start(): Promise<this> {
     try {
       this._assertStarting()
       this.layout = initLayout(this.storageDir)
@@ -912,7 +1013,7 @@ export class Server extends EventEmitter {
     return this.listenPromise
   }
 
-  _abortStartupResources(): void {
+  private _abortStartupResources(): void {
     this.abortController.abort()
     const discovery = this.discovery
     const swarm = this.swarm
@@ -934,13 +1035,13 @@ export class Server extends EventEmitter {
     }
   }
 
-  _dispose(): Promise<void> {
+  private _dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise
     this.disposePromise = this._disposeResources()
     return this.disposePromise
   }
 
-  async _disposeResources(): Promise<void> {
+  private async _disposeResources(): Promise<void> {
     const errors = [...this.abortErrors]
     const attempt = async (operation: () => void | Promise<void>): Promise<void> => {
       try {

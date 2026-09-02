@@ -12,11 +12,33 @@ import {
   type AbortSignalLike
 } from './abort.js'
 import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
-import { buildFileManifest, selectUploadPaths, type UploadPathEntry } from './files.js'
-import { keyPairFromSeed, type KeyPair } from './identity.js'
+import { buildFileManifest, selectUploadPaths, type SkippedUploadReason } from './files.js'
+import { keyPairFromSeed } from './identity.js'
 import { ClientSession, UPLOAD_PROTOCOL } from './protocol/client-session.js'
-import type { FileManifest, ProtocolChannel, SessionScheduler } from './protocol/types.js'
+import type { FileManifest, ProtocolChannel } from './protocol/types.js'
 import { topicFromServerPublicKey } from './topic.js'
+import type {
+  AuthenticationEvent,
+  Clock,
+  Digest,
+  FingerprintEvent,
+  KeyPair,
+  Logger,
+  PublicKey,
+  PublicKeyInput,
+  Scheduler,
+  SeedInput,
+  Swarm,
+  SwarmDiscovery,
+  SwarmFactory,
+  SwarmFactoryOptions,
+  SwarmPeerInfo,
+  SwarmSocket,
+  Topic,
+  TransferEvent,
+  TransferId,
+  TransferLifecycleEvent
+} from './types.js'
 
 const DEFAULT_CONNECT_TIMEOUT = 30_000
 const MAX_CONNECT_TIMEOUT = 30_000
@@ -27,59 +49,34 @@ const MAX_RECONNECT_DELAY = 1_000
 const FINGERPRINT_LENGTH = 12
 const EventEmitter = events.EventEmitter
 
-export interface ClientLogger {
-  info?(message: string, details: Record<string, unknown>): void
-  warn?(message: string, details: Record<string, unknown>): void
-  error?(message: string, details: Record<string, unknown>): void
-}
-
-export interface ClientClock {
-  now(): number
-}
-
-export interface ClientSocket {
-  destroyed?: boolean
-  remotePublicKey?: Uint8Array
-  on(event: 'error', listener: (error: Error) => void): this
-  once(event: 'close', listener: () => void): this
-  destroy(error?: unknown): void
-}
-
-export interface ClientPeerInfo {
-  publicKey?: Uint8Array
-}
-
-export interface ClientDiscovery {
-  flushed(): Promise<void>
-  destroy?(): void | Promise<void>
-}
-
-export interface ClientSwarm {
-  on(event: 'connection', listener: (socket: ClientSocket, peerInfo?: ClientPeerInfo) => void): this
-  join(topic: Uint8Array, options: { server: boolean; client: boolean }): ClientDiscovery
-  destroy(): void | Promise<void>
-}
-
-export interface ClientSwarmOptions {
-  keyPair: KeyPair
-  dht?: unknown
-  maxPeers: number
-  maxClientConnections: number
-  maxServerConnections: number
-}
-
-export type ClientSwarmFactory = (options: ClientSwarmOptions) => ClientSwarm
+export type ClientLogger = Logger
+export type ClientClock = Clock
+export type ClientSocket = SwarmSocket
+export type ClientPeerInfo = SwarmPeerInfo
+export type ClientDiscovery = SwarmDiscovery
+export type ClientSwarm = Swarm
+export type ClientSwarmOptions = SwarmFactoryOptions
+export type ClientSwarmFactory = SwarmFactory
 
 export interface ClientOptions {
-  seed: Uint8Array
-  serverPublicKey: Uint8Array
+  /** Required 32-byte persistent client seed. */
+  seed: SeedInput
+  /** Required, pinned 32-byte server public key. It must differ from the client public key. */
+  serverPublicKey: PublicKeyInput
+  /** Discovery/reconnect window in milliseconds; defaults to 30,000 and is at most 30,000. */
   connectTimeout?: number
+  /** Per-upload idle timeout in milliseconds; defaults to 60,000. */
   idleTimeout?: number
+  /** Optional HyperDHT instance passed to Hyperswarm. */
   dht?: unknown
-  scheduler?: SessionScheduler
-  clock?: ClientClock
-  swarmFactory?: ClientSwarmFactory
-  logger?: ClientLogger | null
+  /** Optional timer adapter; defaults to global timers. */
+  scheduler?: Scheduler
+  /** Optional wall-clock adapter used for connection deadlines; defaults to Date. */
+  clock?: Clock
+  /** Optional Hyperswarm constructor seam; defaults to Hyperswarm. */
+  swarmFactory?: SwarmFactory
+  /** Optional diagnostic sink. Logger failures are ignored. */
+  logger?: Logger | null
 }
 
 export type UploadStatus = 'COMMITTED' | 'ALREADY_COMMITTED'
@@ -87,30 +84,32 @@ export interface UploadResult {
   status: UploadStatus
   name: string
   size: number
-  digest: Buffer
-  transferId: Buffer
+  digest: Digest
+  transferId: TransferId
 }
 export interface BatchUploadFailure {
   name: string
   status: ErrorCode
   reason?: string
 }
+export interface SkippedUploadEntry {
+  name: string
+  path: string
+  reason: SkippedUploadReason
+}
 export interface BatchUploadResult {
   status: 'COMMITTED' | 'FAILED'
   results: Array<UploadResult | BatchUploadFailure>
-  skipped: UploadPathEntry[]
+  skipped: SkippedUploadEntry[]
 }
 export type ClientUploadResult = UploadResult | BatchUploadResult
 
-export interface ClientTransferEvent {
-  transfer: string
-  name: string
-  size: number
-}
+export type { AuthenticationEvent, FingerprintEvent, TransferEvent, TransferLifecycleEvent }
+
 export interface ClientSuccessEvent {
   name: string
   status: UploadStatus
-  reason?: string
+  reason?: undefined
   final: boolean
 }
 export interface ClientFailureEvent {
@@ -122,56 +121,58 @@ export interface ClientFailureEvent {
 export interface ClientBatchResultEvent {
   status: 'COMMITTED' | 'FAILED'
   final: true
-  reason?: string
   files: number
   committed: number
   failed: number
   skipped: number
+  reason?: undefined
 }
 export type ClientResultEvent = ClientSuccessEvent | ClientFailureEvent | ClientBatchResultEvent
-export interface ClientOfferEvent extends ClientTransferEvent {
+/** Emitted for a skipped direct child during a directory upload. */
+export interface ClientSkippedEvent {
+  name: string
+  reason: SkippedUploadReason
+}
+export interface ClientOfferEvent extends TransferEvent {
   status: 'offered' | 'accepted' | 'resumed' | 'rejected' | 'already-committed'
   resumedChunks?: number
   totalChunks?: number
   reason?: ErrorCode
 }
-export interface ClientProgressEvent extends ClientTransferEvent {
+export interface ClientProgressEvent extends TransferEvent {
   chunkIndex: number
   chunksSent: number
   totalChunks: number
   bytesSent: number
   totalBytes: number
 }
-export interface ClientLifecycleEvent extends ClientTransferEvent {
-  status: 'started' | 'succeeded' | 'failed'
-  reason?: string
-}
-export interface ClientCommitEvent extends ClientLifecycleEvent {
+export interface ClientCommitEvent extends TransferLifecycleEvent {
   result?: UploadStatus
+}
+export interface ClientCloseEvent {
+  status: 'closed'
+  reason?: undefined
 }
 
 export interface ClientEventMap {
-  authentication: { status: 'accepted' | 'rejected'; fingerprint: string; reason?: ErrorCode }
-  connection: { fingerprint: string }
-  'connection-open': { fingerprint: string }
-  'connection-close': { fingerprint: string }
-  'rejected-peer': { fingerprint: string }
+  authentication: AuthenticationEvent
+  connection: FingerprintEvent
+  'connection-open': FingerprintEvent
+  'connection-close': FingerprintEvent
+  'rejected-peer': FingerprintEvent
   offer: ClientOfferEvent
   progress: ClientProgressEvent
-  verification: ClientLifecycleEvent
+  verification: TransferLifecycleEvent
   commit: ClientCommitEvent
   result: ClientResultEvent
-  skipped: { name: string; reason: string }
-  close: { status: 'closed'; reason?: string }
+  skipped: ClientSkippedEvent
+  close: ClientCloseEvent
 }
 export type ClientEventName = keyof ClientEventMap
+/** A payload emitted by any Client event. Use ClientEventMap for event-name narrowing. */
 export type ClientEvent = ClientEventMap[ClientEventName]
 
-interface SafeLogger {
-  info(message: string, details: Record<string, unknown>): void
-  warn(message: string, details: Record<string, unknown>): void
-  error(message: string, details: Record<string, unknown>): void
-}
+export type SafeLogger = Required<Logger>
 
 interface SocketWaiter {
   resolve(socket: ClientSocket): void
@@ -285,34 +286,47 @@ function isErrorCode(value: string): value is ErrorCode {
   return Object.values(ERRORS).some((code) => code === value)
 }
 
+export interface Client {
+  on<EventName extends ClientEventName>(
+    event: EventName,
+    listener: (event: ClientEventMap[EventName]) => void
+  ): this
+  on(event: string | symbol, listener: (...args: unknown[]) => void): this
+  once<EventName extends ClientEventName>(
+    event: EventName,
+    listener: (event: ClientEventMap[EventName]) => void
+  ): this
+  once(event: string | symbol, listener: (...args: unknown[]) => void): this
+}
+
 export class Client extends EventEmitter {
-  readonly _keyPair: KeyPair
-  readonly publicKey: Buffer
-  readonly serverPublicKey: Buffer
-  readonly topic: Buffer
+  private readonly _keyPair: KeyPair
+  readonly publicKey: PublicKey
+  readonly serverPublicKey: PublicKey
+  readonly topic: Topic
   readonly connectTimeout: number
   readonly idleTimeout: number
   readonly dht: unknown
-  readonly scheduler: SessionScheduler
-  readonly clock: ClientClock
-  readonly swarmFactory: ClientSwarmFactory
-  readonly logger: SafeLogger
-  swarm: ClientSwarm | null
-  discovery: ClientDiscovery | null
-  socket: ClientSocket | null
-  sockets: Set<ClientSocket>
-  sessions: Set<ClientSession>
-  socketWaiters: SocketWaiter[]
-  delayWaiters: DelayWaiter[]
+  readonly scheduler: Scheduler
+  readonly clock: Clock
+  readonly swarmFactory: SwarmFactory
+  readonly logger: Required<Logger>
   closed: boolean
-  closePromise: Promise<void> | null
-  disposePromise: Promise<void> | null
-  abortDisposals: Promise<void>[]
-  abortErrors: unknown[]
-  startPromise: Promise<this> | null
-  uploadQueue: Promise<void>
-  readonly abortController: ReturnType<typeof createAbortController>
-  readonly signal: AbortSignalLike
+  private swarm: Swarm | null
+  private discovery: SwarmDiscovery | null
+  private socket: SwarmSocket | null
+  private sockets: Set<SwarmSocket>
+  private sessions: Set<ClientSession>
+  private socketWaiters: SocketWaiter[]
+  private delayWaiters: DelayWaiter[]
+  private closePromise: Promise<void> | null
+  private disposePromise: Promise<void> | null
+  private abortDisposals: Promise<void>[]
+  private abortErrors: unknown[]
+  private startPromise: Promise<this> | null
+  private uploadQueue: Promise<void>
+  private readonly abortController: ReturnType<typeof createAbortController>
+  private readonly signal: AbortSignalLike
 
   constructor(options: ClientOptions) {
     super()
@@ -371,13 +385,13 @@ export class Client extends EventEmitter {
     this.signal = this.abortController.signal
   }
 
-  _emitSafe(event: string, details: Record<string, unknown>): void {
+  private _emitSafe(event: string, details: Record<string, unknown>): void {
     try {
       this.emit(event, details)
     } catch {}
   }
 
-  async _start(): Promise<this> {
+  private async _start(): Promise<this> {
     try {
       this.swarm = this.swarmFactory({
         keyPair: this._keyPair,
@@ -408,13 +422,13 @@ export class Client extends EventEmitter {
     }
   }
 
-  _ensureStarted(): Promise<this> {
+  private _ensureStarted(): Promise<this> {
     if (this.closed) return Promise.reject(clientClosedError())
     if (!this.startPromise) this.startPromise = this._start()
     return this.startPromise
   }
 
-  _resolveSocketWaiters(socket: ClientSocket): void {
+  private _resolveSocketWaiters(socket: SwarmSocket): void {
     const waiters = this.socketWaiters
     this.socketWaiters = []
     for (const waiter of waiters) {
@@ -423,7 +437,7 @@ export class Client extends EventEmitter {
     }
   }
 
-  _rejectSocketWaiters(error: unknown): void {
+  private _rejectSocketWaiters(error: unknown): void {
     const waiters = this.socketWaiters
     this.socketWaiters = []
     for (const waiter of waiters) {
@@ -432,7 +446,7 @@ export class Client extends EventEmitter {
     }
   }
 
-  _onConnection(socket: ClientSocket, peerInfo: ClientPeerInfo | null = null): void {
+  private _onConnection(socket: SwarmSocket, peerInfo: SwarmPeerInfo | null = null): void {
     if (socket && typeof socket.on === 'function') socket.on('error', () => {})
     const peerKey = peerInfo?.publicKey || socket?.remotePublicKey
     if (
@@ -477,7 +491,7 @@ export class Client extends EventEmitter {
     this._resolveSocketWaiters(socket)
   }
 
-  _waitForSocket(deadline: number): Promise<ClientSocket> {
+  private _waitForSocket(deadline: number): Promise<SwarmSocket> {
     if (this.closed || this.signal.aborted) return Promise.reject(abortError())
     if (this.socket && !this.socket.destroyed) return Promise.resolve(this.socket)
     const remaining = deadline - this.clock.now()
@@ -510,7 +524,7 @@ export class Client extends EventEmitter {
     })
   }
 
-  _delay(timeout: number, signal: AbortSignalLike | null = this.signal): Promise<boolean> {
+  private _delay(timeout: number, signal: AbortSignalLike | null = this.signal): Promise<boolean> {
     if (this.closed || signal?.aborted) return Promise.reject(abortError())
     return new Promise((resolve, reject) => {
       let removeAbort = () => {}
@@ -533,7 +547,7 @@ export class Client extends EventEmitter {
     })
   }
 
-  _rejectDelays(error: unknown): void {
+  private _rejectDelays(error: unknown): void {
     const waiters = this.delayWaiters
     this.delayWaiters = []
     for (const waiter of waiters) {
@@ -542,7 +556,7 @@ export class Client extends EventEmitter {
     }
   }
 
-  async _startSession(socket: ClientSocket, manifest: FileManifest): Promise<UploadResult> {
+  private async _startSession(socket: SwarmSocket, manifest: FileManifest): Promise<UploadResult> {
     if (this.closed || socket !== this.socket || socket.destroyed) throw transportError()
     const mux = Protomux.from(socket)
     const channel = mux.createChannel({
@@ -578,7 +592,7 @@ export class Client extends EventEmitter {
     }
   }
 
-  async _uploadManifest(manifest: FileManifest): Promise<UploadResult> {
+  private async _uploadManifest(manifest: FileManifest): Promise<UploadResult> {
     await this._ensureStarted()
     let deadline = this.clock.now() + this.connectTimeout
     let delay = INITIAL_RECONNECT_DELAY
@@ -611,14 +625,14 @@ export class Client extends EventEmitter {
     )
   }
 
-  _reportResult(result: UploadResult, final = true): UploadResult {
+  private _reportResult(result: UploadResult, final = true): UploadResult {
     const details = { name: result.name, status: result.status, final }
     this.logger.info('Upload completed', details)
     this._emitSafe('result', details)
     return result
   }
 
-  async _upload(inputPath: string): Promise<ClientUploadResult> {
+  private async _upload(inputPath: string): Promise<ClientUploadResult> {
     throwIfAborted(this.signal)
     if (typeof inputPath !== 'string' || inputPath.length === 0) {
       throw configurationError(ERRORS.INVALID_FILENAME, 'Invalid upload path')
@@ -685,7 +699,7 @@ export class Client extends EventEmitter {
     return batch
   }
 
-  upload(inputPath: string): Promise<ClientUploadResult> {
+  upload(inputPath: string): Promise<UploadResult | BatchUploadResult> {
     if (this.closed || this.signal.aborted) return Promise.reject(abortError())
     const operation = this.uploadQueue.then(
       () => this._upload(inputPath),
@@ -706,7 +720,7 @@ export class Client extends EventEmitter {
     return pending
   }
 
-  _abortResources(): void {
+  private _abortResources(): void {
     const error = abortError()
     this._rejectSocketWaiters(error)
     this._rejectDelays(error)
@@ -745,13 +759,13 @@ export class Client extends EventEmitter {
     }
   }
 
-  _dispose(): Promise<void> {
+  private _dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise
     this.disposePromise = this._disposeResources()
     return this.disposePromise
   }
 
-  async _disposeResources(): Promise<void> {
+  private async _disposeResources(): Promise<void> {
     const errors = [...this.abortErrors]
     this._rejectSocketWaiters(clientClosedError())
     this._rejectDelays(clientClosedError())

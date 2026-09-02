@@ -107,6 +107,10 @@ interface SessionStoreOptions {
     | null
 }
 
+function isBytes(value: unknown): value is Uint8Array {
+  return b4a.isBuffer(value) || value instanceof Uint8Array
+}
+
 function errorCode(error: unknown): string | null {
   if (typeof error !== 'object' || error === null || !('code' in error)) return null
   return typeof error.code === 'string' ? error.code : null
@@ -898,9 +902,7 @@ class SessionStore {
       if (!chunk || typeof chunk !== 'object') throw storageError('Invalid chunk')
       assertSafeUint(chunk.index, 'chunk index')
       assertFixed32(chunk.digest, 'chunk digest')
-      if (!(b4a.isBuffer(chunk.data) || chunk.data instanceof Uint8Array)) {
-        throw storageError('Invalid chunk bytes')
-      }
+      if (!isBytes(chunk.data)) throw storageError('Invalid chunk bytes')
 
       const id = toHex(transferId)
       const session = this.sessions.get(id)

@@ -4,6 +4,7 @@ import os from '#os'
 import crypto from '#crypto'
 import { abortError, onAbort, throwIfAborted, type AbortSignalLike } from './abort.js'
 import { ERRORS, SwarmDeployError } from './errors.js'
+import type { Digest } from './types.js'
 
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
 const DEFAULT_CHUNK_SIZE = 1024 * 1024
@@ -18,15 +19,20 @@ export interface FileManifest {
   path: string
   name: string
   size: number
-  digest: Buffer
-  chunkDigests: Buffer[]
+  digest: Digest
+  chunkDigests: Digest[]
   chunkCount: number
   chunkSize: number
   stat: FileSnapshot
 }
 
 export interface BuildFileManifestOptions {
-  chunkSize?: unknown
+  /** Logical chunk size in bytes; defaults to 1 MiB. */
+  chunkSize?: number
+  signal?: AbortSignalLike | null
+}
+
+export interface SelectUploadPathsOptions {
   signal?: AbortSignalLike | null
 }
 
@@ -88,10 +94,7 @@ function assertStableStat(before: FileSnapshot, after: FileSnapshot): void {
 }
 
 type SelectedEntry = { kind: 'selected'; name: string }
-type SkippedEntry = {
-  kind: 'skipped'
-  reason: 'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename'
-}
+type SkippedEntry = { kind: 'skipped'; reason: SkippedUploadReason }
 type ClassifiedEntry = SelectedEntry | SkippedEntry
 
 function errorCode(error: unknown): string | null {
@@ -120,24 +123,41 @@ function classifyEntry(entryPath: string, stat: fs.Stats): ClassifiedEntry {
   return { kind: 'selected', name }
 }
 
-export interface UploadPathEntry {
-  kind?: 'selected' | 'skipped' | 'failed'
+export type SkippedUploadReason = 'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename'
+
+export interface SelectedUploadPath {
+  kind: 'selected'
   name: string
   path: string
-  reason?: string
-  code?: string | null
 }
+
+export interface SkippedUploadPath {
+  kind: 'skipped'
+  name: string
+  path: string
+  reason: SkippedUploadReason
+}
+
+export interface FailedUploadPath {
+  kind: 'failed'
+  name: string
+  path: string
+  reason: 'unreadable'
+  code: string | null
+}
+
+export type UploadPathEntry = SelectedUploadPath | SkippedUploadPath | FailedUploadPath
 
 export interface UploadPathSelection {
   paths: string[]
-  skipped: UploadPathEntry[]
-  failed: UploadPathEntry[]
+  skipped: Array<Omit<SkippedUploadPath, 'kind'>>
+  failed: Array<Omit<FailedUploadPath, 'kind'>>
   entries: UploadPathEntry[]
 }
 
 export async function selectUploadPaths(
   inputPath: string,
-  { signal = null }: { signal?: AbortSignalLike | null } = {}
+  { signal = null }: SelectUploadPathsOptions = {}
 ): Promise<UploadPathSelection> {
   throwIfAborted(signal)
   const rootStat = await fs.promises.lstat(inputPath)
@@ -165,8 +185,8 @@ export async function selectUploadPaths(
   names.sort()
 
   const paths: string[] = []
-  const skipped: UploadPathEntry[] = []
-  const failed: UploadPathEntry[] = []
+  const skipped: Array<Omit<SkippedUploadPath, 'kind'>> = []
+  const failed: Array<Omit<FailedUploadPath, 'kind'>> = []
   const entries: UploadPathEntry[] = []
 
   for (const name of names) {
@@ -177,7 +197,12 @@ export async function selectUploadPaths(
       entryStat = await fs.promises.lstat(entryPath)
     } catch (err: unknown) {
       throwIfAborted(signal)
-      const entry = { name, path: entryPath, reason: 'unreadable', code: errorCode(err) }
+      const entry: Omit<FailedUploadPath, 'kind'> = {
+        name,
+        path: entryPath,
+        reason: 'unreadable',
+        code: errorCode(err)
+      }
       failed.push(entry)
       entries.push({ kind: 'failed', ...entry })
       continue

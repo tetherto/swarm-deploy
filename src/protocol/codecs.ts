@@ -8,7 +8,9 @@ import {
   MAX_CONTROL_BYTES,
   MAX_CHUNK_BYTES,
   MAX_CHUNK_COUNT,
-  MAX_BITMAP_BITS
+  MAX_BITMAP_BITS,
+  type ResultCode,
+  type StatusCode
 } from './constants.js'
 import {
   assertFixed32,
@@ -17,54 +19,87 @@ import {
   assertBoundedChunkSize
 } from './validation.js'
 import type {
+  Binary,
+  BinaryInput,
   BitmapPage,
+  BitmapPageInput,
   Chunk,
   ChunkAck,
+  ChunkAckInput,
+  ChunkInput,
   Codec,
+  EncodingState,
+  Finish,
+  FinishInput,
+  Fixed32,
   Offer,
-  ProtocolState,
+  OfferInput,
+  Ready,
+  ReadyInput,
   Result,
+  ResultInput,
   Status,
+  StatusInput,
   TransferMessage
 } from './types.js'
 
-function struct<T extends object>(fields: { [K in keyof T]: Codec<T[K]> }): Codec<T> {
-  const keys = Object.keys(fields)
-  return {
-    preencode(state: ProtocolState, obj: T): void {
-      for (const key of keys) {
-        const field = fields[key as keyof T]
-        field.preencode(state, obj[key as keyof T])
-      }
-    },
-    encode(state: ProtocolState, obj: T): void {
-      for (const key of keys) {
-        const field = fields[key as keyof T]
-        field.encode(state, obj[key as keyof T])
-      }
-    },
-    decode(state: ProtocolState): T {
-      const result = new Map<keyof T, T[keyof T]>()
-      for (const key of keys) {
-        const typedKey = key as keyof T
-        result.set(typedKey, fields[typedKey].decode(state))
-      }
-      return Object.fromEntries(result) as T
-    }
+const EMPTY = b4a.alloc(0)
+
+/**
+ * Mirrors `compact-encoding`'s two-pass encoder while preserving the concrete
+ * Buffer type its allocation produces.
+ */
+export function encodeToBinary<Input, Output>(codec: Codec<Input, Output>, value: Input): Binary {
+  const state: EncodingState = { start: 0, end: 0, buffer: EMPTY }
+  codec.preencode(state, value)
+  state.buffer = b4a.allocUnsafe(state.end)
+  codec.encode(state, value)
+  return state.buffer
+}
+
+/** A 32-byte field decoded as a view over the source buffer. */
+export const fixed32: Codec<Fixed32, Binary> = {
+  preencode(state: EncodingState, value: Fixed32): void {
+    c.fixed32.preencode(state, value)
+  },
+  encode(state: EncodingState, value: Fixed32): void {
+    c.fixed32.encode(state, value)
+  },
+  decode(state: EncodingState): Binary {
+    if (state.end - state.start < 32) throw new Error('Out of bounds')
+    return state.buffer.subarray(state.start, (state.start += 32))
   }
 }
 
-function validatedCodec<T>(raw: Codec<T>, validate: (value: T) => void): Codec<T> {
+/** A length-prefixed field decoded as a view over the source buffer. */
+const binary: Codec<BinaryInput, Binary> = {
+  preencode(state: EncodingState, value: BinaryInput): void {
+    c.buffer.preencode(state, value)
+  },
+  encode(state: EncodingState, value: BinaryInput): void {
+    c.buffer.encode(state, value)
+  },
+  decode(state: EncodingState): Binary {
+    const length = c.uint.decode(state)
+    if (state.end - state.start < length) throw new Error('Out of bounds')
+    return state.buffer.subarray(state.start, (state.start += length))
+  }
+}
+
+function validatedCodec<Input, Output extends Input>(
+  raw: Codec<Input, Output>,
+  validate: (value: Input) => void
+): Codec<Input, Output> {
   return {
-    preencode(state: ProtocolState, value: T): void {
+    preencode(state: EncodingState, value: Input): void {
       validate(value)
       raw.preencode(state, value)
     },
-    encode(state: ProtocolState, value: T): void {
+    encode(state: EncodingState, value: Input): void {
       validate(value)
       raw.encode(state, value)
     },
-    decode(state: ProtocolState): T {
+    decode(state: EncodingState): Output {
       const value = raw.decode(state)
       validate(value)
       return value
@@ -73,18 +108,18 @@ function validatedCodec<T>(raw: Codec<T>, validate: (value: T) => void): Codec<T
 }
 
 const optionalString: Codec<string | undefined, string> = {
-  preencode(state: ProtocolState, value: string | undefined): void {
+  preencode(state: EncodingState, value: string | undefined): void {
     c.string.preencode(state, value === undefined ? '' : value)
   },
-  encode(state: ProtocolState, value: string | undefined): void {
+  encode(state: EncodingState, value: string | undefined): void {
     c.string.encode(state, value === undefined ? '' : value)
   },
-  decode(state: ProtocolState): string {
+  decode(state: EncodingState): string {
     return c.string.decode(state)
   }
 }
 
-function assertStatusCode(code: unknown): asserts code is number {
+function assertStatusCode(code: unknown): asserts code is StatusCode {
   assertSafeUint(code, 'code')
   if (
     code !== STATUS_CODE.ACCEPT &&
@@ -94,6 +129,41 @@ function assertStatusCode(code: unknown): asserts code is number {
     code !== STATUS_CODE.REJECTED
   ) {
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid status code')
+  }
+}
+
+function assertResultCode(code: unknown): asserts code is ResultCode {
+  assertSafeUint(code, 'code')
+  if (code !== RESULT_CODE.COMMITTED && code !== RESULT_CODE.REJECTED) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid result code')
+  }
+}
+
+const statusCodeField: Codec<StatusCode> = {
+  preencode(state: EncodingState, value: StatusCode): void {
+    c.uint.preencode(state, value)
+  },
+  encode(state: EncodingState, value: StatusCode): void {
+    c.uint.encode(state, value)
+  },
+  decode(state: EncodingState): StatusCode {
+    const code = c.uint.decode(state)
+    assertStatusCode(code)
+    return code
+  }
+}
+
+const resultCodeField: Codec<ResultCode> = {
+  preencode(state: EncodingState, value: ResultCode): void {
+    c.uint.preencode(state, value)
+  },
+  encode(state: EncodingState, value: ResultCode): void {
+    c.uint.encode(state, value)
+  },
+  decode(state: EncodingState): ResultCode {
+    const code = c.uint.decode(state)
+    assertResultCode(code)
+    return code
   }
 }
 
@@ -117,7 +187,7 @@ function assertBitmapPadding(count: number, bits: Uint8Array): void {
   }
 }
 
-function validateBitmapPage(value: BitmapPage): void {
+function validateBitmapPage(value: BitmapPageInput): void {
   assertFixed32(value.transferId, 'transferId')
   assertSafeUint(value.start, 'start')
   assertPositiveSafeUint(value.count, 'count')
@@ -136,12 +206,15 @@ function bitIsSet(bits: Uint8Array, offset: number): boolean {
   return (bits[byteIndex] & (1 << bitIndex)) !== 0
 }
 
-export function mergeBitmapPages(pages: Iterable<BitmapPage>, chunkCount: number): Set<number> {
+export function mergeBitmapPages(
+  pages: Iterable<BitmapPageInput>,
+  chunkCount: number
+): Set<number> {
   assertSafeUint(chunkCount, 'chunkCount')
   const verified = new Set<number>()
   const sorted = [...pages].sort((a, b) => a.start - b.start)
   let rangeEnd = 0
-  let expectedTransferId = null
+  let expectedTransferId: BinaryInput | null = null
 
   for (const page of sorted) {
     validateBitmapPage(page)
@@ -172,10 +245,14 @@ function protocolInvalid(cause: unknown): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid protocol message', cause)
 }
 
-export function encodeBounded<T>(codec: Codec<T>, value: T, max = MAX_CONTROL_BYTES): Uint8Array {
+export function encodeBounded<Input, Output>(
+  codec: Codec<Input, Output>,
+  value: Input,
+  max = MAX_CONTROL_BYTES
+): Binary {
   let buf
   try {
-    buf = c.encode(codec, value)
+    buf = encodeToBinary(codec, value)
   } catch (err) {
     throw protocolInvalid(err)
   }
@@ -185,7 +262,11 @@ export function encodeBounded<T>(codec: Codec<T>, value: T, max = MAX_CONTROL_BY
   return buf
 }
 
-export function decodeBounded<T>(codec: Codec<T>, buf: Uint8Array, max = MAX_CONTROL_BYTES): T {
+export function decodeBounded<Input, Output>(
+  codec: Codec<Input, Output>,
+  buf: BinaryInput,
+  max = MAX_CONTROL_BYTES
+): Output {
   if (!b4a.isBuffer(buf)) {
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid message buffer')
   }
@@ -193,7 +274,7 @@ export function decodeBounded<T>(codec: Codec<T>, buf: Uint8Array, max = MAX_CON
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Message too large')
   }
 
-  const state = c.state(0, buf.byteLength, b4a.from(buf))
+  const state: EncodingState = { start: 0, end: buf.byteLength, buffer: b4a.from(buf) }
   let value
   try {
     value = codec.decode(state)
@@ -206,119 +287,226 @@ export function decodeBounded<T>(codec: Codec<T>, buf: Uint8Array, max = MAX_CON
   return value
 }
 
-export const offer = validatedCodec<Offer>(
-  struct<Offer>({
-    version: c.uint,
-    transferId: c.fixed32,
-    name: c.string,
-    size: c.uint,
-    digest: c.fixed32,
-    chunkSize: c.uint,
-    chunkCount: c.uint
-  }),
-  (value: Offer) => {
-    assertSafeUint(value.version, 'version')
-    if (value.version !== PROTOCOL_VERSION) {
-      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid protocol version')
-    }
-    assertFixed32(value.transferId, 'transferId')
-    if (typeof value.name !== 'string') {
-      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid name')
-    }
-    assertSafeUint(value.size, 'size')
-    assertFixed32(value.digest, 'digest')
-    assertBoundedChunkSize(value.chunkSize, 'chunkSize')
-    assertSafeUint(value.chunkCount, 'chunkCount')
-    if (
-      value.chunkCount !== Math.ceil(value.size / value.chunkSize) ||
-      value.chunkCount > MAX_CHUNK_COUNT
-    ) {
-      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid offer chunk count')
+const offerStruct: Codec<OfferInput, Offer> = {
+  preencode(state: EncodingState, value: OfferInput): void {
+    c.uint.preencode(state, value.version)
+    fixed32.preencode(state, value.transferId)
+    c.string.preencode(state, value.name)
+    c.uint.preencode(state, value.size)
+    fixed32.preencode(state, value.digest)
+    c.uint.preencode(state, value.chunkSize)
+    c.uint.preencode(state, value.chunkCount)
+  },
+  encode(state: EncodingState, value: OfferInput): void {
+    c.uint.encode(state, value.version)
+    fixed32.encode(state, value.transferId)
+    c.string.encode(state, value.name)
+    c.uint.encode(state, value.size)
+    fixed32.encode(state, value.digest)
+    c.uint.encode(state, value.chunkSize)
+    c.uint.encode(state, value.chunkCount)
+  },
+  decode(state: EncodingState): Offer {
+    return {
+      version: c.uint.decode(state),
+      transferId: fixed32.decode(state),
+      name: c.string.decode(state),
+      size: c.uint.decode(state),
+      digest: fixed32.decode(state),
+      chunkSize: c.uint.decode(state),
+      chunkCount: c.uint.decode(state)
     }
   }
-)
+}
 
-export const status = validatedCodec<Status>(
-  struct({
-    transferId: c.fixed32,
-    code: c.uint,
-    reason: optionalString
-  }),
-  (value: Status) => {
+export const offer: Codec<OfferInput, Offer> = validatedCodec(offerStruct, (value: OfferInput) => {
+  assertSafeUint(value.version, 'version')
+  if (value.version !== PROTOCOL_VERSION) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid protocol version')
+  }
+  assertFixed32(value.transferId, 'transferId')
+  if (typeof value.name !== 'string') {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid name')
+  }
+  assertSafeUint(value.size, 'size')
+  assertFixed32(value.digest, 'digest')
+  assertBoundedChunkSize(value.chunkSize, 'chunkSize')
+  assertSafeUint(value.chunkCount, 'chunkCount')
+  if (
+    value.chunkCount !== Math.ceil(value.size / value.chunkSize) ||
+    value.chunkCount > MAX_CHUNK_COUNT
+  ) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid offer chunk count')
+  }
+})
+
+const statusStruct: Codec<StatusInput, Status> = {
+  preencode(state: EncodingState, value: StatusInput): void {
+    fixed32.preencode(state, value.transferId)
+    statusCodeField.preencode(state, value.code)
+    optionalString.preencode(state, value.reason)
+  },
+  encode(state: EncodingState, value: StatusInput): void {
+    fixed32.encode(state, value.transferId)
+    statusCodeField.encode(state, value.code)
+    optionalString.encode(state, value.reason)
+  },
+  decode(state: EncodingState): Status {
+    return {
+      transferId: fixed32.decode(state),
+      code: statusCodeField.decode(state),
+      reason: optionalString.decode(state)
+    }
+  }
+}
+
+export const status: Codec<StatusInput, Status> = validatedCodec(
+  statusStruct,
+  (value: StatusInput) => {
     assertFixed32(value.transferId, 'transferId')
     assertStatusCode(value.code)
     assertOptionalReason(value.reason)
   }
 )
 
-export const bitmapPage = validatedCodec<BitmapPage>(
-  struct({
-    transferId: c.fixed32,
-    start: c.uint,
-    count: c.uint,
-    bits: c.buffer
-  }),
+const bitmapPageStruct: Codec<BitmapPageInput, BitmapPage> = {
+  preencode(state: EncodingState, value: BitmapPageInput): void {
+    fixed32.preencode(state, value.transferId)
+    c.uint.preencode(state, value.start)
+    c.uint.preencode(state, value.count)
+    binary.preencode(state, value.bits)
+  },
+  encode(state: EncodingState, value: BitmapPageInput): void {
+    fixed32.encode(state, value.transferId)
+    c.uint.encode(state, value.start)
+    c.uint.encode(state, value.count)
+    binary.encode(state, value.bits)
+  },
+  decode(state: EncodingState): BitmapPage {
+    return {
+      transferId: fixed32.decode(state),
+      start: c.uint.decode(state),
+      count: c.uint.decode(state),
+      bits: binary.decode(state)
+    }
+  }
+}
+
+export const bitmapPage: Codec<BitmapPageInput, BitmapPage> = validatedCodec(
+  bitmapPageStruct,
   validateBitmapPage
 )
 
-export const ready = validatedCodec<TransferMessage>(
-  struct({
-    transferId: c.fixed32
-  }),
-  (value: TransferMessage) => {
-    assertFixed32(value.transferId, 'transferId')
-  }
-)
-
-export const finish = validatedCodec<TransferMessage>(
-  struct({
-    transferId: c.fixed32
-  }),
-  (value: TransferMessage) => {
-    assertFixed32(value.transferId, 'transferId')
-  }
-)
-
-export const chunk = validatedCodec<Chunk>(
-  struct({
-    transferId: c.fixed32,
-    index: c.uint,
-    digest: c.fixed32,
-    data: c.buffer
-  }),
-  (value: Chunk) => {
-    assertFixed32(value.transferId, 'transferId')
-    assertSafeUint(value.index, 'index')
-    assertFixed32(value.digest, 'digest')
-    if (!b4a.isBuffer(value.data) || value.data.byteLength > MAX_CHUNK_BYTES) {
-      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid chunk data')
+function transferMessageStruct(): Codec<TransferMessage> {
+  return {
+    preencode(state: EncodingState, value: TransferMessage): void {
+      fixed32.preencode(state, value.transferId)
+    },
+    encode(state: EncodingState, value: TransferMessage): void {
+      fixed32.encode(state, value.transferId)
+    },
+    decode(state: EncodingState): TransferMessage {
+      return { transferId: fixed32.decode(state) }
     }
   }
+}
+
+function assertTransferMessage(value: ReadyInput): void {
+  assertFixed32(value.transferId, 'transferId')
+}
+
+export const ready: Codec<ReadyInput, Ready> = validatedCodec(
+  transferMessageStruct(),
+  assertTransferMessage
 )
 
-export const chunkAck = validatedCodec<ChunkAck>(
-  struct({
-    transferId: c.fixed32,
-    index: c.uint
-  }),
-  (value: ChunkAck) => {
+export const finish: Codec<FinishInput, Finish> = validatedCodec(
+  transferMessageStruct(),
+  assertTransferMessage
+)
+
+const chunkStruct: Codec<ChunkInput, Chunk> = {
+  preencode(state: EncodingState, value: ChunkInput): void {
+    fixed32.preencode(state, value.transferId)
+    c.uint.preencode(state, value.index)
+    fixed32.preencode(state, value.digest)
+    binary.preencode(state, value.data)
+  },
+  encode(state: EncodingState, value: ChunkInput): void {
+    fixed32.encode(state, value.transferId)
+    c.uint.encode(state, value.index)
+    fixed32.encode(state, value.digest)
+    binary.encode(state, value.data)
+  },
+  decode(state: EncodingState): Chunk {
+    return {
+      transferId: fixed32.decode(state),
+      index: c.uint.decode(state),
+      digest: fixed32.decode(state),
+      data: binary.decode(state)
+    }
+  }
+}
+
+export const chunk: Codec<ChunkInput, Chunk> = validatedCodec(chunkStruct, (value: ChunkInput) => {
+  assertFixed32(value.transferId, 'transferId')
+  assertSafeUint(value.index, 'index')
+  assertFixed32(value.digest, 'digest')
+  if (!b4a.isBuffer(value.data) || value.data.byteLength > MAX_CHUNK_BYTES) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid chunk data')
+  }
+})
+
+const chunkAckStruct: Codec<ChunkAckInput, ChunkAck> = {
+  preencode(state: EncodingState, value: ChunkAckInput): void {
+    fixed32.preencode(state, value.transferId)
+    c.uint.preencode(state, value.index)
+  },
+  encode(state: EncodingState, value: ChunkAckInput): void {
+    fixed32.encode(state, value.transferId)
+    c.uint.encode(state, value.index)
+  },
+  decode(state: EncodingState): ChunkAck {
+    return {
+      transferId: fixed32.decode(state),
+      index: c.uint.decode(state)
+    }
+  }
+}
+
+export const chunkAck: Codec<ChunkAckInput, ChunkAck> = validatedCodec(
+  chunkAckStruct,
+  (value: ChunkAckInput) => {
     assertFixed32(value.transferId, 'transferId')
     assertSafeUint(value.index, 'index')
   }
 )
 
-export const result = validatedCodec<Result>(
-  struct({
-    transferId: c.fixed32,
-    code: c.uint,
-    reason: optionalString
-  }),
-  (value: Result) => {
-    assertFixed32(value.transferId, 'transferId')
-    assertSafeUint(value.code, 'code')
-    if (value.code !== RESULT_CODE.COMMITTED && value.code !== RESULT_CODE.REJECTED) {
-      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid result code')
+const resultStruct: Codec<ResultInput, Result> = {
+  preencode(state: EncodingState, value: ResultInput): void {
+    fixed32.preencode(state, value.transferId)
+    resultCodeField.preencode(state, value.code)
+    optionalString.preencode(state, value.reason)
+  },
+  encode(state: EncodingState, value: ResultInput): void {
+    fixed32.encode(state, value.transferId)
+    resultCodeField.encode(state, value.code)
+    optionalString.encode(state, value.reason)
+  },
+  decode(state: EncodingState): Result {
+    return {
+      transferId: fixed32.decode(state),
+      code: resultCodeField.decode(state),
+      reason: optionalString.decode(state)
     }
+  }
+}
+
+export const result: Codec<ResultInput, Result> = validatedCodec(
+  resultStruct,
+  (value: ResultInput) => {
+    assertFixed32(value.transferId, 'transferId')
+    assertResultCode(value.code)
     assertOptionalReason(value.reason)
   }
 )

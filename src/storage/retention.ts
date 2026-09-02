@@ -39,13 +39,14 @@ interface Clock {
   now(): number
 }
 
-interface TimerHandle {
-  unref?: () => unknown
+interface Scheduler {
+  setInterval(callback: () => void, interval: number): unknown
+  clearInterval(timer: unknown): void
 }
 
-interface Scheduler {
-  setInterval(callback: () => void, interval: number): TimerHandle
-  clearInterval(timer: unknown): void
+function unrefTimer(timer: unknown): void {
+  if (typeof timer !== 'object' || timer === null || !('unref' in timer)) return
+  if (typeof timer.unref === 'function') timer.unref()
 }
 
 type RetentionEvent =
@@ -234,7 +235,7 @@ class RetentionManager {
   isSessionActive: (session: Session) => boolean
   hasActiveUploads: () => boolean
   logger: Logger | null
-  timer: TimerHandle | null
+  timer: unknown | null
   cleanupFailure: unknown | null
   scheduler: Scheduler
   onEvent: ((event: RetentionEvent) => void) | null
@@ -540,7 +541,7 @@ class RetentionManager {
         () => this._scheduleTick(lifecycle),
         this.cleanupInterval
       )
-      if (typeof this.timer.unref === 'function') this.timer.unref()
+      unrefTimer(this.timer)
     })()
     this.startPromise = start
     start.then(

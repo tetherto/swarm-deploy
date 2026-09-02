@@ -23,9 +23,11 @@ export const ERRORS = {
 export type ErrorCode = (typeof ERRORS)[keyof typeof ERRORS]
 
 export class SwarmDeployError extends Error {
-  code: ErrorCode | string
-  cause: unknown | null
-  transport?: boolean
+  // `declare` keeps these out of the emitted class body so instances gain own
+  // properties only where the runtime assigns them, exactly as before.
+  declare code: ErrorCode | string
+  declare cause: unknown | null
+  declare transport?: boolean
 
   constructor(code: ErrorCode | string, message: string, cause: unknown | null = null) {
     super(message)
