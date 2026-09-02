@@ -18,7 +18,7 @@ The server OS account and dedicated storage root are trusted against concurrent 
 
 ## Install
 
-The package is private until an npm release is configured. From a checkout:
+The public npm package is `@tetherto/swarm-deploy`. From a checkout:
 
 ```sh
 npm ci
@@ -105,7 +105,12 @@ Accepted basenames match:
 ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$
 ```
 
-Files retain their original basename. Existing files are never replaced. Retrying the same authenticated transfer returns `ALREADY_COMMITTED`; different content using an existing name returns `FILE_EXISTS`.
+Files retain their original basename. Names are create-only by default. A server
+may explicitly configure exact mutable names with repeatable
+`--replace-name <name>` options; matching content is idempotent, while
+different content replaces the configured current artifact and preserves the
+prior managed version under `history-<transfer-id>`. See the specification for
+the exact retention and recovery semantics.
 
 Files use fixed 1 MiB SHA-256 chunks. Verified chunks are hidden under `.swarm-deploy/` and resume after reconnect. A final file becomes visible only after exact size and whole-file SHA-256 verification plus an atomic no-replace commit.
 
@@ -206,4 +211,5 @@ npm run test:node
 npm run test:bare
 ```
 
-See `docs/superpowers/specs/2026-08-31-swarm-deploy-design.md` for the complete protocol and threat model.
+See [the Swarm Deploy specification](docs/spec/swarm-deploy.md) for the
+complete protocol, replacement, package, and threat-model requirements.

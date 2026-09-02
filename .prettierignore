@@ -1,1 +1,6 @@
-.superpowers/
+node_modules/
+coverage/
+/.superpowers/
+/docs/superpowers/
+/dist/
+/.test-dist/

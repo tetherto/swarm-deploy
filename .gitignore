@@ -1,4 +1,9 @@
 node_modules/
 coverage/
 *.seed
-.swarm-deploy/
+/.superpowers/
+/docs/superpowers/
+/dist/
+/.test-dist/
+*.tsbuildinfo
+/.swarm-deploy/
