@@ -286,17 +286,18 @@ function isErrorCode(value: string): value is ErrorCode {
   return Object.values(ERRORS).some((code) => code === value)
 }
 
+/** See {@link Server} for why the dynamic overload uses a `never[]` rest. */
 export interface Client {
   on<EventName extends ClientEventName>(
     event: EventName,
     listener: (event: ClientEventMap[EventName]) => void
   ): this
-  on(event: string | symbol, listener: (...args: unknown[]) => void): this
+  on(event: string | symbol, listener: (...args: never[]) => void): this
   once<EventName extends ClientEventName>(
     event: EventName,
     listener: (event: ClientEventMap[EventName]) => void
   ): this
-  once(event: string | symbol, listener: (...args: unknown[]) => void): this
+  once(event: string | symbol, listener: (...args: never[]) => void): this
 }
 
 export class Client extends EventEmitter {
@@ -408,7 +409,9 @@ export class Client extends EventEmitter {
       ) {
         throw configurationError(ERRORS.PROTOCOL_INVALID, 'Invalid swarm')
       }
-      this.swarm.on('connection', (socket, peerInfo) => this._onConnection(socket, peerInfo))
+      this.swarm.on('connection', (socket: ClientSocket, peerInfo?: ClientPeerInfo) =>
+        this._onConnection(socket, peerInfo)
+      )
       this.discovery = this.swarm.join(this.topic, { server: false, client: true })
       if (!this.discovery || typeof this.discovery.flushed !== 'function') {
         throw configurationError(ERRORS.PROTOCOL_INVALID, 'Invalid swarm discovery')

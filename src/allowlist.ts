@@ -25,12 +25,12 @@ export interface AllowlistFailureEvent {
 
 export interface AllowlistWatcherOptions {
   filePath: string
-  storage?: AllowlistStorage
+  storage?: Pick<StorageAdapter, 'readFile'>
   onReload(keys: Set<string>): void | Promise<void>
   /** `null` is accepted and treated as "no handler". */
   onFailure?: ((event: AllowlistFailureEvent) => void) | null
   pollInterval?: number
-  scheduler?: AllowlistScheduler
+  scheduler?: Pick<ServerScheduler, 'setInterval' | 'clearInterval'>
   logger?: Logger | null
 }
 
@@ -73,15 +73,16 @@ export function parseAllowlist(text: string): Set<string> {
   return keys
 }
 
+/** See `Server` for why the dynamic overload uses a `never[]` rest. */
 export interface AllowlistWatcher {
   on(event: 'reloaded', listener: (event: AllowlistReloadedEvent) => void): this
   on(event: 'removed', listener: (event: AllowlistRemovedEvent) => void): this
   on(event: 'failure', listener: (event: AllowlistFailureEvent) => void): this
-  on(event: string | symbol, listener: (...args: unknown[]) => void): this
+  on(event: string | symbol, listener: (...args: never[]) => void): this
   once(event: 'reloaded', listener: (event: AllowlistReloadedEvent) => void): this
   once(event: 'removed', listener: (event: AllowlistRemovedEvent) => void): this
   once(event: 'failure', listener: (event: AllowlistFailureEvent) => void): this
-  once(event: string | symbol, listener: (...args: unknown[]) => void): this
+  once(event: string | symbol, listener: (...args: never[]) => void): this
 }
 
 export class AllowlistWatcher extends EventEmitter {

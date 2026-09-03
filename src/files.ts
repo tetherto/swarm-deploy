@@ -2,7 +2,7 @@ import fs from '#fs'
 import path from '#path'
 import os from '#os'
 import crypto from '#crypto'
-import { abortError, onAbort, throwIfAborted, type AbortSignalLike } from './abort.js'
+import { abortError, onAbort, throwIfAborted } from './abort.js'
 import { ERRORS, SwarmDeployError } from './errors.js'
 import type { Digest } from './types.js'
 
@@ -29,11 +29,21 @@ export interface FileManifest {
 export interface BuildFileManifestOptions {
   /** Logical chunk size in bytes; defaults to 1 MiB. */
   chunkSize?: number
-  signal?: AbortSignalLike | null
+  /**
+   * Any `AbortSignal`, or the fallback controller signal used on runtimes
+   * without a global `AbortController`. Spelled structurally so the published
+   * surface never points at a type that cannot be imported from the root.
+   */
+  signal?: {
+    readonly aborted: boolean
+    addEventListener(event: 'abort', callback: () => void, options?: { once?: boolean }): void
+    removeEventListener(event: 'abort', callback: () => void): void
+  } | null
 }
 
 export interface SelectUploadPathsOptions {
-  signal?: AbortSignalLike | null
+  /** See {@link BuildFileManifestOptions.signal}. */
+  signal?: BuildFileManifestOptions['signal']
 }
 
 function platformName(): string {

@@ -10,6 +10,7 @@ import {
   type Binary,
   type BitmapPage,
   type BitmapPageInput,
+  type BuildFileManifestOptions,
   type Chunk,
   type ChunkAck,
   type ChunkAckInput,
@@ -49,6 +50,7 @@ import {
   type RetentionEvent,
   type ScrubEvent,
   type SelectedUploadPath,
+  type SelectUploadPathsOptions,
   type ServerCloseEvent,
   type ServerConnectionEvent,
   type ServerEventMap,
@@ -430,6 +432,33 @@ const manifest: FileManifest = {
 void manifest
 
 /*
+ * Cancellation surface. The old handwritten declaration spelled these as
+ * `AbortSignal | null`, so a real signal and an explicit `null` must both stay
+ * assignable. The implementation now spells the shape structurally, which also
+ * has to accept the fallback controller used on runtimes without a global
+ * `AbortController`.
+ */
+const abortController = new AbortController()
+const manifestSignals: BuildFileManifestOptions[] = [
+  { signal: abortController.signal },
+  { signal: null },
+  {}
+]
+const selectionSignals: SelectUploadPathsOptions[] = [
+  { signal: abortController.signal },
+  { signal: null },
+  {}
+]
+const fallbackSignal = {
+  aborted: false,
+  addEventListener(_event: 'abort', _callback: () => void, _options?: { once?: boolean }) {},
+  removeEventListener(_event: 'abort', _callback: () => void) {}
+}
+const fallbackManifestOptions: BuildFileManifestOptions = { signal: fallbackSignal }
+const fallbackSelectionOptions: SelectUploadPathsOptions = { signal: fallbackSignal }
+void [manifestSignals, selectionSignals, fallbackManifestOptions, fallbackSelectionOptions]
+
+/*
  * Listener and declaration exactness checks. `Equals` is invariant, so these
  * fail whenever an event payload silently widens to `any`, `unknown`, or a
  * reshaped structural approximation.
@@ -439,11 +468,14 @@ type Equals<A, B> =
 type Expect<T extends true> = T
 type IsAny<T> = 0 extends 1 & T ? true : false
 
-type NoImplicitAnyListeners = [
-  Expect<Equals<IsAny<Parameters<Parameters<Server['on']>[1]>[0]>, false>>,
-  Expect<Equals<IsAny<Parameters<Parameters<Client['on']>[1]>[0]>, false>>,
-  Expect<Equals<IsAny<Parameters<Parameters<AllowlistWatcher['on']>[1]>[0]>, false>>
-]
+/**
+ * Asserts a contextually inferred listener payload is exactly `Expected` and is
+ * not `any`. Because the payload comes from overload resolution at the
+ * registration site, deleting a typed `on`/`once` overload collapses `Actual`
+ * to the dynamic fallback's `never` and every use below fails to compile.
+ */
+type ExactPayload<Actual, Expected> =
+  IsAny<Actual> extends true ? false : Equals<Actual, Expected> extends true ? true : false
 
 type ServerEventNameCoverage = Expect<
   Equals<
@@ -554,7 +586,6 @@ type UploadUnionContract = [
 ]
 
 void [
-  null as unknown as NoImplicitAnyListeners,
   null as unknown as ServerEventNameCoverage,
   null as unknown as ClientEventNameCoverage,
   null as unknown as ServerEventMapShapes,
@@ -565,70 +596,167 @@ void [
 ]
 
 server.on('authentication', (event) => {
-  const check: Expect<Equals<typeof event, AuthenticationEvent>> = true
+  const check: ExactPayload<typeof event, AuthenticationEvent> = true
   void [check, event.fingerprint, event.status, event.reason]
 })
+server.on('connection', (event) => {
+  const check: ExactPayload<typeof event, ServerConnectionEvent> = true
+  void [check, event.fingerprint, event.connections]
+})
+server.on('connection-open', (event) => {
+  const check: ExactPayload<typeof event, ConnectionOpenEvent> = true
+  void check
+})
+server.on('connection-close', (event) => {
+  const check: ExactPayload<typeof event, ConnectionCloseEvent> = true
+  void check
+})
 server.on('offer', (event) => {
-  const check: Expect<Equals<typeof event, ServerOfferEvent>> = true
+  const check: ExactPayload<typeof event, ServerOfferEvent> = true
   void [check, event.fingerprint, event.transfer, event.status, event.resumed, event.reason]
 })
+server.on('progress', (event) => {
+  const check: ExactPayload<typeof event, ServerProgressEvent> = true
+  void check
+})
 server.on('verification', (event) => {
-  const check: Expect<Equals<typeof event, ServerTransferLifecycleEvent>> = true
+  const check: ExactPayload<typeof event, ServerTransferLifecycleEvent> = true
   void [check, event.fingerprint, event.status, event.name, event.size]
 })
 server.once('commit', (event) => {
-  const check: Expect<Equals<typeof event, ServerTransferLifecycleEvent>> = true
+  const check: ExactPayload<typeof event, ServerTransferLifecycleEvent> = true
   void [check, event.transfer, event.status]
 })
+server.on('recovery', (event) => {
+  const check: ExactPayload<typeof event, RecoveryEvent> = true
+  void [check, event.status, event.phase]
+})
 server.on('scrub', (event) => {
-  const check: Expect<Equals<typeof event, ScrubEvent>> = true
+  const check: ExactPayload<typeof event, ScrubEvent> = true
   void [check, event.status, event.deleted, event.unknownCount]
 })
+server.on('retention', (event) => {
+  const check: ExactPayload<typeof event, RetentionEvent> = true
+  void check
+})
 server.on('cleanup', (event) => {
-  const check: Expect<Equals<typeof event, CleanupEvent>> = true
+  const check: ExactPayload<typeof event, CleanupEvent> = true
   void [check, event.transfer, event.name, event.reason]
 })
-server.on('revoked', (event) => {
-  const check: Expect<Equals<typeof event, FingerprintEvent>> = true
+server.on('allowlist', (event) => {
+  const check: ExactPayload<typeof event, AllowlistEvent> = true
+  void check
+})
+server.on('revocation', (event) => {
+  const check: ExactPayload<typeof event, FingerprintEvent> = true
   void [check, event.fingerprint]
 })
+server.once('revoked', (event) => {
+  const check: ExactPayload<typeof event, FingerprintEvent> = true
+  void [check, event.fingerprint]
+})
+server.on('listening', (event) => {
+  const check: ExactPayload<typeof event, ServerListeningEvent> = true
+  void check
+})
 server.on('close', (event) => {
-  const check: Expect<Equals<typeof event, ServerCloseEvent>> = true
+  const check: ExactPayload<typeof event, ServerCloseEvent> = true
   void [check, event.status]
 })
 
+client.on('authentication', (event) => {
+  const check: ExactPayload<typeof event, AuthenticationEvent> = true
+  void check
+})
+client.on('connection', (event) => {
+  const check: ExactPayload<typeof event, FingerprintEvent> = true
+  void check
+})
+client.on('connection-open', (event) => {
+  const check: ExactPayload<typeof event, FingerprintEvent> = true
+  void check
+})
+client.on('connection-close', (event) => {
+  const check: ExactPayload<typeof event, FingerprintEvent> = true
+  void check
+})
+client.on('rejected-peer', (event) => {
+  const check: ExactPayload<typeof event, FingerprintEvent> = true
+  void check
+})
 client.on('offer', (event) => {
-  const check: Expect<Equals<typeof event, ClientOfferEvent>> = true
+  const check: ExactPayload<typeof event, ClientOfferEvent> = true
   void [check, event.status, event.resumedChunks, event.totalChunks, event.reason]
 })
 client.on('progress', (event) => {
-  const check: Expect<Equals<typeof event, ClientProgressEvent>> = true
+  const check: ExactPayload<typeof event, ClientProgressEvent> = true
   void [check, event.chunksSent, event.bytesSent]
 })
 client.on('verification', (event) => {
-  const check: Expect<Equals<typeof event, TransferLifecycleEvent>> = true
+  const check: ExactPayload<typeof event, TransferLifecycleEvent> = true
   void [check, event.status]
 })
 client.once('commit', (event) => {
-  const check: Expect<Equals<typeof event, ClientCommitEvent>> = true
+  const check: ExactPayload<typeof event, ClientCommitEvent> = true
   void [check, event.result, event.status]
 })
+client.on('result', (event) => {
+  const check: ExactPayload<typeof event, ClientResultEvent> = true
+  void check
+})
+client.on('skipped', (event) => {
+  const check: ExactPayload<typeof event, ClientSkippedEvent> = true
+  void check
+})
 client.on('close', (event) => {
-  const check: Expect<Equals<typeof event, ClientCloseEvent>> = true
+  const check: ExactPayload<typeof event, ClientCloseEvent> = true
   void [check, event.status]
 })
 
 allowlistWatcher.on('reloaded', (event) => {
-  const check: Expect<Equals<typeof event, AllowlistReloadedEvent>> = true
+  const check: ExactPayload<typeof event, AllowlistReloadedEvent> = true
   void [check, event.count]
 })
 allowlistWatcher.on('removed', (event) => {
-  const check: Expect<Equals<typeof event, AllowlistRemovedEvent>> = true
+  const check: ExactPayload<typeof event, AllowlistRemovedEvent> = true
   void [check, event.removed]
 })
 allowlistWatcher.once('failure', (event) => {
-  const check: Expect<Equals<typeof event, AllowlistFailureEvent>> = true
+  const check: ExactPayload<typeof event, AllowlistFailureEvent> = true
   void [check, event.reason]
+})
+
+/*
+ * Dynamic-name compatibility. A non-literal event name falls through to the
+ * trailing overload, which must still accept a precisely typed listener the way
+ * the historical `any[]` signature did. These calls fail to compile if that
+ * overload widens back to `unknown[]`.
+ */
+const dynamicEvent: string = 'offer'
+const dynamicSymbol: symbol = Symbol('custom')
+
+server.on(dynamicEvent, (event: ServerOfferEvent) => void event.transfer)
+server.once(dynamicEvent, (event: ServerOfferEvent) => void event.transfer)
+server.on(dynamicSymbol, () => {})
+client.on(dynamicEvent, (event: ClientOfferEvent) => void event.status)
+client.once(dynamicSymbol, (event: ClientCloseEvent) => void event.status)
+allowlistWatcher.on(dynamicEvent, (event: AllowlistFailureEvent) => void event.reason)
+
+/*
+ * Narrowing must survive the added fallback: a literal event name still selects
+ * the typed overload rather than the dynamic one.
+ */
+server.on('offer', (event) => {
+  const stillNarrowed: ExactPayload<typeof event, ServerOfferEvent> = true
+  void stillNarrowed
+})
+client.on('progress', (event) => {
+  const stillNarrowed: ExactPayload<typeof event, ClientProgressEvent> = true
+  void stillNarrowed
+})
+allowlistWatcher.on('reloaded', (event) => {
+  const stillNarrowed: ExactPayload<typeof event, AllowlistReloadedEvent> = true
+  void stillNarrowed
 })
 
 function describeUploadEntry(entry: UploadPathEntry): string {

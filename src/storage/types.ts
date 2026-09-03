@@ -32,22 +32,19 @@ export interface StorageStatFs {
   bsize: number | bigint
 }
 
-/** The tolerated `statfs` result shape: fields are validated at runtime. */
-export type StorageFileSystemStats = Partial<StorageStatFs>
-
 export interface StorageFileHandle {
   stat(): Promise<StorageStats>
   write(
     bytes: Uint8Array,
-    offset?: number,
-    length?: number,
-    position?: number
+    offset: number,
+    length: number,
+    position: number | null
   ): Promise<number | StorageWriteResult>
   read(
     bytes: Uint8Array,
-    offset?: number,
-    length?: number,
-    position?: number
+    offset: number,
+    length: number,
+    position: number | null
   ): Promise<number | StorageReadResult>
   sync(): Promise<void>
   close(): Promise<void>
@@ -64,7 +61,7 @@ export interface StorageAdapter {
   unlink(path: string): Promise<void>
   rmdir(path: string): Promise<void>
   readdir(path: string): Promise<string[]>
-  statfs?(path: string): Promise<StorageFileSystemStats>
+  statfs?(path: string): Promise<StorageStatFs>
 }
 
 export interface StorageLayout {

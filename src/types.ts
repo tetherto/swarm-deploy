@@ -69,9 +69,13 @@ export interface SwarmPeerInfo {
 }
 
 export interface Swarm {
-  on(
+  /**
+   * `connection` is generic over the listener arguments so a precisely typed
+   * handler is accepted without naming a transport type in the public surface.
+   */
+  on<Socket, PeerInfo>(
     event: 'connection',
-    listener: (socket: SwarmSocket, peerInfo?: SwarmPeerInfo) => void
+    listener: (socket: Socket, peerInfo?: PeerInfo) => void
   ): unknown
   on(event: string, listener: (...args: unknown[]) => void): unknown
   join(topic: Topic, options: { server: boolean; client: boolean }): SwarmDiscovery
@@ -84,7 +88,7 @@ export interface SwarmFactoryOptions {
   maxPeers: number
   maxClientConnections: number
   maxServerConnections: number
-  firewall?: (remotePublicKey: PublicKeyInput) => boolean
+  firewall?: (remotePublicKey: PublicKey) => boolean
 }
 
 export type SwarmFactory = (options: SwarmFactoryOptions) => Swarm

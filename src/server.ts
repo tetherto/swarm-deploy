@@ -371,17 +371,24 @@ function isProtocolChannel(value: unknown): value is ProtocolChannel {
   )
 }
 
+/**
+ * Known events narrow their payload; the trailing overload keeps the historical
+ * dynamic-name compatibility. Its rest element is `never[]` rather than
+ * `unknown[]` because `strictFunctionTypes` compares listener parameters
+ * contravariantly, so `never[]` accepts every listener the old `any[]`
+ * signature accepted while still keeping `any` out of the surface.
+ */
 export interface Server {
   on<EventName extends ServerEventName>(
     event: EventName,
     listener: (event: ServerEventMap[EventName]) => void
   ): this
-  on(event: string | symbol, listener: (...args: unknown[]) => void): this
+  on(event: string | symbol, listener: (...args: never[]) => void): this
   once<EventName extends ServerEventName>(
     event: EventName,
     listener: (event: ServerEventMap[EventName]) => void
   ): this
-  once(event: string | symbol, listener: (...args: unknown[]) => void): this
+  once(event: string | symbol, listener: (...args: never[]) => void): this
 }
 
 export class Server extends EventEmitter {
