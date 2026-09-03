@@ -292,7 +292,8 @@ test('Node and Bare lifecycle closes swarms, timers, descriptors, and testnet', 
     t.is(clientInternal.socketWaiters.length, 0)
     t.is(clientInternal.delayWaiters.length, 0)
     t.is(serverInternal.swarm, null)
-    t.is(serverInternal.sessionStore, null)
+    // `close()` clears the store, so the closed-state expectation is nullable.
+    t.is<SessionStore | null>(serverInternal.sessionStore, null)
     t.is(serverInternal._connections.size, 0)
     t.is(serverInternal._sessions.size, 0)
     t.is(watcher.timer, null)

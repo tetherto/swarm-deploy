@@ -33,11 +33,17 @@ import {
   mergeBitmapPages,
   keyPairFromSeed,
   publicKeyFromSeed,
+  type BitmapPageInput,
+  type ChunkAckInput,
+  type ChunkInput,
   type Codec,
+  type FinishInput,
   type Fixed32,
   type OfferInput,
+  type ReadyInput,
   type ResultCode,
   type ResultInput,
+  type StatusCode,
   type StatusInput
 } from '../../dist/index.js'
 import { CHUNK_SIZE, digestBuffer } from '../helpers/files.js'
@@ -94,10 +100,18 @@ function sampleOffer(overrides: OfferOverrides = {}): OfferInput {
   }
 }
 
-function snapshotValue(value: StatusInput | ResultInput): Record<string, unknown> {
-  const copy: Record<string, unknown> = { ...value }
-  if (b4a.isBuffer(value.transferId)) copy.transferId = b4a.from(value.transferId)
-  return copy
+/** STATUS and RESULT frames share the fields these mutation probes snapshot. */
+interface FrameSnapshot {
+  transferId: Fixed32
+  code: StatusCode | ResultCode
+  reason?: string
+}
+
+function snapshotValue(value: FrameSnapshot): FrameSnapshot {
+  return {
+    ...value,
+    transferId: b4a.isBuffer(value.transferId) ? b4a.from(value.transferId) : value.transferId
+  }
 }
 
 function assertCanonicalBuffer(t: Assert, value: Uint8Array, label: string): void {
@@ -137,7 +151,7 @@ test('message index constants follow wire order', (t) => {
 test('offer codec round-trips representative data', (t) => {
   const value = sampleOffer()
   const decoded = decodeBounded(offer, encodeBounded(offer, value))
-  t.alike(decoded, value)
+  t.alike<OfferInput>(decoded, value)
 })
 
 test('status codec round-trips representative data', (t) => {
@@ -146,7 +160,7 @@ test('status codec round-trips representative data', (t) => {
     code: STATUS_CODE.ACCEPT
   }
   const decoded = decodeBounded(status, encodeBounded(status, value))
-  t.alike(decoded, { ...value, reason: '' })
+  t.alike<StatusInput>(decoded, { ...value, reason: '' })
 })
 
 test('status codec round-trips rejected responses with reason', (t) => {
@@ -156,7 +170,7 @@ test('status codec round-trips rejected responses with reason', (t) => {
     reason: 'staging limit'
   }
   const decoded = decodeBounded(status, encodeBounded(status, value))
-  t.alike(decoded, value)
+  t.alike<StatusInput>(decoded, value)
 })
 
 test('status and result encoders do not mutate caller values', (t) => {
@@ -166,7 +180,7 @@ test('status and result encoders do not mutate caller values', (t) => {
   }
   const statusSnapshot = snapshotValue(statusValue)
   encodeBounded(status, statusValue)
-  t.alike(statusValue, statusSnapshot)
+  t.alike<FrameSnapshot>(statusValue, statusSnapshot)
   t.is(statusValue.reason, undefined)
 
   const resultValue: ResultInput = {
@@ -175,7 +189,7 @@ test('status and result encoders do not mutate caller values', (t) => {
   }
   const resultSnapshot = snapshotValue(resultValue)
   encodeBounded(result, resultValue)
-  t.alike(resultValue, resultSnapshot)
+  t.alike<FrameSnapshot>(resultValue, resultSnapshot)
   t.is(resultValue.reason, undefined)
 })
 
@@ -190,14 +204,18 @@ test('bitmap page codec round-trips representative data', (t) => {
     bits
   }
   const decoded = decodeBounded(bitmapPage, encodeBounded(bitmapPage, value))
-  t.alike(decoded, value)
+  t.alike<BitmapPageInput>(decoded, value)
 })
 
 test('ready, finish, and result codecs round-trip', (t) => {
   const id = sampleOffer().transferId
-  t.alike(decodeBounded(ready, encodeBounded(ready, { transferId: id })), { transferId: id })
-  t.alike(decodeBounded(finish, encodeBounded(finish, { transferId: id })), { transferId: id })
-  t.alike(
+  t.alike<ReadyInput>(decodeBounded(ready, encodeBounded(ready, { transferId: id })), {
+    transferId: id
+  })
+  t.alike<FinishInput>(decodeBounded(finish, encodeBounded(finish, { transferId: id })), {
+    transferId: id
+  })
+  t.alike<ResultInput>(
     decodeBounded(
       result,
       encodeBounded(result, { transferId: id, code: RESULT_CODE.COMMITTED, reason: '' })
@@ -224,7 +242,7 @@ test('chunk frame bound includes header overhead for full 1 MiB payload', (t) =>
   }
   const encoded = encodeBounded(chunk, value, MAX_CHUNK_FRAME_BYTES)
   t.ok(encoded.byteLength <= MAX_CHUNK_FRAME_BYTES)
-  t.alike(decodeBounded(chunk, encoded, MAX_CHUNK_FRAME_BYTES), value)
+  t.alike<ChunkInput>(decodeBounded(chunk, encoded, MAX_CHUNK_FRAME_BYTES), value)
 
   const worstCase = {
     transferId: b4a.alloc(32),
@@ -254,7 +272,7 @@ test('chunkAck codec round-trips representative data', (t) => {
     index: 4
   }
   const decoded = decodeBounded(chunkAck, encodeBounded(chunkAck, value))
-  t.alike(decoded, value)
+  t.alike<ChunkAckInput>(decoded, value)
 })
 
 test('decodeBounded canonicalizes plain Uint8Array codec outputs', (t) => {

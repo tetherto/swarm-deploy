@@ -15,7 +15,13 @@ import {
   type ServerSessionOptions,
   type ServerSessionStore
 } from '../../dist/protocol/server-session.js'
-import { OFFER, CHUNK, FINISH, STATUS_CODE } from '../../dist/protocol/constants.js'
+import {
+  OFFER,
+  CHUNK,
+  FINISH,
+  STATUS_CODE,
+  type StatusCode
+} from '../../dist/protocol/constants.js'
 import {
   offer,
   status,
@@ -361,7 +367,7 @@ test('server session rejects chunks before READY by destroying the connection', 
 })
 
 test('server session returns terminal statuses for unavailable or capacity-rejected offers', async (t) => {
-  const cases: Array<[InspectStatus, number]> = [
+  const cases: Array<[InspectStatus, StatusCode]> = [
     ['ALREADY_COMMITTED', STATUS_CODE.ALREADY_COMMITTED],
     ['FILE_EXISTS', STATUS_CODE.FILE_EXISTS],
     ['FILE_BUSY', STATUS_CODE.FILE_BUSY]

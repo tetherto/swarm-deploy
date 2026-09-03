@@ -30,6 +30,7 @@ interface ErrnoError extends Error {
 
 /** The fields the harness inspects on a caught recovery error. */
 interface CaughtError {
+  message?: string
   code?: unknown
 }
 

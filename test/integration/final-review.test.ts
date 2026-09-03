@@ -369,7 +369,8 @@ test('Server close aborts a never-resolving discovery flush and releases resourc
   t.is(server.listening, false)
   t.is(internal.swarm, null)
   t.is(internal.discovery, null)
-  t.is(internal.sessionStore, null)
+  // `close()` clears the store, so the closed-state expectation is nullable.
+  t.is<SessionStore | null>(internal.sessionStore, null)
   t.is(internal._connections.size, 0)
   t.is(internal._sessions.size, 0)
   t.is(retention.timer, null)

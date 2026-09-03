@@ -100,5 +100,8 @@ test('runtime scripts and CI execute only compiled test output', (t) => {
     /brittle-(?:node|bare) (?!\.test-dist\/)/.test(workflow),
     'no CI job may run tests outside .test-dist'
   )
-  t.ok(workflow.includes('npm run build && npm run test:types'), 'CI must compile before linting')
+  t.ok(
+    workflow.includes('npm run build && npm run build:test && npm run test:types'),
+    'CI must compile sources and tests before linting'
+  )
 })

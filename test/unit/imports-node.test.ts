@@ -10,6 +10,48 @@ import path from 'node:path'
 const packageRequire = createRequire(__filename)
 const repoRoot = path.join(__dirname, '../..')
 
+interface CompileResult {
+  status: number | null
+  output: string
+  relativePath: string
+}
+
+/**
+ * Type-checks deliberately unsound test code through the real
+ * `tsconfig.test.json` settings and include globs, so a loosened compiler
+ * option cannot pass unnoticed. The scratch file lives inside `test/` because
+ * that is the only place the project include glob reaches.
+ */
+function compileThroughTestProject(source: string): CompileResult {
+  const scratchDir = path.join(repoRoot, 'test', '__negative-control__')
+  const scratchFile = path.join(scratchDir, 'unsound.ts')
+  const relativePath = path.relative(repoRoot, scratchFile).split(path.sep).join('/')
+
+  try {
+    fs.mkdirSync(scratchDir, { recursive: true })
+    fs.writeFileSync(scratchFile, source)
+    const result = spawnSync('npx', ['tsc', '-p', 'tsconfig.test.json', '--noEmit'], {
+      cwd: repoRoot,
+      encoding: 'utf8'
+    })
+    return { status: result.status, output: `${result.stdout}${result.stderr}`, relativePath }
+  } finally {
+    fs.rmSync(scratchDir, { recursive: true, force: true })
+  }
+}
+
+function listCompiledTests(directory: string): string[] {
+  const found: string[] = []
+
+  for (const entry of fs.readdirSync(directory)) {
+    const absolute = path.join(directory, entry)
+    if (fs.statSync(absolute).isDirectory()) found.push(...listCompiledTests(absolute))
+    else if (entry.endsWith('.js')) found.push(absolute)
+  }
+
+  return found
+}
+
 test('dist bin entry exists with node shebang', (t) => {
   const binPath = path.join(repoRoot, 'dist/bin/swarm-deploy.js')
   t.ok(fs.existsSync(binPath))
@@ -106,7 +148,7 @@ test('production build removes stale dist artifacts', (t) => {
   fs.writeFileSync(stale, 'module.exports = {}')
   t.ok(fs.existsSync(stale))
   execSync('npm run build', { cwd: repoRoot, stdio: 'pipe' })
-  t.not(fs.existsSync(stale), 'stale artifact must be removed by clean build')
+  t.absent(fs.existsSync(stale), 'stale artifact must be removed by clean build')
 })
 
 test('test build removes stale compiled test artifacts', (t) => {
@@ -116,7 +158,7 @@ test('test build removes stale compiled test artifacts', (t) => {
   fs.writeFileSync(stale, 'module.exports = {}')
   t.ok(fs.existsSync(stale))
   execSync('npm run build:test', { cwd: repoRoot, stdio: 'pipe' })
-  t.not(fs.existsSync(stale), 'stale compiled test artifact must be removed by clean build')
+  t.absent(fs.existsSync(stale), 'stale compiled test artifact must be removed by clean build')
   t.ok(fs.existsSync(path.join(testDist, 'run.js')), 'clean build must re-emit the runner')
 })
 
@@ -135,35 +177,125 @@ test('tracked test sources contain no JavaScript', (t) => {
   t.alike(generated, [], `generated output must not be tracked: ${generated}`)
 })
 
-test('test compiler settings reject unsound test code', (t) => {
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-deploy-strict-'))
-  const negativeControl = path.join(scratch, 'negative-control.ts')
-  fs.writeFileSync(negativeControl, 'export const size: number = "not a number"\n')
+test('project test compiler settings reject unsound test code', (t) => {
+  // Both statements only fail while `strict` is on: the first needs
+  // `noImplicitAny`, the second needs `strictNullChecks`.
+  const compiled = compileThroughTestProject(
+    [
+      'export function size(value) {',
+      '  return value.length',
+      '}',
+      '',
+      'export const name: string = null',
+      ''
+    ].join('\n')
+  )
 
-  try {
-    const result = spawnSync(
-      'npx',
-      [
-        'tsc',
-        '--ignoreConfig',
-        '--noEmit',
-        '--strict',
-        '--module',
-        'node16',
-        '--moduleResolution',
-        'node16',
-        '--types',
-        'node',
-        negativeControl
-      ],
-      { cwd: repoRoot, encoding: 'utf8' }
-    )
-    t.not(result.status, 0, 'strict compilation must reject the negative control')
-    t.ok(
-      `${result.stdout}${result.stderr}`.includes('negative-control.ts'),
-      'the failure must name the offending file'
-    )
-  } finally {
-    fs.rmSync(scratch, { recursive: true, force: true })
+  t.not(compiled.status, 0, 'the project test config must reject the negative control')
+  t.ok(
+    compiled.output.includes(compiled.relativePath),
+    `the failure must name the offending file: ${compiled.output}`
+  )
+  t.ok(
+    compiled.output.includes('error TS7006'),
+    `implicit any must be rejected: ${compiled.output}`
+  )
+  t.ok(
+    compiled.output.includes('error TS2322'),
+    `null assignment must be rejected: ${compiled.output}`
+  )
+})
+
+test('brittle comparison assertions reject drifted expectations', (t) => {
+  const compiled = compileThroughTestProject(
+    [
+      'import test from "brittle"',
+      '',
+      'declare const code: "ERR_ABORTED" | "ERR_CHECKSUM_MISMATCH"',
+      '',
+      'test("union drift", (t) => {',
+      '  t.is(code, "ERR_CHEKSUM_MISMATCH")',
+      '})',
+      ''
+    ].join('\n')
+  )
+
+  t.not(compiled.status, 0, 'a misspelled expected union member must not type-check')
+  t.ok(
+    compiled.output.includes(compiled.relativePath),
+    `the failure must name the offending file: ${compiled.output}`
+  )
+  t.ok(
+    compiled.output.includes('ERR_CHEKSUM_MISMATCH'),
+    `the failure must name the drifted expectation: ${compiled.output}`
+  )
+})
+
+test('compiled tests emit source maps that point back to TypeScript', (t) => {
+  const testDist = path.join(repoRoot, '.test-dist')
+  const compiled = listCompiledTests(testDist)
+  t.ok(compiled.length > 0, 'compiled test output must exist')
+
+  const offenders: string[] = []
+
+  for (const file of compiled) {
+    const label = path.relative(repoRoot, file)
+    const mapPath = `${file}.map`
+
+    if (!fs.readFileSync(file, 'utf8').includes(`//# sourceMappingURL=${path.basename(mapPath)}`)) {
+      offenders.push(`${label} (no sourceMappingURL)`)
+      continue
+    }
+    if (!fs.existsSync(mapPath)) {
+      offenders.push(`${label} (no source map)`)
+      continue
+    }
+
+    const map = JSON.parse(fs.readFileSync(mapPath, 'utf8')) as {
+      version: number
+      sources: string[]
+      mappings: string
+    }
+
+    if (map.version !== 3) offenders.push(`${label} (unexpected map version ${map.version})`)
+    if (map.mappings.length === 0) offenders.push(`${label} (empty mappings)`)
+
+    for (const source of map.sources) {
+      const resolved = path.resolve(path.dirname(mapPath), source)
+      const inTestSources = resolved.startsWith(path.join(repoRoot, 'test') + path.sep)
+
+      if (!source.endsWith('.ts')) offenders.push(`${label} -> ${source} (not TypeScript)`)
+      else if (!inTestSources) offenders.push(`${label} -> ${source} (outside test sources)`)
+      else if (!fs.existsSync(resolved)) offenders.push(`${label} -> ${source} (missing source)`)
+    }
   }
+
+  t.alike(offenders, [], `every compiled test must map back to its source: ${offenders}`)
+})
+
+test('source-mapped stacks report TypeScript test frames', (t) => {
+  const probe = spawnSync(
+    'node',
+    [
+      '--enable-source-maps',
+      '-e',
+      `const files = require(${JSON.stringify(path.join(repoRoot, '.test-dist/helpers/files.js'))})
+try {
+  files.digestBuffer(null)
+} catch (err) {
+  console.log(err.stack)
+}`
+    ],
+    { cwd: repoRoot, encoding: 'utf8' }
+  )
+
+  t.is(probe.status, 0, probe.stderr)
+  t.ok(
+    probe.stdout.includes(`${path.join('test', 'helpers', 'files.ts')}:`),
+    `the stack must name the TypeScript helper: ${probe.stdout}`
+  )
+  t.absent(
+    probe.stdout.includes(`${path.join('.test-dist', 'helpers', 'files.js')}:`),
+    `the stack must not name the emitted JavaScript: ${probe.stdout}`
+  )
 })
