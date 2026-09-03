@@ -75,6 +75,7 @@ interface CreateStoreOptions {
   maxStagingBytes?: number
   checkpointChunks?: number
   storage?: TestStorage
+  replaceNames?: Iterable<string>
 }
 
 interface CreatedStore {
@@ -186,7 +187,8 @@ async function createStore(t: Assert, options: CreateStoreOptions = {}): Promise
     maxStagingBytes: options.maxStagingBytes ?? 4 * 1024 * 1024,
     clock,
     checkpointChunks: options.checkpointChunks ?? 16,
-    storage: options.storage
+    storage: options.storage,
+    replaceNames: options.replaceNames
   })
   await store.init()
   t.teardown(() => store.close())
@@ -1397,4 +1399,35 @@ test('retireCommitted releases only the in-memory session reservation', async (t
   t.is(store.reservedBytes, 0)
   t.is(await pathExists(sessionPath(layout, upload.offer)), true)
   t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+})
+
+test('offer stages a configured mutable name whose destination is occupied', async (t) => {
+  const { layout, store } = await createStore(t, { replaceNames: ['release.tar.gz'] })
+  await fs.promises.writeFile(path.join(layout.root, 'release.tar.gz'), b4a.from('published'))
+  await fs.promises.writeFile(path.join(layout.root, 'other.bin'), b4a.from('published'))
+
+  const mutable = makeUpload(OWNER, { name: 'release.tar.gz', data: b4a.from('next release') })
+  const snapshot = await store.offer(OWNER, mutable.offer)
+  t.is(snapshot.state, 'receiving')
+  t.alike(store.replaceNames, new Set(['release.tar.gz']))
+
+  const other = makeUpload(OWNER, { name: 'other.bin', data: b4a.from('next other') })
+  await t.exception(() => store.offer(OWNER, other.offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.FILE_EXISTS
+  })
+})
+
+test('offer refuses the reserved history namespace', async (t) => {
+  const { store } = await createStore(t)
+  const reserved = makeUpload(OWNER, {
+    name: `history-${'a'.repeat(64)}`,
+    data: b4a.from('reserved')
+  })
+
+  await t.exception(() => store.offer(OWNER, reserved.offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.INVALID_FILENAME
+  })
+  t.is(store.sessions.size, 0)
 })

@@ -4,7 +4,12 @@ import test from 'brittle'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS, validateBasename, selectUploadPaths, buildFileManifest } from '../../dist/index.js'
-import type { BuildFileManifestOptions } from '../../dist/files.js'
+import {
+  historyName,
+  isReservedHistoryName,
+  validateReplaceNames,
+  type BuildFileManifestOptions
+} from '../../dist/files.js'
 import { createAbortController } from '../../dist/abort.js'
 import {
   CHUNK_SIZE,
@@ -62,6 +67,64 @@ test('validateBasename accepts safe names and rejects unsafe names', (t) => {
     name: 'SwarmDeployError',
     code: ERRORS.INVALID_FILENAME
   })
+})
+
+test('isReservedHistoryName reserves only the exact history prefix', (t) => {
+  t.is(isReservedHistoryName('history-a'), true)
+  t.is(isReservedHistoryName('history-'), true)
+  t.is(isReservedHistoryName(`history-${'a'.repeat(64)}`), true)
+  t.is(isReservedHistoryName('history'), false)
+  t.is(isReservedHistoryName('historyx'), false)
+  t.is(isReservedHistoryName('release.tar.gz'), false)
+})
+
+test('historyName derives a valid basename from a full transfer ID', (t) => {
+  const id = 'a'.repeat(64)
+
+  t.is(historyName(id), `history-${id}`)
+  t.is(validateBasename(historyName(id)), `history-${id}`)
+  t.is(isReservedHistoryName(historyName(id)), true)
+  for (const invalid of ['a'.repeat(63), 'a'.repeat(65), 'A'.repeat(64), 'g'.repeat(64), '']) {
+    t.exception(() => historyName(invalid), {
+      name: 'SwarmDeployError',
+      code: ERRORS.PROTOCOL_INVALID
+    })
+  }
+})
+
+test('validateReplaceNames copies exact upload names and rejects reserved input', (t) => {
+  t.alike(validateReplaceNames(), new Set())
+  t.alike(validateReplaceNames(undefined), new Set())
+  t.alike(
+    validateReplaceNames(['release.tar.gz', 'manifest.json']),
+    new Set(['release.tar.gz', 'manifest.json'])
+  )
+
+  function* names(): Generator<string> {
+    yield 'release.tar.gz'
+  }
+  t.alike(validateReplaceNames(names()), new Set(['release.tar.gz']))
+
+  const source = ['release.tar.gz']
+  const copied = validateReplaceNames(source)
+  source.push('manifest.json')
+  t.alike(copied, new Set(['release.tar.gz']))
+
+  for (const invalid of [['history-a'], [`history-${'a'.repeat(64)}`], ['.swarm-deploy'], ['']]) {
+    t.exception(() => validateReplaceNames(invalid), {
+      name: 'SwarmDeployError',
+      code: ERRORS.INVALID_FILENAME
+    })
+  }
+  t.exception(() => validateReplaceNames(['release.tar.gz', 'release.tar.gz']), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  for (const invalid of ['release.tar.gz', 7, {}, [1]]) {
+    t.exception(() => validateReplaceNames(invalid as unknown as Iterable<string>), {
+      name: 'SwarmDeployError'
+    })
+  }
 })
 
 test('buildFileManifest hashes boundary sizes with logical chunks', async (t) => {

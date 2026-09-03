@@ -812,3 +812,439 @@ test('recovery aborts on uncoded storage-safety errors without reporting corrupt
   t.is(await pathExists(expected.journal), true)
   t.is(await pathExists(expected.final), false)
 })
+
+/** Every durable v2 boundary, in the order the transaction reaches them. */
+const REPLACEMENT_BOUNDARIES = [
+  'journal durable',
+  'history link created',
+  'history root synchronized',
+  'publication link created',
+  'final renamed',
+  'final root synchronized',
+  'current sidecar renamed',
+  'current sidecar durable',
+  'history sidecar durable',
+  'session removed',
+  'staging removed',
+  'journal removed'
+] as const
+
+type ReplacementBoundary = (typeof REPLACEMENT_BOUNDARIES)[number]
+
+/**
+ * Recovery preserves the new content from the moment the new current sidecar
+ * is visible, even when the interrupted attempt could not record its phase.
+ */
+const LINEARIZED_BOUNDARIES = new Set<ReplacementBoundary>([
+  'current sidecar renamed',
+  'current sidecar durable',
+  'history sidecar durable',
+  'session removed',
+  'staging removed',
+  'journal removed'
+])
+
+/** Boundaries the interrupted call itself reports as a committed replacement. */
+const COMMITTED_BOUNDARIES = new Set<ReplacementBoundary>([
+  'current sidecar durable',
+  'history sidecar durable',
+  'session removed',
+  'staging removed',
+  'journal removed'
+])
+
+/** Operations a stopped process can no longer perform. */
+const MUTATIONS = new Set(['link', 'rename', 'unlink', 'rmdir', 'rm', 'write', 'sync', 'truncate'])
+
+const MUTABLE = 'release.tar.gz'
+const OLD_BYTES = b4a.from('release one payload')
+const NEW_BYTES = b4a.from('release two payload')
+
+interface ReplacementPaths {
+  final: string
+  history: string
+  staging: string
+  session: string
+  journal: string
+  record: string
+  oldRecord: string
+}
+
+interface CrashedReplacement {
+  layout: StorageLayout
+  clock: TestClock
+  replaceNames: Set<string>
+  oldRecord: CommitRecord
+  newTransferId: string
+  paths: ReplacementPaths
+  oldInode: string
+  stagingInode: string
+  unknown: string
+}
+
+function replacementUpload(name: string, data: Buffer): HarnessUpload {
+  const offer = {
+    version: 1,
+    name,
+    size: data.byteLength,
+    digest: sha256(data),
+    chunkSize: CHUNK_SIZE,
+    chunkCount: Math.ceil(data.byteLength / CHUNK_SIZE)
+  }
+  return {
+    offer: {
+      ...offer,
+      transferId: transferId({
+        clientPublicKey: OWNER,
+        name: offer.name,
+        size: offer.size,
+        digest: offer.digest,
+        chunkSize: offer.chunkSize
+      })
+    },
+    chunk: { index: 0, data, digest: sha256(data) }
+  }
+}
+
+async function inodeOf(filePath: string): Promise<string> {
+  const stat = await fs.promises.lstat(filePath)
+  return `${stat.dev}:${stat.ino}`
+}
+
+async function crashDuringReplacement(
+  t: Assert,
+  boundary: ReplacementBoundary
+): Promise<CrashedReplacement> {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const clock = createClock()
+  const replaceNames = new Set([MUTABLE])
+  const finalPath = path.join(layout.root, MUTABLE)
+
+  let crashed = false
+  let armed = false
+  let stage = 'start'
+  let commitSyncs = 0
+  let historyPath = ''
+  let journalFile = ''
+  let sessionFile = ''
+  let stagingFile = ''
+
+  const storage = createStorage({
+    async beforeOperation(name) {
+      if (crashed && MUTATIONS.has(name)) throw new Error('Storage stopped at crash point')
+    },
+    async afterOperation(name, source, destination) {
+      if (!armed || crashed) return
+      const publication =
+        typeof destination === 'string' &&
+        destination.startsWith(`${layout.publications}${path.sep}`)
+      if (name === 'link' && destination === historyPath) stage = 'history'
+      else if (name === 'link' && publication) stage = 'publication'
+      else if (name === 'rename' && destination === finalPath) stage = 'renamed'
+      if (name === 'sync' && source === layout.commits) commitSyncs++
+
+      const crash =
+        (boundary === 'journal durable' &&
+          name === 'sync' &&
+          source === layout.journals &&
+          stage === 'start') ||
+        (boundary === 'history link created' && name === 'link' && destination === historyPath) ||
+        (boundary === 'history root synchronized' &&
+          name === 'sync' &&
+          source === layout.root &&
+          stage === 'history') ||
+        (boundary === 'publication link created' && name === 'link' && publication) ||
+        (boundary === 'final renamed' && name === 'rename' && destination === finalPath) ||
+        (boundary === 'final root synchronized' &&
+          name === 'sync' &&
+          source === layout.root &&
+          stage === 'renamed') ||
+        (boundary === 'current sidecar renamed' &&
+          name === 'sync' &&
+          source === layout.commits &&
+          commitSyncs === 1) ||
+        (boundary === 'current sidecar durable' &&
+          name === 'write' &&
+          typeof source === 'string' &&
+          source.startsWith(`${layout.journals}${path.sep}.`) &&
+          commitSyncs === 1) ||
+        (boundary === 'history sidecar durable' &&
+          name === 'sync' &&
+          source === layout.commits &&
+          commitSyncs === 2) ||
+        (boundary === 'session removed' && name === 'unlink' && source === sessionFile) ||
+        (boundary === 'staging removed' && name === 'unlink' && source === stagingFile) ||
+        (boundary === 'journal removed' && name === 'unlink' && source === journalFile)
+      if (!crash) return
+      crashed = true
+      throw new Error(`Injected crash after ${boundary}`)
+    }
+  })
+
+  const sessionStore = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    clock,
+    checkpointChunks: 1,
+    storage,
+    replaceNames
+  })
+  await sessionStore.init()
+  const commits = new CommitStore({ layout, clock, storage, logger: { warn() {} } })
+
+  const first = replacementUpload(MUTABLE, OLD_BYTES)
+  await sessionStore.offer(OWNER, first.offer)
+  await sessionStore.writeChunk(first.offer.transferId, asChunk(first.chunk))
+  await sessionStore.finish(first.offer.transferId)
+  const oldRecord = await commits.commit(sessionStore.sessions.get(hex(first.offer.transferId))!, {
+    replaceNames
+  })
+  await sessionStore.retireCommitted(first.offer.transferId)
+  const oldInode = await inodeOf(finalPath)
+
+  const next = replacementUpload(MUTABLE, NEW_BYTES)
+  await sessionStore.offer(OWNER, next.offer)
+  await sessionStore.writeChunk(next.offer.transferId, asChunk(next.chunk))
+  await sessionStore.finish(next.offer.transferId)
+  const newTransferId = hex(next.offer.transferId)
+  const replacementPaths: ReplacementPaths = {
+    final: finalPath,
+    history: path.join(layout.root, `history-${oldRecord.transferId}`),
+    staging: path.join(layout.staging, `${newTransferId}.part`),
+    session: path.join(layout.sessions, `${newTransferId}.json`),
+    journal: path.join(layout.journals, `${newTransferId}.json`),
+    record: path.join(layout.commits, `${newTransferId}.json`),
+    oldRecord: path.join(layout.commits, `${oldRecord.transferId}.json`)
+  }
+  historyPath = replacementPaths.history
+  journalFile = replacementPaths.journal
+  sessionFile = replacementPaths.session
+  stagingFile = replacementPaths.staging
+  const stagingInode = await inodeOf(replacementPaths.staging)
+  const unknown = path.join(layout.root, 'operator-note.txt')
+  await fs.promises.writeFile(unknown, b4a.from('do not modify'))
+
+  armed = true
+  const attempt = commits.commit(sessionStore.sessions.get(newTransferId)!, { replaceNames })
+  if (COMMITTED_BOUNDARIES.has(boundary)) await attempt
+  else await t.exception(() => attempt)
+  t.ok(crashed, `${boundary} crashed`)
+  await sessionStore.close()
+
+  return {
+    layout,
+    clock,
+    replaceNames,
+    oldRecord,
+    newTransferId,
+    paths: replacementPaths,
+    oldInode,
+    stagingInode,
+    unknown
+  }
+}
+
+for (const boundary of REPLACEMENT_BOUNDARIES) {
+  test(`replacement recovery converges after crash at ${boundary}`, async (t) => {
+    const crash = await crashDuringReplacement(t, boundary)
+    const { layout, clock, paths: expected, replaceNames } = crash
+    const linearized = LINEARIZED_BOUNDARIES.has(boundary)
+
+    const restarted = new SessionStore({
+      layout,
+      maxStagingBytes: CHUNK_SIZE,
+      clock,
+      checkpointChunks: 1,
+      replaceNames
+    })
+    await restarted.init()
+    t.teardown(() => restarted.close())
+    const commits = new CommitStore({ layout, clock })
+
+    const results = await recoverStorage({
+      layout,
+      sessionStore: restarted,
+      commitStore: commits,
+      logger: { warn() {} }
+    })
+
+    // The last boundary already discarded the journal, so nothing is left to recover.
+    const pending = boundary === 'journal removed' ? 0 : 1
+    t.is(results.length, pending, `${boundary} recovered journals`)
+    if (pending > 0) {
+      t.is(results[0].status, linearized ? 'COMMITTED' : 'RESUMABLE', `${boundary} status`)
+    }
+    t.alike(await fs.promises.readFile(crash.unknown), b4a.from('do not modify'), boundary)
+    t.is(await pathExists(expected.journal), false, `${boundary} journal discarded`)
+    t.is((await fs.promises.readdir(layout.publications)).length, 0, `${boundary} publications`)
+
+    if (!linearized) {
+      t.alike(await fs.promises.readFile(expected.final), OLD_BYTES, `${boundary} old restored`)
+      t.is(await inodeOf(expected.final), crash.oldInode, `${boundary} old inode restored`)
+      t.is(await pathExists(expected.history), false, `${boundary} no history`)
+      t.is(await pathExists(expected.record), false, `${boundary} no new sidecar`)
+      t.is((await readCommitRecord(expected.oldRecord)).name, MUTABLE, `${boundary} old sidecar`)
+      t.is(await pathExists(expected.staging), true, `${boundary} staging retained`)
+      t.is(await pathExists(expected.session), true, `${boundary} session retained`)
+      t.is(restarted.sessions.get(crash.newTransferId)!.state, 'verified', `${boundary} resumable`)
+      t.alike(await commits.list(), [await readCommitRecord(expected.oldRecord)], boundary)
+
+      const retried = await commits.commit(restarted.sessions.get(crash.newTransferId)!, {
+        replaceNames
+      })
+      t.is(retried.version, 2, `${boundary} retry replaces`)
+      t.alike(await fs.promises.readFile(expected.final), NEW_BYTES, `${boundary} retry published`)
+      t.alike(await fs.promises.readFile(expected.history), OLD_BYTES, `${boundary} retry history`)
+      t.is(await inodeOf(expected.history), crash.oldInode, `${boundary} retry history inode`)
+      return
+    }
+
+    t.alike(await fs.promises.readFile(expected.final), NEW_BYTES, `${boundary} new preserved`)
+    t.is(await inodeOf(expected.final), crash.stagingInode, `${boundary} new inode preserved`)
+    t.alike(await fs.promises.readFile(expected.history), OLD_BYTES, `${boundary} history content`)
+    t.is(await inodeOf(expected.history), crash.oldInode, `${boundary} history inode`)
+    t.is(
+      (await readCommitRecord(expected.oldRecord)).name,
+      `history-${crash.oldRecord.transferId}`,
+      `${boundary} history sidecar`
+    )
+    const record = await readCommitRecord(expected.record)
+    t.is(record.version, 2, `${boundary} v2 record`)
+    t.alike(
+      record.replaces,
+      {
+        name: MUTABLE,
+        transferId: crash.oldRecord.transferId,
+        historyName: `history-${crash.oldRecord.transferId}`
+      },
+      `${boundary} replacement metadata`
+    )
+    t.is(await pathExists(expected.staging), false, `${boundary} staging cleaned`)
+    t.is(await pathExists(expected.session), false, `${boundary} session cleaned`)
+    t.is(restarted.sessions.size, 0, `${boundary} no resumed session`)
+    t.is(restarted.reservedBytes, 0, `${boundary} no reservation`)
+
+    const again = await recoverStorage({
+      layout,
+      sessionStore: restarted,
+      commitStore: commits,
+      logger: { warn() {} }
+    })
+    t.is(again.length, 0, `${boundary} idempotent recovery`)
+    t.alike(await fs.promises.readFile(expected.final), NEW_BYTES, `${boundary} still new`)
+    t.alike(
+      (await commits.list()).map((entry) => entry.name).sort(),
+      [MUTABLE, `history-${crash.oldRecord.transferId}`].sort(),
+      `${boundary} converged records`
+    )
+  })
+}
+
+test('startup revocation aborts an interrupted replacement and restores the old artifact', async (t) => {
+  const crash = await crashDuringReplacement(t, 'history link created')
+  const { layout, clock, paths: expected } = crash
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    clock,
+    checkpointChunks: 1,
+    replaceNames: crash.replaceNames
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  const commits = new CommitStore({ layout, clock })
+
+  const results = await recoverStorage({
+    layout,
+    sessionStore: restarted,
+    commitStore: commits,
+    isAuthorized: () => false,
+    logger: { warn() {} }
+  })
+
+  t.is(results[0].status, 'ABORTED')
+  t.alike(await fs.promises.readFile(expected.final), OLD_BYTES)
+  t.is(await inodeOf(expected.final), crash.oldInode)
+  t.is(await pathExists(expected.history), false)
+  t.is(await pathExists(expected.record), false)
+  t.is(await pathExists(expected.journal), false)
+  t.is(await pathExists(expected.staging), false)
+  t.is(await pathExists(expected.session), false)
+  t.alike(
+    (await commits.list()).map((entry) => entry.name),
+    [MUTABLE]
+  )
+})
+
+test('startup revocation cannot unpublish a linearized replacement', async (t) => {
+  const crash = await crashDuringReplacement(t, 'current sidecar renamed')
+  const { layout, clock, paths: expected } = crash
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    clock,
+    checkpointChunks: 1,
+    replaceNames: crash.replaceNames
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  const commits = new CommitStore({ layout, clock })
+
+  const results = await recoverStorage({
+    layout,
+    sessionStore: restarted,
+    commitStore: commits,
+    isAuthorized: () => false,
+    logger: { warn() {} }
+  })
+
+  t.is(results[0].status, 'COMMITTED')
+  t.alike(await fs.promises.readFile(expected.final), NEW_BYTES)
+  t.alike(await fs.promises.readFile(expected.history), OLD_BYTES)
+  t.is(await pathExists(expected.journal), false)
+  t.is((await readCommitRecord(expected.oldRecord)).name, `history-${crash.oldRecord.transferId}`)
+})
+
+test('recovery quarantines a corrupt replacement journal without touching artifacts', async (t) => {
+  const crash = await crashDuringReplacement(t, 'history link created')
+  const { layout, clock, paths: expected } = crash
+  await fs.promises.writeFile(expected.journal, b4a.from('{"version":2,"phase":'))
+
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    clock,
+    checkpointChunks: 1,
+    replaceNames: crash.replaceNames
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  const commits = new CommitStore({ layout, clock })
+  const warnings: string[] = []
+
+  const results = await recoverStorage({
+    layout,
+    sessionStore: restarted,
+    commitStore: commits,
+    logger: {
+      warn(message: string) {
+        warnings.push(message)
+      }
+    }
+  })
+
+  t.is(results[0].status, 'CORRUPT')
+  t.ok(warnings.includes('Skipping corrupt commit journal'))
+  t.alike(await fs.promises.readFile(expected.final), OLD_BYTES)
+  t.is(await inodeOf(expected.final), crash.oldInode)
+  t.is((await readCommitRecord(expected.oldRecord)).name, MUTABLE)
+  t.is(await pathExists(expected.journal), false)
+  t.is(await pathExists(expected.record), false)
+  t.is(await pathExists(expected.history), true, 'quarantine preserves the orphan link')
+  t.alike(await fs.promises.readFile(crash.unknown), b4a.from('do not modify'))
+  t.alike(
+    (await commits.list()).map((entry) => entry.name),
+    [MUTABLE]
+  )
+})

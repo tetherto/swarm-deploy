@@ -327,3 +327,133 @@ test('scheduled retention uses lstat metadata without rehashing healthy finals',
   t.is(reads, 0)
   t.is(await pathExists(valid.finalPath), true)
 })
+
+/** Leaves a crashed replacement whose old sidecar still claims the mutable name. */
+async function crashAfterNewSidecar(t: Assert): Promise<{
+  layout: StorageLayout
+  commitStore: CommitStore
+  manager: RetentionManager
+  current: CommitRecord
+  superseded: CommitRecord
+  journalPath: string
+}> {
+  const layout = initLayout(await createTempDir(t))
+  const clock = createClock()
+  const replaceNames = new Set(['release.tar.gz'])
+  let crashed = false
+  let armed = false
+  const storage = createStorage({
+    async beforeOperation(name) {
+      if (crashed && name !== 'lstat' && name !== 'stat' && name !== 'readdir' && name !== 'open') {
+        throw new Error('Storage stopped at crash point')
+      }
+    },
+    async afterOperation(name, source) {
+      if (!armed || crashed || name !== 'sync' || source !== layout.commits) return
+      crashed = true
+      throw new Error('Injected crash after the new current sidecar')
+    }
+  })
+  const sessionStore = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    checkpointChunks: 1,
+    clock,
+    storage,
+    replaceNames
+  })
+  await sessionStore.init()
+  t.teardown(() => sessionStore.close())
+  const commitStore = new CommitStore({ layout, clock, storage })
+
+  const publish = async (data: Buffer): Promise<CommitRecord> => {
+    const upload = makeUpload('release.tar.gz', data)
+    await sessionStore.offer(OWNER, upload.offer)
+    await sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
+    await sessionStore.finish(upload.offer.transferId)
+    const session = sessionStore.sessions.get(hex(upload.offer.transferId))!
+    const record = await commitStore.commit(session, { replaceNames })
+    await sessionStore.retireCommitted(upload.offer.transferId)
+    return record
+  }
+
+  const superseded = await publish(b4a.from('release one'))
+  const upload = makeUpload('release.tar.gz', b4a.from('release two'))
+  await sessionStore.offer(OWNER, upload.offer)
+  await sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
+  await sessionStore.finish(upload.offer.transferId)
+  armed = true
+  await t.exception(() =>
+    commitStore.commit(sessionStore.sessions.get(hex(upload.offer.transferId))!, { replaceNames })
+  )
+
+  const reader = new CommitStore({ layout, clock })
+  const manager = new RetentionManager({
+    layout,
+    sessionStore,
+    commitStore: reader,
+    clock,
+    isSessionActive: () => false
+  })
+  const current = await reader.list()
+  t.is(current.length, 2, 'the crash left both sidecars on disk')
+  return {
+    layout,
+    commitStore: reader,
+    manager,
+    current: current.find((record) => record.name === 'release.tar.gz')!,
+    superseded,
+    journalPath: path.join(layout.journals, `${hex(upload.offer.transferId)}.json`)
+  }
+}
+
+test('scrub tolerates a journal-owned duplicate name and reports no unknown paths', async (t) => {
+  const crashed = await crashAfterNewSidecar(t)
+
+  const records = await crashed.commitStore.list()
+  t.alike(
+    records.map((record) => record.name).sort(),
+    ['release.tar.gz', `history-${crashed.superseded.transferId}`].sort()
+  )
+  t.is(
+    records.reduce((total, record) => total + record.size, 0),
+    22
+  )
+
+  const scrub = await crashed.manager.scrubCommitted()
+  t.is(scrub.deleted, 0)
+  t.alike(scrub.unknown, [])
+  t.is(scrub.records.length, 2)
+  t.is(await pathExists(path.join(crashed.layout.root, 'release.tar.gz')), true)
+  t.is(
+    await pathExists(path.join(crashed.layout.root, `history-${crashed.superseded.transferId}`)),
+    true
+  )
+})
+
+test('enumeration rejects a duplicate name no journal explains', async (t) => {
+  const crashed = await crashAfterNewSidecar(t)
+  await fs.promises.unlink(crashed.journalPath)
+
+  await t.exception(() => crashed.commitStore.list(), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  await t.exception(() => crashed.manager.scrubCommitted())
+})
+
+test('deletion tolerates the journal-owned rename of a superseded record', async (t) => {
+  const crashed = await crashAfterNewSidecar(t)
+  const history = (await crashed.commitStore.list()).find((record) =>
+    record.name.startsWith('history-')
+  )!
+
+  t.is(await crashed.commitStore.delete(history), true)
+
+  t.is(await pathExists(path.join(crashed.layout.root, history.name)), false)
+  t.is(await pathExists(path.join(crashed.layout.root, 'release.tar.gz')), true)
+  t.alike(
+    (await crashed.commitStore.list()).map((record) => record.name),
+    ['release.tar.gz']
+  )
+})

@@ -71,6 +71,8 @@ export interface StorageLayout {
   sessions: string
   commits: string
   journals: string
+  /** Private destinations for replacement publications before they are visible. */
+  publications: string
   lock: string
 }
 

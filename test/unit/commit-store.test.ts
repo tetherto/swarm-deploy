@@ -9,6 +9,7 @@ import path from '#path'
 import { ERRORS } from '../../dist/errors.js'
 import { transferId } from '../../dist/protocol/transfer-id.js'
 import type { Chunk, Digest, Offer } from '../../dist/protocol/types.js'
+import { historyName } from '../../dist/files.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { readJson } from '../../dist/storage/atomic-file.js'
 import { SessionStore } from '../../dist/storage/session-store.js'
@@ -16,9 +17,11 @@ import { CommitStore } from '../../dist/storage/commit-store.js'
 import {
   assertCommitRecord,
   type CommitJournal,
-  type CommitRecord
+  type CommitRecord,
+  type ReplacementJournal
 } from '../../dist/storage/commit-journal.js'
 import { recoverStorage } from '../../dist/storage/recovery.js'
+import { withNameLease } from '../../dist/storage/root-coordinator.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import { createClock, type TestClock } from '../helpers/clock.js'
 import { createTempDir } from '../helpers/files.js'
@@ -60,6 +63,15 @@ interface ExpectedPaths {
 interface LoggedWarning {
   message: string
   details: Record<string, unknown>
+}
+
+type CommitStoreLogger = ConstructorParameters<typeof CommitStore>[0]['logger']
+
+/** Records the retention calls a replacement makes while the old current is pinned. */
+interface RetentionCall {
+  incomingBytes: number
+  trigger: string
+  names: string[]
 }
 
 interface CreateVerifiedSessionOptions {
@@ -159,6 +171,16 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+async function verifyUpload(
+  sessionStore: SessionStore,
+  upload: HarnessUpload
+): Promise<Parameters<CommitStore['commit']>[0]> {
+  await sessionStore.offer(OWNER, upload.offer)
+  await sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
+  await sessionStore.finish(upload.offer.transferId)
+  return sessionStore.sessions.get(hex(upload.offer.transferId))!
+}
+
 async function createVerifiedSession(
   t: Assert,
   { storage, upload = makeUpload() }: CreateVerifiedSessionOptions = {}
@@ -174,18 +196,77 @@ async function createVerifiedSession(
     storage
   })
   await sessionStore.init()
-  await sessionStore.offer(OWNER, upload.offer)
-  await sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
-  await sessionStore.finish(upload.offer.transferId)
+  const session = await verifyUpload(sessionStore, upload)
   t.teardown(() => sessionStore.close())
+
+  return { layout, clock, sessionStore, upload, session }
+}
+
+/** One mutable name plus a reusable session store, for replacement sequences. */
+interface ReplacementHarness {
+  layout: StorageLayout
+  clock: TestClock
+  sessionStore: SessionStore
+  commits: CommitStore
+  replaceNames: Set<string>
+  publish(data: Buffer, name?: string): Promise<CommitRecord>
+  stage(data: Buffer, name?: string): Promise<HarnessUpload>
+  session(upload: HarnessUpload): Parameters<CommitStore['commit']>[0]
+}
+
+const MUTABLE = 'release.tar.gz'
+
+async function createReplacementHarness(
+  t: Assert,
+  { storage, logger }: { storage?: TestStorage; logger?: CommitStoreLogger } = {}
+): Promise<ReplacementHarness> {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const clock = createClock()
+  const replaceNames = new Set([MUTABLE])
+  const sessionStore = new SessionStore({
+    layout,
+    maxStagingBytes: CHUNK_SIZE,
+    clock,
+    checkpointChunks: 1,
+    storage,
+    replaceNames
+  })
+  await sessionStore.init()
+  t.teardown(() => sessionStore.close())
+  const commits = new CommitStore({ layout, clock, storage, logger })
+
+  async function stage(data: Buffer, name = MUTABLE): Promise<HarnessUpload> {
+    const upload = makeUpload({ name, data })
+    await verifyUpload(sessionStore, upload)
+    return upload
+  }
 
   return {
     layout,
     clock,
     sessionStore,
-    upload,
-    session: sessionStore.sessions.get(hex(upload.offer.transferId))!
+    commits,
+    replaceNames,
+    stage,
+    session: (upload) => sessionStore.sessions.get(hex(upload.offer.transferId))!,
+    async publish(data: Buffer, name = MUTABLE): Promise<CommitRecord> {
+      const upload = await stage(data, name)
+      const record = await commits.commit(
+        sessionStore.sessions.get(hex(upload.offer.transferId))!,
+        {
+          replaceNames
+        }
+      )
+      await sessionStore.retireCommitted(upload.offer.transferId)
+      return record
+    }
   }
+}
+
+async function inode(filePath: string): Promise<string> {
+  const stat = await fs.promises.lstat(filePath)
+  return `${stat.dev}:${stat.ino}`
 }
 
 test('commit hard-links the complete verified staging inode and writes its sidecar', async (t) => {
@@ -704,4 +785,409 @@ test('retryAbortedAttempt leaves foreign final and sidecar state untouched', asy
     t.is(await pathExists(stagingPath(layout, upload.offer)), true, `${boundary} staging retained`)
     t.is(await pathExists(sessionMetadata), true, `${boundary} session retained`)
   }
+})
+
+test('initLayout protects the private publication namespace', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const stat = await fs.promises.lstat(layout.publications)
+
+  t.is(layout.publications, path.join(layout.internal, 'publications'))
+  t.is(stat.isDirectory(), true)
+
+  const commits = new CommitStore({ layout })
+  await fs.promises.rmdir(layout.publications)
+
+  await t.exception(() => commits.list(), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+})
+
+test('withNameLease serializes one name while distinct names proceed', async (t) => {
+  const root = await createTempDir(t)
+  const order: string[] = []
+  let releaseFirst: (() => void) | null = null
+  const first = new Promise<void>((resolve) => {
+    releaseFirst = resolve
+  })
+
+  const serialized = withNameLease(root, MUTABLE, async () => {
+    order.push('first-start')
+    await first
+    order.push('first-end')
+  })
+  const queued = withNameLease(root, MUTABLE, async () => {
+    order.push('second-start')
+  })
+  const concurrent = withNameLease(root, 'manifest.json', async () => {
+    order.push('other')
+  })
+
+  await concurrent
+  t.alike(order, ['first-start', 'other'])
+  releaseFirst!()
+  await Promise.all([serialized, queued])
+  t.alike(order, ['first-start', 'other', 'first-end', 'second-start'])
+
+  t.is(await withNameLease(root, MUTABLE, () => 'value'), 'value')
+  await t.exception(
+    () =>
+      withNameLease(root, MUTABLE, () => {
+        throw new Error('leased failure')
+      }),
+    { message: 'leased failure' }
+  )
+  t.is(await withNameLease(root, MUTABLE, () => 'after failure'), 'after failure')
+})
+
+test('inspect reports replaceability only for configured managed mutable names', async (t) => {
+  const harness = await createReplacementHarness(t)
+  const { commits, replaceNames } = harness
+
+  const first = makeUpload({ name: MUTABLE, data: b4a.from('release one') })
+  t.is((await commits.inspect(MUTABLE, first.offer, { replaceNames })).status, 'AVAILABLE')
+
+  await harness.publish(b4a.from('release one'))
+
+  const same = makeUpload({ name: MUTABLE, data: b4a.from('release one') })
+  const next = makeUpload({ name: MUTABLE, data: b4a.from('release two') })
+
+  t.is((await commits.inspect(MUTABLE, same.offer, { replaceNames })).status, 'ALREADY_COMMITTED')
+  const replaceable = await commits.inspect(MUTABLE, next.offer, { replaceNames })
+  t.is(replaceable.status, 'REPLACEABLE')
+  t.is(
+    replaceable.status === 'REPLACEABLE' ? replaceable.record.sha256 : null,
+    hex(sha256(b4a.from('release one')))
+  )
+
+  t.is((await commits.inspect(MUTABLE, next.offer)).status, 'FILE_EXISTS')
+  t.is(
+    (await commits.inspect(MUTABLE, next.offer, { replaceNames: new Set(['other.bin']) })).status,
+    'FILE_EXISTS'
+  )
+})
+
+test('inspect never replaces prefix-sharing or unmanaged mutable paths', async (t) => {
+  const harness = await createReplacementHarness(t)
+  const { commits, layout, replaceNames } = harness
+
+  await harness.publish(b4a.from('sibling content'), 'release.tar.gz.bak')
+  const sibling = makeUpload({ name: 'release.tar.gz.bak', data: b4a.from('sibling next') })
+  t.is(
+    (await commits.inspect('release.tar.gz.bak', sibling.offer, { replaceNames })).status,
+    'FILE_EXISTS'
+  )
+
+  await fs.promises.writeFile(path.join(layout.root, MUTABLE), b4a.from('operator artifact'))
+  const unmanaged = makeUpload({ name: MUTABLE, data: b4a.from('replacement bytes') })
+  t.is((await commits.inspect(MUTABLE, unmanaged.offer, { replaceNames })).status, 'FILE_EXISTS')
+  t.alike(
+    await fs.promises.readFile(path.join(layout.root, MUTABLE)),
+    b4a.from('operator artifact')
+  )
+})
+
+test('inspect and commit refuse the reserved history namespace', async (t) => {
+  const harness = await createReplacementHarness(t)
+  const reserved = `history-${'a'.repeat(64)}`
+  const upload = makeUpload({ name: reserved, data: b4a.from('reserved') })
+
+  await t.exception(() => harness.commits.inspect(reserved, upload.offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.INVALID_FILENAME
+  })
+  await t.exception(() => harness.sessionStore.offer(OWNER, upload.offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.INVALID_FILENAME
+  })
+  t.is(await pathExists(path.join(harness.layout.root, reserved)), false)
+})
+
+test('replacement preserves the old inode as history and publishes the new inode', async (t) => {
+  const retention: RetentionCall[] = []
+  const harness = await createReplacementHarness(t)
+  const { commits, layout, sessionStore, replaceNames } = harness
+  const oldRecord = await harness.publish(b4a.from('release one'))
+  const finalPath = path.join(layout.root, MUTABLE)
+  const oldInode = await inode(finalPath)
+  const history = path.join(layout.root, historyName(oldRecord.transferId))
+
+  const upload = await harness.stage(b4a.from('release two content'))
+  const staging = stagingPath(layout, upload.offer)
+  const stagingInode = await inode(staging)
+  const retentionManager = {
+    async run() {},
+    async afterCommit() {},
+    async _runUnlocked(options: { incomingBytes: number; trigger: string }) {
+      retention.push({
+        incomingBytes: options.incomingBytes,
+        trigger: options.trigger,
+        names: (await commits.list()).map((record) => record.name).sort()
+      })
+    },
+    async _afterCommitUnlocked() {
+      retention.push({
+        incomingBytes: 0,
+        trigger: 'post-commit',
+        names: (await commits.list()).map((record) => record.name).sort()
+      })
+    }
+  }
+
+  const record = await commits.commit(harness.session(upload), {
+    replaceNames,
+    retentionManager
+  })
+  await sessionStore.retireCommitted(upload.offer.transferId)
+
+  t.is(record.version, 2)
+  t.is(record.name, MUTABLE)
+  t.alike(record.replaces, {
+    name: MUTABLE,
+    transferId: oldRecord.transferId,
+    historyName: historyName(oldRecord.transferId)
+  })
+  t.alike(await fs.promises.readFile(finalPath), b4a.from('release two content'))
+  t.is(await inode(finalPath), stagingInode)
+  t.alike(await fs.promises.readFile(history), b4a.from('release one'))
+  t.is(await inode(history), oldInode)
+
+  t.alike(await readCommitRecord(recordPath(layout, upload.offer)), record)
+  t.alike(await readCommitRecord(path.join(layout.commits, `${oldRecord.transferId}.json`)), {
+    ...oldRecord,
+    name: historyName(oldRecord.transferId)
+  })
+  t.is(await pathExists(staging), false)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+  t.is((await fs.promises.readdir(layout.publications)).length, 0)
+
+  t.alike(
+    (await commits.list()).map((entry) => entry.name).sort(),
+    [MUTABLE, historyName(oldRecord.transferId)].sort()
+  )
+  t.alike(retention, [
+    { incomingBytes: record.size, trigger: 'commit', names: [MUTABLE] },
+    {
+      incomingBytes: 0,
+      trigger: 'post-commit',
+      names: [MUTABLE, historyName(oldRecord.transferId)].sort()
+    }
+  ])
+})
+
+test('replacement of identical verified content publishes nothing new', async (t) => {
+  const harness = await createReplacementHarness(t)
+  const { commits, layout, replaceNames } = harness
+  const record = await harness.publish(b4a.from('release one'))
+  const finalPath = path.join(layout.root, MUTABLE)
+  const before = await inode(finalPath)
+
+  const upload = await harness.stage(b4a.from('release one'))
+  const repeated = await commits.commit(harness.session(upload), { replaceNames })
+
+  t.alike(repeated, record)
+  t.is(await inode(finalPath), before)
+  t.is(await pathExists(path.join(layout.root, historyName(record.transferId))), false)
+  t.alike(await commits.list(), [record])
+  t.is(await pathExists(stagingPath(layout, upload.offer)), false)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), false)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+})
+
+test('repeated replacement dedupes an identical superseded history artifact', async (t) => {
+  const harness = await createReplacementHarness(t)
+  const { commits, layout, replaceNames } = harness
+  const first = await harness.publish(b4a.from('content A'))
+  const second = await harness.publish(b4a.from('content B'))
+  const historyA = path.join(layout.root, historyName(first.transferId))
+  const historyB = path.join(layout.root, historyName(second.transferId))
+  t.is(await pathExists(historyA), true)
+
+  const third = await harness.publish(b4a.from('content A'))
+  t.is(third.transferId, first.transferId)
+  t.is(third.name, MUTABLE)
+  t.is(await pathExists(historyB), true)
+  t.is(await pathExists(historyA), false)
+  t.alike(await fs.promises.readFile(path.join(layout.root, MUTABLE)), b4a.from('content A'))
+  t.alike(
+    (await commits.list()).map((entry) => entry.name).sort(),
+    [MUTABLE, historyName(second.transferId)].sort()
+  )
+  t.alike(await readCommitRecord(path.join(layout.commits, `${third.transferId}.json`)), third)
+
+  const fourth = await harness.publish(b4a.from('content B'))
+  t.is(fourth.transferId, second.transferId)
+  t.is(await pathExists(historyA), true)
+  t.is(await pathExists(historyB), false)
+  t.alike(
+    (await commits.list()).map((entry) => entry.name).sort(),
+    [MUTABLE, historyName(first.transferId)].sort()
+  )
+})
+
+test('replacement refuses a foreign path at its history name', async (t) => {
+  const harness = await createReplacementHarness(t)
+  const { commits, layout, replaceNames } = harness
+  const oldRecord = await harness.publish(b4a.from('release one'))
+  const history = path.join(layout.root, historyName(oldRecord.transferId))
+  await fs.promises.writeFile(history, b4a.from('operator history'))
+  const finalInode = await inode(path.join(layout.root, MUTABLE))
+
+  const upload = await harness.stage(b4a.from('release two'))
+  await t.exception(() => commits.commit(harness.session(upload), { replaceNames }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.FILE_EXISTS
+  })
+
+  t.alike(await fs.promises.readFile(history), b4a.from('operator history'))
+  t.alike(await fs.promises.readFile(path.join(layout.root, MUTABLE)), b4a.from('release one'))
+  t.is(await inode(path.join(layout.root, MUTABLE)), finalInode)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+  t.is(await pathExists(sessionPath(layout, upload.offer)), true)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+})
+
+test('replacement journals every provenance identity before visible mutation', async (t) => {
+  let armed = false
+  let journalBytes: ReplacementJournal | null = null
+  let expectedHistory: string | null = null
+  let journalFile: string | null = null
+  const storage = createStorage({
+    async beforeOperation(name, source, destination) {
+      if (!armed || name !== 'link' || destination !== expectedHistory) return
+      armed = false
+      journalBytes = (await readJson(journalFile!)) as unknown as ReplacementJournal
+      throw new Error('Injected history link failure')
+    }
+  })
+  const harness = await createReplacementHarness(t, { storage })
+  const { commits, layout, replaceNames } = harness
+  const oldRecord = await harness.publish(b4a.from('release one'))
+  const finalStat = await fs.promises.lstat(path.join(layout.root, MUTABLE))
+  expectedHistory = path.join(layout.root, historyName(oldRecord.transferId))
+
+  const upload = await harness.stage(b4a.from('release two'))
+  const stagingStat = await fs.promises.lstat(stagingPath(layout, upload.offer))
+  journalFile = journalPath(layout, upload.offer)
+  armed = true
+
+  await t.exception(() => commits.commit(harness.session(upload), { replaceNames }))
+
+  const journal = journalBytes!
+  t.is(journal.version, 2)
+  t.is(journal.intent, 'replace')
+  t.is(journal.state, 'committing')
+  t.is(journal.phase, 'journaled')
+  t.is(journal.name, MUTABLE)
+  t.is(journal.historyName, historyName(oldRecord.transferId))
+  t.ok(/^[0-9a-f]{64}$/.test(journal.attemptId))
+  t.ok(journal.publicationName.startsWith(journal.attemptId))
+  t.alike(journal.sourceStagingIdentity, {
+    dev: String(stagingStat.dev),
+    ino: String(stagingStat.ino)
+  })
+  t.alike(journal.finalIdentity, { dev: String(finalStat.dev), ino: String(finalStat.ino) })
+  t.alike(journal.historyIdentity, journal.finalIdentity)
+  t.alike(journal.publicationIdentity, journal.sourceStagingIdentity)
+  t.alike(journal.oldRecord, oldRecord)
+  t.is(journal.record.transferId, hex(upload.offer.transferId))
+
+  t.alike(await fs.promises.readFile(path.join(layout.root, MUTABLE)), b4a.from('release one'))
+  t.is(await pathExists(expectedHistory), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+  t.is(await pathExists(journalFile), false)
+})
+
+test('replacement revoked before its history link restores the pinned old artifact', async (t) => {
+  const signal = { aborted: false }
+  let historyPath: string | null = null
+  const storage = createStorage({
+    async afterOperation(name, source, destination) {
+      if (name === 'link' && destination === historyPath) signal.aborted = true
+    }
+  })
+  const harness = await createReplacementHarness(t, { storage })
+  const { layout, commits, replaceNames } = harness
+  const old = await harness.publish(b4a.from('release one'))
+  const finalPath = path.join(layout.root, MUTABLE)
+  const oldInode = await inode(finalPath)
+  historyPath = path.join(layout.root, `history-${old.transferId}`)
+  const upload = await harness.stage(b4a.from('release two'))
+
+  await t.exception(() => commits.commit(harness.session(upload), { replaceNames, signal }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.REVOKED
+  })
+
+  t.alike(await fs.promises.readFile(finalPath), b4a.from('release one'))
+  t.is(await inode(finalPath), oldInode)
+  t.is(await pathExists(historyPath), false)
+  t.is(await pathExists(recordPath(layout, upload.offer)), false)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+  t.is((await fs.promises.readdir(layout.publications)).length, 0)
+  t.alike(await commits.list(), [old])
+})
+
+test('replacement revoked after its final rename restores the old inode from history', async (t) => {
+  const signal = { aborted: false }
+  let finalPath: string | null = null
+  const storage = createStorage({
+    async afterOperation(name, source, destination) {
+      if (name === 'rename' && destination === finalPath) signal.aborted = true
+    }
+  })
+  const harness = await createReplacementHarness(t, { storage })
+  const { layout, commits, replaceNames } = harness
+  const old = await harness.publish(b4a.from('release one'))
+  const historyPath = path.join(layout.root, `history-${old.transferId}`)
+  const oldInode = await inode(path.join(layout.root, MUTABLE))
+  const upload = await harness.stage(b4a.from('release two'))
+  finalPath = path.join(layout.root, MUTABLE)
+
+  await t.exception(() => commits.commit(harness.session(upload), { replaceNames, signal }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.REVOKED
+  })
+
+  t.alike(await fs.promises.readFile(finalPath), b4a.from('release one'))
+  t.is(await inode(finalPath), oldInode)
+  t.is(await pathExists(historyPath), false)
+  t.is(await pathExists(recordPath(layout, upload.offer)), false)
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), true)
+  t.is((await fs.promises.readdir(layout.publications)).length, 0)
+  t.alike(await commits.list(), [old])
+})
+
+test('revocation after the new sidecar cannot unpublish the replacement', async (t) => {
+  const signal = { aborted: false }
+  let armed = false
+  let commitsDir: string | null = null
+  const storage = createStorage({
+    async afterOperation(name, source) {
+      if (armed && name === 'sync' && source === commitsDir) signal.aborted = true
+    }
+  })
+  const harness = await createReplacementHarness(t, { storage })
+  const { layout, commits, replaceNames } = harness
+  commitsDir = layout.commits
+  const old = await harness.publish(b4a.from('release one'))
+  const historyPath = path.join(layout.root, `history-${old.transferId}`)
+  const upload = await harness.stage(b4a.from('release two'))
+
+  armed = true
+  const record = await commits.commit(harness.session(upload), { replaceNames, signal })
+
+  t.is(record.version, 2)
+  t.alike(await fs.promises.readFile(path.join(layout.root, MUTABLE)), b4a.from('release two'))
+  t.alike(await fs.promises.readFile(historyPath), b4a.from('release one'))
+  t.is(await pathExists(journalPath(layout, upload.offer)), false)
+  t.is(await pathExists(stagingPath(layout, upload.offer)), false)
+  t.alike(
+    (await commits.list()).map((entry) => entry.name).sort(),
+    [MUTABLE, `history-${old.transferId}`].sort()
+  )
 })

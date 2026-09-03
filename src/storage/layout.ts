@@ -91,6 +91,7 @@ export function initLayout(storageDir: string): StorageLayout {
     sessions: path.join(internal, 'sessions'),
     commits: path.join(internal, 'commits'),
     journals: path.join(internal, 'journals'),
+    publications: path.join(internal, 'publications'),
     lock: path.join(internal, 'lock')
   }
 
@@ -100,8 +101,22 @@ export function initLayout(storageDir: string): StorageLayout {
   assertDirectorySync(layout.sessions)
   assertDirectorySync(layout.commits)
   assertDirectorySync(layout.journals)
+  assertDirectorySync(layout.publications)
 
   return layout
+}
+
+/** Every protected directory a storage operation revalidates before mutating. */
+export function protectedDirectories(layout: StorageLayout): string[] {
+  return [
+    layout.root,
+    layout.internal,
+    layout.staging,
+    layout.sessions,
+    layout.commits,
+    layout.journals,
+    layout.publications
+  ]
 }
 
 function randomToken(): string {
@@ -385,14 +400,7 @@ async function retireObservedLock(
 
 async function assertLayout(layout: StorageLayout, storage: StorageAdapter): Promise<void> {
   if (!layout || typeof layout !== 'object') throw storageError('Invalid storage layout')
-  for (const directory of [
-    layout.root,
-    layout.internal,
-    layout.staging,
-    layout.sessions,
-    layout.commits,
-    layout.journals
-  ]) {
+  for (const directory of protectedDirectories(layout)) {
     await assertSafeDirectory(directory, storage)
   }
 }

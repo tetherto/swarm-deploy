@@ -139,16 +139,22 @@ export interface ServerSessionStore {
 export interface CommitStore {
   inspect(
     name: string,
-    offer: Offer
+    offer: Offer,
+    options?: { replaceNames?: Iterable<string> }
   ): Promise<
     | { status: 'AVAILABLE' }
+    | { status: 'REPLACEABLE' }
     | { status: 'ALREADY_COMMITTED' }
     | { status: 'FILE_EXISTS' }
     | { status: 'FILE_BUSY' }
   >
   commit(
     session: VerifiedSession,
-    options: { retentionManager: StorageRetentionManager | null; signal: { aborted: boolean } }
+    options: {
+      retentionManager: StorageRetentionManager | null
+      signal: { aborted: boolean }
+      replaceNames?: Iterable<string>
+    }
   ): Promise<unknown>
 }
 
@@ -621,7 +627,9 @@ export class ServerSession {
         await this._rejectOffer(STATUS_CODE.FILE_BUSY, inspection.status)
         return
       }
-      if (inspection.status !== 'AVAILABLE') throw protocolError('Invalid commit inspection status')
+      if (inspection.status !== 'AVAILABLE' && inspection.status !== 'REPLACEABLE') {
+        throw protocolError('Invalid commit inspection status')
+      }
 
       const reservation = this.reserveUpload(this.transferId)
       if (!reservation) {

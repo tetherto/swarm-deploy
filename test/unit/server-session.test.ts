@@ -572,3 +572,39 @@ test('server session settlement retains cleanup errors raised after revocation',
 
   await t.exception(() => pair.serverSession!.settle(), { name: 'AggregateError' })
 })
+
+test('server session admits a replaceable managed offer and commits it', async (t) => {
+  const inspections: Array<Parameters<CommitStore['inspect']>> = []
+  const committed: CommitCall[] = []
+  const sessionStore = createSessionStore()
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore({
+      async inspect(...args) {
+        inspections.push(args)
+        return { status: 'REPLACEABLE' } as InspectResult
+      },
+      async commit(session, options) {
+        committed.push({ session, options })
+        return { name: session.name }
+      }
+    }),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload({ name: 'release.tar.gz' })
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  t.is(pair.received.status[0].code, STATUS_CODE.ACCEPT)
+  t.is(inspections.length, 1)
+  t.is(inspections[0][0], 'release.tar.gz')
+
+  pair.messages[CHUNK].send(upload.chunk)
+  await waitFor(() => pair.received.chunkAck.length === 1)
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+  await waitFor(() => pair.received.result.length === 1)
+
+  t.is(pair.received.result[0].code, 0)
+  t.is(committed.length, 1)
+  t.is(sessionStore.sessions.size, 0)
+})

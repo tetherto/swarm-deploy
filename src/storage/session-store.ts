@@ -3,7 +3,7 @@ import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS, SwarmDeployError } from '../errors.js'
-import { validateBasename } from '../files.js'
+import { isReservedHistoryName, validateBasename, validateReplaceNames } from '../files.js'
 import { MAX_CHUNK_BYTES, MAX_CHUNK_COUNT } from '../protocol/constants.js'
 import { transferId } from '../protocol/transfer-id.js'
 import type { Chunk, Offer, TransferIdInput } from '../protocol/types.js'
@@ -100,6 +100,8 @@ interface SessionStoreOptions {
   clock?: Clock
   checkpointChunks?: number
   storage?: StorageAdapter
+  /** Exact names whose occupied destinations may be staged for replacement. */
+  replaceNames?: Iterable<string>
   onEvent?:
     | ((
         payload: { type: SessionEventType; transfer: string; name: string } & SessionEventDetails
@@ -168,6 +170,9 @@ function assertOffer(ownerKey: Uint8Array, offer: Offer): void {
   assertSafeUint(offer.version, 'version')
   if (offer.version !== 1) throw storageError('Invalid offer version')
   validateBasename(offer.name)
+  if (isReservedHistoryName(offer.name)) {
+    throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
+  }
   assertSafeUint(offer.size, 'size')
   assertFixed32(offer.digest, 'digest')
   assertBoundedChunkSize(offer.chunkSize, 'chunkSize')
@@ -239,6 +244,7 @@ class SessionStore {
   clock: Clock
   checkpointChunks: number
   storage: StorageAdapter
+  replaceNames: Set<string>
   onEvent: SessionStoreOptions['onEvent']
   sessions: Map<string, Session>
   recoveryReservations: Map<string, number>
@@ -254,6 +260,7 @@ class SessionStore {
     clock = Date,
     checkpointChunks = 16,
     storage = fs.promises,
+    replaceNames,
     onEvent = null
   }: SessionStoreOptions) {
     if (!layout || typeof layout !== 'object') throw storageError('Invalid storage layout')
@@ -274,6 +281,7 @@ class SessionStore {
     this.clock = clock
     this.checkpointChunks = checkpointChunks
     this.storage = storage
+    this.replaceNames = validateReplaceNames(replaceNames)
     this.onEvent = onEvent
     this.sessions = new Map()
     this.recoveryReservations = new Map()
@@ -853,7 +861,7 @@ class SessionStore {
           throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Destination has an active session')
         }
       }
-      if (await this._destinationExists(offer.name)) {
+      if (!this.replaceNames.has(offer.name) && (await this._destinationExists(offer.name))) {
         throw new SwarmDeployError(ERRORS.FILE_EXISTS, 'Destination already exists')
       }
       if (this.reservedBytes > this.maxStagingBytes - offer.size) {

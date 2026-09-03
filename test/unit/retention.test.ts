@@ -80,6 +80,7 @@ interface CreateStoresOptions {
   retention?: Partial<RetentionOptions>
   isSessionActive?: (session: RetentionSession) => boolean
   logger?: RetentionOptions['logger']
+  replaceNames?: Iterable<string>
 }
 
 interface Stores {
@@ -187,7 +188,13 @@ function createScheduler(): TestScheduler {
 
 async function createStores(
   t: Assert,
-  { storage, retention = {}, isSessionActive = () => false, logger }: CreateStoresOptions = {}
+  {
+    storage,
+    retention = {},
+    isSessionActive = () => false,
+    logger,
+    replaceNames
+  }: CreateStoresOptions = {}
 ): Promise<Stores> {
   const layout = initLayout(await createTempDir(t))
   const clock = createClock()
@@ -196,7 +203,8 @@ async function createStores(
     maxStagingBytes: CHUNK_SIZE,
     checkpointChunks: 1,
     clock,
-    storage
+    storage,
+    replaceNames
   })
   await sessionStore.init()
   const commitStore = new CommitStore({ layout, clock, storage })
@@ -227,6 +235,20 @@ async function commit(
   const record = await stores.commitStore.commit(
     stores.sessionStore.sessions.get(hex(upload.offer.transferId))!
   )
+  return { upload, record, finalPath: path.join(stores.layout.root, name) }
+}
+
+/** Publishes a replacement so the retained history sibling is real. */
+async function replace(stores: Stores, name: string, data: Buffer): Promise<CommittedArtifact> {
+  const upload = makeUpload(name, data)
+  await stores.sessionStore.offer(OWNER, upload.offer)
+  await stores.sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
+  await stores.sessionStore.finish(upload.offer.transferId)
+  const record = await stores.commitStore.commit(
+    stores.sessionStore.sessions.get(hex(upload.offer.transferId))!,
+    { replaceNames: new Set([name]) }
+  )
+  await stores.sessionStore.retireCommitted(upload.offer.transferId)
   return { upload, record, finalPath: path.join(stores.layout.root, name) }
 }
 
@@ -750,4 +772,84 @@ test('retention rejects a managed record that disappears during enumeration', as
     name: 'SwarmDeployError',
     code: ERRORS.PROTOCOL_INVALID
   })
+})
+
+test('retention rejects an invalid pin predicate', async (t) => {
+  await t.exception(
+    () => createStores(t, { retention: { isPinned: 'always' as unknown as undefined } }),
+    { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
+  )
+})
+
+test('retention retains a pinned mutable current past its age limit', async (t) => {
+  const stores = await createStores(t, {
+    retention: {
+      maxAge: 1_000,
+      isPinned: (record: CommitRecord) => record.name === 'release.tar.gz'
+    },
+    replaceNames: ['release.tar.gz']
+  })
+  const superseded = await commit(t, stores, 'release.tar.gz', b4a.from('first release'))
+  await stores.sessionStore.retireCommitted(superseded.upload.offer.transferId)
+  const current = await replace(stores, 'release.tar.gz', b4a.from('second release'))
+  const history = {
+    finalPath: path.join(stores.layout.root, `history-${superseded.record.transferId}`)
+  }
+  const ordinary = await commit(t, stores, 'ordinary.bin', b4a.from('ordinary'))
+  await stores.sessionStore.retireCommitted(ordinary.upload.offer.transferId)
+  stores.clock.advance(1_000)
+
+  const result = await stores.manager.run()
+
+  t.is(result.ageDeleted, 2)
+  t.is(await pathExists(current.finalPath), true)
+  t.is(await pathExists(history.finalPath), false)
+  t.is(await pathExists(ordinary.finalPath), false)
+  t.alike(await stores.commitStore.list(), [current.record])
+})
+
+test('retention evicts history siblings before a pinned current under quota', async (t) => {
+  const stores = await createStores(t, {
+    retention: {
+      maxStorageBytes: 40,
+      isPinned: (record: CommitRecord) => record.name === 'release.tar.gz'
+    },
+    replaceNames: ['release.tar.gz']
+  })
+  const superseded = await commit(t, stores, 'release.tar.gz', b4a.alloc(20, 1))
+  await stores.sessionStore.retireCommitted(superseded.upload.offer.transferId)
+  stores.clock.advance(1)
+  const current = await replace(stores, 'release.tar.gz', b4a.alloc(20, 2))
+  const history = {
+    finalPath: path.join(stores.layout.root, `history-${superseded.record.transferId}`)
+  }
+  t.is(
+    (await stores.commitStore.list()).reduce((total, entry) => total + entry.size, 0),
+    40
+  )
+
+  const result = await stores.manager.run({ incomingBytes: 20 })
+
+  t.is(result.storageDeleted, 1)
+  t.is(await pathExists(history.finalPath), false)
+  t.is(await pathExists(current.finalPath), true)
+  t.alike(await stores.commitStore.list(), [current.record])
+})
+
+test('retention counts pinned records and refuses an unsatisfiable reservation', async (t) => {
+  const stores = await createStores(t, {
+    retention: {
+      maxStorageBytes: 40,
+      isPinned: (record: CommitRecord) => record.name === 'release.tar.gz'
+    }
+  })
+  const current = await commit(t, stores, 'release.tar.gz', b4a.alloc(30, 1))
+
+  await t.exception(() => stores.manager.run({ incomingBytes: 20 }), {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
+
+  t.is(await pathExists(current.finalPath), true)
+  t.alike(await stores.commitStore.list(), [current.record])
 })

@@ -91,6 +91,7 @@ interface RetentionManagerOptions {
   storage?: StorageAdapter
   isSessionActive: (session: Session) => boolean
   hasActiveUploads?: () => boolean
+  isPinned?: (record: CommitRecord) => boolean
   logger?: Logger | null
   scheduler?: Scheduler
   onEvent?: ((event: RetentionEvent) => void) | null
@@ -234,6 +235,7 @@ class RetentionManager {
   storage: StorageAdapter
   isSessionActive: (session: Session) => boolean
   hasActiveUploads: () => boolean
+  isPinned: (record: CommitRecord) => boolean
   logger: Logger | null
   timer: unknown | null
   cleanupFailure: unknown | null
@@ -256,6 +258,7 @@ class RetentionManager {
     storage = commitStore?.storage || fs.promises,
     isSessionActive,
     hasActiveUploads = () => false,
+    isPinned = () => false,
     logger = null,
     scheduler = { setInterval, clearInterval },
     onEvent = null
@@ -287,6 +290,7 @@ class RetentionManager {
     if (typeof hasActiveUploads !== 'function') {
       throw storageError('Invalid active upload predicate')
     }
+    if (typeof isPinned !== 'function') throw storageError('Invalid retention pin predicate')
     if (onEvent !== null && typeof onEvent !== 'function') {
       throw storageError('Invalid retention event callback')
     }
@@ -307,6 +311,7 @@ class RetentionManager {
     this.storage = storage
     this.isSessionActive = isSessionActive
     this.hasActiveUploads = hasActiveUploads
+    this.isPinned = isPinned
     this.logger = logger
     this.timer = null
     this.cleanupFailure = null
@@ -406,6 +411,15 @@ class RetentionManager {
     report(this.logger, 'info', 'Removed managed commit', { name: record.name, reason })
   }
 
+  /**
+   * Configured mutable current records survive age and quota eviction. Their
+   * size still counts toward the logical total so a replacement that cannot be
+   * afforded fails instead of silently exceeding the limit.
+   */
+  _isPinned(record: CommitRecord): boolean {
+    return this.isPinned(record) === true
+  }
+
   _totalSize(records: CommitRecord[]): number {
     let total = 0
     for (const record of records) {
@@ -493,6 +507,7 @@ class RetentionManager {
       const now = this.clock.now()
       assertSafeUint(now, 'current timestamp')
       for (const record of current.slice().sort(compareRecords)) {
+        if (this._isPinned(record)) continue
         if (now < record.committedAt || now - record.committedAt < this.maxAge) continue
         await this._deleteRecord(record, 'MAX_AGE')
         current.splice(current.indexOf(record), 1)
@@ -506,6 +521,7 @@ class RetentionManager {
       let total = this._totalSize(current)
       for (const record of current.slice().sort(compareRecords)) {
         if (total <= permitted) break
+        if (this._isPinned(record)) continue
         await this._deleteRecord(record, 'MAX_STORAGE')
         total -= record.size
         storageDeleted++

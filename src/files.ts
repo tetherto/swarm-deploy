@@ -8,6 +8,10 @@ import type { Digest } from './types.js'
 
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
 const DEFAULT_CHUNK_SIZE = 1024 * 1024
+const TRANSFER_ID_HEX = /^[0-9a-f]{64}$/
+
+/** Reserved top-level namespace for server-managed historical artifacts. */
+export const HISTORY_NAME_PREFIX = 'history-'
 
 export interface FileSnapshot {
   size: number
@@ -87,6 +91,48 @@ export function validateBasename(name: string): string {
     throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Invalid filename')
   }
   return name
+}
+
+export function isReservedHistoryName(name: unknown): boolean {
+  return typeof name === 'string' && name.startsWith(HISTORY_NAME_PREFIX)
+}
+
+/** The unique top-level path preserving the inode a replacement superseded. */
+export function historyName(oldTransferId: string): string {
+  if (typeof oldTransferId !== 'string' || !TRANSFER_ID_HEX.test(oldTransferId)) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid history transfer ID')
+  }
+  return `${HISTORY_NAME_PREFIX}${oldTransferId}`
+}
+
+/**
+ * Canonicalizes the opt-in mutable-name policy. Values are exact upload names;
+ * the reserved history namespace and duplicate entries are always rejected.
+ */
+export function validateReplaceNames(values?: Iterable<string>): Set<string> {
+  if (values === undefined || values === null) return new Set()
+  if (
+    typeof values === 'string' ||
+    typeof values !== 'object' ||
+    typeof (values as Iterable<string>)[Symbol.iterator] !== 'function'
+  ) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid replacement names')
+  }
+  const names = new Set<string>()
+  for (const value of values) {
+    if (typeof value !== 'string') {
+      throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Invalid filename')
+    }
+    validateBasename(value)
+    if (isReservedHistoryName(value)) {
+      throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved replacement name')
+    }
+    if (names.has(value)) {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Duplicate replacement name')
+    }
+    names.add(value)
+  }
+  return names
 }
 
 function snapshotStat(stat: fs.Stats): FileSnapshot {
