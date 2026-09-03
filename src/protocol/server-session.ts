@@ -1,8 +1,10 @@
 import b4a from 'b4a'
 import crypto from '#crypto'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { validateReplaceNames } from '../files.js'
 import { transferId } from './transfer-id.js'
 import { assertFixed32, assertSafeUint } from './validation.js'
+import type { ReplacementDetails } from '../types.js'
 import {
   STATUS,
   BITMAP_PAGE,
@@ -102,6 +104,7 @@ function statusForError(err: unknown): number | null {
   if (errorCode(err) === ERRORS.FILE_EXISTS) return STATUS_CODE.FILE_EXISTS
   if (errorCode(err) === ERRORS.FILE_BUSY) return STATUS_CODE.FILE_BUSY
   if (
+    errorCode(err) === ERRORS.INVALID_FILENAME ||
     errorCode(err) === ERRORS.STAGING_LIMIT ||
     errorCode(err) === ERRORS.DISK_RESERVE ||
     errorCode(err) === ERRORS.FILE_TOO_LARGE ||
@@ -136,6 +139,45 @@ export interface ServerSessionStore {
   retireCommitted(transferId: Uint8Array): Promise<unknown>
 }
 
+/**
+ * Why an upload could not be admitted. A falsy reservation keeps the historical
+ * active-upload rejection; `FILE_BUSY` reports that another live transfer
+ * already holds the destination name.
+ */
+export interface UploadRejection {
+  rejected: true
+  reason: 'ACTIVE_UPLOAD_LIMIT' | 'FILE_BUSY'
+}
+
+function isUploadRejection(value: unknown): value is UploadRejection {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'rejected' in value &&
+    value.rejected === true &&
+    'reason' in value &&
+    (value.reason === 'ACTIVE_UPLOAD_LIMIT' || value.reason === 'FILE_BUSY')
+  )
+}
+
+function replacementFrom(result: unknown): ReplacementDetails | null {
+  if (typeof result !== 'object' || result === null || !('replaces' in result)) return null
+  const replaces = result.replaces
+  if (typeof replaces !== 'object' || replaces === null) return null
+  if (!('name' in replaces) || !('transferId' in replaces) || !('historyName' in replaces)) {
+    return null
+  }
+  const { name, transferId: superseded, historyName } = replaces
+  if (
+    typeof name !== 'string' ||
+    typeof superseded !== 'string' ||
+    typeof historyName !== 'string'
+  ) {
+    return null
+  }
+  return { name, transferId: superseded, historyName }
+}
+
 export interface CommitStore {
   inspect(
     name: string,
@@ -167,7 +209,9 @@ export interface ServerSessionOptions {
   commitStore: CommitStore
   retentionManager?: RetentionManager | null
   maxFileBytes: number
-  reserveUpload?: (transferId: Uint8Array) => unknown
+  /** Names this server may replace; validated and copied on construction. */
+  replaceNames?: Iterable<string>
+  reserveUpload?: (transferId: Uint8Array, name: string) => unknown
   releaseUpload?: (reservation: unknown) => void
   isAuthorized?: () => boolean
   idleTimeout?: number
@@ -190,7 +234,8 @@ export class ServerSession {
   commitStore: CommitStore
   retentionManager: RetentionManager | null
   maxFileBytes: number
-  reserveUpload: (transferId: Uint8Array) => unknown
+  replaceNames: Set<string>
+  reserveUpload: (transferId: Uint8Array, name: string) => unknown
   releaseUpload: (reservation: unknown) => void
   isAuthorized: () => boolean
   idleTimeout: number
@@ -222,6 +267,7 @@ export class ServerSession {
     commitStore,
     retentionManager = null,
     maxFileBytes,
+    replaceNames,
     reserveUpload = () => true,
     releaseUpload = () => {},
     isAuthorized = () => true,
@@ -283,6 +329,7 @@ export class ServerSession {
     this.commitStore = commitStore
     this.retentionManager = retentionManager
     this.maxFileBytes = maxFileBytes
+    this.replaceNames = validateReplaceNames(replaceNames)
     this.reserveUpload = reserveUpload
     this.releaseUpload = releaseUpload
     this.isAuthorized = isAuthorized
@@ -614,7 +661,23 @@ export class ServerSession {
         return
       }
 
-      const inspection = await this.commitStore.inspect(value.name, value)
+      const reservation = this.reserveUpload(this.transferId, value.name)
+      if (isUploadRejection(reservation)) {
+        await this._rejectOffer(
+          reservation.reason === 'FILE_BUSY' ? STATUS_CODE.FILE_BUSY : STATUS_CODE.REJECTED,
+          reservation.reason
+        )
+        return
+      }
+      if (!reservation) {
+        await this._rejectOffer(STATUS_CODE.REJECTED, 'ACTIVE_UPLOAD_LIMIT')
+        return
+      }
+      this.reservation = reservation
+
+      const inspection = await this.commitStore.inspect(value.name, value, {
+        replaceNames: this.replaceNames
+      })
       if (inspection.status === 'ALREADY_COMMITTED') {
         await this._rejectOffer(STATUS_CODE.ALREADY_COMMITTED, inspection.status)
         return
@@ -630,13 +693,6 @@ export class ServerSession {
       if (inspection.status !== 'AVAILABLE' && inspection.status !== 'REPLACEABLE') {
         throw protocolError('Invalid commit inspection status')
       }
-
-      const reservation = this.reserveUpload(this.transferId)
-      if (!reservation) {
-        await this._rejectOffer(STATUS_CODE.REJECTED, 'ACTIVE_UPLOAD_LIMIT')
-        return
-      }
-      this.reservation = reservation
 
       if (this.retentionManager && typeof this.retentionManager.admit === 'function') {
         await this.retentionManager.admit(value.size)
@@ -705,12 +761,17 @@ export class ServerSession {
       if (!session || session.state !== 'verified') throw protocolError('Missing verified session')
       commitStarted = true
       this._emit('commit', { status: 'started' })
-      await this.commitStore.commit(session, {
+      const committedRecord = await this.commitStore.commit(session, {
         retentionManager: this.retentionManager,
-        signal: this.abortSignal
+        signal: this.abortSignal,
+        replaceNames: this.replaceNames
       })
       committed = true
-      this._emit('commit', { status: 'succeeded' })
+      const replaced = replacementFrom(committedRecord)
+      this._emit('commit', {
+        status: 'succeeded',
+        ...(replaced ? { replaced } : {})
+      })
       await this.sessionStore.retireCommitted(this._transferId())
       if (this.revoked) return
       await this._send(RESULT, { transferId: this._transferId(), code: RESULT_COMMITTED })

@@ -29,6 +29,7 @@ import {
 import type { ServerOptions } from '../../dist/server.js'
 import type { Offer, Result, Status, TransferMessage } from '../../dist/protocol/types.js'
 import type { ChunkAck } from '../../dist/protocol/types.js'
+import type { CommitRecord } from '../../dist/storage/commit-journal.js'
 import type { SwarmDiscovery, Topic } from '../../dist/types.js'
 import type { Testnet } from 'hyperdht/testnet'
 import { createTempDir } from '../helpers/files.js'
@@ -240,6 +241,82 @@ test('Server validates required upload limits', (t) => {
       code: 'PROTOCOL_INVALID'
     })
   }
+})
+
+test('Server validates and copies exact replacement names', (t) => {
+  const replaceNames = new Set(['release.tar.gz'])
+  const options: ServerOptions = {
+    seed: SERVER_SEED,
+    storageDir: '/tmp/swarm-deploy-replacement-validation',
+    allowedKeys: [keyPairFromSeed(ALLOWED_SEED).publicKey],
+    maxFileBytes: 1024 * 1024,
+    maxStagingBytes: 1024 * 1024,
+    replaceNames
+  }
+  const server = new Server(options)
+  replaceNames.add('later.bin')
+
+  t.alike(serverInternals(server).replaceNames, new Set(['release.tar.gz']))
+  for (const invalid of [
+    'release.tar.gz',
+    ['history-owned.bin'],
+    ['release.tar.gz', 'release.tar.gz'],
+    ['../release.tar.gz']
+  ]) {
+    t.exception(
+      () => new Server({ ...options, replaceNames: invalid as unknown as Iterable<string> }),
+      { name: 'SwarmDeployError' }
+    )
+  }
+})
+
+test('Server wires mutable names into staging and current-only retention pins', async (t) => {
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: await createTempDir(t),
+    allowedKeys: [keyPairFromSeed(ALLOWED_SEED).publicKey],
+    maxFileBytes: 1024 * 1024,
+    maxStagingBytes: 1024 * 1024,
+    replaceNames: ['release.tar.gz'],
+    swarmFactory: () => createStubSwarm([])
+  })
+  t.teardown(() => server.close())
+  await server.listen()
+  const internal = serverInternals(server)
+
+  t.alike(internal.sessionStore.replaceNames, new Set(['release.tar.gz']))
+  t.is(internal.retentionManager.isPinned({ name: 'release.tar.gz' } as CommitRecord), true)
+  t.is(
+    internal.retentionManager.isPinned({
+      name: `history-${'1'.repeat(64)}`
+    } as CommitRecord),
+    false
+  )
+  t.is(internal.retentionManager.isPinned({ name: 'release.tar.gz.sig' } as CommitRecord), false)
+})
+
+test('Server releases transfer and name reservations after startup failure', async (t) => {
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: await createTempDir(t),
+    allowedKeys: [keyPairFromSeed(ALLOWED_SEED).publicKey],
+    maxFileBytes: 1024 * 1024,
+    maxStagingBytes: 1024 * 1024,
+    replaceNames: ['release.tar.gz'],
+    swarmFactory() {
+      throw new Error('injected startup failure')
+    }
+  })
+  const internal = serverInternals(server)
+  const first = internal._reserveUpload(b4a.alloc(32, 9), 'release.tar.gz')
+  const competing = internal._reserveUpload(b4a.alloc(32, 10), 'release.tar.gz')
+  t.is('rejected' in competing && competing.reason, 'FILE_BUSY')
+  t.ok('id' in first)
+
+  await t.exception(() => server.listen())
+
+  t.is(internal._activeUploads.size, 0)
+  t.is(internal._activeNames.size, 0)
 })
 
 test('Server firewalls unknown keys before protocol and allows authenticated uploads', async (t) => {

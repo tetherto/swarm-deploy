@@ -42,6 +42,7 @@ export interface PairMux {
 }
 
 export interface ServerInternals {
+  replaceNames: Set<string>
   layout: StorageLayout
   sessionStore: SessionStore
   commitStore: CommitStore
@@ -54,7 +55,12 @@ export interface ServerInternals {
   _connections: Map<TrackedSocket, TrackedConnection>
   _sockets: Map<string, Set<TrackedSocket>>
   _sessions: Set<unknown>
-  _activeUploads: Map<string, { references: number }>
+  _activeUploads: Map<string, { id: string; name: string }>
+  _activeNames: Map<string, { id: string; name: string }>
+  _reserveUpload(
+    transferId: Uint8Array,
+    name: string
+  ): { id: string; name: string } | { rejected: true; reason: string }
   _firewall(key: unknown): boolean
   _onConnection(socket: ConnectableSocket, peerInfo?: SwarmPeerInfo | null): void
   _onPair(mux: PairMux, socket: unknown, connection: TrackedConnection, id: Uint8Array): void

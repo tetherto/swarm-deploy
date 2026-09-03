@@ -114,3 +114,13 @@ export interface TransferLifecycleEvent extends TransferEvent {
   status: 'started' | 'succeeded' | 'failed'
   reason?: string
 }
+
+/** Metadata describing the managed artifact a successful replacement superseded. */
+export interface ReplacementDetails {
+  /** The configured mutable name the new artifact now occupies. */
+  name: string
+  /** The superseded transfer ID, in canonical lowercase hexadecimal. */
+  transferId: string
+  /** The generated top-level sibling that now holds the superseded artifact. */
+  historyName: string
+}

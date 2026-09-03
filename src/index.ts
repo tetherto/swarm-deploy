@@ -11,6 +11,7 @@ export type {
   Logger,
   PublicKey,
   PublicKeyInput,
+  ReplacementDetails,
   Scheduler,
   Seed,
   SeedInput,

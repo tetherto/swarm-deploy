@@ -43,6 +43,7 @@ import {
   type OfferInput,
   type Ready,
   type ReadyInput,
+  type ReplacementDetails,
   type Result,
   type ResultCode,
   type ResultInput,
@@ -625,7 +626,8 @@ server.on('verification', (event) => {
 })
 server.once('commit', (event) => {
   const check: ExactPayload<typeof event, ServerTransferLifecycleEvent> = true
-  void [check, event.transfer, event.status]
+  const replacement: ReplacementDetails | undefined = event.replaced
+  void [check, event.transfer, event.status, replacement]
 })
 server.on('recovery', (event) => {
   const check: ExactPayload<typeof event, RecoveryEvent> = true

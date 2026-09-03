@@ -15,6 +15,7 @@ import type {
   ClientUploadResult,
   UploadResult
 } from '../../dist/client.js'
+import type { ServerOptions } from '../../dist/server.js'
 import type { Testnet } from 'hyperdht/testnet'
 import { createTempDir, writeDeterministicFile, CHUNK_SIZE } from '../helpers/files.js'
 import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
@@ -65,14 +66,20 @@ async function readCommitRecord(file: string): Promise<CommitRecordJson> {
   return JSON.parse(await fs.promises.readFile(file, 'utf8')) as CommitRecordJson
 }
 
-async function setupServer(t: Assert, testnet: Testnet, allowedSeeds: Buffer[]): Promise<Server> {
+async function setupServer(
+  t: Assert,
+  testnet: Testnet,
+  allowedSeeds: Buffer[],
+  options: Pick<ServerOptions, 'replaceNames'> = {}
+): Promise<Server> {
   const server = new Server({
     seed: SERVER_SEED,
     storageDir: await createTempDir(t),
     allowedKeys: allowedSeeds.map((seed) => keyPairFromSeed(seed).publicKey),
     maxFileBytes: 8 * CHUNK_SIZE,
     maxStagingBytes: 16 * CHUNK_SIZE,
-    dht: testnet.createNode()
+    dht: testnet.createNode(),
+    ...options
   })
   t.teardown(() => server.close())
   await server.listen()
@@ -162,6 +169,42 @@ test('Client uploads empty and multi-chunk files with exact bytes and sidecars',
   t.alike(await fs.promises.readdir(layout.staging), [])
   t.alike(await fs.promises.readdir(layout.sessions), [])
   t.is(connections, 1)
+})
+
+test('Server defaults to immutable names and replaces only one exact configured name', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const immutable = await setupServer(t, testnet, [CLIENT_A_SEED])
+  const immutableClient = createClient(t, testnet, immutable, CLIENT_A_SEED)
+  const sourceDir = await createTempDir(t)
+  const source = path.join(sourceDir, 'release.tar.gz')
+  await fs.promises.writeFile(source, b4a.from('release one'))
+
+  t.is((await immutableClient.upload(source)).status, 'COMMITTED')
+  t.is((await immutableClient.upload(source)).status, 'ALREADY_COMMITTED')
+  await fs.promises.writeFile(source, b4a.from('release two'))
+  await t.exception(() => immutableClient.upload(source), {
+    name: 'SwarmDeployError',
+    code: 'FILE_EXISTS'
+  })
+  await immutableClient.close()
+  await immutable.close()
+
+  const mutable = await setupServer(t, testnet, [CLIENT_A_SEED], {
+    replaceNames: ['release.tar.gz']
+  })
+  const mutableClient = createClient(t, testnet, mutable, CLIENT_A_SEED)
+  const layout = serverInternals(mutable).layout
+  await fs.promises.writeFile(source, b4a.from('release one'))
+  t.is((await mutableClient.upload(source)).status, 'COMMITTED')
+  t.is((await mutableClient.upload(source)).status, 'ALREADY_COMMITTED')
+  await fs.promises.writeFile(source, b4a.from('release two'))
+  t.is((await mutableClient.upload(source)).status, 'COMMITTED')
+
+  const records = await serverInternals(mutable).commitStore.list()
+  const current = records.find((record) => record.name === 'release.tar.gz')!
+  const history = records.find((record) => record.name.startsWith('history-'))!
+  t.alike(await fs.promises.readFile(path.join(layout.root, current.name)), b4a.from('release two'))
+  t.alike(await fs.promises.readFile(path.join(layout.root, history.name)), b4a.from('release one'))
 })
 
 test('Client processes directory entries sequentially, preserves skips, and continues failures', async (t) => {

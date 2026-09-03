@@ -13,6 +13,7 @@ import {
   type AbortSignalLike
 } from './abort.js'
 import { keyPairFromSeed } from './identity.js'
+import { validateReplaceNames } from './files.js'
 import { topicFromServerPublicKey } from './topic.js'
 import { AllowlistWatcher } from './allowlist.js'
 import { ServerSession, UPLOAD_PROTOCOL, DEFAULT_IDLE_TIMEOUT } from './protocol/server-session.js'
@@ -24,6 +25,7 @@ import type {
   Logger,
   PublicKey,
   PublicKeyInput,
+  ReplacementDetails,
   SeedInput,
   ServerScheduler,
   Swarm,
@@ -57,7 +59,13 @@ const MAX_CONNECTIONS = 1024
 const MAX_ACTIVE_UPLOADS = 1024
 const FINGERPRINT_LENGTH = 12
 
-export type { AuthenticationEvent, FingerprintEvent, TransferEvent, TransferLifecycleEvent }
+export type {
+  AuthenticationEvent,
+  FingerprintEvent,
+  ReplacementDetails,
+  TransferEvent,
+  TransferLifecycleEvent
+}
 
 export type ServerLogger = Logger
 export type ServerSocket = SwarmSocket
@@ -110,7 +118,11 @@ export interface ServerOptions {
   allowlistPath?: string
   /** Optional diagnostic sink. Logger failures are ignored. */
   logger?: Logger | null
-  /** Names whose committed artifacts may be replaced by a subsequent upload. */
+  /**
+   * Exact artifact names whose committed content a later upload may replace.
+   * Defaults to none, so every name stays create-only. Values must be valid
+   * upload names and must not begin with the reserved `history-` prefix.
+   */
   replaceNames?: Iterable<string>
 }
 
@@ -140,7 +152,11 @@ export interface ServerProgressEvent extends TransferEvent, FingerprintEvent {
   totalBytes: number
 }
 
-export type ServerTransferLifecycleEvent = TransferLifecycleEvent & FingerprintEvent
+export type ServerTransferLifecycleEvent = TransferLifecycleEvent &
+  FingerprintEvent & {
+    /** Present only on a succeeded commit that replaced a configured name. */
+    replaced?: ReplacementDetails
+  }
 
 export interface RecoveryEvent {
   status:
@@ -228,6 +244,7 @@ type SafeLogger = Required<Logger>
 
 interface UploadReservation {
   id: string
+  name: string
 }
 
 interface Connection {
@@ -412,13 +429,15 @@ export class Server extends EventEmitter {
   readonly swarmFactory: SwarmFactory
   readonly allowlistPath: string | undefined
   readonly logger: Required<Logger>
+  private readonly replaceNames: Set<string>
   listening: boolean
   closed: boolean
   private _allowlist: Set<string>
   private _connections: Map<SwarmSocket, Connection>
   private _sockets: Map<string, Set<SwarmSocket>>
   private _sessions: Set<ServerSession>
-  private _activeUploads: Map<string, { references: number }>
+  private _activeUploads: Map<string, UploadReservation>
+  private _activeNames: Map<string, UploadReservation>
   private layout: StorageLayout | null
   private sessionStore: SessionStore | null
   private commitStore: CommitStore | null
@@ -488,6 +507,7 @@ export class Server extends EventEmitter {
     if (options.allowlistPath !== undefined && typeof options.allowlistPath !== 'string') {
       throw configurationError('Invalid allowlist path')
     }
+    const replaceNames = validateReplaceNames(options.replaceNames)
 
     this._keyPair = keyPairFromSeed(b4a.from(options.seed))
     this.publicKey = b4a.from(this._keyPair.publicKey)
@@ -509,11 +529,13 @@ export class Server extends EventEmitter {
     this.swarmFactory = options.swarmFactory || ((opts: ServerSwarmOptions) => new Hyperswarm(opts))
     this.allowlistPath = options.allowlistPath
     this.logger = createSafeLogger(options.logger)
+    this.replaceNames = replaceNames
     this._allowlist = allowlist
     this._connections = new Map()
     this._sockets = new Map()
     this._sessions = new Set()
     this._activeUploads = new Map()
+    this._activeNames = new Map()
     this.layout = null
     this.sessionStore = null
     this.commitStore = null
@@ -568,12 +590,21 @@ export class Server extends EventEmitter {
     return rejected
   }
 
-  private _reserveUpload(transferId: Uint8Array): UploadReservation | null {
+  private _reserveUpload(
+    transferId: Uint8Array,
+    name: string
+  ): UploadReservation | { rejected: true; reason: 'ACTIVE_UPLOAD_LIMIT' | 'FILE_BUSY' } {
     const id = keyHex(transferId)
-    if (this._activeUploads.has(id)) return null
-    if (this._activeUploads.size >= this.maxActiveUploads) return null
-    this._activeUploads.set(id, { references: 1 })
-    return { id }
+    if (this._activeUploads.has(id) || this._activeNames.has(name)) {
+      return { rejected: true, reason: 'FILE_BUSY' }
+    }
+    if (this._activeUploads.size >= this.maxActiveUploads) {
+      return { rejected: true, reason: 'ACTIVE_UPLOAD_LIMIT' }
+    }
+    const reservation = { id, name }
+    this._activeUploads.set(id, reservation)
+    this._activeNames.set(name, reservation)
+    return reservation
   }
 
   private _releaseUpload(reservation: unknown): void {
@@ -586,9 +617,9 @@ export class Server extends EventEmitter {
       return
     }
     const active = this._activeUploads.get(reservation.id)
-    if (!active) return
-    active.references--
-    if (active.references <= 0) this._activeUploads.delete(reservation.id)
+    if (active !== reservation) return
+    this._activeUploads.delete(active.id)
+    if (this._activeNames.get(active.name) === active) this._activeNames.delete(active.name)
   }
 
   private _isSessionActive(session: unknown): boolean {
@@ -651,7 +682,8 @@ export class Server extends EventEmitter {
       commitStore: this.commitStore,
       retentionManager: this.retentionManager,
       maxFileBytes: this.maxFileBytes,
-      reserveUpload: (transferId) => this._reserveUpload(transferId),
+      replaceNames: this.replaceNames,
+      reserveUpload: (transferId, name) => this._reserveUpload(transferId, name),
       releaseUpload: (reservation) => this._releaseUpload(reservation),
       isAuthorized: () => this._isAllowed(connection.ownerKey),
       idleTimeout: this.idleTimeout,
@@ -872,6 +904,7 @@ export class Server extends EventEmitter {
         maxStagingBytes: this.maxStagingBytes,
         minFreeBytes: this.minFreeBytes,
         storage: this.storage,
+        replaceNames: this.replaceNames,
         onEvent: (event: { type: string } & Record<string, unknown>) => {
           const { type, ...details } = event
           this._emitSafe(type, details)
@@ -965,6 +998,7 @@ export class Server extends EventEmitter {
         storage: this.storage,
         isSessionActive: (session) => this._isSessionActive(session),
         hasActiveUploads: () => this._activeUploads.size > 0,
+        isPinned: (record) => this.replaceNames.has(record.name),
         logger: this.logger,
         scheduler: this.scheduler,
         onEvent: (event: { type: string } & Record<string, unknown>) => {
@@ -1082,6 +1116,7 @@ export class Server extends EventEmitter {
     this._connections.clear()
     this._sockets.clear()
     this._activeUploads.clear()
+    this._activeNames.clear()
 
     const swarm = this.swarm
     if (swarm) await attempt(() => swarm.destroy())

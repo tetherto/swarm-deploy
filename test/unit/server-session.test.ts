@@ -482,6 +482,7 @@ test('server session revocation prevents queued chunk writes', async (t) => {
   const started = deferred()
   const release = deferred()
   let writes = 0
+  let reservationsReleased = 0
   const sessionStore = createSessionStore({
     writeChunk: async () => {
       writes++
@@ -492,7 +493,11 @@ test('server session revocation prevents queued chunk writes', async (t) => {
   const pair = createClientServer({
     sessionStore,
     commitStore: createCommitStore(),
-    maxFileBytes: 1024 * 1024
+    maxFileBytes: 1024 * 1024,
+    reserveUpload: () => ({ reserved: true }),
+    releaseUpload: () => {
+      reservationsReleased++
+    }
   })
   const upload = makeUpload()
   pair.messages[OFFER].send(upload.offer)
@@ -506,6 +511,7 @@ test('server session revocation prevents queued chunk writes', async (t) => {
   await pair.serverSession!.settle()
 
   t.is(writes, 1)
+  t.is(reservationsReleased, 1)
 })
 
 test('server session revocation prevents queued finish commit', async (t) => {
@@ -576,6 +582,7 @@ test('server session settlement retains cleanup errors raised after revocation',
 test('server session admits a replaceable managed offer and commits it', async (t) => {
   const inspections: Array<Parameters<CommitStore['inspect']>> = []
   const committed: CommitCall[] = []
+  const events: Array<Record<string, unknown>> = []
   const sessionStore = createSessionStore()
   const pair = createClientServer({
     sessionStore,
@@ -586,9 +593,18 @@ test('server session admits a replaceable managed offer and commits it', async (
       },
       async commit(session, options) {
         committed.push({ session, options })
-        return { name: session.name }
+        return {
+          name: session.name,
+          replaces: {
+            name: session.name,
+            transferId: '1'.repeat(64),
+            historyName: `history-${'1'.repeat(64)}`
+          }
+        }
       }
     }),
+    replaceNames: ['release.tar.gz'],
+    onEvent: (event) => events.push(event),
     maxFileBytes: 1024 * 1024
   })
   const upload = makeUpload({ name: 'release.tar.gz' })
@@ -598,6 +614,7 @@ test('server session admits a replaceable managed offer and commits it', async (
   t.is(pair.received.status[0].code, STATUS_CODE.ACCEPT)
   t.is(inspections.length, 1)
   t.is(inspections[0][0], 'release.tar.gz')
+  t.alike(inspections[0][2]?.replaceNames, new Set(['release.tar.gz']))
 
   pair.messages[CHUNK].send(upload.chunk)
   await waitFor(() => pair.received.chunkAck.length === 1)
@@ -606,5 +623,104 @@ test('server session admits a replaceable managed offer and commits it', async (
 
   t.is(pair.received.result[0].code, 0)
   t.is(committed.length, 1)
+  t.alike(committed[0].options.replaceNames, new Set(['release.tar.gz']))
   t.is(sessionStore.sessions.size, 0)
+  const succeeded = events.find((event) => event.type === 'commit' && event.status === 'succeeded')
+  t.alike(succeeded?.replaced, {
+    name: 'release.tar.gz',
+    transferId: '1'.repeat(64),
+    historyName: `history-${'1'.repeat(64)}`
+  })
+})
+
+test('server session rejects existing empty uploads before staging', async (t) => {
+  let offers = 0
+  let reservationsReleased = 0
+  const sessionStore = createSessionStore()
+  const originalOffer = sessionStore.offer
+  sessionStore.offer = async (...args) => {
+    offers++
+    return originalOffer(...args)
+  }
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore({
+      inspect: async () => ({ status: 'FILE_EXISTS' })
+    }),
+    reserveUpload: () => ({ reserved: true }),
+    releaseUpload: () => {
+      reservationsReleased++
+    },
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload({ name: 'immutable.bin', data: b4a.alloc(0) })
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.status.length === 1)
+
+  t.is(pair.received.status[0].code, STATUS_CODE.FILE_EXISTS)
+  t.is(offers, 0)
+  t.is(reservationsReleased, 1)
+})
+
+test('server session holds one destination lease and releases it on close', async (t) => {
+  const active = new Set<string>()
+  const reserveUpload: NonNullable<ServerSessionOptions['reserveUpload']> = (_id, name) => {
+    if (active.has(name)) return { rejected: true, reason: 'FILE_BUSY' }
+    active.add(name)
+    return { name }
+  }
+  const releaseUpload: NonNullable<ServerSessionOptions['releaseUpload']> = (reservation) => {
+    active.delete((reservation as { name: string }).name)
+  }
+  const options = {
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024,
+    reserveUpload,
+    releaseUpload
+  }
+  const first = createClientServer(options)
+  const second = createClientServer(options)
+  const upload = makeUpload({ name: 'release.tar.gz' })
+
+  first.messages[OFFER].send(upload.offer)
+  await waitFor(() => first.received.ready.length === 1)
+  second.messages[OFFER].send(upload.offer)
+  await waitFor(() => second.received.status.length === 1)
+  t.is(second.received.status[0].code, STATUS_CODE.FILE_BUSY)
+
+  await first.serverSession!.close()
+  const third = createClientServer(options)
+  third.messages[OFFER].send(upload.offer)
+  await waitFor(() => third.received.ready.length === 1)
+  t.is(active.size, 1)
+  await third.serverSession!.close()
+  t.is(active.size, 0)
+})
+
+test('server session rejects reserved history offers without staging', async (t) => {
+  let offered = false
+  const sessionStore = createSessionStore()
+  sessionStore.offer = async (...args) => {
+    offered = true
+    return createSessionStore().offer(...args)
+  }
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore({
+      inspect: async () => {
+        throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
+      }
+    }),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload({ name: 'history-client.bin' })
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.status.length === 1)
+
+  t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
+  t.is(pair.received.status[0].reason, ERRORS.INVALID_FILENAME)
+  t.is(offered, false)
 })
