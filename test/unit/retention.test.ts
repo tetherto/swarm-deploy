@@ -1,32 +1,120 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const { SwarmDeployError, ERRORS } = require('../../dist/errors')
-const { transferId } = require('../../dist/protocol/transfer-id')
-const { initLayout } = require('../../dist/storage/layout')
-const { SessionStore } = require('../../dist/storage/session-store')
-const { CommitStore } = require('../../dist/storage/commit-store')
-const { RetentionManager, DEFAULT_RESUME_TTL } = require('../../dist/storage/retention')
-const { createClock } = require('../helpers/clock')
-const { createTempDir } = require('../helpers/files')
-const { createStorage } = require('../helpers/storage')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import { SwarmDeployError, ERRORS } from '../../dist/errors.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type { Chunk, Digest, Offer } from '../../dist/protocol/types.js'
+import { initLayout } from '../../dist/storage/layout.js'
+import { SessionStore } from '../../dist/storage/session-store.js'
+import { CommitStore } from '../../dist/storage/commit-store.js'
+import type { CommitRecord } from '../../dist/storage/commit-journal.js'
+import { RetentionManager, DEFAULT_RESUME_TTL } from '../../dist/storage/retention.js'
+import type { StorageLayout } from '../../dist/storage/types.js'
+import { createClock, type TestClock } from '../helpers/clock.js'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage, type TestStorage } from '../helpers/storage.js'
 
 const OWNER = b4a.alloc(32, 7)
 const CHUNK_SIZE = 1024 * 1024
 
-function sha256(bytes) {
+type RetentionOptions = ConstructorParameters<typeof RetentionManager>[0]
+type RetentionSession = Parameters<RetentionOptions['isSessionActive']>[0]
+type CommitSession = Parameters<CommitStore['commit']>[0]
+
+interface ErrnoError extends Error {
+  code?: string
+}
+
+/** The fields the harness inspects on a caught retention error. */
+interface CaughtError {
+  code?: unknown
+  cause?: { message?: unknown }
+}
+
+/** Live sessions expose their transfer ID to the activity predicate. */
+interface ActivitySession extends RetentionSession {
+  id: string
+}
+
+interface HarnessChunk {
+  index: number
+  data: Buffer
+  digest: Digest
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunk: HarnessChunk
+}
+
+interface LoggedEntry {
+  message: string
+  details: Record<string, unknown>
+}
+
+interface FakeTimer {
+  callback: () => void
+}
+
+/** Deterministic replacement for the interval scheduler. */
+interface TestScheduler {
+  setInterval(callback: () => void): FakeTimer
+  clearInterval(timer: unknown): void
+  tick(): void
+  readonly installs: number
+  readonly size: number
+}
+
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+}
+
+interface CreateStoresOptions {
+  storage?: TestStorage
+  retention?: Partial<RetentionOptions>
+  isSessionActive?: (session: RetentionSession) => boolean
+  logger?: RetentionOptions['logger']
+}
+
+interface Stores {
+  layout: StorageLayout
+  clock: TestClock
+  sessionStore: SessionStore
+  commitStore: CommitStore
+  manager: RetentionManager
+}
+
+interface CommittedArtifact {
+  upload: HarnessUpload
+  record: CommitRecord
+  finalPath: string
+}
+
+interface VerifiedArtifact {
+  upload: HarnessUpload
+  session: CommitSession
+  finalPath: string
+}
+
+function asChunk(chunk: HarnessChunk): Chunk {
+  return chunk as unknown as Chunk
+}
+
+function sha256(bytes: Uint8Array): Digest {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function hex(bytes) {
+function hex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
 
-function makeUpload(name, data) {
+function makeUpload(name: string, data: Buffer): HarnessUpload {
   const offer = {
     version: 1,
     name,
@@ -35,43 +123,45 @@ function makeUpload(name, data) {
     chunkSize: CHUNK_SIZE,
     chunkCount: 1
   }
-  offer.transferId = transferId({
-    clientPublicKey: OWNER,
-    name,
-    size: offer.size,
-    digest: offer.digest,
-    chunkSize: CHUNK_SIZE
-  })
   return {
-    offer,
+    offer: {
+      ...offer,
+      transferId: transferId({
+        clientPublicKey: OWNER,
+        name,
+        size: offer.size,
+        digest: offer.digest,
+        chunkSize: CHUNK_SIZE
+      })
+    },
     chunk: { index: 0, data, digest: sha256(data) }
   }
 }
 
-async function pathExists(filePath) {
+async function pathExists(filePath: string): Promise<boolean> {
   try {
     await fs.promises.lstat(filePath)
     return true
   } catch (err) {
-    if (err.code === 'ENOENT') return false
+    if ((err as ErrnoError).code === 'ENOENT') return false
     throw err
   }
 }
 
-function deferred() {
-  let resolve
-  const promise = new Promise((done) => {
-    resolve = done
+function deferred(): Deferred {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = () => done()
   })
   return { promise, resolve }
 }
 
-function delay(milliseconds) {
+function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
-function createScheduler() {
-  const timers = new Set()
+function createScheduler(): TestScheduler {
+  const timers = new Set<FakeTimer>()
   let installs = 0
   return {
     setInterval(callback) {
@@ -81,7 +171,7 @@ function createScheduler() {
       return timer
     },
     clearInterval(timer) {
-      timers.delete(timer)
+      timers.delete(timer as FakeTimer)
     },
     tick() {
       for (const timer of timers) timer.callback()
@@ -96,9 +186,9 @@ function createScheduler() {
 }
 
 async function createStores(
-  t,
-  { storage, retention = {}, isSessionActive = () => false, logger } = {}
-) {
+  t: Assert,
+  { storage, retention = {}, isSessionActive = () => false, logger }: CreateStoresOptions = {}
+): Promise<Stores> {
   const layout = initLayout(await createTempDir(t))
   const clock = createClock()
   const sessionStore = new SessionStore({
@@ -124,25 +214,30 @@ async function createStores(
   return { layout, clock, sessionStore, commitStore, manager }
 }
 
-async function commit(t, stores, name, data) {
+async function commit(
+  t: Assert,
+  stores: Stores,
+  name: string,
+  data: Buffer
+): Promise<CommittedArtifact> {
   const upload = makeUpload(name, data)
   await stores.sessionStore.offer(OWNER, upload.offer)
-  await stores.sessionStore.writeChunk(upload.offer.transferId, upload.chunk)
+  await stores.sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
   await stores.sessionStore.finish(upload.offer.transferId)
   const record = await stores.commitStore.commit(
-    stores.sessionStore.sessions.get(hex(upload.offer.transferId))
+    stores.sessionStore.sessions.get(hex(upload.offer.transferId))!
   )
   return { upload, record, finalPath: path.join(stores.layout.root, name) }
 }
 
-async function verify(stores, name, data) {
+async function verify(stores: Stores, name: string, data: Buffer): Promise<VerifiedArtifact> {
   const upload = makeUpload(name, data)
   await stores.sessionStore.offer(OWNER, upload.offer)
-  await stores.sessionStore.writeChunk(upload.offer.transferId, upload.chunk)
+  await stores.sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
   await stores.sessionStore.finish(upload.offer.transferId)
   return {
     upload,
-    session: stores.sessionStore.sessions.get(hex(upload.offer.transferId)),
+    session: stores.sessionStore.sessions.get(hex(upload.offer.transferId))!,
     finalPath: path.join(stores.layout.root, name)
   }
 }
@@ -191,8 +286,8 @@ test('commit reserves retention capacity before final publication', async (t) =>
 })
 
 test('commits serialize different names through capacity reservation', async (t) => {
-  let alphaFinal = null
-  let bravoFinal = null
+  let alphaFinal: string | null = null
+  let bravoFinal: string | null = null
   let alphaLinked = false
   let bravoLinked = false
   let alphaRemovedBeforeBravo = false
@@ -252,12 +347,12 @@ test('commit validates corrupt staging before retention evicts managed commits',
 
 test('commit succeeds when post-commit cleanup fails and retries cleanup later', async (t) => {
   const cleanupFailure = new Error('Injected post-commit cleanup failure')
-  let firstFinal = null
-  let secondFinal = null
+  let firstFinal: string | null = null
+  let secondFinal: string | null = null
   let advanceAfterPublication = false
   let failCleanup = false
-  const errors = []
-  let stores = null
+  const errors: LoggedEntry[] = []
+  let stores!: Stores
   const storage = createStorage({
     async beforeOperation(name, filePath) {
       if (failCleanup && name === 'unlink' && filePath === firstFinal) throw cleanupFailure
@@ -291,7 +386,7 @@ test('commit succeeds when post-commit cleanup fails and retries cleanup later',
   t.is(record.name, 'second.bin')
   t.is(await pathExists(first.finalPath), true)
   t.is(await pathExists(incoming.finalPath), true)
-  t.is(stores.manager.cleanupFailure.code, ERRORS.CLEANUP_FAILED)
+  t.is((stores.manager.cleanupFailure as CaughtError).code, ERRORS.CLEANUP_FAILED)
   t.alike(errors, [
     {
       message: 'Post-commit retention failed',
@@ -357,7 +452,7 @@ test('retention admission is non-destructive and blocks unhealthy capacity', asy
 
 test('retention propagates deletion failure before accepting capacity-dependent commit', async (t) => {
   let failDelete = false
-  let protectedPath = null
+  let protectedPath: string | null = null
   const storage = createStorage({
     async beforeOperation(name, filePath) {
       if (failDelete && name === 'unlink' && filePath === protectedPath) {
@@ -370,25 +465,25 @@ test('retention propagates deletion failure before accepting capacity-dependent 
   protectedPath = existing.finalPath
   failDelete = true
 
-  let caught = null
+  let caught: CaughtError | null = null
   try {
     await stores.manager.run({ incomingBytes: 3 })
   } catch (err) {
-    caught = err
+    caught = err as CaughtError
   }
 
-  t.is(caught.code, ERRORS.CLEANUP_FAILED)
-  t.is(caught.cause.message, 'Injected retention deletion failure')
+  t.is(caught?.code, ERRORS.CLEANUP_FAILED)
+  t.is(caught?.cause?.message, 'Injected retention deletion failure')
   t.is(await pathExists(existing.finalPath), true)
   t.alike(await stores.commitStore.list(), [existing.record])
 })
 
 test('scheduled age retention defers until a receiving upload finishes', async (t) => {
   const scheduler = createScheduler()
-  let activeId = null
+  let activeId: string | null = null
   const stores = await createStores(t, {
     retention: { maxAge: 10, scheduler },
-    isSessionActive: (session) => session.id === activeId
+    isSessionActive: (session) => (session as ActivitySession).id === activeId
   })
   t.teardown(() => stores.manager.stop())
   await stores.manager.start()
@@ -402,7 +497,7 @@ test('scheduled age retention defers until a receiving upload finishes', async (
   await stores.manager.tickPromise
   t.is(await pathExists(existing.finalPath), true)
 
-  await stores.sessionStore.writeChunk(active.offer.transferId, active.chunk)
+  await stores.sessionStore.writeChunk(active.offer.transferId, asChunk(active.chunk))
   await stores.sessionStore.finish(active.offer.transferId)
   scheduler.tick()
   await stores.manager.tickPromise
@@ -411,10 +506,10 @@ test('scheduled age retention defers until a receiving upload finishes', async (
 
 test('scheduled quota retention defers until a receiving upload finishes', async (t) => {
   const scheduler = createScheduler()
-  let activeId = null
+  let activeId: string | null = null
   const stores = await createStores(t, {
     retention: { maxStorageBytes: 2, scheduler },
-    isSessionActive: (session) => session.id === activeId
+    isSessionActive: (session) => (session as ActivitySession).id === activeId
   })
   t.teardown(() => stores.manager.stop())
   await stores.manager.start()
@@ -427,7 +522,7 @@ test('scheduled quota retention defers until a receiving upload finishes', async
   await stores.manager.tickPromise
   t.is(await pathExists(existing.finalPath), true)
 
-  await stores.sessionStore.writeChunk(active.offer.transferId, active.chunk)
+  await stores.sessionStore.writeChunk(active.offer.transferId, asChunk(active.chunk))
   await stores.sessionStore.finish(active.offer.transferId)
   scheduler.tick()
   await stores.manager.tickPromise
@@ -452,9 +547,9 @@ test('retention preserves unknown files and active staging', async (t) => {
 })
 
 test('retention expires only disconnected sessions past the default TTL', async (t) => {
-  let activeId = null
+  let activeId: string | null = null
   const stores = await createStores(t, {
-    isSessionActive: (session) => session.id === activeId
+    isSessionActive: (session) => (session as ActivitySession).id === activeId
   })
   const inactive = makeUpload('inactive.bin', b4a.from('inactive'))
   const active = makeUpload('active.bin', b4a.from('active'))
@@ -532,22 +627,20 @@ test('retention validates numeric limits and durations', async (t) => {
 
 test('retention requires an explicit session activity predicate', async (t) => {
   const stores = await createStores(t)
+  const withoutPredicate: Omit<RetentionOptions, 'isSessionActive'> = {
+    layout: stores.layout,
+    sessionStore: stores.sessionStore,
+    commitStore: stores.commitStore
+  }
 
   await t.exception(
-    () =>
-      Promise.resolve(
-        new RetentionManager({
-          layout: stores.layout,
-          sessionStore: stores.sessionStore,
-          commitStore: stores.commitStore
-        })
-      ),
+    () => Promise.resolve(new RetentionManager(withoutPredicate as RetentionOptions)),
     { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
   )
 })
 
 test('retention serializes overlapping scheduled and manual runs', async (t) => {
-  let stores = null
+  let stores!: Stores
   let hold = false
   let running = 0
   let maximumRunning = 0
@@ -585,7 +678,7 @@ test('retention serializes overlapping scheduled and manual runs', async (t) => 
 
 test('retention start shares startup, coalesces ticks, and stops safely', async (t) => {
   const scheduler = createScheduler()
-  let stores = null
+  let stores!: Stores
   let hold = true
   const entered = deferred()
   const release = deferred()
@@ -640,7 +733,7 @@ test('throwing retention loggers do not escape cleanup handling', async (t) => {
 
 test('retention rejects a managed record that disappears during enumeration', async (t) => {
   let removeRecord = false
-  let recordPath = null
+  let recordPath: string | null = null
   const storage = createStorage({
     async beforeOperation(name, filePath) {
       if (!removeRecord || name !== 'lstat' || filePath !== recordPath) return

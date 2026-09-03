@@ -1,13 +1,14 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const { EventEmitter } = require('#events')
-const fs = require('#fs')
-const path = require('#path')
-const b4a = require('b4a')
-const Hyperswarm = require('hyperswarm')
-const Protomux = require('protomux')
-const {
+import test, { type Assert } from 'brittle'
+import { EventEmitter } from '#events'
+import fs from '#fs'
+import path from '#path'
+import b4a from 'b4a'
+import Hyperswarm from 'hyperswarm'
+import Protomux from 'protomux'
+import {
   parseSeed,
   publicKeyFromSeed,
   keyPairFromSeed,
@@ -20,70 +21,110 @@ const {
   chunkAck,
   finish,
   result
-} = require('../..')
-const { createTempDir } = require('../helpers/files')
-const { createLocalTestnet } = require('../helpers/testnet')
-const { fingerprint } = require('../../dist/server')
-const { topicFromServerPublicKey } = require('../../dist/topic')
-const { main } = require('../../dist/cli')
+} from '../../dist/index.js'
+import { createTempDir } from '../helpers/files.js'
+import { createLocalTestnet } from '../helpers/testnet.js'
+import { fingerprint } from '../../dist/server.js'
+import { topicFromServerPublicKey } from '../../dist/topic.js'
+import { main } from '../../dist/cli.js'
 
 const HEX64 = /^[0-9a-f]{64}$/
 
-function createIo(overrides = {}) {
-  const stdout = []
-  const stderr = []
+type CliIo = NonNullable<Parameters<typeof main>[2]>
+type SpawnSync = typeof import('child_process').spawnSync
+
+interface CapturedStream {
+  write(chunk: unknown): boolean
+}
+
+/** The CLI seams these scenarios inject alongside the captured streams. */
+interface IoOverrides {
+  process?: EventEmitter
+  dht?: unknown
+  connectTimeout?: number
+  idleTimeout?: number
+}
+
+interface TestIo extends CliIo {
+  stdout: CapturedStream
+  stderr: CapturedStream
+  process: EventEmitter
+  captured: { stdout: string[]; stderr: string[] }
+  text(stream: 'stdout' | 'stderr'): string
+}
+
+/** A Protomux message as the malformed-frame server drives it. */
+interface HarnessMessage {
+  send(value: unknown): boolean
+}
+
+interface SpawnedRuntime {
+  name: string
+  bin: string
+}
+
+function createIo(overrides: IoOverrides = {}): TestIo {
+  const stdout: string[] = []
+  const stderr: string[] = []
   const io = {
     stdout: {
-      write(chunk) {
+      write(chunk: unknown) {
         stdout.push(String(chunk))
         return true
       }
     },
     stderr: {
-      write(chunk) {
+      write(chunk: unknown) {
         stderr.push(String(chunk))
         return true
       }
     },
     process: overrides.process || new EventEmitter(),
     ...overrides
-  }
+  } as TestIo
   io.captured = { stdout, stderr }
   io.text = (stream) => (stream === 'stderr' ? stderr : stdout).join('')
   return io
 }
 
-function assertNoSecret(t, text, secret) {
+function assertNoSecret(t: Assert, text: string, secret: string): void {
   t.ok(typeof secret === 'string' && secret.length > 0)
   t.absent(text.includes(secret))
 }
 
-async function waitForText(io, stream, snippet, timeout = 15_000) {
+async function waitForText(
+  io: TestIo,
+  stream: 'stdout' | 'stderr',
+  snippet: string,
+  timeout = 15_000
+): Promise<string> {
   const started = Date.now()
   while (Date.now() - started < timeout) {
     if (io.text(stream).includes(snippet)) return io.text(stream)
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 20)
+    })
   }
   throw new Error(`Timed out waiting for ${snippet}: ${io.text('stdout')} ${io.text('stderr')}`)
 }
 
-function trySpawnSync() {
+function trySpawnSync(): SpawnSync | null {
   try {
-    return require('child_process').spawnSync
+    return (require('child_process') as typeof import('child_process')).spawnSync
   } catch {
     return null
   }
 }
 
-function cliBin() {
+function cliBin(): string {
   return path.join(__dirname, '../../dist/bin/swarm-deploy.js')
 }
 
-function bareBin() {
+function bareBin(): string {
   return path.join(__dirname, '../../node_modules/bare-runtime/bin/bare')
 }
 
-function runtimeLabel() {
+function runtimeLabel(): string {
   return typeof Bare !== 'undefined' ? 'bare' : 'node'
 }
 
@@ -237,7 +278,7 @@ test('CLI classifies a malformed server frame as runtime exit 1', async (t) => {
     const mux = Protomux.from(socket)
     mux.pair({ protocol: 'swarm-deploy/upload/1' }, (id) => {
       const channel = mux.createChannel({ protocol: 'swarm-deploy/upload/1', id })
-      const messages = [
+      const messages: HarnessMessage[] = [
         channel.addMessage({
           encoding: offer,
           onmessage(value) {
@@ -296,7 +337,7 @@ if (spawnSync) {
 
   test('spawned Node and Bare CLI keygen refuse overwrite and hide the seed', async (t) => {
     const dir = await createTempDir(t)
-    const runtimes = [{ name: 'node', bin: process.execPath }]
+    const runtimes: SpawnedRuntime[] = [{ name: 'node', bin: process.execPath }]
     try {
       const bare = bareBin()
       await fs.promises.access(bare)

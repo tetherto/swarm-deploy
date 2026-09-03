@@ -1,32 +1,93 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const { transferId } = require('../../dist/protocol/transfer-id')
-const { initLayout } = require('../../dist/storage/layout')
-const { readJson } = require('../../dist/storage/atomic-file')
-const { SessionStore } = require('../../dist/storage/session-store')
-const { CommitStore } = require('../../dist/storage/commit-store')
-const { recoverStorage } = require('../../dist/storage/recovery')
-const { createClock } = require('../helpers/clock')
-const { createTempDir } = require('../helpers/files')
-const { createStorage } = require('../helpers/storage')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type { Chunk, Digest, Offer } from '../../dist/protocol/types.js'
+import { initLayout } from '../../dist/storage/layout.js'
+import { readJson } from '../../dist/storage/atomic-file.js'
+import { SessionStore } from '../../dist/storage/session-store.js'
+import { CommitStore } from '../../dist/storage/commit-store.js'
+import type { CommitJournal, CommitRecord } from '../../dist/storage/commit-journal.js'
+import { recoverStorage } from '../../dist/storage/recovery.js'
+import type { StorageLayout } from '../../dist/storage/types.js'
+import { createClock, type TestClock } from '../helpers/clock.js'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage, type StorageOperationHook, type TestStorage } from '../helpers/storage.js'
 
 const OWNER = b4a.alloc(32, 7)
 const CHUNK_SIZE = 1024 * 1024
 
-function sha256(bytes) {
+type CommitSession = Parameters<CommitStore['commit']>[0]
+
+interface ErrnoError extends Error {
+  code?: string
+}
+
+/** The fields the harness inspects on a caught recovery error. */
+interface CaughtError {
+  code?: unknown
+}
+
+/** Bypasses the commit lock the way the concurrency probe requires. */
+interface UnlockedCommitStore {
+  _commit(session: CommitSession): Promise<CommitRecord>
+}
+
+interface HarnessChunk {
+  index: number
+  data: Buffer
+  digest: Digest
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunk: HarnessChunk
+}
+
+interface TransferPaths {
+  final: string
+  staging: string
+  session: string
+  journal: string
+  record: string
+}
+
+interface LoggedWarning {
+  message: string
+  detail: Record<string, unknown>
+}
+
+interface VerifiedSession {
+  layout: StorageLayout
+  clock: TestClock
+  upload: HarnessUpload
+  sessionStore: SessionStore
+  session: CommitSession
+}
+
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+}
+
+function asChunk(chunk: HarnessChunk): Chunk {
+  return chunk as unknown as Chunk
+}
+
+function sha256(bytes: Uint8Array): Digest {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function hex(bytes) {
+function hex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
 
-function makeUpload() {
+function makeUpload(): HarnessUpload {
   const data = b4a.from('verified artifact')
   const offer = {
     version: 1,
@@ -36,20 +97,22 @@ function makeUpload() {
     chunkSize: CHUNK_SIZE,
     chunkCount: 1
   }
-  offer.transferId = transferId({
-    clientPublicKey: OWNER,
-    name: offer.name,
-    size: offer.size,
-    digest: offer.digest,
-    chunkSize: offer.chunkSize
-  })
   return {
-    offer,
+    offer: {
+      ...offer,
+      transferId: transferId({
+        clientPublicKey: OWNER,
+        name: offer.name,
+        size: offer.size,
+        digest: offer.digest,
+        chunkSize: offer.chunkSize
+      })
+    },
     chunk: { index: 0, data, digest: sha256(data) }
   }
 }
 
-function paths(layout, offer) {
+function paths(layout: StorageLayout, offer: Offer): TransferPaths {
   const id = hex(offer.transferId)
   return {
     final: path.join(layout.root, offer.name),
@@ -60,17 +123,25 @@ function paths(layout, offer) {
   }
 }
 
-async function pathExists(filePath) {
+async function readCommitRecord(filePath: string): Promise<CommitRecord> {
+  return (await readJson(filePath)) as unknown as CommitRecord
+}
+
+async function readJournalFile(filePath: string): Promise<CommitJournal> {
+  return (await readJson(filePath)) as unknown as CommitJournal
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
   try {
     await fs.promises.lstat(filePath)
     return true
   } catch (err) {
-    if (err.code === 'ENOENT') return false
+    if ((err as ErrnoError).code === 'ENOENT') return false
     throw err
   }
 }
 
-async function createVerifiedSession(t, storage) {
+async function createVerifiedSession(t: Assert, storage?: TestStorage): Promise<VerifiedSession> {
   const root = await createTempDir(t)
   const layout = initLayout(root)
   const clock = createClock()
@@ -84,21 +155,21 @@ async function createVerifiedSession(t, storage) {
   })
   await sessionStore.init()
   await sessionStore.offer(OWNER, upload.offer)
-  await sessionStore.writeChunk(upload.offer.transferId, upload.chunk)
+  await sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
   await sessionStore.finish(upload.offer.transferId)
   return {
     layout,
     clock,
     upload,
     sessionStore,
-    session: sessionStore.sessions.get(hex(upload.offer.transferId))
+    session: sessionStore.sessions.get(hex(upload.offer.transferId))!
   }
 }
 
-function deferred() {
-  let resolve
-  const promise = new Promise((done) => {
-    resolve = done
+function deferred(): Deferred {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = () => done()
   })
   return { promise, resolve }
 }
@@ -112,10 +183,10 @@ for (const point of [
   'journal removed'
 ]) {
   test(`recovery converges after crash point: ${point}`, async (t) => {
-    let layout = null
-    let upload = null
+    let layout: StorageLayout | null = null
+    let upload: HarnessUpload | null = null
     let armed = true
-    const afterOperation = async (name, source, destination) => {
+    const afterOperation: StorageOperationHook = async (name, source, destination) => {
       if (!armed || !layout || !upload) return
       const expected = paths(layout, upload.offer)
       const crash =
@@ -175,12 +246,12 @@ for (const point of [
       t.is(await pathExists(expected.record), false)
       t.is(await pathExists(expected.staging), true)
       t.is(await pathExists(expected.session), true)
-      t.is(restarted.sessions.get(hex(upload.offer.transferId)).state, 'verified')
+      t.is(restarted.sessions.get(hex(upload.offer.transferId))!.state, 'verified')
       return
     }
 
     t.alike(await fs.promises.readFile(expected.final), upload.chunk.data)
-    t.alike(await readJson(expected.record), {
+    t.alike(await readCommitRecord(expected.record), {
       version: 1,
       name: upload.offer.name,
       size: upload.offer.size,
@@ -196,7 +267,7 @@ for (const point of [
 }
 
 test('recovery leaves a same-content foreign final unmanaged', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
     async afterOperation(name, filePath) {
@@ -230,7 +301,7 @@ test('recovery leaves a same-content foreign final unmanaged', async (t) => {
 })
 
 test('recovery rejects a shape-valid journal fingerprint that disagrees with the session', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
     async afterOperation(name, filePath) {
@@ -248,7 +319,7 @@ test('recovery rejects a shape-valid journal fingerprint that disagrees with the
   armed = true
   await t.exception(() => commits.commit(created.session))
   await fs.promises.link(expected.staging, expected.final)
-  const journal = await readJson(expected.journal)
+  const journal = await readJournalFile(expected.journal)
   journal.record.uploaderFingerprint = '0'.repeat(64)
   await fs.promises.writeFile(expected.journal, JSON.stringify(journal))
   await created.sessionStore.close()
@@ -265,9 +336,9 @@ test('recovery rejects a shape-valid journal fingerprint that disagrees with the
 })
 
 test('recovery reports corrupt journals and continues valid journals', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let armed = false
-  const warnings = []
+  const warnings: LoggedWarning[] = []
   const storage = createStorage({
     async afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
@@ -311,7 +382,7 @@ test('recovery reports corrupt journals and continues valid journals', async (t)
 })
 
 test('recovery propagates corrupt resumable metadata from SessionStore', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
     async afterOperation(name, filePath) {
@@ -344,7 +415,7 @@ test('recovery propagates corrupt resumable metadata from SessionStore', async (
 })
 
 test('recoverStorage invoked twice after cleanup-pending commit preserves final and sidecar', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
     async afterOperation(name, filePath) {
@@ -395,8 +466,8 @@ test('concurrent same-transfer commits cannot let the journal loser remove the w
   const loserAtPublication = deferred()
   const winnerPublished = deferred()
   const loserCleaned = deferred()
-  let winnerTemporary = null
-  let loserTemporary = null
+  let winnerTemporary: string | null = null
+  let loserTemporary: string | null = null
 
   const winnerStorage = createStorage({
     async beforeOperation(name, source, destination) {
@@ -436,17 +507,17 @@ test('concurrent same-transfer commits cannot let the journal loser remove the w
   })
 
   const outcomes = await Promise.allSettled([
-    winner._commit(created.session),
-    loser._commit(created.session)
+    (winner as unknown as UnlockedCommitStore)._commit(created.session),
+    (loser as unknown as UnlockedCommitStore)._commit(created.session)
   ])
-  const journal = await readJson(expected.journal)
-  const winnerAttemptId = path.basename(winnerTemporary).split('.')[2]
+  const journal = await readJournalFile(expected.journal)
+  const winnerAttemptId = path.basename(winnerTemporary!).split('.')[2]
 
   t.is(outcomes[0].status, 'rejected')
   t.is(outcomes[1].status, 'rejected')
   t.is(journal.attemptId, winnerAttemptId)
-  t.is(await pathExists(winnerTemporary), false)
-  t.is(await pathExists(loserTemporary), false)
+  t.is(await pathExists(winnerTemporary!), false)
+  t.is(await pathExists(loserTemporary!), false)
   t.is(await pathExists(expected.journal), true)
 
   const results = await recoverStorage({
@@ -465,8 +536,8 @@ test('concurrent same-transfer commits cannot let the journal loser remove the w
 })
 
 test('recovery converges after session metadata unlink before staging cleanup', async (t) => {
-  let layout = null
-  let expected = null
+  let layout!: StorageLayout
+  let expected!: TransferPaths
   let armed = false
   const storage = createStorage({
     async afterOperation(name, filePath) {
@@ -502,7 +573,7 @@ test('recovery converges after session metadata unlink before staging cleanup', 
   t.is(results.length, 1)
   t.is(results[0].status, 'COMMITTED')
   t.alike(await fs.promises.readFile(expected.final), created.upload.chunk.data)
-  t.alike((await readJson(expected.record)).sha256, hex(created.upload.offer.digest))
+  t.alike((await readCommitRecord(expected.record)).sha256, hex(created.upload.offer.digest))
   t.is(await pathExists(expected.staging), false)
   t.is(await pathExists(expected.session), false)
   t.is(await pathExists(expected.journal), false)
@@ -511,7 +582,7 @@ test('recovery converges after session metadata unlink before staging cleanup', 
 })
 
 test('recovery propagates cleanup directory fsync failure and a retry converges', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let crashCommit = false
   let failCleanupSync = false
   const cleanupFailure = new Error('Injected cleanup parent fsync failure')
@@ -537,7 +608,7 @@ test('recovery propagates cleanup directory fsync failure and a retry converges'
   await created.sessionStore.close()
 
   failCleanupSync = true
-  let caught = null
+  let caught: unknown = null
   try {
     await recoverStorage({
       layout,
@@ -567,7 +638,7 @@ test('recovery propagates cleanup directory fsync failure and a retry converges'
 })
 
 test('recovery aborts on journal EIO without continuing to a later valid journal', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let armed = false
   const setupStorage = createStorage({
     async afterOperation(name, filePath) {
@@ -581,10 +652,10 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
   layout = created.layout
   const expected = paths(layout, created.upload.offer)
   const earlierJournal = path.join(layout.journals, `${'0'.repeat(64)}.json`)
-  const eio = new Error('Injected journal read failure')
+  const eio: ErrnoError = new Error('Injected journal read failure')
   eio.code = 'EIO'
-  const warnings = []
-  const events = []
+  const warnings: LoggedWarning[] = []
+  const events: unknown[] = []
   const recoveryStorage = createStorage({
     async beforeOperation(name, filePath) {
       if (name === 'read' && filePath === earlierJournal) throw eio
@@ -597,7 +668,7 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
   await fs.promises.writeFile(earlierJournal, '{}')
   await created.sessionStore.close()
 
-  let caught = null
+  let caught: unknown = null
   try {
     await recoverStorage({
       layout,
@@ -614,7 +685,9 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
       },
       onEvent(event) {
         events.push(event)
-        if (event.status === 'failed') throw new Error('throwing recovery listener')
+        if ('status' in event && event.status === 'failed') {
+          throw new Error('throwing recovery listener')
+        }
       }
     })
   } catch (err) {
@@ -642,7 +715,7 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
 test('startup scrub emits a contained structured failure before rejecting', async (t) => {
   const root = await createTempDir(t)
   const layout = initLayout(root)
-  const scrubFailure = new Error('Injected scrub failure with private local path')
+  const scrubFailure: ErrnoError = new Error('Injected scrub failure with private local path')
   scrubFailure.code = 'EIO'
   const storage = createStorage({
     beforeOperation(name, filePath) {
@@ -655,8 +728,8 @@ test('startup scrub emits a contained structured failure before rejecting', asyn
     storage
   })
   await sessionStore.init()
-  const events = []
-  let caught = null
+  const events: unknown[] = []
+  let caught: unknown = null
   try {
     await recoverStorage({
       layout,
@@ -664,7 +737,9 @@ test('startup scrub emits a contained structured failure before rejecting', asyn
       commitStore: new CommitStore({ layout, storage }),
       onEvent(event) {
         events.push(event)
-        if (event.status === 'failed') throw new Error('throwing scrub listener')
+        if ('status' in event && event.status === 'failed') {
+          throw new Error('throwing scrub listener')
+        }
       }
     })
   } catch (err) {
@@ -681,7 +756,7 @@ test('startup scrub emits a contained structured failure before rejecting', asyn
 })
 
 test('recovery aborts on uncoded storage-safety errors without reporting corruption', async (t) => {
-  let layout = null
+  let layout!: StorageLayout
   let armed = false
   const setupStorage = createStorage({
     async afterOperation(name, filePath) {
@@ -695,7 +770,7 @@ test('recovery aborts on uncoded storage-safety errors without reporting corrupt
   layout = created.layout
   const expected = paths(layout, created.upload.offer)
   const storageSafetyFailure = new Error('Injected directory replacement safety failure')
-  const warnings = []
+  const warnings: LoggedWarning[] = []
   let journalStats = 0
   const recoveryStorage = createStorage({
     async beforeOperation(name, filePath) {
@@ -710,7 +785,7 @@ test('recovery aborts on uncoded storage-safety errors without reporting corrupt
   await t.exception(() => setupCommits.commit(created.session))
   await created.sessionStore.close()
 
-  let caught = null
+  let caught: CaughtError | null = null
   try {
     await recoverStorage({
       layout,
@@ -727,11 +802,11 @@ test('recovery aborts on uncoded storage-safety errors without reporting corrupt
       }
     })
   } catch (err) {
-    caught = err
+    caught = err as CaughtError
   }
 
   t.is(caught, storageSafetyFailure)
-  t.is(caught.code, undefined)
+  t.is(caught?.code, undefined)
   t.is(warnings.length, 0)
   t.is(await pathExists(expected.journal), true)
   t.is(await pathExists(expected.final), false)

@@ -1,10 +1,39 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
 
-const test = require('brittle')
-const { parseAllowlist, AllowlistWatcher } = require('../../dist/allowlist')
+import test from 'brittle'
+import {
+  parseAllowlist,
+  AllowlistWatcher,
+  type AllowlistFailureEvent,
+  type AllowlistRemovedEvent,
+  type AllowlistWatcherOptions
+} from '../../dist/allowlist.js'
 
 const KEY_A = 'a'.repeat(64)
 const KEY_B = 'b'.repeat(64)
+
+interface ErrnoError extends Error {
+  code?: string
+}
+
+/** The watcher marks partially applied cleanup failures with this flag. */
+interface AppliedAggregateError extends AggregateError {
+  allowlistApplied?: boolean
+}
+
+/** The interval handle the injected scheduler hands back to the test. */
+interface FakeInterval {
+  callback(): unknown
+  unref(): void
+}
+
+/**
+ * The watcher tolerates a synchronous `readFile`, which the published storage
+ * adapter type does not describe. This keeps that seam explicit and local.
+ */
+function syncStorage(readFile: () => string): AllowlistWatcherOptions['storage'] {
+  return { readFile } as unknown as AllowlistWatcherOptions['storage']
+}
 
 test('parseAllowlist ignores blanks and comments', (t) => {
   t.alike(
@@ -24,11 +53,13 @@ test('parseAllowlist rejects noncanonical key lines', (t) => {
 
 test('allowlist watcher applies a valid replacement atomically', async (t) => {
   let source = `${KEY_A}\n${KEY_B}\n`
-  const applied = []
+  const applied: Array<Set<string>> = []
   const watcher = new AllowlistWatcher({
     filePath: 'allowed.txt',
     storage: { readFile: async () => source },
-    onReload: async (keys) => applied.push(new Set(keys))
+    onReload: async (keys) => {
+      applied.push(new Set(keys))
+    }
   })
 
   await watcher.poll()
@@ -46,7 +77,7 @@ test('allowlist watcher emits fingerprint-only removal events', async (t) => {
     storage: { readFile: async () => source },
     onReload: async () => {}
   })
-  const removed = []
+  const removed: AllowlistRemovedEvent[] = []
   watcher.on('removed', (details) => removed.push(details))
 
   await watcher.poll()
@@ -64,7 +95,7 @@ test('allowlist watcher retries unchanged applied cleanup failures', async (t) =
     storage: { readFile: async () => `${KEY_A}\n` },
     onReload: async () => {
       if (++attempts === 1) {
-        const error = new AggregateError([new Error('cleanup failed')])
+        const error: AppliedAggregateError = new AggregateError([new Error('cleanup failed')])
         error.allowlistApplied = true
         throw error
       }
@@ -79,20 +110,20 @@ test('allowlist watcher retries unchanged applied cleanup failures', async (t) =
 
 test('live poll failures are contained, retain snapshot, and recover on next valid file', async (t) => {
   let source = `${KEY_A}\n`
-  let readError = null
-  let timer = null
-  const applied = []
-  const failures = []
-  const emitted = []
+  let readError: ErrnoError | null = null
+  let timer: FakeInterval | null = null
+  const applied: Array<Set<string>> = []
+  const failures: AllowlistFailureEvent[] = []
+  const emitted: AllowlistFailureEvent[] = []
   const watcher = new AllowlistWatcher({
     filePath: 'secret-customer-allowlist.txt',
-    storage: {
-      readFile: () => {
-        if (readError) throw readError
-        return source
-      }
+    storage: syncStorage(() => {
+      if (readError) throw readError
+      return source
+    }),
+    onReload: (keys) => {
+      applied.push(new Set(keys))
     },
-    onReload: (keys) => applied.push(new Set(keys)),
     onFailure(details) {
       failures.push(details)
       throw new Error('throwing failure callback')
@@ -118,24 +149,26 @@ test('live poll failures are contained, retain snapshot, and recover on next val
   await watcher.load()
   watcher.startPolling()
   source = `${KEY_A}\nPRIVATE-CONTENT\n`
-  const invalidPoll = timer.callback()
+  const scheduled = timer as FakeInterval | null
+  if (scheduled === null) throw new Error('polling did not schedule an interval')
+  const invalidPoll = scheduled.callback() as Promise<unknown>
   t.ok(invalidPoll && typeof invalidPoll.then === 'function')
   await invalidPoll
   t.alike(watcher.keys, new Set([KEY_A]))
 
   readError = new Error('cannot read /private/customer/secret-customer-allowlist.txt')
   readError.code = 'EACCES'
-  await timer.callback()
+  await scheduled.callback()
   t.alike(watcher.keys, new Set([KEY_A]))
 
   readError = new Error('symbolic allowlist rejected by no-follow safety')
   readError.code = 'ELOOP'
-  await timer.callback()
+  await scheduled.callback()
   t.alike(watcher.keys, new Set([KEY_A]))
 
   readError = null
   source = `${KEY_B}\n`
-  await timer.callback()
+  await scheduled.callback()
   t.alike(watcher.keys, new Set([KEY_B]))
   t.alike(applied, [new Set([KEY_A]), new Set([KEY_B])])
   t.alike(failures, [{ reason: 'INVALID_PUBLIC_KEY' }, { reason: 'EACCES' }, { reason: 'ELOOP' }])

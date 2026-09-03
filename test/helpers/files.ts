@@ -1,19 +1,29 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
 
-const fs = require('#fs')
-const path = require('#path')
-const crypto = require('#crypto')
+import type { Assert } from 'brittle'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import type { Digest } from '../../dist/types.js'
 
-const CHUNK_SIZE = 1024 * 1024
+export const CHUNK_SIZE = 1024 * 1024
 
-function systemTmpdir() {
-  if (typeof Bare !== 'undefined') {
-    return require('bare-os').tmpdir()
-  }
-  return require('os').tmpdir()
+export interface ExpectedManifest {
+  size: number
+  digest: Digest
+  chunkDigests: Digest[]
+  chunkCount: number
+  chunkSize: number
 }
 
-async function createTempDir(t) {
+function systemTmpdir(): string {
+  if (typeof Bare !== 'undefined') {
+    return (require('bare-os') as typeof import('bare-os')).tmpdir()
+  }
+  return (require('os') as typeof import('node:os')).tmpdir()
+}
+
+export async function createTempDir(t?: Assert): Promise<string> {
   const root = await fs.promises.realpath(systemTmpdir())
   const dir = path.join(
     root,
@@ -24,17 +34,17 @@ async function createTempDir(t) {
   return dir
 }
 
-function deterministicByte(index) {
+export function deterministicByte(index: number): number {
   return index & 0xff
 }
 
-function digestBuffer(data) {
+export function digestBuffer(data: Uint8Array): Digest {
   return crypto.createHash('sha256').update(data).digest()
 }
 
-function expectedManifest(size, chunkSize = CHUNK_SIZE) {
+export function expectedManifest(size: number, chunkSize = CHUNK_SIZE): ExpectedManifest {
   const whole = crypto.createHash('sha256')
-  const chunkDigests = []
+  const chunkDigests: Digest[] = []
   let offset = 0
 
   while (offset < size) {
@@ -57,7 +67,7 @@ function expectedManifest(size, chunkSize = CHUNK_SIZE) {
   }
 }
 
-async function writeDeterministicFile(filePath, size) {
+export async function writeDeterministicFile(filePath: string, size: number): Promise<void> {
   const fd = await fs.promises.open(filePath, 'w')
   try {
     const chunkLen = 64 * 1024
@@ -74,13 +84,4 @@ async function writeDeterministicFile(filePath, size) {
   } finally {
     await fd.close()
   }
-}
-
-module.exports = {
-  CHUNK_SIZE,
-  createTempDir,
-  deterministicByte,
-  digestBuffer,
-  expectedManifest,
-  writeDeterministicFile
 }

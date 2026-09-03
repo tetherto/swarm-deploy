@@ -1,36 +1,77 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const fs = require('#fs')
-const path = require('#path')
-const Hyperswarm = require('hyperswarm')
-const { Client, Server, buildFileManifest, keyPairFromSeed, transferId, ERRORS } = require('../..')
-const { createTempDir } = require('../helpers/files')
-const { createLocalTestnet } = require('../helpers/testnet')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import fs from '#fs'
+import path from '#path'
+import Hyperswarm from 'hyperswarm'
+import {
+  Client,
+  Server,
+  buildFileManifest,
+  keyPairFromSeed,
+  transferId,
+  ERRORS
+} from '../../dist/index.js'
+import { createTempDir } from '../helpers/files.js'
+import { createLocalTestnet } from '../helpers/testnet.js'
+import { serverInternals } from '../helpers/internals.js'
 
 const SERVER_SEED = b4a.alloc(32, 0xa1)
 const CLIENT_SEED = b4a.alloc(32, 0xa2)
 const UNKNOWN_SEED = b4a.alloc(32, 0xa3)
 const CHUNK_SIZE = 1024 * 1024
 
-function deferred() {
-  let resolve
-  const promise = new Promise((done) => {
-    resolve = done
+/** The observable fields the emitted lifecycle payloads are asserted on. */
+interface EventPayload {
+  status?: string
+  reason?: string
+  trigger?: string
+  bytesReceived?: number
+  bytesSent?: number
+  final?: boolean
+  fingerprint?: string
+  [key: string]: unknown
+}
+
+interface RecordedEvent {
+  name: string
+  payload: EventPayload
+}
+
+/** Any emitter whose lifecycle events carry a single payload object. */
+interface EventSource {
+  on(name: string, listener: (payload: EventPayload) => void): unknown
+}
+
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+}
+
+function deferred(): Deferred {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = () => done()
   })
   return { promise, resolve }
 }
 
-function hex(bytes) {
+function hex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
 
-function recordEvents(emitter, names, output) {
+function recordEvents(emitter: EventSource, names: string[], output: RecordedEvent[]): void {
   for (const name of names) emitter.on(name, (payload) => output.push({ name, payload }))
 }
 
-function assertSubsequence(t, events, expected, label) {
+function assertSubsequence(
+  t: Assert,
+  events: RecordedEvent[],
+  expected: Array<(event: RecordedEvent) => boolean>,
+  label: string
+): void {
   let cursor = 0
   for (const event of events) {
     if (expected[cursor](event)) cursor++
@@ -50,8 +91,8 @@ test('typed observability covers resume reject recovery retention auth and priva
   await fs.promises.writeFile(rejectedSource, b4a.alloc(2 * CHUNK_SIZE + 1, 0x6b))
 
   const ownerKey = keyPairFromSeed(CLIENT_SEED).publicKey
-  const serverEvents = []
-  const clientEvents = []
+  const serverEvents: RecordedEvent[] = []
+  const clientEvents: RecordedEvent[] = []
   const server = new Server({
     seed: SERVER_SEED,
     storageDir: root,
@@ -62,6 +103,7 @@ test('typed observability covers resume reject recovery retention auth and priva
     minFreeBytes: 0,
     dht: testnet.createNode()
   })
+  const internal = serverInternals(server)
   recordEvents(
     server,
     [
@@ -103,8 +145,8 @@ test('typed observability covers resume reject recovery retention auth and priva
     chunkSize: manifest.chunkSize,
     chunkCount: manifest.chunkCount
   }
-  await server.sessionStore.offer(ownerKey, offer)
-  await server.sessionStore.writeChunk(id, {
+  await internal.sessionStore.offer(ownerKey, offer)
+  await internal.sessionStore.writeChunk(id, {
     transferId: id,
     index: 0,
     digest: manifest.chunkDigests[0],
@@ -146,9 +188,11 @@ test('typed observability covers resume reject recovery retention auth and priva
   })
 
   const firewallAttempt = deferred()
-  const originalFirewall = server._firewall.bind(server)
-  server._firewall = (key) => {
-    if (b4a.equals(key, keyPairFromSeed(UNKNOWN_SEED).publicKey)) firewallAttempt.resolve()
+  const originalFirewall = internal._firewall.bind(server)
+  internal._firewall = (key) => {
+    if (b4a.equals(key as Uint8Array, keyPairFromSeed(UNKNOWN_SEED).publicKey)) {
+      firewallAttempt.resolve()
+    }
     return originalFirewall(key)
   }
   const unknown = new Hyperswarm({
@@ -167,7 +211,7 @@ test('typed observability covers resume reject recovery retention auth and priva
     digest: cleanup.digest,
     chunkSize: cleanup.chunkSize
   })
-  await server.sessionStore.offer(ownerKey, {
+  await internal.sessionStore.offer(ownerKey, {
     version: 1,
     transferId: cleanupId,
     name: cleanup.name,
@@ -233,7 +277,10 @@ test('typed observability covers resume reject recovery retention auth and priva
   for (const secret of [SERVER_SEED, CLIENT_SEED, UNKNOWN_SEED, ownerKey, server.publicKey]) {
     t.absent(serialized.includes(hex(secret)), `events hide ${hex(secret).slice(0, 4)} material`)
   }
-  for (const event of serverEvents.filter((entry) => entry.payload.fingerprint)) {
-    t.ok(/^[0-9a-f]{12}$/.test(event.payload.fingerprint))
+  const fingerprints = serverEvents
+    .map((entry) => entry.payload.fingerprint)
+    .filter((value): value is string => Boolean(value))
+  for (const fingerprint of fingerprints) {
+    t.ok(/^[0-9a-f]{12}$/.test(fingerprint))
   }
 })

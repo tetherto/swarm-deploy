@@ -108,3 +108,62 @@ test('production build removes stale dist artifacts', (t) => {
   execSync('npm run build', { cwd: repoRoot, stdio: 'pipe' })
   t.not(fs.existsSync(stale), 'stale artifact must be removed by clean build')
 })
+
+test('test build removes stale compiled test artifacts', (t) => {
+  const testDist = path.join(repoRoot, '.test-dist')
+  const stale = path.join(testDist, '__stale-test-artifact__.js')
+  fs.mkdirSync(testDist, { recursive: true })
+  fs.writeFileSync(stale, 'module.exports = {}')
+  t.ok(fs.existsSync(stale))
+  execSync('npm run build:test', { cwd: repoRoot, stdio: 'pipe' })
+  t.not(fs.existsSync(stale), 'stale compiled test artifact must be removed by clean build')
+  t.ok(fs.existsSync(path.join(testDist, 'run.js')), 'clean build must re-emit the runner')
+})
+
+test('tracked test sources contain no JavaScript', (t) => {
+  const tracked = execSync('git ls-files -- test', { cwd: repoRoot, encoding: 'utf8' })
+    .split('\n')
+    .filter((entry) => entry.length > 0)
+  t.ok(tracked.length > 0, 'test sources must be tracked')
+
+  const javascript = tracked.filter((entry) => entry.endsWith('.js'))
+  t.alike(javascript, [], `tracked test JavaScript must not exist: ${javascript}`)
+
+  const generated = execSync('git ls-files -- dist .test-dist', { cwd: repoRoot, encoding: 'utf8' })
+    .split('\n')
+    .filter((entry) => entry.length > 0)
+  t.alike(generated, [], `generated output must not be tracked: ${generated}`)
+})
+
+test('test compiler settings reject unsound test code', (t) => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-deploy-strict-'))
+  const negativeControl = path.join(scratch, 'negative-control.ts')
+  fs.writeFileSync(negativeControl, 'export const size: number = "not a number"\n')
+
+  try {
+    const result = spawnSync(
+      'npx',
+      [
+        'tsc',
+        '--ignoreConfig',
+        '--noEmit',
+        '--strict',
+        '--module',
+        'node16',
+        '--moduleResolution',
+        'node16',
+        '--types',
+        'node',
+        negativeControl
+      ],
+      { cwd: repoRoot, encoding: 'utf8' }
+    )
+    t.not(result.status, 0, 'strict compilation must reject the negative control')
+    t.ok(
+      `${result.stdout}${result.stderr}`.includes('negative-control.ts'),
+      'the failure must name the offending file'
+    )
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true })
+  }
+})

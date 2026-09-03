@@ -1,17 +1,48 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
 
-const test = require('brittle')
-const fs = require('#fs')
-const path = require('#path')
-const { ERRORS, validateBasename, selectUploadPaths, buildFileManifest } = require('../..')
-const { createAbortController } = require('../../dist/abort')
-const {
+import test from 'brittle'
+import fs from '#fs'
+import path from '#path'
+import { ERRORS, validateBasename, selectUploadPaths, buildFileManifest } from '../../dist/index.js'
+import type { BuildFileManifestOptions } from '../../dist/files.js'
+import { createAbortController } from '../../dist/abort.js'
+import {
   CHUNK_SIZE,
   createTempDir,
   expectedManifest,
   writeDeterministicFile
-} = require('../helpers/files')
-const { blockManifestAfterFirstRead, settlePromptly } = require('../helpers/cancellation')
+} from '../helpers/files.js'
+import {
+  blockManifestAfterFirstRead,
+  settledError,
+  settlePromptly
+} from '../helpers/cancellation.js'
+
+interface ErrnoError extends Error {
+  code?: string
+}
+
+/** The stream members the read-stream patches wrap. */
+interface PatchableStream {
+  on(event: string, listener: (chunk: Buffer) => void): unknown
+  destroy(): void
+  emit(event: string): boolean
+}
+
+/** A mutable view of the members these tests replace on the runtime `fs`. */
+interface PatchableFs {
+  createReadStream(filePath: string, options?: Record<string, unknown>): PatchableStream
+  promises: {
+    lstat(lstatPath: string, options?: unknown): Promise<unknown>
+  }
+}
+
+const patchable = fs as unknown as PatchableFs
+
+/** Chunk sizes the manifest builder must reject, including a non-number. */
+function invalidChunkSize(value: number | string): BuildFileManifestOptions {
+  return { chunkSize: value } as unknown as BuildFileManifestOptions
+}
 
 test('validateBasename accepts safe names and rejects unsafe names', (t) => {
   t.is(validateBasename('artifact-linux-x64.tar.gz'), 'artifact-linux-x64.tar.gz')
@@ -67,12 +98,12 @@ test('buildFileManifest assembles logical chunks independent of stream size', as
   const filePath = path.join(dir, 'stream-chunks.bin')
   await writeDeterministicFile(filePath, size)
 
-  const original = fs.createReadStream
-  fs.createReadStream = function patchedCreateReadStream(p, opts = {}) {
-    return original.call(fs, p, { ...opts, highWaterMark: 17 })
+  const original = patchable.createReadStream
+  patchable.createReadStream = function patchedCreateReadStream(p, opts = {}) {
+    return original.call(patchable, p, { ...opts, highWaterMark: 17 })
   }
   t.teardown(() => {
-    fs.createReadStream = original
+    patchable.createReadStream = original
   })
 
   const manifest = await buildFileManifest(filePath)
@@ -87,10 +118,10 @@ test('buildFileManifest rejects mutation during hashing', async (t) => {
   const filePath = path.join(dir, 'mutable.bin')
   await writeDeterministicFile(filePath, 8 * CHUNK_SIZE)
 
-  const original = fs.createReadStream
+  const original = patchable.createReadStream
   let chunks = 0
-  fs.createReadStream = function patchedCreateReadStream(p, opts) {
-    const stream = original.call(fs, p, opts)
+  patchable.createReadStream = function patchedCreateReadStream(p, opts) {
+    const stream = original.call(patchable, p, opts)
     stream.on('data', () => {
       chunks++
       if (chunks === 2) {
@@ -100,7 +131,7 @@ test('buildFileManifest rejects mutation during hashing', async (t) => {
     return stream
   }
   t.teardown(() => {
-    fs.createReadStream = original
+    patchable.createReadStream = original
   })
 
   await t.exception(() => buildFileManifest(filePath), {
@@ -139,7 +170,7 @@ test('buildFileManifest rejects invalid chunkSize values', async (t) => {
 
   for (const chunkSize of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1, '1024']) {
     await t.exception(
-      () => buildFileManifest(filePath, { chunkSize }),
+      () => buildFileManifest(filePath, invalidChunkSize(chunkSize)),
       {
         name: 'SwarmDeployError',
         code: ERRORS.PROTOCOL_INVALID
@@ -188,9 +219,13 @@ test('buildFileManifest maps ELOOP from no-follow open to INVALID_FILENAME', asy
   await writeDeterministicFile(filePath, 5)
   await writeDeterministicFile(otherPath, 5)
 
-  const originalLstat = fs.promises.lstat
+  const originalLstat = patchable.promises.lstat
   let lstatCalls = 0
-  fs.promises.lstat = async function patchedLstat(lstatPath, opts) {
+  patchable.promises.lstat = async function patchedLstat(
+    this: unknown,
+    lstatPath: string,
+    opts?: unknown
+  ) {
     const stat = await originalLstat.call(this, lstatPath, opts)
     if (lstatPath === filePath && lstatCalls++ === 0) {
       await fs.promises.rename(filePath, path.join(dir, 'moved.bin'))
@@ -199,7 +234,7 @@ test('buildFileManifest maps ELOOP from no-follow open to INVALID_FILENAME', asy
     return stat
   }
   t.teardown(() => {
-    fs.promises.lstat = originalLstat
+    patchable.promises.lstat = originalLstat
   })
 
   await t.exception(() => buildFileManifest(filePath), {
@@ -213,9 +248,9 @@ test('buildFileManifest rejects when bytes read mismatch initial size', async (t
   const filePath = path.join(dir, 'short-read.bin')
   await writeDeterministicFile(filePath, 10)
 
-  const original = fs.createReadStream
-  fs.createReadStream = function patchedCreateReadStream(p, opts = {}) {
-    const stream = original.call(fs, p, opts)
+  const original = patchable.createReadStream
+  patchable.createReadStream = function patchedCreateReadStream(p, opts = {}) {
+    const stream = original.call(patchable, p, opts)
     const origOn = stream.on.bind(stream)
     stream.on = function (event, listener) {
       if (event === 'data') {
@@ -230,7 +265,7 @@ test('buildFileManifest rejects when bytes read mismatch initial size', async (t
     return stream
   }
   t.teardown(() => {
-    fs.createReadStream = original
+    patchable.createReadStream = original
   })
 
   await t.exception(() => buildFileManifest(filePath), {
@@ -261,17 +296,21 @@ test('selectUploadPaths records unreadable directory entries and continues lexic
   const good = path.join(dir, 'b-good.bin')
   await writeDeterministicFile(blocked, 1)
   await writeDeterministicFile(good, 1)
-  const original = fs.promises.lstat
-  fs.promises.lstat = async function patchedLstat(entryPath, opts) {
+  const original = patchable.promises.lstat
+  patchable.promises.lstat = async function patchedLstat(
+    this: unknown,
+    entryPath: string,
+    opts?: unknown
+  ) {
     if (entryPath === blocked) {
-      const error = new Error('denied')
+      const error: ErrnoError = new Error('denied')
       error.code = 'EACCES'
       throw error
     }
     return original.call(this, entryPath, opts)
   }
   t.teardown(() => {
-    fs.promises.lstat = original
+    patchable.promises.lstat = original
   })
 
   const selection = await selectUploadPaths(dir)
@@ -313,9 +352,9 @@ test('buildFileManifest aborts an active hash and closes its stream and descript
 
   const [hashResult] = await settlePromptly([hashing, blocked.streamClosed])
   t.is(hashResult.status, 'rejected')
-  t.is(hashResult.reason.name, 'SwarmDeployError')
-  t.is(hashResult.reason.code, ERRORS.ABORTED)
+  t.is(settledError(hashResult).name, 'SwarmDeployError')
+  t.is(settledError(hashResult).code, ERRORS.ABORTED)
   t.ok(blocked.state.streamClosed)
   t.ok(blocked.state.descriptorCloseAttempted)
-  await t.exception(() => blocked.state.descriptor.stat(), { code: 'EBADF' })
+  await t.exception(() => blocked.state.descriptor?.stat?.(), { code: 'EBADF' })
 })

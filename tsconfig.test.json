@@ -12,5 +12,6 @@
     "sourceMap": true,
     "types": ["node"]
   },
-  "include": ["test/run.ts", "test/unit/imports.test.ts", "test/unit/imports-node.test.ts"]
+  "include": ["test/**/*.ts"],
+  "exclude": ["test/types/public-api.ts"]
 }

@@ -1,79 +1,185 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const { EventEmitter } = require('#events')
-const { Server, keyPairFromSeed, transferId, ERRORS } = require('../..')
-const { ServerSession } = require('../../dist/protocol/server-session')
-const { OFFER, CHUNK, FINISH, RESULT } = require('../../dist/protocol/constants')
-const { initLayout } = require('../../dist/storage/layout')
-const { readJson } = require('../../dist/storage/atomic-file')
-const { SessionStore } = require('../../dist/storage/session-store')
-const { CommitStore } = require('../../dist/storage/commit-store')
-const { createTempDir } = require('../helpers/files')
-const { createStorage } = require('../helpers/storage')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import { EventEmitter } from '#events'
+import { Server, keyPairFromSeed, transferId, ERRORS } from '../../dist/index.js'
+import { ServerSession } from '../../dist/protocol/server-session.js'
+import { OFFER, CHUNK, FINISH, RESULT } from '../../dist/protocol/constants.js'
+import type { Codec, Offer, ProtocolChannel } from '../../dist/protocol/types.js'
+import type { SwarmDiscovery } from '../../dist/types.js'
+import { initLayout } from '../../dist/storage/layout.js'
+import { readJson } from '../../dist/storage/atomic-file.js'
+import { SessionStore } from '../../dist/storage/session-store.js'
+import { CommitStore } from '../../dist/storage/commit-store.js'
+import type { StorageAdapter, StorageLayout } from '../../dist/storage/types.js'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage, type TestStorage } from '../helpers/storage.js'
+import { serverInternals, type TrackedConnection } from '../helpers/internals.js'
 
 const OWNER = b4a.alloc(32, 0x51)
 const OWNER_SEED = b4a.alloc(32, 0x52)
 const CHUNK_SIZE = 1024 * 1024
 
-function sha256(bytes) {
+/** A destroy reason captured from the transport seam. */
+interface CaughtError {
+  name?: string
+  code?: string
+}
+
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+}
+
+interface HarnessChunk {
+  transferId: Buffer
+  index: number
+  digest: Buffer
+  data: Buffer
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunk: HarnessChunk
+}
+
+/**
+ * A message recorded by the fake channel, retaining the inbound handler.
+ * `ServerSession` installs handlers only for the messages it consumes, so the
+ * harness drives the handler through a non-null assertion exactly where the
+ * untyped original relied on it being present.
+ */
+interface RecordedMessage {
+  onmessage?(value: unknown): unknown
+  send(value: unknown): boolean
+}
+
+interface OutboundFrame {
+  index: number
+  value: unknown
+}
+
+/**
+ * The fake channel implements only the members `ServerSession` exercises, so
+ * the harness keeps the same observable surface as the untyped original.
+ */
+interface FakeChannel {
+  drained: boolean
+  closed: boolean
+  _recv(): void
+  addMessage<Input, Output>(options: {
+    encoding: Codec<Input, Output>
+    onmessage?: (value: Output) => unknown
+  }): RecordedMessage
+  open(): void
+  close(): void
+}
+
+interface FakeTransport {
+  channel: FakeChannel
+  messages: RecordedMessage[]
+  outbound: OutboundFrame[]
+}
+
+interface CreatedSession extends FakeTransport {
+  layout: StorageLayout
+  sessionStore: SessionStore
+  commitStore: CommitStore
+  session: ServerSession
+  destroyed: CaughtError[]
+}
+
+/** A socket stand-in whose destruction the revocation path reports. */
+interface FakeSocket extends EventEmitter {
+  destroy(error?: unknown): void
+}
+
+interface AttachedSession extends FakeTransport {
+  socket: FakeSocket
+  connection: TrackedConnection
+  session: ServerSession
+}
+
+interface LinearizedRun {
+  server: Server
+  storage: TestStorage
+  storageDir: string
+  upload: HarnessUpload
+  id: string
+  sessionPath: string
+  stagingPath: string
+  journalPath: string
+  finalPath: string
+  sidecarPath: string
+  reloadError: CaughtError | null
+}
+
+/** The journal fields these assertions read back. */
+interface JournalRecord {
+  state?: unknown
+}
+
+function sha256(bytes: Uint8Array): Buffer {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function hex(bytes) {
+function hex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
 
-function deferred() {
-  let resolve
-  const promise = new Promise((done) => {
-    resolve = done
+function deferred(): Deferred {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = () => done()
   })
   return { promise, resolve }
 }
 
-function diagnosticTimeout(promise, label, timeout = 1_000) {
-  let timer
+function diagnosticTimeout<T>(promise: Promise<T>, label: string, timeout = 1_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
   return Promise.race([
     promise,
-    new Promise((resolve, reject) => {
+    new Promise<T>((resolve, reject) => {
       timer = setTimeout(() => reject(new Error(`Timed out at ${label}`)), timeout)
     })
   ]).finally(() => clearTimeout(timer))
 }
 
-function makeUpload(ownerKey = OWNER, name = 'revoked.bin') {
+function makeUpload(ownerKey: Uint8Array = OWNER, name = 'revoked.bin'): HarnessUpload {
   const data = b4a.from('revocation barrier payload')
   const digest = sha256(data)
-  const offer = {
-    version: 1,
+  const size = data.byteLength
+  const id = transferId({
+    clientPublicKey: ownerKey,
     name,
-    size: data.byteLength,
+    size,
+    digest,
+    chunkSize: CHUNK_SIZE
+  })
+  const offer: Offer = {
+    version: 1,
+    transferId: id,
+    name,
+    size,
     digest,
     chunkSize: CHUNK_SIZE,
     chunkCount: 1
   }
-  offer.transferId = transferId({
-    clientPublicKey: ownerKey,
-    name,
-    size: offer.size,
-    digest,
-    chunkSize: CHUNK_SIZE
-  })
   return {
     offer,
-    chunk: { transferId: offer.transferId, index: 0, digest, data }
+    chunk: { transferId: id, index: 0, digest, data }
   }
 }
 
-function createChannel() {
-  const outbound = []
-  const messages = []
-  const channel = {
+function createChannel(): FakeTransport {
+  const outbound: OutboundFrame[] = []
+  const messages: RecordedMessage[] = []
+  const channel: FakeChannel = {
     drained: true,
     closed: false,
     _recv() {},
@@ -81,7 +187,7 @@ function createChannel() {
       const index = messages.length
       const message = {
         ...options,
-        send(value) {
+        send(value: unknown) {
           outbound.push({ index, value })
           return true
         }
@@ -97,7 +203,10 @@ function createChannel() {
   return { channel, messages, outbound }
 }
 
-async function createSession(t, storage = fs.promises) {
+async function createSession(
+  t: Assert,
+  storage: StorageAdapter = fs.promises
+): Promise<CreatedSession> {
   const layout = initLayout(await createTempDir(t))
   const sessionStore = new SessionStore({
     layout,
@@ -109,27 +218,27 @@ async function createSession(t, storage = fs.promises) {
   t.teardown(() => sessionStore.close())
   const commitStore = new CommitStore({ layout, storage })
   const transport = createChannel()
-  const destroyed = []
+  const destroyed: CaughtError[] = []
   const session = new ServerSession({
-    channel: transport.channel,
+    channel: transport.channel as unknown as ProtocolChannel,
     ownerKey: OWNER,
     sessionStore,
     commitStore,
     maxFileBytes: CHUNK_SIZE,
     destroy(error) {
-      destroyed.push(error)
+      destroyed.push(error as CaughtError)
     }
   })
   t.teardown(() => session.close())
   return { layout, sessionStore, commitStore, session, destroyed, ...transport }
 }
 
-async function offerReady(created, upload) {
-  await created.messages[OFFER].onmessage(upload.offer)
+async function offerReady(created: CreatedSession, upload: HarnessUpload): Promise<void> {
+  await created.messages[OFFER].onmessage!(upload.offer)
   tIsReady(created)
 }
 
-function tIsReady(created) {
+function tIsReady(created: CreatedSession): void {
   if (created.session.state !== 'READY') {
     throw new Error(`Expected READY session, got ${created.session.state}`)
   }
@@ -151,9 +260,9 @@ test('revocation stops an active write and its queued successor without acknowle
   const upload = makeUpload()
   await offerReady(created, upload)
 
-  const active = created.messages[CHUNK].onmessage(upload.chunk)
+  const active = created.messages[CHUNK].onmessage!(upload.chunk)
   await diagnosticTimeout(writeStarted.promise, 'active staging write barrier')
-  const queued = created.messages[CHUNK].onmessage(upload.chunk)
+  const queued = created.messages[CHUNK].onmessage!(upload.chunk)
   created.session.revoke()
   releaseWrite.resolve()
   await Promise.all([active, queued])
@@ -170,7 +279,7 @@ test('revocation stops an active write and its queued successor without acknowle
 test('revocation at the publication link rolls back final and sidecar', async (t) => {
   const linkStarted = deferred()
   const releaseLink = deferred()
-  let finalPath = null
+  let finalPath: string | null = null
   let blocked = false
   const storage = createStorage({
     async beforeOperation(name, source, destination) {
@@ -184,9 +293,9 @@ test('revocation at the publication link rolls back final and sidecar', async (t
   const upload = makeUpload(OWNER, 'committing.bin')
   finalPath = path.join(created.layout.root, upload.offer.name)
   await offerReady(created, upload)
-  await created.messages[CHUNK].onmessage(upload.chunk)
+  await created.messages[CHUNK].onmessage!(upload.chunk)
 
-  const finishing = created.messages[FINISH].onmessage({
+  const finishing = created.messages[FINISH].onmessage!({
     transferId: upload.offer.transferId
   })
   await diagnosticTimeout(linkStarted.promise, 'commit publication link barrier')
@@ -199,7 +308,7 @@ test('revocation at the publication link rolls back final and sidecar', async (t
     created.outbound.some((entry) => entry.index === RESULT),
     false
   )
-  await t.exception(() => fs.promises.lstat(finalPath), { code: 'ENOENT' })
+  await t.exception(() => fs.promises.lstat(finalPath!), { code: 'ENOENT' })
   await t.exception(
     () =>
       fs.promises.lstat(path.join(created.layout.commits, `${hex(upload.offer.transferId)}.json`)),
@@ -213,28 +322,39 @@ test('revocation at the publication link rolls back final and sidecar', async (t
   t.is(created.sessionStore.sessions.size, 0)
 })
 
-function createStubSwarm() {
-  const swarm = new EventEmitter()
+/** The swarm seam replacement: an emitter plus the two methods used. */
+interface StubSwarm extends EventEmitter {
+  join(): SwarmDiscovery
+  destroy(): Promise<void>
+}
+
+function createStubSwarm(): StubSwarm {
+  const swarm = new EventEmitter() as StubSwarm
   swarm.join = () => ({ flushed: async () => {} })
   swarm.destroy = async () => {}
   return swarm
 }
 
-function attachServerSession(server, ownerKey, onDestroy) {
+function attachServerSession(
+  server: Server,
+  ownerKey: Buffer,
+  onDestroy: (error?: unknown) => void
+): AttachedSession {
   const transport = createChannel()
-  const socket = new EventEmitter()
+  const socket = new EventEmitter() as FakeSocket
   socket.destroy = (error) => onDestroy(error)
   const owner = hex(ownerKey)
-  const connection = {
+  const connection: TrackedConnection = {
     owner,
     ownerKey,
     sessions: new Set(),
     socket,
     refreshTransport() {}
   }
-  server._connections.set(socket, connection)
-  server._sockets.set(owner, new Set([socket]))
-  server._onPair(
+  const internal = serverInternals(server)
+  internal._connections.set(socket, connection)
+  internal._sockets.set(owner, new Set([socket]))
+  internal._onPair(
     {
       createChannel() {
         return transport.channel
@@ -244,15 +364,28 @@ function attachServerSession(server, ownerKey, onDestroy) {
     connection,
     b4a.from('late-revocation')
   )
-  return { ...transport, socket, connection, session: [...connection.sessions][0] }
+  return {
+    ...transport,
+    socket,
+    connection,
+    session: [...connection.sessions][0] as ServerSession
+  }
 }
 
-async function runLinearizedServerRevocation(t, name, { deferRetry = false } = {}) {
+interface LinearizedOptions {
+  deferRetry?: boolean
+}
+
+async function runLinearizedServerRevocation(
+  t: Assert,
+  name: string,
+  { deferRetry = false }: LinearizedOptions = {}
+): Promise<LinearizedRun> {
   const cleanupStarted = deferred()
   const releaseCleanup = deferred()
   const revocationStarted = deferred()
   let armed = false
-  let sessionPath = null
+  let sessionPath: string | null = null
   const storage = createStorage({
     async beforeOperation(operation, filePath) {
       if (!armed || operation !== 'unlink' || filePath !== sessionPath) return
@@ -276,22 +409,23 @@ async function runLinearizedServerRevocation(t, name, { deferRetry = false } = {
   })
   t.teardown(() => server.close())
   await server.listen()
+  const internal = serverInternals(server)
   const attached = attachServerSession(server, ownerKey, () => revocationStarted.resolve())
   const upload = makeUpload(ownerKey, name)
   const id = hex(upload.offer.transferId)
-  sessionPath = path.join(server.layout.sessions, `${id}.json`)
-  const stagingPath = path.join(server.layout.staging, `${id}.part`)
-  const journalPath = path.join(server.layout.journals, `${id}.json`)
-  const finalPath = path.join(server.layout.root, name)
-  const sidecarPath = path.join(server.layout.commits, `${id}.json`)
-  await attached.messages[OFFER].onmessage(upload.offer)
-  await attached.messages[CHUNK].onmessage(upload.chunk)
+  sessionPath = path.join(internal.layout.sessions, `${id}.json`)
+  const stagingPath = path.join(internal.layout.staging, `${id}.part`)
+  const journalPath = path.join(internal.layout.journals, `${id}.json`)
+  const finalPath = path.join(internal.layout.root, name)
+  const sidecarPath = path.join(internal.layout.commits, `${id}.json`)
+  await attached.messages[OFFER].onmessage!(upload.offer)
+  await attached.messages[CHUNK].onmessage!(upload.chunk)
 
   armed = true
-  const finishing = attached.messages[FINISH].onmessage({ transferId: upload.offer.transferId })
+  const finishing = attached.messages[FINISH].onmessage!({ transferId: upload.offer.transferId })
   await diagnosticTimeout(cleanupStarted.promise, `${name} cleanup barrier`)
   if (deferRetry) {
-    server.commitStore.retryAbortedAttempt = async () => {
+    internal.commitStore.retryAbortedAttempt = async () => {
       throw new Error('Simulated restart before pending retry')
     }
   }
@@ -301,11 +435,11 @@ async function runLinearizedServerRevocation(t, name, { deferRetry = false } = {
   await finishing
   await attached.session.settle()
 
-  let reloadError = null
+  let reloadError: CaughtError | null = null
   try {
     await reloading
   } catch (err) {
-    reloadError = err
+    reloadError = err as CaughtError
   }
   return {
     server,
@@ -324,21 +458,22 @@ async function runLinearizedServerRevocation(t, name, { deferRetry = false } = {
 
 test('late Server revocation preserves linearized commits online and after restart', async (t) => {
   const online = await runLinearizedServerRevocation(t, 'late-online.bin')
+  const onlineInternal = serverInternals(online.server)
   const onlineRecord = await readJson(online.sidecarPath)
   const onlineFinal = await fs.promises.lstat(online.finalPath)
   t.is(online.reloadError, null)
-  t.is(online.server.sessionStore.sessions.size, 0)
-  t.is(online.server.sessionStore.reservedBytes, 0)
-  t.is(online.server._activeUploads.size, 0)
-  t.is(online.server.pendingRevocations.size, 0)
+  t.is(onlineInternal.sessionStore.sessions.size, 0)
+  t.is(onlineInternal.sessionStore.reservedBytes, 0)
+  t.is(onlineInternal._activeUploads.size, 0)
+  t.is(onlineInternal.pendingRevocations.size, 0)
   t.alike(await fs.promises.readFile(online.finalPath), online.upload.chunk.data)
   await t.exception(() => fs.promises.lstat(online.sessionPath), { code: 'ENOENT' })
   await t.exception(() => fs.promises.lstat(online.stagingPath), { code: 'ENOENT' })
   await t.exception(() => fs.promises.lstat(online.journalPath), { code: 'ENOENT' })
   t.is(
-    await online.server.commitStore.retryAbortedAttempt(
+    await onlineInternal.commitStore.retryAbortedAttempt(
       online.upload.offer.transferId,
-      online.server.sessionStore
+      onlineInternal.sessionStore
     ),
     false
   )
@@ -351,15 +486,16 @@ test('late Server revocation preserves linearized commits online and after resta
   const interrupted = await runLinearizedServerRevocation(t, 'late-restart.bin', {
     deferRetry: true
   })
+  const interruptedInternal = serverInternals(interrupted.server)
   const interruptedRecord = await readJson(interrupted.sidecarPath)
   const interruptedFinal = await fs.promises.lstat(interrupted.finalPath)
-  t.is(interrupted.reloadError.name, 'AggregateError')
-  t.is(interrupted.server.sessionStore.sessions.size, 0)
-  t.is(interrupted.server.sessionStore.reservedBytes, 0)
-  t.is(interrupted.server._activeUploads.size, 0)
-  t.is(interrupted.server.pendingRevocations.size, 1)
+  t.is(interrupted.reloadError!.name, 'AggregateError')
+  t.is(interruptedInternal.sessionStore.sessions.size, 0)
+  t.is(interruptedInternal.sessionStore.reservedBytes, 0)
+  t.is(interruptedInternal._activeUploads.size, 0)
+  t.is(interruptedInternal.pendingRevocations.size, 1)
   t.alike(await fs.promises.readFile(interrupted.finalPath), interrupted.upload.chunk.data)
-  t.is((await readJson(interrupted.journalPath)).state, 'committing')
+  t.is(((await readJson(interrupted.journalPath)) as JournalRecord).state, 'committing')
   await interrupted.server.close()
 
   const restarted = new Server({
@@ -374,6 +510,7 @@ test('late Server revocation preserves linearized commits online and after resta
   })
   t.teardown(() => restarted.close())
   await restarted.listen()
+  const restartedInternal = serverInternals(restarted)
   const restartedFinal = await fs.promises.lstat(interrupted.finalPath)
   t.is(restartedFinal.dev, interruptedFinal.dev)
   t.is(restartedFinal.ino, interruptedFinal.ino)
@@ -382,14 +519,14 @@ test('late Server revocation preserves linearized commits online and after resta
   await t.exception(() => fs.promises.lstat(interrupted.sessionPath), { code: 'ENOENT' })
   await t.exception(() => fs.promises.lstat(interrupted.stagingPath), { code: 'ENOENT' })
   await t.exception(() => fs.promises.lstat(interrupted.journalPath), { code: 'ENOENT' })
-  t.is(restarted.sessionStore.sessions.size, 0)
-  t.is(restarted.sessionStore.reservedBytes, 0)
+  t.is(restartedInternal.sessionStore.sessions.size, 0)
+  t.is(restartedInternal.sessionStore.reservedBytes, 0)
 })
 
 test('an unchanged allowlist reload retries failed revocation cleanup', async (t) => {
   const ownerKey = keyPairFromSeed(OWNER_SEED).publicKey
   let armed = false
-  let sessionPath = null
+  let sessionPath: string | null = null
   let failures = 0
   const storage = createStorage({
     async beforeOperation(name, filePath) {
@@ -410,27 +547,28 @@ test('an unchanged allowlist reload retries failed revocation cleanup', async (t
   })
   t.teardown(() => server.close())
   await server.listen()
+  const internal = serverInternals(server)
   const upload = makeUpload(ownerKey, 'retry-revocation.bin')
-  await server.sessionStore.offer(ownerKey, upload.offer)
-  sessionPath = path.join(server.layout.sessions, `${hex(upload.offer.transferId)}.json`)
+  await internal.sessionStore.offer(ownerKey, upload.offer)
+  sessionPath = path.join(internal.layout.sessions, `${hex(upload.offer.transferId)}.json`)
   armed = true
 
-  let firstFailure = null
+  let firstFailure: CaughtError | null = null
   try {
     await server.reloadAllowlist([])
   } catch (err) {
-    firstFailure = err
+    firstFailure = err as CaughtError
   }
-  t.is(firstFailure.name, 'AggregateError')
+  t.is(firstFailure!.name, 'AggregateError')
   t.alike(server.allowedKeys, new Set())
-  t.is(server.pendingRevocations.size, 1)
-  t.is(server.sessionStore.sessions.size, 1)
+  t.is(internal.pendingRevocations.size, 1)
+  t.is(internal.sessionStore.sessions.size, 1)
 
   await server.reloadAllowlist([])
 
   t.is(failures, 1)
-  t.is(server.pendingRevocations.size, 0)
-  t.is(server.sessionStore.sessions.size, 0)
-  t.alike(await fs.promises.readdir(server.layout.sessions), [])
-  t.alike(await fs.promises.readdir(server.layout.staging), [])
+  t.is(internal.pendingRevocations.size, 0)
+  t.is(internal.sessionStore.sessions.size, 0)
+  t.alike(await fs.promises.readdir(internal.layout.sessions), [])
+  t.alike(await fs.promises.readdir(internal.layout.staging), [])
 })

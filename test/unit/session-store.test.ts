@@ -1,44 +1,120 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const { ERRORS } = require('../../dist/errors')
-const { transferId } = require('../../dist/protocol/transfer-id')
-const { initLayout, acquireStorageLock } = require('../../dist/storage/layout')
-const { writeAtomic, readJson } = require('../../dist/storage/atomic-file')
-const { SessionStore } = require('../../dist/storage/session-store')
-const { createTempDir } = require('../helpers/files')
-const { createClock } = require('../helpers/clock')
-const { createStorage } = require('../helpers/storage')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import { ERRORS } from '../../dist/errors.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type { Chunk, Digest, Offer } from '../../dist/protocol/types.js'
+import { initLayout, acquireStorageLock } from '../../dist/storage/layout.js'
+import { writeAtomic, readJson } from '../../dist/storage/atomic-file.js'
+import { SessionStore } from '../../dist/storage/session-store.js'
+import type { StorageLayout } from '../../dist/storage/types.js'
+import { createTempDir } from '../helpers/files.js'
+import { createClock, type TestClock } from '../helpers/clock.js'
+import { createStorage, type StorageOperationName, type TestStorage } from '../helpers/storage.js'
 
 const OWNER = b4a.alloc(32, 7)
 const OTHER_OWNER = b4a.alloc(32, 8)
 const MAX_SESSION_METADATA_BYTES = 32 * 1024 * 1024
 
-function digest(bytes) {
+interface ErrnoError extends Error {
+  code?: string
+}
+
+/** The fields the harness inspects on an error raised by the session store. */
+interface CaughtError {
+  name?: unknown
+  code?: unknown
+  cause?: unknown
+  cleanupCause?: unknown
+}
+
+/** The chunk fields the store reads; the transfer ID is passed separately. */
+interface HarnessChunk {
+  index: number
+  data: Buffer
+  digest: Digest
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunks: HarnessChunk[]
+}
+
+interface UploadOptions {
+  name?: string
+  data?: Buffer
+  chunkSize?: number
+}
+
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+  reject: (reason: unknown) => void
+}
+
+interface LockOwner {
+  pid: number
+  startedAt: number
+  token: string
+}
+
+/** Persisted session metadata as stored on disk. */
+interface SessionMetadataJson extends Record<string, unknown> {
+  bitmap: string
+  chunkDigests: Array<string | null>
+  state: string
+}
+
+interface CreateStoreOptions {
+  clock?: TestClock
+  maxStagingBytes?: number
+  checkpointChunks?: number
+  storage?: TestStorage
+}
+
+interface CreatedStore {
+  root: string
+  layout: StorageLayout
+  clock: TestClock
+  store: SessionStore
+}
+
+type ReleaseLock = () => Promise<void>
+
+function asChunk(chunk: HarnessChunk): Chunk {
+  return chunk as unknown as Chunk
+}
+
+function digest(bytes: Uint8Array): Digest {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function transferHex(offer) {
+function transferHex(offer: Offer): string {
   return b4a.toString(offer.transferId, 'hex')
 }
 
-function stagingPath(layout, offer) {
+function stagingPath(layout: StorageLayout, offer: Offer): string {
   return path.join(layout.staging, `${transferHex(offer)}.part`)
 }
 
-function sessionPath(layout, offer) {
+function sessionPath(layout: StorageLayout, offer: Offer): string {
   return path.join(layout.sessions, `${transferHex(offer)}.json`)
 }
 
 function makeUpload(
-  owner = OWNER,
-  { name = 'artifact.bin', data = b4a.from('abcdefghijk'), chunkSize = 1024 * 1024 } = {}
-) {
-  const chunks = []
+  owner: Uint8Array = OWNER,
+  {
+    name = 'artifact.bin',
+    data = b4a.from('abcdefghijk'),
+    chunkSize = 1024 * 1024
+  }: UploadOptions = {}
+): HarnessUpload {
+  const chunks: Buffer[] = []
   for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
     chunks.push(data.subarray(offset, Math.min(offset + chunkSize, data.byteLength)))
   }
@@ -51,49 +127,57 @@ function makeUpload(
     chunkSize,
     chunkCount: chunks.length
   }
-  offer.transferId = transferId({
-    clientPublicKey: owner,
-    name: offer.name,
-    size: offer.size,
-    digest: offer.digest,
-    chunkSize: offer.chunkSize
-  })
 
   return {
-    offer,
+    offer: {
+      ...offer,
+      transferId: transferId({
+        clientPublicKey: owner,
+        name: offer.name,
+        size: offer.size,
+        digest: offer.digest,
+        chunkSize: offer.chunkSize
+      })
+    },
     chunks: chunks.map((data, index) => ({ index, data, digest: digest(data) }))
   }
 }
 
-async function pathExists(filePath) {
+async function pathExists(filePath: string): Promise<boolean> {
   try {
     await fs.promises.lstat(filePath)
     return true
   } catch (err) {
-    if (err.code === 'ENOENT') return false
+    if ((err as ErrnoError).code === 'ENOENT') return false
     throw err
   }
 }
 
-function createDeferred() {
-  let resolve
-  let reject
-  const promise = new Promise((onResolve, onReject) => {
-    resolve = onResolve
+function createDeferred(): Deferred {
+  let resolve!: () => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<void>((onResolve, onReject) => {
+    resolve = () => onResolve()
     reject = onReject
   })
   return { promise, resolve, reject }
 }
 
-async function lockOwner(layout) {
-  return JSON.parse(await fs.promises.readFile(path.join(layout.lock, 'owner.json'), 'utf8'))
+async function lockOwner(layout: Pick<StorageLayout, 'lock'>): Promise<LockOwner> {
+  return JSON.parse(
+    await fs.promises.readFile(path.join(layout.lock, 'owner.json'), 'utf8')
+  ) as LockOwner
 }
 
-function retiredLockPath(layout, token) {
+async function readSessionMetadata(filePath: string): Promise<SessionMetadataJson> {
+  return (await readJson(filePath)) as SessionMetadataJson
+}
+
+function retiredLockPath(layout: StorageLayout, token: string): string {
   return `${layout.lock}.retired-${token}`
 }
 
-async function createStore(t, options = {}) {
+async function createStore(t: Assert, options: CreateStoreOptions = {}): Promise<CreatedStore> {
   const root = await createTempDir(t)
   const layout = initLayout(root)
   const clock = options.clock ?? createClock()
@@ -211,7 +295,7 @@ test('metadata descriptors close after read, write, and sync failures', async (t
   const metadata = path.join(layout.sessions, 'atom.json')
   await fs.promises.writeFile(metadata, '{"inside":true}')
   let mode = 'read'
-  const events = []
+  const events: string[] = []
   const storage = createStorage({
     failWriteFor: (filePath) => mode === 'write' && filePath.endsWith('.tmp'),
     failSyncFor: (filePath) => mode === 'sync' && filePath.endsWith('.tmp'),
@@ -298,11 +382,11 @@ test('default process liveness rejects a second storage owner', async (t) => {
 
 test('storage lock publishes only after syncing its complete candidate', async (t) => {
   const layout = initLayout(await createTempDir(t))
-  const events = []
+  const events: string[] = []
   const storage = createStorage({
     afterOperation(name, source, destination) {
       if (name === 'sync') events.push(`sync:${source}`)
-      if (name === 'rename') events.push(`rename:${source}->${destination}`)
+      if (name === 'rename') events.push(`rename:${source}->${destination as string}`)
     }
   })
   const release = await acquireStorageLock(layout, {
@@ -374,15 +458,15 @@ test("stale-lock contenders cannot retire the winner's new lock", async (t) => {
   const allowSecondRetirement = createDeferred()
   let observations = 0
   let secondRetirementBlocked = false
-  let releaseWinner = null
-  let releaseLoser = null
+  let releaseWinner: ReleaseLock | null = null
+  let releaseLoser: ReleaseLock | null = null
   t.teardown(async () => {
     if (releaseLoser) await releaseLoser()
     if (releaseWinner) await releaseWinner()
     await releaseStale()
   })
 
-  async function observeFixedOwner(name, filePath) {
+  async function observeFixedOwner(name: StorageOperationName, filePath: string): Promise<void> {
     if (
       (name !== 'readFile' && name !== 'open') ||
       filePath !== path.join(layout.lock, 'owner.json')
@@ -456,7 +540,7 @@ test('delayed release cannot retire a newer lock', async (t) => {
     pid: 402,
     isProcessAlive: (pid) => pid === 402
   })
-  let releaseThird = null
+  let releaseThird: ReleaseLock | null = null
   t.teardown(async () => {
     if (releaseThird) await releaseThird()
     await releaseNew()
@@ -561,10 +645,10 @@ test('offer rejects a symlinked transfer-derived staging path', async (t) => {
 
 test('offer rejects protected staging-parent replacement', async (t) => {
   let replaced = false
-  let layout
-  let upload
-  let retired
-  const events = []
+  let layout!: StorageLayout
+  let upload!: HarnessUpload
+  let retired!: string
+  const events: string[] = []
   const storage = createStorage({
     async beforeOperation(name, filePath) {
       if (replaced || name !== 'open' || filePath !== stagingPath(layout, upload.offer)) return
@@ -597,10 +681,10 @@ test('offer rejects protected staging-parent replacement', async (t) => {
 })
 
 test('staging opens require regular no-follow descriptors', async (t) => {
-  const opened = []
+  const opened: unknown[] = []
   let stagingStats = 0
-  let layout
-  let upload
+  let layout!: StorageLayout
+  let upload!: HarnessUpload
   const storage = createStorage({
     async afterOperation(name, filePath, flags) {
       if (!layout || !upload) return
@@ -614,7 +698,7 @@ test('staging opens require regular no-follow descriptors', async (t) => {
   upload = makeUpload()
 
   await created.store.offer(OWNER, upload.offer)
-  await created.store.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await created.store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
 
   t.is(opened.length, 3)
   t.is(stagingStats, 3)
@@ -672,7 +756,7 @@ test('offer requires 1 MiB chunks and caps chunk count before allocation', async
   })
 
   const count = 262_145
-  const offer = {
+  const base = {
     version: 1,
     name: 'oversized.bin',
     size: count * 1024 * 1024,
@@ -680,7 +764,10 @@ test('offer requires 1 MiB chunks and caps chunk count before allocation', async
     chunkSize: 1024 * 1024,
     chunkCount: count
   }
-  offer.transferId = transferId({ clientPublicKey: OWNER, ...offer })
+  const offer: Offer = {
+    ...base,
+    transferId: transferId({ clientPublicKey: OWNER, ...base })
+  }
   await t.exception(() => store.offer(OWNER, offer), {
     name: 'SwarmDeployError',
     code: ERRORS.PROTOCOL_INVALID
@@ -692,27 +779,27 @@ test('writeChunk writes exact offsets, verifies digests, and checkpoints metadat
   const upload = makeUpload(OWNER, { data: b4a.concat([b4a.alloc(1024 * 1024), b4a.from('efgh')]) })
   await store.offer(OWNER, upload.offer)
 
-  const result = await store.writeChunk(upload.offer.transferId, upload.chunks[1])
+  const result = await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[1]))
   t.ok(result.verified.has(1))
   t.alike(
     await fs.promises.readFile(stagingPath(layout, upload.offer)),
     b4a.concat([b4a.alloc(1024 * 1024), b4a.from('efgh')])
   )
 
-  const before = await readJson(sessionPath(layout, upload.offer))
+  const before = await readSessionMetadata(sessionPath(layout, upload.offer))
   t.is(before.bitmap, 'AA==')
   await store.checkpoint(upload.offer.transferId)
-  const persisted = await readJson(sessionPath(layout, upload.offer))
+  const persisted = await readSessionMetadata(sessionPath(layout, upload.offer))
   t.is(persisted.bitmap, 'Ag==')
   t.is(persisted.chunkDigests[1], b4a.toString(upload.chunks[1].digest, 'hex'))
 })
 
 test('offer syncs durable staging before publishing its session metadata', async (t) => {
-  const events = []
+  const events: string[] = []
   const storage = createStorage({
     async afterOperation(name, source, destination) {
       if (name === 'sync' || name === 'rename') {
-        events.push(`${name}:${source}->${destination ?? ''}`)
+        events.push(`${name}:${source}->${(destination as string | undefined) ?? ''}`)
       }
     }
   })
@@ -732,8 +819,8 @@ test('offer syncs durable staging before publishing its session metadata', async
 
 test('offer cleans and syncs staging after its parent sync fails', async (t) => {
   let failNextStagingSync = false
-  let layout
-  const events = []
+  let layout!: StorageLayout
+  const events: string[] = []
   const storage = createStorage({
     failSyncFor: (filePath) => {
       if (!failNextStagingSync || filePath !== layout.staging) return false
@@ -781,7 +868,7 @@ test('offer cleans and syncs staging after its parent sync fails', async (t) => 
 
 test('offer removes staging after metadata fails before rename', async (t) => {
   let failMetadataWrite = false
-  const events = []
+  const events: string[] = []
   const storage = createStorage({
     failWriteFor: (filePath) => failMetadataWrite && filePath.includes('.json.'),
     async afterOperation(name, filePath) {
@@ -821,7 +908,7 @@ test('offer removes staging after metadata fails before rename', async (t) => {
 
 test('offer preserves renamed metadata after its parent sync fails', async (t) => {
   let failNextSessionSync = false
-  let layout
+  let layout!: StorageLayout
   const storage = createStorage({
     failSyncFor: (filePath) => {
       if (!failNextSessionSync || filePath !== layout.sessions) return false
@@ -849,7 +936,7 @@ test('offer preserves renamed metadata after its parent sync fails', async (t) =
 
 test('offer preserves primary and cleanup failures', async (t) => {
   let failStagingParentSync = false
-  let layout
+  let layout!: StorageLayout
   const storage = createStorage({
     failSyncFor: (filePath) => failStagingParentSync && filePath === layout.staging
   })
@@ -858,11 +945,11 @@ test('offer preserves primary and cleanup failures', async (t) => {
   const upload = makeUpload()
 
   failStagingParentSync = true
-  let failure = null
+  let failure: CaughtError | null = null
   try {
     await created.store.offer(OWNER, upload.offer)
   } catch (err) {
-    failure = err
+    failure = err as CaughtError
   }
   t.is(failure?.name, 'SwarmDeployError')
   t.is(failure?.code, ERRORS.PROTOCOL_INVALID)
@@ -872,7 +959,7 @@ test('offer preserves primary and cleanup failures', async (t) => {
 })
 
 test('deletion persists intent before removing staging and metadata names', async (t) => {
-  const events = []
+  const events: string[] = []
   const storage = createStorage({
     async afterOperation(name, source) {
       if (name === 'unlink' || name === 'sync') events.push(`${name}:${source}`)
@@ -903,13 +990,17 @@ test('chunks require exact lengths and failed writes never become verified', asy
   await store.offer(OWNER, upload.offer)
 
   await t.exception(
-    () => store.writeChunk(upload.offer.transferId, { ...upload.chunks[0], data: b4a.from('xx') }),
+    () =>
+      store.writeChunk(
+        upload.offer.transferId,
+        asChunk({ ...upload.chunks[0], data: b4a.from('xx') })
+      ),
     { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }
   )
-  await t.exception(() => store.writeChunk(upload.offer.transferId, upload.chunks[0]))
+  await t.exception(() => store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0])))
 
   await store.checkpoint(upload.offer.transferId)
-  const persisted = await readJson(sessionPath(layout, upload.offer))
+  const persisted = await readSessionMetadata(sessionPath(layout, upload.offer))
   t.is(persisted.bitmap, 'AA==')
   t.is(await pathExists(stagingPath(layout, upload.offer)), true)
 })
@@ -922,21 +1013,21 @@ test('automatic checkpoint rolls back in-memory chunks after staging sync failur
   const { layout, store } = await createStore(t, { storage, checkpointChunks: 1 })
   const upload = makeUpload()
   await store.offer(OWNER, upload.offer)
-  const before = await readJson(sessionPath(layout, upload.offer))
+  const before = await readSessionMetadata(sessionPath(layout, upload.offer))
 
   failStagingSync = true
-  await t.exception(() => store.writeChunk(upload.offer.transferId, upload.chunks[0]))
+  await t.exception(() => store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0])))
 
   const rolledBack = await store.offer(OWNER, upload.offer)
   t.is(rolledBack.state, 'receiving')
   t.is(rolledBack.verified.has(0), false)
-  t.alike(await readJson(sessionPath(layout, upload.offer)), before)
+  t.alike(await readSessionMetadata(sessionPath(layout, upload.offer)), before)
 
   if (rolledBack.verified.has(0)) {
     await store.delete(upload.offer.transferId)
   } else {
     failStagingSync = false
-    const retried = await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+    const retried = await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
     t.ok(retried.verified.has(0))
   }
 })
@@ -949,28 +1040,28 @@ test('automatic checkpoint rolls back in-memory chunks after metadata write fail
   const { layout, store } = await createStore(t, { storage, checkpointChunks: 1 })
   const upload = makeUpload()
   await store.offer(OWNER, upload.offer)
-  const before = await readJson(sessionPath(layout, upload.offer))
+  const before = await readSessionMetadata(sessionPath(layout, upload.offer))
 
   failMetadataWrite = true
-  await t.exception(() => store.writeChunk(upload.offer.transferId, upload.chunks[0]))
+  await t.exception(() => store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0])))
 
   const rolledBack = await store.offer(OWNER, upload.offer)
   t.is(rolledBack.state, 'receiving')
   t.is(rolledBack.verified.has(0), false)
-  t.alike(await readJson(sessionPath(layout, upload.offer)), before)
+  t.alike(await readSessionMetadata(sessionPath(layout, upload.offer)), before)
 
   if (rolledBack.verified.has(0)) {
     await store.delete(upload.offer.transferId)
   } else {
     failMetadataWrite = false
-    const retried = await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+    const retried = await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
     t.ok(retried.verified.has(0))
   }
 })
 
 test('automatic checkpoint keeps renamed metadata after session-parent sync failure', async (t) => {
   let failSessionSync = false
-  let layout
+  let layout!: StorageLayout
   const storage = createStorage({
     failSyncFor: (filePath) => failSessionSync && filePath === layout.sessions
   })
@@ -980,12 +1071,14 @@ test('automatic checkpoint keeps renamed metadata after session-parent sync fail
   await created.store.offer(OWNER, upload.offer)
 
   failSessionSync = true
-  await t.exception(() => created.store.writeChunk(upload.offer.transferId, upload.chunks[0]))
+  await t.exception(() =>
+    created.store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
+  )
 
   const resumed = await created.store.offer(OWNER, upload.offer)
   t.is(resumed.state, 'receiving')
   t.is(resumed.verified.has(0), true)
-  t.is((await readJson(sessionPath(layout, upload.offer))).bitmap, 'AQ==')
+  t.is((await readSessionMetadata(sessionPath(layout, upload.offer))).bitmap, 'AQ==')
   failSessionSync = false
 })
 
@@ -993,17 +1086,20 @@ test('duplicate chunk digests are idempotent but conflicting duplicates fail clo
   const { layout, store } = await createStore(t)
   const upload = makeUpload()
   await store.offer(OWNER, upload.offer)
-  await store.writeChunk(upload.offer.transferId, upload.chunks[0])
-  const duplicate = await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
+  const duplicate = await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
   t.ok(duplicate.duplicate)
 
   await t.exception(
     () =>
-      store.writeChunk(upload.offer.transferId, {
-        ...upload.chunks[0],
-        digest: digest(b4a.alloc(11, 'z'.charCodeAt(0))),
-        data: b4a.alloc(11, 'z'.charCodeAt(0))
-      }),
+      store.writeChunk(
+        upload.offer.transferId,
+        asChunk({
+          ...upload.chunks[0],
+          digest: digest(b4a.alloc(11, 'z'.charCodeAt(0))),
+          data: b4a.alloc(11, 'z'.charCodeAt(0))
+        })
+      ),
     { name: 'SwarmDeployError', code: ERRORS.CHECKSUM_MISMATCH }
   )
   t.is(await pathExists(sessionPath(layout, upload.offer)), false)
@@ -1017,7 +1113,11 @@ test('invalid chunk digest deletes the session and releases its reservation', as
   await store.offer(OWNER, upload.offer)
 
   await t.exception(
-    () => store.writeChunk(upload.offer.transferId, { ...upload.chunks[0], digest: b4a.alloc(32) }),
+    () =>
+      store.writeChunk(
+        upload.offer.transferId,
+        asChunk({ ...upload.chunks[0], digest: b4a.alloc(32) })
+      ),
     { name: 'SwarmDeployError', code: ERRORS.CHECKSUM_MISMATCH }
   )
   t.is(await pathExists(sessionPath(layout, upload.offer)), false)
@@ -1033,7 +1133,7 @@ test('checkpointed sessions reconstruct reservations and verified chunks after r
   const first = new SessionStore({ layout, maxStagingBytes: 1024, clock })
   await first.init()
   await first.offer(OWNER, upload.offer)
-  await first.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await first.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
   await first.checkpoint(upload.offer.transferId)
   await first.close()
 
@@ -1053,7 +1153,7 @@ test('init rejects receiving staging with trailing bytes', async (t) => {
   const first = new SessionStore({ layout, maxStagingBytes: 1024, checkpointChunks: 1 })
   await first.init()
   await first.offer(OWNER, upload.offer)
-  await first.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await first.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
   await first.close()
   await fs.promises.appendFile(stagingPath(layout, upload.offer), b4a.from('trailing'))
 
@@ -1072,7 +1172,7 @@ test('init requires exact staging length for verified sessions', async (t) => {
     const first = new SessionStore({ layout, maxStagingBytes: 1024, checkpointChunks: 1 })
     await first.init()
     await first.offer(OWNER, upload.offer)
-    await first.writeChunk(upload.offer.transferId, upload.chunks[0])
+    await first.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
     await first.finish(upload.offer.transferId)
     await first.close()
     await fs.promises.truncate(stagingPath(layout, upload.offer), size)
@@ -1113,7 +1213,7 @@ test('init rejects a verified session that does not contain every chunk', async 
   await store.close()
 
   const metadataPath = sessionPath(layout, upload.offer)
-  const metadata = await readJson(metadataPath)
+  const metadata = await readSessionMetadata(metadataPath)
   metadata.state = 'verified'
   await fs.promises.writeFile(metadataPath, JSON.stringify(metadata))
 
@@ -1131,7 +1231,7 @@ test('init rejects unknown persisted session state without admission', async (t)
   await store.close()
 
   const metadataPath = sessionPath(layout, upload.offer)
-  const metadata = await readJson(metadataPath)
+  const metadata = await readSessionMetadata(metadataPath)
   metadata.state = 'publishing'
   await fs.promises.writeFile(metadataPath, JSON.stringify(metadata))
 
@@ -1154,10 +1254,12 @@ test('finish requires all chunks, forces a checkpoint, and supports empty files'
     name: 'SwarmDeployError',
     code: ERRORS.PROTOCOL_INVALID
   })
-  for (const chunk of upload.chunks) await store.writeChunk(upload.offer.transferId, chunk)
+  for (const chunk of upload.chunks) {
+    await store.writeChunk(upload.offer.transferId, asChunk(chunk))
+  }
   const finished = await store.finish(upload.offer.transferId)
   t.is(finished.state, 'verified')
-  t.is((await readJson(sessionPath(layout, upload.offer))).state, 'verified')
+  t.is((await readSessionMetadata(sessionPath(layout, upload.offer))).state, 'verified')
 
   const empty = makeUpload(OWNER, { name: 'empty.bin', data: b4a.alloc(0) })
   const accepted = await store.offer(OWNER, empty.offer)
@@ -1173,8 +1275,8 @@ test('finish restores receiving state when verified metadata cannot persist', as
   const { layout, store } = await createStore(t, { storage, checkpointChunks: 1 })
   const upload = makeUpload()
   await store.offer(OWNER, upload.offer)
-  await store.writeChunk(upload.offer.transferId, upload.chunks[0])
-  const before = await readJson(sessionPath(layout, upload.offer))
+  await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
+  const before = await readSessionMetadata(sessionPath(layout, upload.offer))
 
   failMetadataWrite = true
   await t.exception(() => store.finish(upload.offer.transferId))
@@ -1182,7 +1284,7 @@ test('finish restores receiving state when verified metadata cannot persist', as
   const rolledBack = await store.offer(OWNER, upload.offer)
   t.is(rolledBack.state, 'receiving')
   t.is(rolledBack.verified.has(0), true)
-  t.alike(await readJson(sessionPath(layout, upload.offer)), before)
+  t.alike(await readSessionMetadata(sessionPath(layout, upload.offer)), before)
 
   failMetadataWrite = false
   t.is((await store.finish(upload.offer.transferId)).state, 'verified')
@@ -1190,7 +1292,7 @@ test('finish restores receiving state when verified metadata cannot persist', as
 
 test('finish keeps renamed verified metadata after session-parent sync failure', async (t) => {
   let failSessionSync = false
-  let layout
+  let layout!: StorageLayout
   const storage = createStorage({
     failSyncFor: (filePath) => failSessionSync && filePath === layout.sessions
   })
@@ -1198,14 +1300,14 @@ test('finish keeps renamed verified metadata after session-parent sync failure',
   layout = created.layout
   const upload = makeUpload()
   await created.store.offer(OWNER, upload.offer)
-  await created.store.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await created.store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
 
   failSessionSync = true
   await t.exception(() => created.store.finish(upload.offer.transferId))
 
   const resumed = await created.store.offer(OWNER, upload.offer)
   t.is(resumed.state, 'verified')
-  t.is((await readJson(sessionPath(layout, upload.offer))).state, 'verified')
+  t.is((await readSessionMetadata(sessionPath(layout, upload.offer))).state, 'verified')
   failSessionSync = false
 })
 
@@ -1246,7 +1348,7 @@ test('finish rehashes staging and deletes mismatched whole-file sessions', async
     chunkSize: upload.offer.chunkSize
   })
   await store.offer(OWNER, upload.offer)
-  await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
 
   await t.exception(() => store.finish(upload.offer.transferId), {
     name: 'SwarmDeployError',
@@ -1286,7 +1388,7 @@ test('retireCommitted releases only the in-memory session reservation', async (t
   const { layout, store } = await createStore(t)
   const upload = makeUpload()
   await store.offer(OWNER, upload.offer)
-  await store.writeChunk(upload.offer.transferId, upload.chunks[0])
+  await store.writeChunk(upload.offer.transferId, asChunk(upload.chunks[0]))
   await store.finish(upload.offer.transferId)
 
   t.is(await store.retireCommitted(upload.offer.transferId), true)

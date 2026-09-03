@@ -1,8 +1,9 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const {
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import {
   ERRORS,
   OFFER,
   STATUS,
@@ -29,10 +30,17 @@ const {
   result,
   transferId,
   encodeTransferIdCanonical,
-  mergeBitmapPages
-} = require('../..')
-const { CHUNK_SIZE, digestBuffer } = require('../helpers/files')
-const { keyPairFromSeed, publicKeyFromSeed } = require('../..')
+  mergeBitmapPages,
+  keyPairFromSeed,
+  publicKeyFromSeed,
+  type Codec,
+  type Fixed32,
+  type OfferInput,
+  type ResultCode,
+  type ResultInput,
+  type StatusInput
+} from '../../dist/index.js'
+import { CHUNK_SIZE, digestBuffer } from '../helpers/files.js'
 
 const KEY = publicKeyFromSeed(b4a.alloc(32, 7))
 const DIGEST = digestBuffer(b4a.alloc(32, 9))
@@ -54,7 +62,15 @@ const TRANSFER_ID_VECTOR_HASH = b4a.from(
   'hex'
 )
 
-function sampleOffer(overrides = {}) {
+/**
+ * `clientPublicKey` only feeds transfer-ID derivation; it is not an OFFER
+ * field, but overriding it stays available exactly as in the original harness.
+ */
+interface OfferOverrides extends Partial<OfferInput> {
+  clientPublicKey?: Fixed32
+}
+
+function sampleOffer(overrides: OfferOverrides = {}): OfferInput {
   const size = overrides.size ?? CHUNK_SIZE + 17
   const chunkSize = overrides.chunkSize ?? CHUNK_SIZE
   const chunkCount = Math.ceil(size / chunkSize) || 1
@@ -78,13 +94,13 @@ function sampleOffer(overrides = {}) {
   }
 }
 
-function snapshotValue(value) {
-  const copy = { ...value }
+function snapshotValue(value: StatusInput | ResultInput): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...value }
   if (b4a.isBuffer(value.transferId)) copy.transferId = b4a.from(value.transferId)
   return copy
 }
 
-function assertCanonicalBuffer(t, value, label) {
+function assertCanonicalBuffer(t: Assert, value: Uint8Array, label: string): void {
   if (typeof Bare === 'undefined') {
     t.ok(Buffer.isBuffer(value), label)
     return
@@ -92,7 +108,12 @@ function assertCanonicalBuffer(t, value, label) {
   t.is(value.constructor, b4a.alloc(0).constructor, label)
 }
 
-function decodePlainBytes(t, codec, value, max) {
+function decodePlainBytes<Input, Output>(
+  t: Assert,
+  codec: Codec<Input, Output>,
+  value: Input,
+  max?: number
+): Output {
   const encoded = encodeBounded(codec, value, max)
   const plain = new Uint8Array(encoded.byteLength)
   plain.set(encoded)
@@ -139,7 +160,7 @@ test('status codec round-trips rejected responses with reason', (t) => {
 })
 
 test('status and result encoders do not mutate caller values', (t) => {
-  const statusValue = {
+  const statusValue: StatusInput = {
     transferId: sampleOffer().transferId,
     code: STATUS_CODE.ACCEPT
   }
@@ -148,7 +169,7 @@ test('status and result encoders do not mutate caller values', (t) => {
   t.alike(statusValue, statusSnapshot)
   t.is(statusValue.reason, undefined)
 
-  const resultValue = {
+  const resultValue: ResultInput = {
     transferId: sampleOffer().transferId,
     code: RESULT_CODE.COMMITTED
   }
@@ -187,7 +208,7 @@ test('ready, finish, and result codecs round-trip', (t) => {
       reason: ''
     }
   )
-  t.exception(() => encodeBounded(result, { transferId: id, code: 2 }), {
+  t.exception(() => encodeBounded(result, { transferId: id, code: 2 as ResultCode }), {
     name: 'SwarmDeployError',
     code: ERRORS.PROTOCOL_INVALID
   })

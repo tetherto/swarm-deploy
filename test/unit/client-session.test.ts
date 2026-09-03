@@ -1,20 +1,22 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const c = require('compact-encoding')
-const Protomux = require('protomux')
-const { Duplex } = require('streamx')
-const {
+import test from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import c from 'compact-encoding'
+import Protomux, { type ProtomuxChannel } from 'protomux'
+import { Duplex } from 'streamx'
+import {
   ClientSession,
+  type ClientSessionResult,
   UPLOAD_PROTOCOL,
   MAX_IN_FLIGHT,
   boundedEncoding
-} = require('../../dist/protocol/client-session')
-const {
+} from '../../dist/protocol/client-session.js'
+import {
   OFFER,
   STATUS,
   BITMAP_PAGE,
@@ -25,8 +27,8 @@ const {
   RESULT,
   STATUS_CODE,
   MAX_CONTROL_BYTES
-} = require('../../dist/protocol/constants')
-const {
+} from '../../dist/protocol/constants.js'
+import {
   offer,
   status,
   bitmapPage,
@@ -35,21 +37,76 @@ const {
   chunkAck,
   finish,
   result
-} = require('../../dist/protocol/codecs')
-const { transferId } = require('../../dist/protocol/transfer-id')
-const { buildFileManifest } = require('../../dist/files')
-const { createTempDir } = require('../helpers/files')
+} from '../../dist/protocol/codecs.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type {
+  Chunk,
+  Digest,
+  FileManifest,
+  FileSnapshot,
+  Offer,
+  ProtocolChannel,
+  SessionScheduler,
+  TransferMessage
+} from '../../dist/protocol/types.js'
+import { buildFileManifest } from '../../dist/files.js'
+import { createTempDir } from '../helpers/files.js'
 
 const CLIENT_KEY = b4a.alloc(32, 9)
 
-function sha256(bytes) {
+/**
+ * The harness manifest. `stat` and `chunks` are optional so both the in-memory
+ * fixtures and a real `buildFileManifest` result share one shape.
+ */
+interface HarnessManifest extends Omit<FileManifest, 'stat'> {
+  stat?: FileSnapshot
+  chunks?: Buffer[]
+}
+
+/** A Protomux message as the harness drives it: any encoded payload. */
+interface HarnessMessage {
+  send(value: unknown): boolean
+}
+
+interface ReceivedMessages {
+  offer: Offer[]
+  chunk: Chunk[]
+  finish: TransferMessage[]
+}
+
+interface FakeTimer {
+  callback: () => void
+}
+
+interface CreatePairOptions {
+  manifest?: HarnessManifest
+  scheduler?: SessionScheduler | null
+  readChunk?: ((manifest: FileManifest, index: number) => Promise<Uint8Array>) | null
+  useFileReader?: boolean
+}
+
+interface ProtocolPair {
+  channel: ProtomuxChannel
+  clientMux: Protomux
+  received: ReceivedMessages
+  session: ClientSession
+  readonly serverChannel: ProtomuxChannel
+  readonly serverMessages: HarnessMessage[]
+  accept(verified?: number[]): void
+}
+
+function asManifest(manifest: HarnessManifest): FileManifest {
+  return manifest as FileManifest
+}
+
+function sha256(bytes: Uint8Array): Digest {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function waitFor(predicate, timeout = 500) {
+function waitFor(predicate: () => boolean, timeout = 500): Promise<void> {
   return new Promise((resolve, reject) => {
     const started = Date.now()
-    const check = () => {
+    const check = (): void => {
       if (predicate()) return resolve()
       if (Date.now() - started >= timeout) {
         return reject(new Error('Timed out waiting for protocol progress'))
@@ -60,9 +117,9 @@ function waitFor(predicate, timeout = 500) {
   })
 }
 
-function createDuplexPair() {
-  let left = null
-  let right = null
+function createDuplexPair(): { left: Duplex; right: Duplex } {
+  let left!: Duplex
+  let right!: Duplex
   left = new Duplex({
     write(data, callback) {
       right.push(data)
@@ -80,7 +137,7 @@ function createDuplexPair() {
   return { left, right }
 }
 
-function createManifest(count = 3) {
+function createManifest(count = 3): HarnessManifest {
   const chunkSize = 8
   const chunks = Array.from({ length: count }, (_, index) => b4a.alloc(chunkSize, index))
   const data = b4a.concat(chunks)
@@ -101,36 +158,37 @@ function createPair({
   scheduler = null,
   readChunk = null,
   useFileReader = false
-} = {}) {
+}: CreatePairOptions = {}): ProtocolPair {
   const { left, right } = createDuplexPair()
   const clientMux = Protomux.from(left)
   const serverMux = Protomux.from(right)
-  const received = { offer: [], chunk: [], finish: [] }
-  let serverChannel = null
-  let serverMessages = null
+  const received: ReceivedMessages = { offer: [], chunk: [], finish: [] }
+  let serverChannel: ProtomuxChannel | null = null
+  let serverMessages: HarnessMessage[] | null = null
 
   serverMux.pair({ protocol: UPLOAD_PROTOCOL }, (id) => {
-    serverChannel = serverMux.createChannel({ protocol: UPLOAD_PROTOCOL, id })
+    const channel = serverMux.createChannel({ protocol: UPLOAD_PROTOCOL, id })
+    serverChannel = channel
     serverMessages = [
-      serverChannel.addMessage({
+      channel.addMessage({
         encoding: offer,
         onmessage: (value) => received.offer.push(value)
       }),
-      serverChannel.addMessage({ encoding: status }),
-      serverChannel.addMessage({ encoding: bitmapPage }),
-      serverChannel.addMessage({ encoding: ready }),
-      serverChannel.addMessage({
+      channel.addMessage({ encoding: status }),
+      channel.addMessage({ encoding: bitmapPage }),
+      channel.addMessage({ encoding: ready }),
+      channel.addMessage({
         encoding: chunk,
         onmessage: (value) => received.chunk.push(value)
       }),
-      serverChannel.addMessage({ encoding: chunkAck }),
-      serverChannel.addMessage({
+      channel.addMessage({ encoding: chunkAck }),
+      channel.addMessage({
         encoding: finish,
         onmessage: (value) => received.finish.push(value)
       }),
-      serverChannel.addMessage({ encoding: result })
+      channel.addMessage({ encoding: result })
     ]
-    serverChannel.open()
+    channel.open()
   })
 
   const channel = clientMux.createChannel({
@@ -138,9 +196,11 @@ function createPair({
     id: b4a.from('client-session-test')
   })
   const session = new ClientSession({
-    channel,
+    channel: channel as unknown as ProtocolChannel,
     clientPublicKey: CLIENT_KEY,
-    readChunk: useFileReader ? null : readChunk || (async (_, index) => manifest.chunks[index]),
+    readChunk: useFileReader
+      ? null
+      : readChunk || (async (_manifest, index) => manifest.chunks![index]),
     ...(scheduler ? { scheduler } : {})
   })
 
@@ -150,31 +210,34 @@ function createPair({
     received,
     session,
     get serverChannel() {
-      return serverChannel
+      return serverChannel!
     },
     get serverMessages() {
-      return serverMessages
+      return serverMessages!
     },
-    accept(verified = []) {
+    accept(verified: number[] = []) {
       const id = received.offer[0].transferId
-      serverMessages[STATUS].send({ transferId: id, code: STATUS_CODE.ACCEPT })
+      serverMessages![STATUS].send({ transferId: id, code: STATUS_CODE.ACCEPT })
       if (manifest.chunkCount > 0) {
         const bits = b4a.alloc(Math.ceil(manifest.chunkCount / 8))
         for (const index of verified) bits[Math.floor(index / 8)] |= 1 << (index % 8)
-        serverMessages[BITMAP_PAGE].send({
+        serverMessages![BITMAP_PAGE].send({
           transferId: id,
           start: 0,
           count: manifest.chunkCount,
           bits
         })
       }
-      serverMessages[READY].send({ transferId: id })
+      serverMessages![READY].send({ transferId: id })
     }
   }
 }
 
-async function openAndOffer(pair, manifest) {
-  const uploading = pair.session.upload(manifest)
+async function openAndOffer(
+  pair: ProtocolPair,
+  manifest: HarnessManifest
+): Promise<{ uploading: Promise<ClientSessionResult> }> {
+  const uploading = pair.session.upload(asManifest(manifest))
   await new Promise((resolve) => setTimeout(resolve, 5))
   pair.channel.open()
   await waitFor(() => pair.received.offer.length === 1)
@@ -184,7 +247,7 @@ async function openAndOffer(pair, manifest) {
 test('client session sends OFFER only after its channel fully opens', async (t) => {
   const manifest = createManifest(0)
   const pair = createPair({ manifest })
-  const uploading = pair.session.upload(manifest)
+  const uploading = pair.session.upload(asManifest(manifest))
 
   await new Promise((resolve) => setTimeout(resolve, 5))
   t.is(pair.received.offer.length, 0)
@@ -318,7 +381,7 @@ test('client session fails closed on every forbidden server message direction', 
         transferId: id,
         index: 0,
         digest: manifest.chunkDigests[0],
-        data: manifest.chunks[0]
+        data: manifest.chunks![0]
       })
     }
     if (type === FINISH) pair.serverMessages[type].send({ transferId: id })
@@ -401,15 +464,15 @@ test('client session turns terminal statuses, local checksums, timeouts, and bad
   checksum.accept()
   await t.exception(() => checksumUpload, { name: 'SwarmDeployError', code: 'CHECKSUM_MISMATCH' })
 
-  const timers = new Set()
-  const scheduler = {
+  const timers = new Set<FakeTimer>()
+  const scheduler: SessionScheduler = {
     setTimeout(callback) {
       const timer = { callback }
       timers.add(timer)
       return timer
     },
     clearTimeout(timer) {
-      timers.delete(timer)
+      timers.delete(timer as FakeTimer)
     }
   }
   const timedOut = createPair({ manifest, scheduler })
@@ -456,7 +519,7 @@ test('client session closes its channel when source descriptor cleanup fails', a
     async close() {
       throw new Error('injected close failure')
     }
-  }
+  } as unknown as NonNullable<ClientSession['file']>
   pair.serverMessages[RESULT].send({ transferId: id, code: 0 })
 
   await t.exception(() => uploading)

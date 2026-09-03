@@ -1,17 +1,30 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const fs = require('#fs')
-const path = require('#path')
-const { Client, Server, keyPairFromSeed } = require('../..')
-const { createTempDir, writeDeterministicFile, CHUNK_SIZE } = require('../helpers/files')
-const { createLocalTestnet } = require('../helpers/testnet')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import fs from '#fs'
+import path from '#path'
+import { Client, Server, keyPairFromSeed } from '../../dist/index.js'
+import { SwarmDeployError, ERRORS } from '../../dist/errors.js'
+import { createTempDir, writeDeterministicFile, CHUNK_SIZE } from '../helpers/files.js'
+import { createLocalTestnet } from '../helpers/testnet.js'
+import { clientInternals, destroyServerConnections, serverInternals } from '../helpers/internals.js'
 
 const SERVER_SEED = b4a.alloc(32, 31)
 const CLIENT_SEED = b4a.alloc(32, 32)
 
-async function setup(t) {
+/** A transport-loss failure carries the flag the reconnect window keys on. */
+interface TransportError extends SwarmDeployError {
+  transport?: boolean
+}
+
+interface Harness {
+  client: Client
+  server: Server
+}
+
+async function setup(t: Assert): Promise<Harness> {
   const testnet = await createLocalTestnet(t)
   const server = new Server({
     seed: SERVER_SEED,
@@ -34,18 +47,15 @@ async function setup(t) {
   return { client, server }
 }
 
-function destroyServerConnections(server) {
-  for (const socket of server._connections.keys()) socket.destroy()
-}
-
 test('Client reconnects and resumes by sending only server-missing chunks', async (t) => {
   const { client, server } = await setup(t)
+  const internal = serverInternals(server)
   const input = path.join(await createTempDir(t), 'resume.bin')
   await writeDeterministicFile(input, 5 * CHUNK_SIZE + 11)
 
-  const writes = []
-  const writeChunk = server.sessionStore.writeChunk.bind(server.sessionStore)
-  server.sessionStore.writeChunk = async (transferId, value) => {
+  const writes: number[] = []
+  const writeChunk = internal.sessionStore.writeChunk.bind(internal.sessionStore)
+  internal.sessionStore.writeChunk = async (transferId, value) => {
     const snapshot = await writeChunk(transferId, value)
     writes.push(value.index)
     if (writes.length === 2) destroyServerConnections(server)
@@ -56,19 +66,20 @@ test('Client reconnects and resumes by sending only server-missing chunks', asyn
   t.is(result.status, 'COMMITTED')
   t.alike(writes, [0, 1, 2, 3, 4, 5])
   t.alike(
-    await fs.promises.readFile(path.join(server.layout.root, 'resume.bin')),
+    await fs.promises.readFile(path.join(internal.layout.root, 'resume.bin')),
     await fs.promises.readFile(input)
   )
 })
 
 test('Client resolves a lost final result through ALREADY_COMMITTED', async (t) => {
   const { client, server } = await setup(t)
+  const internal = serverInternals(server)
   const input = path.join(await createTempDir(t), 'lost-result.bin')
   await fs.promises.writeFile(input, b4a.from('durably committed before result loss'))
 
-  const retireCommitted = server.sessionStore.retireCommitted.bind(server.sessionStore)
+  const retireCommitted = internal.sessionStore.retireCommitted.bind(internal.sessionStore)
   let disconnected = false
-  server.sessionStore.retireCommitted = async (transferId) => {
+  internal.sessionStore.retireCommitted = async (transferId) => {
     const retired = await retireCommitted(transferId)
     if (!disconnected) {
       disconnected = true
@@ -79,9 +90,9 @@ test('Client resolves a lost final result through ALREADY_COMMITTED', async (t) 
 
   const result = await client.upload(input)
   t.is(result.status, 'ALREADY_COMMITTED')
-  t.alike(await fs.promises.readdir(server.layout.staging), [])
+  t.alike(await fs.promises.readdir(internal.layout.staging), [])
   t.alike(
-    await fs.promises.readFile(path.join(server.layout.root, 'lost-result.bin')),
+    await fs.promises.readFile(path.join(internal.layout.root, 'lost-result.bin')),
     b4a.from('durably committed before result loss')
   )
 })
@@ -93,30 +104,25 @@ test('Client starts a fresh reconnect window after an active transport loss', as
     serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
     clock: { now: () => now }
   })
-  const deadlines = []
+  const deadlines: number[] = []
   const socket = {}
-  client._ensureStarted = async () => client
-  client._delay = async () => true
-  client._waitForSocket = async (deadline) => {
+  const internal = clientInternals(client)
+  internal._ensureStarted = async () => client
+  internal._delay = async () => true
+  internal._waitForSocket = async (deadline) => {
     deadlines.push(deadline)
     if (deadlines.length === 1) return socket
     now = deadline
-    throw new (require('../../dist/errors').SwarmDeployError)(
-      require('../../dist/errors').ERRORS.UPLOAD_IDLE_TIMEOUT,
-      'unavailable'
-    )
+    throw new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'unavailable')
   }
-  client._startSession = async () => {
+  internal._startSession = async () => {
     now = 60_000
-    const error = new (require('../../dist/errors').SwarmDeployError)(
-      require('../../dist/errors').ERRORS.PROTOCOL_INVALID,
-      'lost'
-    )
+    const error: TransportError = new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'lost')
     error.transport = true
     throw error
   }
 
-  await t.exception(() => client._uploadManifest({}), {
+  await t.exception(() => internal._uploadManifest({}), {
     name: 'SwarmDeployError',
     code: 'UPLOAD_IDLE_TIMEOUT'
   })

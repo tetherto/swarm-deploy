@@ -1,67 +1,124 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const { EventEmitter } = require('#events')
-const Hyperswarm = require('hyperswarm')
-const { Server, keyPairFromSeed, transferId, ERRORS } = require('../..')
-const { initLayout } = require('../../dist/storage/layout')
-const { SessionStore } = require('../../dist/storage/session-store')
-const { CommitStore } = require('../../dist/storage/commit-store')
-const { createTempDir } = require('../helpers/files')
-const { createStorage } = require('../helpers/storage')
-const { createLocalTestnet } = require('../helpers/testnet')
-const { settlePromptly } = require('../helpers/cancellation')
+import test from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import { EventEmitter } from '#events'
+import Hyperswarm from 'hyperswarm'
+import { Server, keyPairFromSeed, transferId, ERRORS } from '../../dist/index.js'
+import type { ServerOptions } from '../../dist/server.js'
+import type { Offer } from '../../dist/protocol/types.js'
+import type { ErrorCode } from '../../dist/errors.js'
+import type { SwarmDiscovery } from '../../dist/types.js'
+import { initLayout } from '../../dist/storage/layout.js'
+import { SessionStore } from '../../dist/storage/session-store.js'
+import { CommitStore } from '../../dist/storage/commit-store.js'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage } from '../helpers/storage.js'
+import { createLocalTestnet } from '../helpers/testnet.js'
+import { settledError, settlePromptly } from '../helpers/cancellation.js'
+import {
+  serverInternals,
+  type ConnectableSocket,
+  type TrackedConnection,
+  type TrackedSocket
+} from '../helpers/internals.js'
 
 const SERVER_SEED = b4a.alloc(32, 0x71)
 const CLIENT_SEED = b4a.alloc(32, 0x72)
 const CHUNK_SIZE = 1024 * 1024
 
-function sha256(bytes) {
+interface HarnessChunk {
+  transferId: Buffer
+  index: number
+  digest: Buffer
+  data: Buffer
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunk: HarnessChunk
+}
+
+interface Deferred<T = void> {
+  promise: Promise<T>
+  resolve(value: T): void
+}
+
+/**
+ * A live Hyperswarm transport as the rejection branches observe it: the error
+ * listener count is inspected around the destroy the server performs.
+ */
+interface RejectedSocket extends ConnectableSocket {
+  listenerCount(event: string): number
+  emit(event: string, ...args: unknown[]): boolean
+  destroy(error?: unknown): void
+}
+
+interface RejectionRecord {
+  socket: RejectedSocket
+  error: { code?: ErrorCode }
+  before: number
+  atDestroy: number
+}
+
+/** The swarm seam replacement: an emitter plus the two methods used. */
+interface StubSwarm extends EventEmitter {
+  join(): SwarmDiscovery
+  destroy(): Promise<void>
+}
+
+/** The cleanup payload this suite filters on. */
+interface CleanupEvent {
+  reason?: string
+}
+
+function sha256(bytes: Uint8Array): Buffer {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function hex(bytes) {
+function hex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
 
-function deferred() {
-  let resolve
-  const promise = new Promise((done) => {
+function deferred<T = void>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
     resolve = done
   })
   return { promise, resolve }
 }
 
-function uploadFor(ownerKey, name = 'offline-revocation.bin') {
+function uploadFor(ownerKey: Uint8Array, name = 'offline-revocation.bin'): HarnessUpload {
   const data = b4a.from('persisted partial upload')
   const digest = sha256(data)
-  const offer = {
-    version: 1,
-    name,
-    size: data.byteLength,
-    digest,
-    chunkSize: CHUNK_SIZE,
-    chunkCount: 1
-  }
-  offer.transferId = transferId({
+  const id = transferId({
     clientPublicKey: ownerKey,
     name,
     size: data.byteLength,
     digest,
     chunkSize: CHUNK_SIZE
   })
+  const offer: Offer = {
+    version: 1,
+    transferId: id,
+    name,
+    size: data.byteLength,
+    digest,
+    chunkSize: CHUNK_SIZE,
+    chunkCount: 1
+  }
   return {
     offer,
-    chunk: { transferId: offer.transferId, index: 0, digest, data }
+    chunk: { transferId: id, index: 0, digest, data }
   }
 }
 
-function stubSwarm(events = []) {
-  const swarm = new EventEmitter()
+function stubSwarm(events: string[] = []): StubSwarm {
+  const swarm = new EventEmitter() as StubSwarm
   swarm.join = () => {
     events.push('join')
     return {
@@ -82,7 +139,7 @@ function stubSwarm(events = []) {
 test('real Hyperswarm rejection branches install socket errors before destroy', async (t) => {
   const testnet = await createLocalTestnet(t)
   const ownerKey = keyPairFromSeed(CLIENT_SEED).publicKey
-  const modes = [
+  const modes: Array<[string, ErrorCode]> = [
     ['closed', ERRORS.AUTH_REJECTED],
     ['newly-revoked', ERRORS.AUTH_REJECTED],
     ['capacity', ERRORS.FILE_BUSY]
@@ -90,7 +147,7 @@ test('real Hyperswarm rejection branches install socket errors before destroy', 
 
   for (let index = 0; index < modes.length; index++) {
     const [mode, expectedCode] = modes[index]
-    const reached = deferred()
+    const reached = deferred<RejectionRecord>()
     let firewallAttempts = 0
     const server = new Server({
       seed: b4a.alloc(32, 0x73 + index),
@@ -103,26 +160,35 @@ test('real Hyperswarm rejection branches install socket errors before destroy', 
       minFreeBytes: 0,
       dht: testnet.createNode()
     })
-    const originalFirewall = server._firewall.bind(server)
-    server._firewall = (key) => {
-      if (b4a.equals(key, ownerKey)) firewallAttempts++
+    const internal = serverInternals(server)
+    const originalFirewall = internal._firewall.bind(server)
+    internal._firewall = (key) => {
+      if (b4a.equals(key as Uint8Array, ownerKey)) firewallAttempts++
       return originalFirewall(key)
     }
-    const originalConnection = server._onConnection.bind(server)
-    server._onConnection = (socket, peerInfo) => {
+    const originalConnection = internal._onConnection.bind(server)
+    internal._onConnection = (candidate, peerInfo) => {
+      const socket = candidate as RejectedSocket
       const before = socket.listenerCount('error')
       const destroy = socket.destroy.bind(socket)
       socket.destroy = (error) => {
         const atDestroy = socket.listenerCount('error')
         destroy()
-        reached.resolve({ socket, error, before, atDestroy })
+        reached.resolve({ socket, error: error as { code?: ErrorCode }, before, atDestroy })
       }
       if (mode === 'closed') server.closed = true
-      if (mode === 'newly-revoked') server._allowlist.delete(hex(ownerKey))
-      if (mode === 'capacity') server._connections.set({ occupied: true }, {})
+      if (mode === 'newly-revoked') internal._allowlist.delete(hex(ownerKey))
+      // The capacity branch only reads `_connections.size`, so the occupying
+      // entries stay the same opaque placeholders as in the untyped harness.
+      if (mode === 'capacity') {
+        internal._connections.set(
+          { occupied: true } as unknown as TrackedSocket,
+          {} as TrackedConnection
+        )
+      }
       originalConnection(socket, peerInfo)
       if (mode === 'closed') server.closed = false
-      if (mode === 'capacity') server._connections.clear()
+      if (mode === 'capacity') internal._connections.clear()
     }
     await server.listen()
 
@@ -137,7 +203,7 @@ test('real Hyperswarm rejection branches install socket errors before destroy', 
     t.is(rejected.error.code, expectedCode, `${mode} rejection code`)
     t.ok(firewallAttempts > 0, `${mode} passed through the real firewall`)
     t.ok(rejected.atDestroy > rejected.before, `${mode} installed a safe error listener`)
-    t.is(server._sessions.size, 0, `${mode} opened no protocol session`)
+    t.is(internal._sessions.size, 0, `${mode} opened no protocol session`)
     rejected.socket.emit('error', new Error(`${mode} late socket error`))
     t.pass(`${mode} process remained alive after socket error`)
 
@@ -164,24 +230,26 @@ test('restart purges offline-revoked resumable state before networking', async (
     swarmFactory: () => stubSwarm()
   }
   const first = new Server({ ...options, allowedKeys: [ownerKey] })
+  const firstInternal = serverInternals(first)
   await first.listen()
-  await first.sessionStore.offer(ownerKey, upload.offer)
-  await first.sessionStore.writeChunk(upload.offer.transferId, upload.chunk)
+  await firstInternal.sessionStore.offer(ownerKey, upload.offer)
+  await firstInternal.sessionStore.writeChunk(upload.offer.transferId, upload.chunk)
   await first.close()
 
   await fs.promises.writeFile(allowlistPath, '')
   const restarted = new Server({ ...options, allowedKeys: [] })
+  const restartedInternal = serverInternals(restarted)
   await restarted.listen()
-  t.is(restarted.sessionStore.sessions.size, 0)
-  t.is(restarted.sessionStore.reservedBytes, 0)
-  t.alike(await fs.promises.readdir(restarted.layout.sessions), [])
-  t.alike(await fs.promises.readdir(restarted.layout.staging), [])
+  t.is(restartedInternal.sessionStore.sessions.size, 0)
+  t.is(restartedInternal.sessionStore.reservedBytes, 0)
+  t.alike(await fs.promises.readdir(restartedInternal.layout.sessions), [])
+  t.alike(await fs.promises.readdir(restartedInternal.layout.staging), [])
   await restarted.close()
 
   await fs.promises.writeFile(allowlistPath, `${hex(ownerKey)}\n`)
   const reallowed = new Server({ ...options, allowedKeys: [ownerKey] })
   await reallowed.listen()
-  const offered = await reallowed.sessionStore.offer(ownerKey, upload.offer)
+  const offered = await serverInternals(reallowed).sessionStore.offer(ownerKey, upload.offer)
   t.is(offered.resumed, false)
   await reallowed.close()
 })
@@ -218,14 +286,14 @@ test('Server retires corrupt journal orphan staging before networking', async (t
   await sessions.offer(ownerKey, valid.offer)
   const commits = new CommitStore({ layout, storage })
   crashAfterSessionUnlink = true
-  await commits.commit(sessions.sessions.get(hex(corrupt.offer.transferId)))
+  await commits.commit(sessions.sessions.get(hex(corrupt.offer.transferId))!)
   await fs.promises.writeFile(
     path.join(layout.journals, `${hex(corrupt.offer.transferId)}.json`),
     '{corrupt'
   )
   await sessions.close()
 
-  const lifecycle = []
+  const lifecycle: string[] = []
   const server = new Server({
     seed: SERVER_SEED,
     storageDir,
@@ -238,13 +306,13 @@ test('Server retires corrupt journal orphan staging before networking', async (t
       return stubSwarm()
     }
   })
-  server.on('cleanup', (event) => {
+  server.on('cleanup', (event: CleanupEvent) => {
     if (event.reason === 'corrupt-journal') lifecycle.push('cleanup')
   })
   await server.listen()
 
   t.alike(lifecycle, ['cleanup', 'network'])
-  t.is(server.sessionStore.sessions.has(hex(valid.offer.transferId)), true)
+  t.is(serverInternals(server).sessionStore.sessions.has(hex(valid.offer.transferId)), true)
   const journalNames = await fs.promises.readdir(layout.journals)
   t.is(journalNames.length, 1)
   t.ok(journalNames[0].startsWith(`.${hex(corrupt.offer.transferId)}.corrupt-`))
@@ -262,9 +330,9 @@ test('Server retires corrupt journal orphan staging before networking', async (t
 test('Server close aborts a never-resolving discovery flush and releases resources', async (t) => {
   const storageDir = await createTempDir(t)
   const joined = deferred()
-  const events = []
-  const swarm = new EventEmitter()
-  const discovery = {
+  const events: string[] = []
+  const swarm = new EventEmitter() as StubSwarm
+  const discovery: SwarmDiscovery = {
     flushed() {
       joined.resolve()
       return new Promise(() => {})
@@ -277,7 +345,7 @@ test('Server close aborts a never-resolving discovery flush and releases resourc
   swarm.destroy = async () => {
     events.push('swarm-destroy')
   }
-  const options = {
+  const options: ServerOptions = {
     seed: SERVER_SEED,
     storageDir,
     allowedKeys: [keyPairFromSeed(CLIENT_SEED).publicKey],
@@ -286,23 +354,24 @@ test('Server close aborts a never-resolving discovery flush and releases resourc
     minFreeBytes: 0
   }
   const server = new Server({ ...options, swarmFactory: () => swarm })
+  const internal = serverInternals(server)
   const starting = server.listen()
   await joined.promise
-  const retention = server.retentionManager
+  const retention = internal.retentionManager
   const closing = server.close()
 
   t.ok(events.includes('discovery-destroy'), 'close synchronously starts discovery cancellation')
   t.ok(events.includes('swarm-destroy'), 'close synchronously starts swarm cancellation')
   const [startResult, closeResult] = await settlePromptly([starting, closing])
   t.is(startResult.status, 'rejected')
-  t.is(startResult.reason.code, ERRORS.ABORTED)
+  t.is(settledError(startResult).code, ERRORS.ABORTED)
   t.is(closeResult.status, 'fulfilled')
   t.is(server.listening, false)
-  t.is(server.swarm, null)
-  t.is(server.discovery, null)
-  t.is(server.sessionStore, null)
-  t.is(server._connections.size, 0)
-  t.is(server._sessions.size, 0)
+  t.is(internal.swarm, null)
+  t.is(internal.discovery, null)
+  t.is(internal.sessionStore, null)
+  t.is(internal._connections.size, 0)
+  t.is(internal._sessions.size, 0)
   t.is(retention.timer, null)
 
   const recovered = new Server({ ...options, swarmFactory: () => stubSwarm() })
@@ -315,7 +384,6 @@ test('Server close during storage startup prevents later swarm announcement', as
   const release = deferred()
   let blocked = false
   let swarmCreations = 0
-  let storageDir
   const storage = createStorage({
     async beforeOperation(operation, filePath) {
       if (blocked || operation !== 'readdir' || !filePath.endsWith('/sessions')) return
@@ -324,7 +392,7 @@ test('Server close during storage startup prevents later swarm announcement', as
       await release.promise
     }
   })
-  storageDir = await createTempDir(t)
+  const storageDir = await createTempDir(t)
   const server = new Server({
     seed: SERVER_SEED,
     storageDir,
@@ -345,7 +413,7 @@ test('Server close during storage startup prevents later swarm announcement', as
   const [startResult, closeResult] = await settlePromptly([starting, closing])
 
   t.is(startResult.status, 'rejected')
-  t.is(startResult.reason.code, ERRORS.ABORTED)
+  t.is(settledError(startResult).code, ERRORS.ABORTED)
   t.is(closeResult.status, 'fulfilled')
   t.is(swarmCreations, 0)
   t.is(server.listening, false)

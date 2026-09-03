@@ -1,20 +1,52 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const path = require('#path')
-const { EventEmitter } = require('#events')
-const { Client, ERRORS, keyPairFromSeed } = require('../..')
-const { blockManifestAfterFirstRead, settlePromptly } = require('../helpers/cancellation')
-const { CHUNK_SIZE, createTempDir, writeDeterministicFile } = require('../helpers/files')
+import test from 'brittle'
+import b4a from 'b4a'
+import path from '#path'
+import { EventEmitter } from '#events'
+import { Client, ERRORS, keyPairFromSeed } from '../../dist/index.js'
+import type { Swarm } from '../../dist/types.js'
+import {
+  blockManifestAfterFirstRead,
+  settledError,
+  settlePromptly
+} from '../helpers/cancellation.js'
+import { CHUNK_SIZE, createTempDir, writeDeterministicFile } from '../helpers/files.js'
 
 const SERVER_SEED = b4a.alloc(32, 71)
 const CLIENT_SEED = b4a.alloc(32, 72)
 
-function createStalledSwarm() {
-  const swarm = new EventEmitter()
+/** A swarm whose discovery flush never settles, so close must abort it. */
+interface StalledSwarm extends Swarm {
+  destroyed: boolean
+}
+
+/**
+ * The private client members these cancellation tests observe or replace. The
+ * production surface keeps them private, so the harness names them explicitly.
+ */
+interface ClientInternals {
+  _ensureStarted(): Promise<unknown>
+  _delay(milliseconds: number): Promise<unknown>
+  _uploadManifest(...args: unknown[]): Promise<unknown>
+  swarm: unknown
+  sessions: { size: number }
+  sockets: { size: number }
+}
+
+interface FakeTimer {
+  callback: () => void
+}
+
+function internals(client: Client): ClientInternals {
+  return client as unknown as ClientInternals
+}
+
+function createStalledSwarm(): StalledSwarm {
+  const swarm = new EventEmitter() as unknown as StalledSwarm
   swarm.destroyed = false
-  swarm.join = () => ({ flushed: () => new Promise(() => {}) })
+  swarm.join = () => ({ flushed: () => new Promise<never>(() => {}) })
   swarm.destroy = async () => {
     swarm.destroyed = true
   }
@@ -28,7 +60,7 @@ test('Client close aborts a stalled discovery flush and destroys its swarm', asy
     serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
     swarmFactory: () => swarm
   })
-  const starting = client._ensureStarted()
+  const starting = internals(client)._ensureStarted()
   await new Promise((resolve) => setTimeout(resolve, 0))
 
   await client.close()
@@ -37,7 +69,7 @@ test('Client close aborts a stalled discovery flush and destroys its swarm', asy
 })
 
 test('Client close rejects a pending reconnect delay and clears its timer', async (t) => {
-  const timers = new Set()
+  const timers = new Set<FakeTimer>()
   const client = new Client({
     seed: CLIENT_SEED,
     serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
@@ -48,11 +80,11 @@ test('Client close rejects a pending reconnect delay and clears its timer', asyn
         return timer
       },
       clearTimeout(timer) {
-        timers.delete(timer)
+        timers.delete(timer as FakeTimer)
       }
     }
   })
-  const delayed = client._delay(30_000)
+  const delayed = internals(client)._delay(30_000)
   await client.close()
 
   await t.exception(() => delayed, { name: 'SwarmDeployError', code: 'ABORTED' })
@@ -74,8 +106,9 @@ test('Client close stops directory processing during the first active hash', asy
       throw new Error('networking must not start while the first hash is blocked')
     }
   })
-  const originalUploadManifest = client._uploadManifest.bind(client)
-  client._uploadManifest = async (...args) => {
+  const client_ = internals(client)
+  const originalUploadManifest = client_._uploadManifest.bind(client_)
+  client_._uploadManifest = async (...args: unknown[]) => {
     uploadStarts++
     return originalUploadManifest(...args)
   }
@@ -88,18 +121,18 @@ test('Client close stops directory processing during the first active hash', asy
   const [batchResult, closeResult] = await settlePromptly([batch, closing, blocked.streamClosed])
 
   t.is(batchResult.status, 'rejected')
-  t.is(batchResult.reason.name, 'SwarmDeployError')
-  t.is(batchResult.reason.code, ERRORS.ABORTED)
+  t.is(settledError(batchResult).name, 'SwarmDeployError')
+  t.is(settledError(batchResult).code, ERRORS.ABORTED)
   t.is(closeResult.status, 'fulfilled')
   t.absent(blocked.state.openPaths.includes(laterPath))
   t.absent(blocked.state.readPaths.includes(laterPath))
   t.is(uploadStarts, 0)
-  t.is(client.sessions.size, 0)
-  t.is(client.sockets.size, 0)
-  t.is(client.swarm, null)
+  t.is(client_.sessions.size, 0)
+  t.is(client_.sockets.size, 0)
+  t.is(client_.swarm, null)
   t.ok(blocked.state.streamClosed)
   t.ok(blocked.state.descriptorCloseAttempted)
-  await t.exception(() => blocked.state.descriptor.stat(), { code: 'EBADF' })
+  await t.exception(() => blocked.state.descriptor!.stat!(), { code: 'EBADF' })
 })
 
 test('Client close rejects an active upload and its queued successor before startup', async (t) => {
@@ -119,8 +152,9 @@ test('Client close rejects an active upload and its queued successor before star
       return createStalledSwarm()
     }
   })
-  const originalUploadManifest = client._uploadManifest.bind(client)
-  client._uploadManifest = async (...args) => {
+  const client_ = internals(client)
+  const originalUploadManifest = client_._uploadManifest.bind(client_)
+  client_._uploadManifest = async (...args: unknown[]) => {
     uploadStarts++
     return originalUploadManifest(...args)
   }
@@ -139,8 +173,8 @@ test('Client close rejects an active upload and its queued successor before star
 
   for (const result of [activeResult, queuedResult]) {
     t.is(result.status, 'rejected')
-    t.is(result.reason.name, 'SwarmDeployError')
-    t.is(result.reason.code, ERRORS.ABORTED)
+    t.is(settledError(result).name, 'SwarmDeployError')
+    t.is(settledError(result).code, ERRORS.ABORTED)
   }
   t.is(closeResult.status, 'fulfilled')
   t.absent(blocked.state.lstatPaths.includes(queuedPath))
@@ -148,10 +182,10 @@ test('Client close rejects an active upload and its queued successor before star
   t.absent(blocked.state.readPaths.includes(queuedPath))
   t.is(swarmStarts, 0)
   t.is(uploadStarts, 0)
-  t.is(client.sessions.size, 0)
-  t.is(client.sockets.size, 0)
-  t.is(client.swarm, null)
+  t.is(client_.sessions.size, 0)
+  t.is(client_.sockets.size, 0)
+  t.is(client_.swarm, null)
   t.ok(blocked.state.streamClosed)
   t.ok(blocked.state.descriptorCloseAttempted)
-  await t.exception(() => blocked.state.descriptor.stat(), { code: 'EBADF' })
+  await t.exception(() => blocked.state.descriptor!.stat!(), { code: 'EBADF' })
 })

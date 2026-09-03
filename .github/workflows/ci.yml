@@ -18,6 +18,7 @@ jobs:
         with:
           version: lts/*
       - run: npm ci
+      - run: npm run build && npm run test:types
       - run: npm run lint
 
   node:
@@ -58,4 +59,5 @@ jobs:
         with:
           version: lts/*
       - run: npm ci
-      - run: npx brittle-node test/unit/protocol-property.test.js
+      - run: npm run build && npm run build:test
+      - run: npx brittle-node .test-dist/unit/protocol-property.test.js

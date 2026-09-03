@@ -1,10 +1,11 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const c = require('compact-encoding')
-const crypto = require('#crypto')
-const {
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import c from 'compact-encoding'
+import crypto from '#crypto'
+import {
   ERRORS,
   OFFER,
   STATUS,
@@ -29,18 +30,102 @@ const {
   finish,
   result,
   transferId,
-  mergeBitmapPages
-} = require('../..')
-const { ServerSession } = require('../../dist/protocol/server-session')
+  mergeBitmapPages,
+  type Codec,
+  type Digest,
+  type OfferInput
+} from '../../dist/index.js'
+import type { ProtocolChannel } from '../../dist/protocol/types.js'
+import {
+  ServerSession,
+  type CommitStore,
+  type ServerSessionStore
+} from '../../dist/protocol/server-session.js'
 
 const OWNER = b4a.alloc(32, 0x31)
 const DATA = b4a.from('deterministic protocol property payload')
 
-function sha256(bytes) {
+/** The fields the harness reads from an error thrown by protocol code. */
+interface CaughtError {
+  code?: unknown
+  name?: unknown
+  message?: unknown
+}
+
+/** A message recorded by the fake channel, retaining its inbound handler. */
+interface RecordedMessage {
+  onmessage(value: unknown): unknown
+  send(value: unknown): boolean
+}
+
+/**
+ * The fake channel deliberately implements only the members `ServerSession`
+ * exercises, so the tests keep observing the same missing-member behaviour as
+ * the untyped harness.
+ */
+interface FakeChannel {
+  drained: boolean
+  _recv(type: number, state: unknown): unknown
+  addMessage<Input, Output>(options: {
+    encoding: Codec<Input, Output>
+    onmessage: (value: Output) => unknown
+  }): RecordedMessage
+  open(): void
+  close(): void
+}
+
+interface FakeSessionStore {
+  sessions: Map<string, unknown>
+  offer(): Promise<{ verified: Set<number> }>
+  writeChunk(): Promise<void>
+  finish(): Promise<void>
+  retireCommitted(): Promise<void>
+}
+
+interface ProtocolSessionHarness {
+  channel: FakeChannel
+  messages: RecordedMessage[]
+  destroyed: CaughtError[]
+  session: ServerSession
+  sessionStore: FakeSessionStore
+  readonly offerCalls: number
+}
+
+interface CorpusEntry {
+  name: string
+  encoded: Buffer
+  maximum: number
+  decode(bytes: Uint8Array, maximum?: number): unknown
+}
+
+interface LengthMutationCase {
+  name: string
+  maximum: number
+  encoded: Buffer
+  lengthOffset: number
+  declared: Buffer
+  decode(bytes: Uint8Array, maximum?: number): unknown
+}
+
+interface TinyDeclarationCase {
+  name: string
+  index: number
+  encoded: Buffer
+  decode(bytes: Uint8Array, maximum?: number): unknown
+}
+
+function sha256(bytes: Uint8Array): Digest {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function sampleOffer() {
+/** Erases a codec's input/output types so heterogeneous cases share a table. */
+function decoder<Input, Output>(
+  codec: Codec<Input, Output>
+): (bytes: Uint8Array, maximum?: number) => Output {
+  return (bytes, maximum) => decodeBounded(codec, bytes, maximum)
+}
+
+function sampleOffer(): OfferInput {
   const value = {
     version: 1,
     name: 'property.bin',
@@ -49,34 +134,50 @@ function sampleOffer() {
     chunkSize: MAX_CHUNK_BYTES,
     chunkCount: 1
   }
-  value.transferId = transferId({
-    clientPublicKey: OWNER,
-    name: value.name,
-    size: value.size,
-    digest: value.digest,
-    chunkSize: value.chunkSize
-  })
-  return value
+  return {
+    ...value,
+    transferId: transferId({
+      clientPublicKey: OWNER,
+      name: value.name,
+      size: value.size,
+      digest: value.digest,
+      chunkSize: value.chunkSize
+    })
+  }
 }
 
-function corpus() {
+function corpusEntry<Input, Output>(
+  name: string,
+  codec: Codec<Input, Output>,
+  value: Input,
+  maximum: number
+): CorpusEntry {
+  return {
+    name,
+    encoded: encodeBounded(codec, value, maximum),
+    maximum,
+    decode: decoder(codec)
+  }
+}
+
+function corpus(): CorpusEntry[] {
   const offered = sampleOffer()
   return [
-    ['offer', offer, offered, MAX_CONTROL_BYTES],
-    [
+    corpusEntry('offer', offer, offered, MAX_CONTROL_BYTES),
+    corpusEntry(
       'status',
       status,
       { transferId: offered.transferId, code: STATUS_CODE.REJECTED, reason: 'bounded' },
       MAX_CONTROL_BYTES
-    ],
-    [
+    ),
+    corpusEntry(
       'bitmap-page',
       bitmapPage,
       { transferId: offered.transferId, start: 0, count: 1, bits: b4a.from([1]) },
       MAX_CONTROL_BYTES
-    ],
-    ['ready', ready, { transferId: offered.transferId }, MAX_CONTROL_BYTES],
-    [
+    ),
+    corpusEntry('ready', ready, { transferId: offered.transferId }, MAX_CONTROL_BYTES),
+    corpusEntry(
       'chunk',
       chunk,
       {
@@ -86,22 +187,32 @@ function corpus() {
         data: DATA
       },
       MAX_CHUNK_FRAME_BYTES
-    ],
-    ['chunk-ack', chunkAck, { transferId: offered.transferId, index: 0 }, MAX_CONTROL_BYTES],
-    ['finish', finish, { transferId: offered.transferId }, MAX_CONTROL_BYTES],
-    ['result', result, { transferId: offered.transferId, code: 0, reason: '' }, MAX_CONTROL_BYTES]
+    ),
+    corpusEntry(
+      'chunk-ack',
+      chunkAck,
+      { transferId: offered.transferId, index: 0 },
+      MAX_CONTROL_BYTES
+    ),
+    corpusEntry('finish', finish, { transferId: offered.transferId }, MAX_CONTROL_BYTES),
+    corpusEntry(
+      'result',
+      result,
+      { transferId: offered.transferId, code: 0, reason: '' },
+      MAX_CONTROL_BYTES
+    )
   ]
 }
 
-function assertProtocolInvalid(t, operation, message) {
+function assertProtocolInvalid(t: Assert, operation: () => unknown, message: string): void {
   t.exception(operation, { name: 'SwarmDeployError', code: ERRORS.PROTOCOL_INVALID }, message)
 }
 
-function createProtocolSession(t) {
-  const messages = []
-  const destroyed = []
+function createProtocolSession(t: Assert): ProtocolSessionHarness {
+  const messages: RecordedMessage[] = []
+  const destroyed: CaughtError[] = []
   let offerCalls = 0
-  const channel = {
+  const channel: FakeChannel = {
     drained: true,
     _recv() {},
     addMessage(options) {
@@ -112,7 +223,7 @@ function createProtocolSession(t) {
     open() {},
     close() {}
   }
-  const sessionStore = {
+  const sessionStore: FakeSessionStore = {
     sessions: new Map(),
     async offer() {
       offerCalls++
@@ -123,18 +234,18 @@ function createProtocolSession(t) {
     async retireCommitted() {}
   }
   const session = new ServerSession({
-    channel,
+    channel: channel as unknown as ProtocolChannel,
     ownerKey: OWNER,
-    sessionStore,
+    sessionStore: sessionStore as unknown as ServerSessionStore,
     commitStore: {
       async inspect() {
         return { status: 'AVAILABLE' }
       },
       async commit() {}
-    },
+    } as unknown as CommitStore,
     maxFileBytes: MAX_CHUNK_BYTES,
     destroy(error) {
-      destroyed.push(error)
+      destroyed.push(error as CaughtError)
     }
   })
   t.teardown(() => session.close())
@@ -150,7 +261,11 @@ function createProtocolSession(t) {
   }
 }
 
-async function closeProtocolSession(t, created, label) {
+async function closeProtocolSession(
+  t: Assert,
+  created: ProtocolSessionHarness,
+  label: string
+): Promise<void> {
   await created.session.close()
   await created.session.settle()
   t.is(created.session.timer, null, `${label} timer cleared`)
@@ -158,12 +273,11 @@ async function closeProtocolSession(t, created, label) {
 }
 
 test('every codec rejects truncation at every byte offset with a typed error', (t) => {
-  for (const [name, codec, value, maximum] of corpus()) {
-    const encoded = encodeBounded(codec, value, maximum)
+  for (const { name, encoded, maximum, decode } of corpus()) {
     for (let offset = 0; offset < encoded.byteLength; offset++) {
       assertProtocolInvalid(
         t,
-        () => decodeBounded(codec, encoded.subarray(0, offset), maximum),
+        () => decode(encoded.subarray(0, offset), maximum),
         `${name} truncated at ${offset}/${encoded.byteLength}`
       )
     }
@@ -171,16 +285,15 @@ test('every codec rejects truncation at every byte offset with a typed error', (
 })
 
 test('every codec rejects trailing bytes and oversized framed input', (t) => {
-  for (const [name, codec, value, maximum] of corpus()) {
-    const encoded = encodeBounded(codec, value, maximum)
+  for (const { name, encoded, maximum, decode } of corpus()) {
     assertProtocolInvalid(
       t,
-      () => decodeBounded(codec, b4a.concat([encoded, b4a.from([0])])),
+      () => decode(b4a.concat([encoded, b4a.from([0])])),
       `${name} trailing byte`
     )
     assertProtocolInvalid(
       t,
-      () => decodeBounded(codec, b4a.alloc(maximum + 1), maximum),
+      () => decode(b4a.alloc(maximum + 1), maximum),
       `${name} oversized input`
     )
   }
@@ -188,10 +301,10 @@ test('every codec rejects trailing bytes and oversized framed input', (t) => {
 
 test('one-bit length mutations and oversized declarations fail before allocation', (t) => {
   const offered = sampleOffer()
-  const cases = [
+  const cases: LengthMutationCase[] = [
     {
       name: 'offer string',
-      codec: offer,
+      decode: decoder(offer),
       maximum: MAX_CONTROL_BYTES,
       encoded: encodeBounded(offer, offered),
       lengthOffset: 33,
@@ -203,7 +316,7 @@ test('one-bit length mutations and oversized declarations fail before allocation
     },
     {
       name: 'status reason',
-      codec: status,
+      decode: decoder(status),
       maximum: MAX_CONTROL_BYTES,
       encoded: encodeBounded(status, {
         transferId: offered.transferId,
@@ -219,7 +332,7 @@ test('one-bit length mutations and oversized declarations fail before allocation
     },
     {
       name: 'bitmap bits',
-      codec: bitmapPage,
+      decode: decoder(bitmapPage),
       maximum: MAX_CONTROL_BYTES,
       encoded: encodeBounded(bitmapPage, {
         transferId: offered.transferId,
@@ -237,7 +350,7 @@ test('one-bit length mutations and oversized declarations fail before allocation
     },
     {
       name: 'chunk data',
-      codec: chunk,
+      decode: decoder(chunk),
       maximum: MAX_CHUNK_FRAME_BYTES,
       encoded: encodeBounded(
         chunk,
@@ -264,12 +377,12 @@ test('one-bit length mutations and oversized declarations fail before allocation
     mutated[entry.lengthOffset] ^= 1
     assertProtocolInvalid(
       t,
-      () => decodeBounded(entry.codec, mutated, entry.maximum),
+      () => entry.decode(mutated, entry.maximum),
       `${entry.name} one-bit length`
     )
     assertProtocolInvalid(
       t,
-      () => decodeBounded(entry.codec, entry.declared, entry.maximum),
+      () => entry.decode(entry.declared, entry.maximum),
       `${entry.name} oversized declaration`
     )
   }
@@ -319,17 +432,17 @@ test('unknown status and invalid bitmap padding, overlap, and ranges are typed',
 test('huge tiny declarations fail before reaching storage-backed state', async (t) => {
   const offered = sampleOffer()
   const huge = Number.MAX_SAFE_INTEGER
-  const cases = [
+  const cases: TinyDeclarationCase[] = [
     {
       name: 'offer name length',
       index: OFFER,
-      codec: offer,
+      decode: decoder(offer),
       encoded: b4a.concat([c.encode(c.uint, 1), offered.transferId, c.encode(c.uint, huge)])
     },
     {
       name: 'offer chunk count',
       index: OFFER,
-      codec: offer,
+      decode: decoder(offer),
       encoded: b4a.concat([
         c.encode(c.uint, 1),
         offered.transferId,
@@ -343,7 +456,7 @@ test('huge tiny declarations fail before reaching storage-backed state', async (
     {
       name: 'bitmap declared count',
       index: BITMAP_PAGE,
-      codec: bitmapPage,
+      decode: decoder(bitmapPage),
       encoded: b4a.concat([
         offered.transferId,
         c.encode(c.uint, 0),
@@ -354,7 +467,7 @@ test('huge tiny declarations fail before reaching storage-backed state', async (
     {
       name: 'chunk data length',
       index: CHUNK,
-      codec: chunk,
+      decode: decoder(chunk),
       encoded: b4a.concat([
         offered.transferId,
         c.encode(c.uint, 0),
@@ -368,13 +481,13 @@ test('huge tiny declarations fail before reaching storage-backed state', async (
     const created = createProtocolSession(t)
     try {
       t.ok(entry.encoded.byteLength < 128, `${entry.name} input remains tiny`)
-      let decodingError = null
+      let decodingError: CaughtError | null = null
       try {
-        decodeBounded(entry.codec, entry.encoded, MAX_CHUNK_FRAME_BYTES)
+        entry.decode(entry.encoded, MAX_CHUNK_FRAME_BYTES)
       } catch (err) {
-        decodingError = err
+        decodingError = err as CaughtError
       }
-      t.is(decodingError.code, ERRORS.PROTOCOL_INVALID, entry.name)
+      t.is(decodingError?.code, ERRORS.PROTOCOL_INVALID, entry.name)
       t.is(created.destroyed.length, 0, `${entry.name} rejected before session dispatch`)
       t.is(created.offerCalls, 0, `${entry.name} bypasses SessionStore.offer`)
       t.is(created.sessionStore.sessions.size, 0, `${entry.name} creates no session state`)
@@ -404,8 +517,8 @@ test('one-bit digest mutation reaches real session validation and tears down typ
 
 test('reordered, repeated, direction-invalid, and unknown messages tear down deterministically', async (t) => {
   const offered = sampleOffer()
-  const created = []
-  const makeSession = () => {
+  const created: ProtocolSessionHarness[] = []
+  const makeSession = (): ProtocolSessionHarness => {
     const session = createProtocolSession(t)
     created.push(session)
     return session
@@ -427,7 +540,7 @@ test('reordered, repeated, direction-invalid, and unknown messages tear down det
     await repeated.session.settle()
     t.is(repeated.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
 
-    const inbound = [
+    const inbound: Array<[number, unknown]> = [
       [STATUS, { transferId: offered.transferId, code: STATUS_CODE.ACCEPT }],
       [BITMAP_PAGE, { transferId: offered.transferId, start: 0, count: 1, bits: b4a.from([0]) }],
       [READY, { transferId: offered.transferId }],

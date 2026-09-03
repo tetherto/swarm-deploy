@@ -1,8 +1,9 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const {
+import test from 'brittle'
+import b4a from 'b4a'
+import {
   ERRORS,
   parseSeed,
   parsePublicKey,
@@ -10,7 +11,7 @@ const {
   keyPairFromSeed,
   publicKeyFromSeed,
   topicFromServerPublicKey
-} = require('../..')
+} from '../../dist/index.js'
 
 test('identity derives stable and separate key pairs', (t) => {
   const first = b4a.alloc(32, 1)

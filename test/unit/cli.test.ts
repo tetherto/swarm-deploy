@@ -1,68 +1,139 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const { EventEmitter } = require('#events')
-const fs = require('#fs')
-const path = require('#path')
-const b4a = require('b4a')
-const { SwarmDeployError, ERRORS, parseSeed, publicKeyFromSeed } = require('../..')
-const { createTempDir } = require('../helpers/files')
-const { fingerprint } = require('../../dist/server')
-const { topicFromServerPublicKey } = require('../../dist/topic')
-const { main } = require('../../dist/cli')
+import test, { type Assert } from 'brittle'
+import { EventEmitter } from '#events'
+import fs from '#fs'
+import path from '#path'
+import b4a from 'b4a'
+import { SwarmDeployError, ERRORS, parseSeed, publicKeyFromSeed } from '../../dist/index.js'
+import type { PublicKey, Topic } from '../../dist/types.js'
+import type { ServerOptions } from '../../dist/server.js'
+import type { ClientOptions } from '../../dist/client.js'
+import { createTempDir } from '../helpers/files.js'
+import { fingerprint } from '../../dist/server.js'
+import { topicFromServerPublicKey } from '../../dist/topic.js'
+import { main } from '../../dist/cli.js'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const SEED_A = 'ab'.repeat(32)
 const SEED_B = 'cd'.repeat(32)
 const PUBLIC_A = b4a.toString(publicKeyFromSeed(parseSeed(SEED_A)), 'hex')
 
-function createIo(overrides = {}) {
-  const stdout = []
-  const stderr = []
+type CliIo = NonNullable<Parameters<typeof main>[2]>
+type ServerConstructor = NonNullable<CliIo['Server']>
+type ClientConstructor = NonNullable<CliIo['Client']>
+
+interface CapturedStream {
+  write(chunk: unknown): boolean
+}
+
+interface IoOverrides {
+  process?: EventEmitter
+  Server?: ServerConstructor
+  Client?: ClientConstructor
+}
+
+/** The CLI IO seam plus the capture helpers these tests assert against. */
+interface TestIo extends CliIo {
+  stdout: CapturedStream
+  stderr: CapturedStream
+  process: EventEmitter
+  captured: { stdout: string[]; stderr: string[] }
+  text(stream: 'stdout' | 'stderr'): string
+}
+
+interface ServerRunExtras {
+  process?: EventEmitter
+  Server?: ServerConstructor
+  signal?: string
+}
+
+interface ServerRun {
+  code: number
+  io: TestIo
+  server: FakeServer
+  process: EventEmitter
+}
+
+/** The file handle members the keygen race replaces or forwards. */
+interface KeygenDescriptor {
+  fd: number
+  chmod(...args: unknown[]): Promise<unknown>
+  stat(...args: unknown[]): Promise<unknown>
+  write(...args: unknown[]): Promise<unknown>
+  sync(...args: unknown[]): Promise<unknown>
+  close(): Promise<void>
+}
+
+/**
+ * A mutable view of the runtime filesystem module. `#fs` is patched in place so
+ * the CLI observes the injected behaviour; only the two replaced members are
+ * described here.
+ */
+interface PatchableFs {
+  promises: {
+    open(openPath: string, flags?: unknown, mode?: unknown): Promise<KeygenDescriptor>
+    unlink(unlinkPath: string): Promise<void>
+  }
+}
+
+function createIo(overrides: IoOverrides = {}): TestIo {
+  const stdout: string[] = []
+  const stderr: string[] = []
   const io = {
     stdout: {
-      write(chunk) {
+      write(chunk: unknown) {
         stdout.push(String(chunk))
         return true
       }
     },
     stderr: {
-      write(chunk) {
+      write(chunk: unknown) {
         stderr.push(String(chunk))
         return true
       }
     },
     process: overrides.process || new EventEmitter(),
     ...overrides
-  }
+  } as TestIo
   io.captured = { stdout, stderr }
   io.text = (stream) => (stream === 'stderr' ? stderr : stdout).join('')
   return io
 }
 
-function assertNoSecret(t, text, secret) {
+function assertNoSecret(t: Assert, text: string, secret: string): void {
   t.ok(typeof secret === 'string' && secret.length > 0)
   t.absent(text.includes(secret), 'output must not contain secret material')
 }
 
-function publicKeyHex(seedHex) {
+function publicKeyHex(seedHex: string): string {
   return b4a.toString(publicKeyFromSeed(parseSeed(seedHex)), 'hex')
 }
 
-async function writeSeedFile(filePath, seedHex, newline = true) {
+async function writeSeedFile(filePath: string, seedHex: string, newline = true): Promise<void> {
   await fs.promises.writeFile(filePath, newline ? `${seedHex}\n` : seedHex, { mode: 0o600 })
 }
 
-async function writeAllowlist(filePath, keys) {
+async function writeAllowlist(filePath: string, keys: string[]): Promise<void> {
   await fs.promises.writeFile(filePath, keys.map((key) => `${key}\n`).join(''))
 }
 
-function topicFingerprint(seedHex) {
+function topicFingerprint(seedHex: string): string {
   return fingerprint(topicFromServerPublicKey(publicKeyFromSeed(parseSeed(seedHex))))
 }
 
 class FakeServer {
-  constructor(options) {
+  static last: FakeServer | null = null
+
+  options: ServerOptions
+  publicKey: PublicKey
+  topic: Topic
+  closeCount: number
+  closed: boolean
+  listening: boolean
+
+  constructor(options: ServerOptions) {
     FakeServer.last = this
     this.options = options
     this.publicKey = publicKeyFromSeed(options.seed)
@@ -71,19 +142,19 @@ class FakeServer {
     this.closed = false
     this.listening = false
     if (options.logger) {
-      options.logger.info('fake-server-constructed')
-      options.logger.warn('fake-server-warn')
-      options.logger.error('fake-server-error')
+      options.logger.info?.('fake-server-constructed')
+      options.logger.warn?.('fake-server-warn')
+      options.logger.error?.('fake-server-error')
     }
   }
 
-  async listen() {
+  async listen(): Promise<this> {
     if (this.closed) throw new Error('server already closed')
     this.listening = true
     return this
   }
 
-  close() {
+  close(): Promise<void> {
     this.closeCount++
     this.closed = true
     return Promise.resolve()
@@ -91,26 +162,53 @@ class FakeServer {
 }
 
 class FakeClient {
-  constructor(options) {
+  static last: FakeClient | null = null
+  static uploadImpl: ((inputPath: string, client: FakeClient) => Promise<unknown>) | null = null
+
+  options: ClientOptions
+  closeCount: number
+  closed: boolean
+
+  constructor(options: ClientOptions) {
     FakeClient.last = this
     this.options = options
     this.closeCount = 0
     this.closed = false
   }
 
-  async upload(inputPath) {
+  async upload(inputPath: string): Promise<unknown> {
     if (typeof FakeClient.uploadImpl === 'function') return FakeClient.uploadImpl(inputPath, this)
     return { name: path.basename(inputPath), status: 'COMMITTED' }
   }
 
-  close() {
+  close(): Promise<void> {
     this.closeCount++
     this.closed = true
     return Promise.resolve()
   }
 }
 
-async function waitForText(io, stream, snippet, timeout = 2_000) {
+const fakeServer = FakeServer as unknown as ServerConstructor
+const fakeClient = FakeClient as unknown as ClientConstructor
+
+function asServerConstructor(value: unknown): ServerConstructor {
+  return value as ServerConstructor
+}
+
+function asClientConstructor(value: unknown): ClientConstructor {
+  return value as ClientConstructor
+}
+
+function allowedKeys(options: ServerOptions): Set<string> {
+  return options.allowedKeys as Set<string>
+}
+
+async function waitForText(
+  io: TestIo,
+  stream: 'stdout' | 'stderr',
+  snippet: string,
+  timeout = 2_000
+): Promise<string> {
   const started = Date.now()
   while (Date.now() - started < timeout) {
     if (io.text(stream).includes(snippet)) return io.text(stream)
@@ -119,23 +217,26 @@ async function waitForText(io, stream, snippet, timeout = 2_000) {
   throw new Error(`Timed out waiting for ${snippet}: ${io.text(stream)} ${io.text('stderr')}`)
 }
 
-async function runServerCommand(args, env = {}, extras = {}) {
+async function runServerCommand(
+  args: string[],
+  env: Record<string, string | undefined> = {},
+  extras: ServerRunExtras = {}
+): Promise<ServerRun> {
   const proc = extras.process || new EventEmitter()
   const io = createIo({
     process: proc,
-    Server: extras.Server || FakeServer,
-    ...extras
+    Server: extras.Server || fakeServer
   })
   const running = main(['server', ...args], env, io)
   await waitForText(io, 'stdout', 'ready')
   proc.emit(extras.signal || 'SIGINT')
   const code = await running
-  return { code, io, server: FakeServer.last, process: proc }
+  return { code, io, server: FakeServer.last!, process: proc }
 }
 
 test('main never calls process.exit and --help exits 0', async (t) => {
   const proc = new EventEmitter()
-  proc.exit = () => {
+  ;(proc as unknown as { exit: () => never }).exit = () => {
     throw new Error('process.exit must not be called from main')
   }
   const io = createIo({ process: proc })
@@ -302,7 +403,7 @@ test('server requires options and accepts file or env seed but not both', async 
     '2048'
   ]
 
-  t.is(await main(['server', ...required], {}, createIo({ Server: FakeServer })), 2)
+  t.is(await main(['server', ...required], {}, createIo({ Server: fakeServer })), 2)
   t.is(
     await main(
       [
@@ -317,7 +418,7 @@ test('server requires options and accepts file or env seed but not both', async 
         '1'
       ],
       {},
-      createIo({ Server: FakeServer })
+      createIo({ Server: fakeServer })
     ),
     2
   )
@@ -335,7 +436,7 @@ test('server requires options and accepts file or env seed but not both', async 
         '1'
       ],
       {},
-      createIo({ Server: FakeServer })
+      createIo({ Server: fakeServer })
     ),
     2
   )
@@ -353,7 +454,7 @@ test('server requires options and accepts file or env seed but not both', async 
         '1'
       ],
       {},
-      createIo({ Server: FakeServer })
+      createIo({ Server: fakeServer })
     ),
     2
   )
@@ -375,7 +476,7 @@ test('server requires options and accepts file or env seed but not both', async 
   t.is(fileOnly.server.options.maxStorageBytes, 4096)
   t.is(fileOnly.server.options.maxAge, 7 * 24 * 60 * 60 * 1000)
   t.is(fileOnly.server.options.allowlistPath, allowlist)
-  t.ok(fileOnly.server.options.allowedKeys.has(PUBLIC_A))
+  t.ok(allowedKeys(fileOnly.server.options).has(PUBLIC_A))
   t.is(fileOnly.io.text('stdout'), `${PUBLIC_A}\n${topicFingerprint(SEED_A)}\nready\n`)
   assertNoSecret(t, fileOnly.io.text('stdout') + fileOnly.io.text('stderr'), SEED_A)
 
@@ -384,7 +485,7 @@ test('server requires options and accepts file or env seed but not both', async 
   t.alike(envOnly.server.options.seed, parseSeed(SEED_B))
   assertNoSecret(t, envOnly.io.text('stdout') + envOnly.io.text('stderr'), SEED_B)
 
-  const conflict = createIo({ Server: FakeServer })
+  const conflict = createIo({ Server: fakeServer })
   t.is(
     await main(
       ['server', '--seed-file', seedPath, ...required],
@@ -418,7 +519,7 @@ test('server rejects non-canonical byte and day options', async (t) => {
     '2048'
   ]
 
-  const invalid = [
+  const invalid: Array<{ replace?: Record<string, string>; extra?: string[] }> = [
     { replace: { '--max-file-bytes': '0' } },
     { replace: { '--max-file-bytes': '-1' } },
     { replace: { '--max-file-bytes': '1.5' } },
@@ -442,7 +543,7 @@ test('server rejects non-canonical byte and day options', async (t) => {
       }
     }
     if (case_.extra) args.push(...case_.extra)
-    const io = createIo({ Server: FakeServer })
+    const io = createIo({ Server: fakeServer })
     const label = JSON.stringify(case_.replace || case_.extra)
     t.is(await main(['server', ...args], {}, io), 2, label)
     assertNoSecret(t, io.text('stdout') + io.text('stderr'), SEED_A)
@@ -470,7 +571,7 @@ test('server config failures exit 2 and listen failures exit 1', async (t) => {
     '2048'
   ]
 
-  const invalidAllowlist = createIo({ Server: FakeServer })
+  const invalidAllowlist = createIo({ Server: fakeServer })
   t.is(await main(['server', ...args], {}, invalidAllowlist), 2)
 
   await writeAllowlist(allowlist, [PUBLIC_A])
@@ -479,28 +580,28 @@ test('server config failures exit 2 and listen failures exit 1', async (t) => {
       throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid server options')
     }
   }
-  const ctor = createIo({ Server: CtorFail })
+  const ctor = createIo({ Server: asServerConstructor(CtorFail) })
   t.is(await main(['server', ...args], {}, ctor), 2)
 
   class ListenFail extends FakeServer {
-    async listen() {
+    async listen(): Promise<this> {
       throw new Error('swarm bind failed')
     }
   }
-  const listen = createIo({ Server: ListenFail })
+  const listen = createIo({ Server: asServerConstructor(ListenFail) })
   t.is(await main(['server', ...args], {}, listen), 1)
-  t.is(ListenFail.last.closeCount, 1)
+  t.is(ListenFail.last!.closeCount, 1)
   assertNoSecret(t, listen.text('stdout') + listen.text('stderr'), SEED_A)
   t.absent(listen.text('stdout').includes('ready'))
 
   class ProtocolListenFail extends FakeServer {
-    async listen() {
+    async listen(): Promise<this> {
       throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Malformed runtime frame')
     }
   }
-  const protocol = createIo({ Server: ProtocolListenFail })
+  const protocol = createIo({ Server: asServerConstructor(ProtocolListenFail) })
   t.is(await main(['server', ...args], {}, protocol), 1)
-  t.is(ProtocolListenFail.last.closeCount, 1)
+  t.is(ProtocolListenFail.last!.closeCount, 1)
   assertNoSecret(t, protocol.text('stdout') + protocol.text('stderr'), SEED_A)
 })
 
@@ -537,13 +638,13 @@ test('SIGINT and SIGTERM close the server once and remain idempotent', async (t)
   }
 
   const proc = new EventEmitter()
-  const io = createIo({ process: proc, Server: FakeServer })
+  const io = createIo({ process: proc, Server: fakeServer })
   const running = main(['server', ...args], {}, io)
   await waitForText(io, 'stdout', 'ready')
   proc.emit('SIGINT')
   proc.emit('SIGTERM')
   t.is(await running, 0)
-  t.is(FakeServer.last.closeCount, 1)
+  t.is(FakeServer.last!.closeCount, 1)
 })
 
 test('server logger exceptions are contained', async (t) => {
@@ -555,7 +656,7 @@ test('server logger exceptions are contained', async (t) => {
   await writeAllowlist(allowlist, [PUBLIC_A])
   await fs.promises.mkdir(storage)
   const proc = new EventEmitter()
-  const io = createIo({ process: proc, Server: FakeServer })
+  const io = createIo({ process: proc, Server: fakeServer })
   io.stderr.write = () => {
     throw new Error('stderr unavailable')
   }
@@ -579,7 +680,7 @@ test('server logger exceptions are contained', async (t) => {
   await waitForText(io, 'stdout', 'ready')
   proc.emit('SIGTERM')
   t.is(await running, 0)
-  t.is(FakeServer.last.closeCount, 1)
+  t.is(FakeServer.last!.closeCount, 1)
 })
 
 test('upload requires options and accepts file or env seed but not both', async (t) => {
@@ -593,19 +694,19 @@ test('upload requires options and accepts file or env seed but not both', async 
     await main(
       ['upload', '--server-key', PUBLIC_A, artifact],
       {},
-      createIo({ Client: FakeClient })
+      createIo({ Client: fakeClient })
     ),
     2
   )
   t.is(
-    await main(['upload', '--seed-file', seedPath, artifact], {}, createIo({ Client: FakeClient })),
+    await main(['upload', '--seed-file', seedPath, artifact], {}, createIo({ Client: fakeClient })),
     2
   )
   t.is(
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A],
       {},
-      createIo({ Client: FakeClient })
+      createIo({ Client: fakeClient })
     ),
     2
   )
@@ -613,7 +714,7 @@ test('upload requires options and accepts file or env seed but not both', async 
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', 'AA'.repeat(32), artifact],
       {},
-      createIo({ Client: FakeClient })
+      createIo({ Client: fakeClient })
     ),
     2
   )
@@ -621,13 +722,13 @@ test('upload requires options and accepts file or env seed but not both', async 
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', 'ab', artifact],
       {},
-      createIo({ Client: FakeClient })
+      createIo({ Client: fakeClient })
     ),
     2
   )
 
   FakeClient.last = null
-  const fileOnly = createIo({ Client: FakeClient })
+  const fileOnly = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
@@ -636,15 +737,15 @@ test('upload requires options and accepts file or env seed but not both', async 
     ),
     0
   )
-  t.alike(FakeClient.last.options.seed, parseSeed(SEED_A))
-  t.alike(FakeClient.last.options.serverPublicKey, parseSeed(PUBLIC_A))
+  t.alike(FakeClient.last!.options.seed, parseSeed(SEED_A))
+  t.alike(FakeClient.last!.options.serverPublicKey, parseSeed(PUBLIC_A))
   t.is(fileOnly.text('stdout'), 'artifact.bin COMMITTED\n')
-  t.is(FakeClient.last.closeCount, 1)
+  t.is(FakeClient.last!.closeCount, 1)
   assertNoSecret(t, fileOnly.text('stdout') + fileOnly.text('stderr'), SEED_A)
   t.absent(fileOnly.text('stdout').includes(PUBLIC_A))
 
   FakeClient.last = null
-  const envOnly = createIo({ Client: FakeClient })
+  const envOnly = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--server-key', PUBLIC_A, artifact],
@@ -653,10 +754,10 @@ test('upload requires options and accepts file or env seed but not both', async 
     ),
     0
   )
-  t.alike(FakeClient.last.options.seed, parseSeed(SEED_B))
+  t.alike(FakeClient.last!.options.seed, parseSeed(SEED_B))
   assertNoSecret(t, envOnly.text('stdout') + envOnly.text('stderr'), SEED_B)
 
-  const conflict = createIo({ Client: FakeClient })
+  const conflict = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
@@ -683,7 +784,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
     ],
     skipped: [{ name: 'nested', reason: 'directory' }]
   })
-  const ok = createIo({ Client: FakeClient })
+  const ok = createIo({ Client: fakeClient })
   t.is(
     await main(['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact], {}, ok),
     0
@@ -700,7 +801,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
     ],
     skipped: [{ name: 'link', reason: 'symlink' }]
   })
-  const partial = createIo({ Client: FakeClient })
+  const partial = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
@@ -717,7 +818,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   FakeClient.uploadImpl = async () => {
     throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Path must be a regular file')
   }
-  const discovery = createIo({ Client: FakeClient })
+  const discovery = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
@@ -730,7 +831,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   FakeClient.uploadImpl = async () => {
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Malformed server frame')
   }
-  const malformed = createIo({ Client: FakeClient })
+  const malformed = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
@@ -783,7 +884,7 @@ test('client-only env is ignored by server and server-only env is ignored by upl
   t.alike(server.server.options.seed, parseSeed(SEED_A))
 
   FakeClient.last = null
-  const upload = createIo({ Client: FakeClient })
+  const upload = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
@@ -792,7 +893,7 @@ test('client-only env is ignored by server and server-only env is ignored by upl
     ),
     0
   )
-  t.alike(FakeClient.last.options.seed, parseSeed(SEED_A))
+  t.alike(FakeClient.last!.options.seed, parseSeed(SEED_A))
 })
 
 test('parser errors stay generic and never echo unique raw seed tokens', async (t) => {
@@ -840,7 +941,7 @@ test('wrong-role env alone is a missing seed source', async (t) => {
   await fs.promises.mkdir(storage)
   await fs.promises.writeFile(artifact, 'bytes')
 
-  const server = createIo({ Server: FakeServer })
+  const server = createIo({ Server: fakeServer })
   t.is(
     await main(
       [
@@ -861,7 +962,7 @@ test('wrong-role env alone is a missing seed source', async (t) => {
   )
   assertNoSecret(t, server.text('stdout') + server.text('stderr'), wrongServer)
 
-  const upload = createIo({ Client: FakeClient })
+  const upload = createIo({ Client: fakeClient })
   t.is(
     await main(
       ['upload', '--server-key', PUBLIC_A, artifact],
@@ -877,19 +978,25 @@ test('failed keygen unlinks only its own exclusive inode', async (t) => {
   const dir = await createTempDir(t)
   const out = path.join(dir, 'race.seed')
   const replacement = '99'.repeat(32)
-  const originalOpen = fs.promises.open
-  const originalUnlink = fs.promises.unlink
+  const patchable = fs as unknown as PatchableFs
+  const originalOpen = patchable.promises.open
+  const originalUnlink = patchable.promises.unlink
   let unlinked = false
 
-  fs.promises.open = async function patchedOpen(filePath, flags, mode) {
+  patchable.promises.open = async function patchedOpen(
+    this: unknown,
+    filePath: string,
+    flags?: unknown,
+    mode?: unknown
+  ): Promise<KeygenDescriptor> {
     const handle = await originalOpen.call(this, filePath, flags, mode)
     if (filePath !== out) return handle
     return {
       fd: handle.fd,
-      chmod: (...args) => handle.chmod(...args),
-      stat: (...args) => handle.stat(...args),
+      chmod: (...args: unknown[]) => handle.chmod(...args),
+      stat: (...args: unknown[]) => handle.stat(...args),
       write: () => Promise.reject(new Error('injected write failure')),
-      sync: (...args) => handle.sync(...args),
+      sync: (...args: unknown[]) => handle.sync(...args),
       close: async () => {
         await handle.close()
         await originalUnlink(out)
@@ -897,19 +1004,19 @@ test('failed keygen unlinks only its own exclusive inode', async (t) => {
       }
     }
   }
-  fs.promises.unlink = function patchedUnlink(filePath) {
+  patchable.promises.unlink = function patchedUnlink(filePath: string): Promise<void> {
     if (filePath === out) unlinked = true
     return originalUnlink(filePath)
   }
   t.teardown(() => {
-    fs.promises.open = originalOpen
-    fs.promises.unlink = originalUnlink
+    patchable.promises.open = originalOpen
+    patchable.promises.unlink = originalUnlink
   })
 
   const io = createIo()
   t.is(await main(['keygen', '--out', out], {}, io), 2)
   t.absent(unlinked)
-  let remaining = null
+  let remaining: string | null = null
   try {
     remaining = await fs.promises.readFile(out, 'utf8')
   } catch {
@@ -930,7 +1037,7 @@ test('server close failure after ready exits 1 with generic cleanup output', asy
   await fs.promises.mkdir(storage)
 
   class CloseFailServer extends FakeServer {
-    close() {
+    close(): Promise<void> {
       this.closeCount++
       this.closed = true
       return Promise.reject(new Error(`close leaked ${leaked}`))
@@ -951,7 +1058,7 @@ test('server close failure after ready exits 1 with generic cleanup output', asy
       '2048'
     ],
     {},
-    { Server: CloseFailServer }
+    { Server: asServerConstructor(CloseFailServer) }
   )
   t.is(result.code, 1)
   t.is(result.server.closeCount, 1)
@@ -971,14 +1078,14 @@ test('listen failure still exits 1 when a signal arrives first', async (t) => {
   await fs.promises.mkdir(storage)
 
   class DelayedListenFail extends FakeServer {
-    async listen() {
+    async listen(): Promise<this> {
       await new Promise((resolve) => setTimeout(resolve, 40))
       throw new Error('swarm bind failed')
     }
   }
 
   const proc = new EventEmitter()
-  const io = createIo({ process: proc, Server: DelayedListenFail })
+  const io = createIo({ process: proc, Server: asServerConstructor(DelayedListenFail) })
   const running = main(
     [
       'server',
@@ -999,7 +1106,7 @@ test('listen failure still exits 1 when a signal arrives first', async (t) => {
   await new Promise((resolve) => setTimeout(resolve, 5))
   proc.emit('SIGINT')
   t.is(await running, 1)
-  t.is(DelayedListenFail.last.closeCount, 1)
+  t.is(DelayedListenFail.last!.closeCount, 1)
   t.absent(io.text('stdout').includes('ready'))
 })
 
@@ -1012,19 +1119,19 @@ test('upload success with a rejecting client close exits 1', async (t) => {
   await fs.promises.writeFile(artifact, 'bytes')
 
   class CloseFailClient extends FakeClient {
-    close() {
+    close(): Promise<void> {
       this.closeCount++
       this.closed = true
       return Promise.reject(new Error(`close leaked ${leaked}`))
     }
   }
 
-  const io = createIo({ Client: CloseFailClient })
+  const io = createIo({ Client: asClientConstructor(CloseFailClient) })
   t.is(
     await main(['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact], {}, io),
     1
   )
-  t.is(CloseFailClient.last.closeCount, 1)
+  t.is(CloseFailClient.last!.closeCount, 1)
   t.ok(io.text('stdout').includes('artifact.bin COMMITTED'))
   t.ok(io.text('stderr').includes('Cleanup failed'))
   t.absent(io.text('stderr').includes('close leaked'))

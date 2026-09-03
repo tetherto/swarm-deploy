@@ -1,33 +1,61 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const { ERRORS } = require('../../dist/errors')
-const { transferId } = require('../../dist/protocol/transfer-id')
-const { initLayout } = require('../../dist/storage/layout')
-const { readJson } = require('../../dist/storage/atomic-file')
-const { SessionStore } = require('../../dist/storage/session-store')
-const { CommitStore } = require('../../dist/storage/commit-store')
-const { prepareStorageRecovery, recoverStorage } = require('../../dist/storage/recovery')
-const { createClock } = require('../helpers/clock')
-const { createTempDir } = require('../helpers/files')
-const { createStorage } = require('../helpers/storage')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import { ERRORS } from '../../dist/errors.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type { Chunk, Digest, Offer } from '../../dist/protocol/types.js'
+import { initLayout } from '../../dist/storage/layout.js'
+import { readJson } from '../../dist/storage/atomic-file.js'
+import { SessionStore } from '../../dist/storage/session-store.js'
+import { CommitStore } from '../../dist/storage/commit-store.js'
+import type { CommitJournal, CommitRecord } from '../../dist/storage/commit-journal.js'
+import { prepareStorageRecovery, recoverStorage } from '../../dist/storage/recovery.js'
+import type { StorageAdapter, StorageLayout } from '../../dist/storage/types.js'
+import { createClock, type TestClock } from '../helpers/clock.js'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage } from '../helpers/storage.js'
 
 const OWNER = b4a.alloc(32, 0x81)
 const CHUNK_SIZE = 1024 * 1024
 
-function sha256(bytes) {
+type CommitSession = Parameters<CommitStore['commit']>[0]
+
+interface ErrnoError extends Error {
+  code?: string
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunk: Chunk
+}
+
+/** The persisted session fields these crash-recovery assertions read. */
+interface SessionMetadataJson {
+  state: string
+}
+
+interface VerifiedStore {
+  layout: StorageLayout
+  clock: TestClock
+  sessionStore: SessionStore
+  upload: HarnessUpload
+  session: CommitSession
+}
+
+function sha256(bytes: Uint8Array): Digest {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function hex(bytes) {
+function hex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
 
-function makeUpload(name = 'crash-safe-delete.bin') {
+function makeUpload(name = 'crash-safe-delete.bin'): HarnessUpload {
   const data = b4a.from(`payload:${name}`)
   const digest = sha256(data)
   const offer = {
@@ -38,7 +66,7 @@ function makeUpload(name = 'crash-safe-delete.bin') {
     chunkSize: CHUNK_SIZE,
     chunkCount: 1
   }
-  offer.transferId = transferId({
+  const id = transferId({
     clientPublicKey: OWNER,
     name,
     size: data.byteLength,
@@ -46,22 +74,38 @@ function makeUpload(name = 'crash-safe-delete.bin') {
     chunkSize: CHUNK_SIZE
   })
   return {
-    offer,
-    chunk: { transferId: offer.transferId, index: 0, digest, data }
+    offer: { ...offer, transferId: id },
+    chunk: { transferId: id, index: 0, digest, data }
   }
 }
 
-async function exists(filePath) {
+async function readSessionMetadata(filePath: string): Promise<SessionMetadataJson> {
+  return (await readJson(filePath)) as unknown as SessionMetadataJson
+}
+
+async function readCommitRecord(filePath: string): Promise<CommitRecord> {
+  return (await readJson(filePath)) as unknown as CommitRecord
+}
+
+async function readJournalFile(filePath: string): Promise<CommitJournal> {
+  return (await readJson(filePath)) as unknown as CommitJournal
+}
+
+async function exists(filePath: string): Promise<boolean> {
   try {
     await fs.promises.lstat(filePath)
     return true
   } catch (err) {
-    if (err.code === 'ENOENT') return false
+    if ((err as ErrnoError).code === 'ENOENT') return false
     throw err
   }
 }
 
-async function verifiedStore(t, storage = fs.promises, name = 'journal-retry.bin') {
+async function verifiedStore(
+  t: Assert,
+  storage: StorageAdapter = fs.promises,
+  name = 'journal-retry.bin'
+): Promise<VerifiedStore> {
   const layout = initLayout(await createTempDir(t))
   const clock = createClock()
   const sessionStore = new SessionStore({
@@ -82,13 +126,13 @@ async function verifiedStore(t, storage = fs.promises, name = 'journal-retry.bin
     clock,
     sessionStore,
     upload,
-    session: sessionStore.sessions.get(hex(upload.offer.transferId))
+    session: sessionStore.sessions.get(hex(upload.offer.transferId))!
   }
 }
 
 test('deleting state recovers expiry revocation and checksum cleanup crashes', async (t) => {
   for (const reason of ['expiry', 'revocation', 'checksum']) {
-    let layout
+    let layout!: StorageLayout
     let failCleanupSync = false
     const storage = createStorage({
       failSyncFor: (filePath) => {
@@ -128,7 +172,11 @@ test('deleting state recovers expiry revocation and checksum cleanup crashes', a
     const id = hex(upload.offer.transferId)
     const metadataPath = path.join(layout.sessions, `${id}.json`)
     const stagingPath = path.join(layout.staging, `${id}.part`)
-    t.is((await readJson(metadataPath)).state, 'deleting', `${reason} persisted deletion intent`)
+    t.is(
+      (await readSessionMetadata(metadataPath)).state,
+      'deleting',
+      `${reason} persisted deletion intent`
+    )
     t.is(await exists(stagingPath), false, `${reason} removed staging before crash`)
 
     const reopened = new SessionStore({
@@ -146,8 +194,8 @@ test('deleting state recovers expiry revocation and checksum cleanup crashes', a
 })
 
 test('deletion never unlinks staging before deleting metadata is durably synchronized', async (t) => {
-  let layout
-  let metadataPath
+  let layout!: StorageLayout
+  let metadataPath!: string
   let armAfterDeletingRename = false
   let failSessionSyncs = 0
   const storage = createStorage({
@@ -160,7 +208,7 @@ test('deletion never unlinks staging before deleting metadata is durably synchro
       if (
         armAfterDeletingRename &&
         name === 'rename' &&
-        path.basename(destination) === path.basename(metadataPath)
+        path.basename(destination as string) === path.basename(metadataPath)
       ) {
         armAfterDeletingRename = false
         failSessionSyncs = 1
@@ -183,12 +231,12 @@ test('deletion never unlinks staging before deleting metadata is durably synchro
 
   armAfterDeletingRename = true
   await t.exception(() => store.delete(upload.offer.transferId))
-  t.is((await readJson(metadataPath)).state, 'deleting')
+  t.is((await readSessionMetadata(metadataPath)).state, 'deleting')
   t.is(await exists(stagingPath), true, 'post-rename sync failure preserves staging')
 
   failSessionSyncs = 1
   await t.exception(() => store.delete(upload.offer.transferId))
-  t.is((await readJson(metadataPath)).state, 'deleting')
+  t.is((await readSessionMetadata(metadataPath)).state, 'deleting')
   t.is(await exists(stagingPath), true, 'failed retry sync still preserves staging')
   await store.close()
 
@@ -205,7 +253,7 @@ test('deletion never unlinks staging before deleting metadata is durably synchro
 })
 
 test('commit retries its canonical journal after journal-directory sync failure', async (t) => {
-  let layout
+  let layout!: StorageLayout
   let failJournalSync = false
   const storage = createStorage({
     failSyncFor: (filePath) => {
@@ -221,12 +269,12 @@ test('commit retries its canonical journal after journal-directory sync failure'
 
   failJournalSync = true
   await t.exception(() => commitStore.commit(created.session))
-  const owned = await readJson(journalPath)
+  const owned = await readJournalFile(journalPath)
   const record = await commitStore.commit(created.session)
 
   t.is(record.transferId, hex(created.upload.offer.transferId))
   t.is(
-    (await readJson(path.join(layout.commits, `${record.transferId}.json`))).transferId,
+    (await readCommitRecord(path.join(layout.commits, `${record.transferId}.json`))).transferId,
     record.transferId
   )
   t.is(await exists(journalPath), false)
@@ -238,7 +286,7 @@ test('commit retries its canonical journal after journal-directory sync failure'
 })
 
 test('restart retires a corrupt matching journal and preserves resumable transfer', async (t) => {
-  let layout
+  let layout!: StorageLayout
   let failJournalSync = false
   const storage = createStorage({
     failSyncFor: (filePath) => {
@@ -274,8 +322,8 @@ test('restart retires a corrupt matching journal and preserves resumable transfe
 })
 
 test('startup classifies a corrupt journal before removing its orphan staging', async (t) => {
-  let layout
-  let orphanSessionPath
+  let layout!: StorageLayout
+  let orphanSessionPath!: string
   let crashAfterSessionUnlink = false
   const storage = createStorage({
     afterOperation(name, filePath) {
@@ -302,7 +350,7 @@ test('startup classifies a corrupt journal before removing its orphan staging', 
   await fs.promises.writeFile(orphanJournalPath, '{corrupt')
   await created.sessionStore.close()
 
-  const events = []
+  const events: unknown[] = []
   await prepareStorageRecovery({
     layout,
     commitStore,
@@ -346,7 +394,7 @@ test('startup classifies a corrupt journal before removing its orphan staging', 
 })
 
 test('a valid foreign journal is not adopted or removed by commit retry', async (t) => {
-  let layout
+  let layout!: StorageLayout
   let failJournalSync = false
   const storage = createStorage({
     failSyncFor: (filePath) => {
@@ -363,7 +411,7 @@ test('a valid foreign journal is not adopted or removed by commit retry', async 
 
   failJournalSync = true
   await t.exception(() => commitStore.commit(created.session))
-  const foreign = await readJson(journalPath)
+  const foreign = await readJournalFile(journalPath)
   foreign.sourceStagingIdentity.ino = String(BigInt(foreign.sourceStagingIdentity.ino) + 1n)
   await fs.promises.writeFile(journalPath, JSON.stringify(foreign))
 
@@ -371,7 +419,7 @@ test('a valid foreign journal is not adopted or removed by commit retry', async 
     name: 'SwarmDeployError',
     code: ERRORS.PROTOCOL_INVALID
   })
-  t.alike(await readJson(journalPath), foreign)
+  t.alike(await readJournalFile(journalPath), foreign)
   t.is(await exists(path.join(layout.root, created.upload.offer.name)), false)
 
   const recovered = await recoverStorage({

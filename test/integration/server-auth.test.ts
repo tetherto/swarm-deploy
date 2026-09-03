@@ -1,14 +1,15 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const { EventEmitter } = require('#events')
-const fs = require('#fs')
-const path = require('#path')
-const Hyperswarm = require('hyperswarm')
-const Protomux = require('protomux')
-const {
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import { EventEmitter } from '#events'
+import fs from '#fs'
+import path from '#path'
+import Hyperswarm, { type HyperswarmSocket } from 'hyperswarm'
+import Protomux from 'protomux'
+import {
   Server,
   keyPairFromSeed,
   transferId,
@@ -24,60 +25,129 @@ const {
   chunkAck,
   finish,
   result
-} = require('../..')
-const { createTempDir } = require('../helpers/files')
-const { createStorage } = require('../helpers/storage')
-const { createLocalTestnet, waitFor } = require('../helpers/testnet')
+} from '../../dist/index.js'
+import type { ServerOptions } from '../../dist/server.js'
+import type { Offer, Result, Status, TransferMessage } from '../../dist/protocol/types.js'
+import type { ChunkAck } from '../../dist/protocol/types.js'
+import type { SwarmDiscovery, Topic } from '../../dist/types.js'
+import type { Testnet } from 'hyperdht/testnet'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage } from '../helpers/storage.js'
+import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
+import { serverInternals, watcherInternals } from '../helpers/internals.js'
 
 const SERVER_SEED = b4a.alloc(32, 1)
 const ALLOWED_SEED = b4a.alloc(32, 2)
 const UNKNOWN_SEED = b4a.alloc(32, 3)
 
-function sha256(bytes) {
+/** Option shapes deliberately missing or out of range for validation. */
+type IncompleteServerOptions = Partial<ServerOptions>
+
+/** An injected read failure carries the errno the watcher reports. */
+interface ErrnoError extends Error {
+  code?: string
+}
+
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+}
+
+/** A Protomux message as this harness drives it: any encoded payload. */
+interface HarnessMessage {
+  send(value: unknown): boolean
+}
+
+interface ReceivedMessages {
+  status: Status[]
+  ready: TransferMessage[]
+  chunkAck: ChunkAck[]
+  result: Result[]
+}
+
+interface ClientChannel {
+  messages: HarnessMessage[]
+  received: ReceivedMessages
+}
+
+/** A scheduler handle that keeps its callback reachable for the tests. */
+interface FakeTimer {
+  callback: () => void
+  unref(): void
+}
+
+interface TestScheduler {
+  intervals: Set<FakeTimer>
+  setInterval(callback: () => void): FakeTimer
+  clearInterval(timer: unknown): void
+  setTimeout(callback: () => void): FakeTimer
+  clearTimeout(): void
+}
+
+interface StubSwarmEvent {
+  type: string
+  topic?: Topic
+  options?: { server: boolean; client: boolean }
+}
+
+/** The swarm seam replacement: an emitter plus the two methods used. */
+interface StubSwarm extends EventEmitter {
+  join(topic: Topic, options: { server: boolean; client: boolean }): SwarmDiscovery
+  destroy(): Promise<void>
+}
+
+interface LoggedInfo {
+  message: string
+  details?: Record<string, unknown>
+}
+
+function sha256(bytes: Uint8Array): Buffer {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function fingerprint(key) {
+function fingerprint(key: Uint8Array): string {
   return b4a.toString(sha256(key), 'hex').slice(0, 12)
 }
 
-function deferred() {
-  let resolve
-  const promise = new Promise((done) => {
-    resolve = done
+function deferred(): Deferred {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = () => done()
   })
   return { promise, resolve }
 }
 
-function uploadFor(ownerKey) {
+function uploadFor(ownerKey: Uint8Array): Offer {
   const data = b4a.from('authenticated upload')
   const digest = sha256(data)
-  const value = {
+  const name = 'artifact.bin'
+  const size = data.byteLength
+  const chunkSize = 1024 * 1024
+  return {
     version: 1,
-    name: 'artifact.bin',
-    size: data.byteLength,
+    transferId: transferId({
+      clientPublicKey: ownerKey,
+      name,
+      size,
+      digest,
+      chunkSize
+    }),
+    name,
+    size,
     digest,
-    chunkSize: 1024 * 1024,
+    chunkSize,
     chunkCount: 1
   }
-  value.transferId = transferId({
-    clientPublicKey: ownerKey,
-    name: value.name,
-    size: value.size,
-    digest,
-    chunkSize: value.chunkSize
-  })
-  return value
 }
 
-function openClientChannel(socket) {
+function openClientChannel(socket: HyperswarmSocket): ClientChannel {
   const mux = Protomux.from(socket)
-  const received = { status: [], ready: [], chunkAck: [], result: [] }
+  const received: ReceivedMessages = { status: [], ready: [], chunkAck: [], result: [] }
   const channel = mux.createChannel({
     protocol: 'swarm-deploy/upload/1',
     id: b4a.from('integration-upload')
   })
-  const messages = [
+  const messages: HarnessMessage[] = [
     channel.addMessage({ encoding: offer }),
     channel.addMessage({ encoding: status, onmessage: (value) => received.status.push(value) }),
     channel.addMessage({ encoding: bitmapPage }),
@@ -91,7 +161,7 @@ function openClientChannel(socket) {
   return { messages, received }
 }
 
-function createClient(t, testnet, seed) {
+function createClient(t: Assert, testnet: Testnet, seed: Buffer): Hyperswarm {
   const swarm = new Hyperswarm({
     dht: testnet.createNode(),
     keyPair: keyPairFromSeed(seed)
@@ -100,15 +170,15 @@ function createClient(t, testnet, seed) {
   return swarm
 }
 
-function connect(swarm, topic) {
+function connect(swarm: Hyperswarm, topic: Topic): Promise<HyperswarmSocket> {
   return new Promise((resolve) => {
     swarm.once('connection', resolve)
     swarm.join(topic, { server: false, client: true })
   })
 }
 
-function createScheduler() {
-  const intervals = new Set()
+function createScheduler(): TestScheduler {
+  const intervals = new Set<FakeTimer>()
   return {
     intervals,
     setInterval(callback) {
@@ -117,7 +187,7 @@ function createScheduler() {
       return timer
     },
     clearInterval(timer) {
-      intervals.delete(timer)
+      intervals.delete(timer as FakeTimer)
     },
     setTimeout(callback) {
       return { callback, unref() {} }
@@ -126,8 +196,8 @@ function createScheduler() {
   }
 }
 
-function createStubSwarm(events) {
-  const swarm = new EventEmitter()
+function createStubSwarm(events: StubSwarmEvent[]): StubSwarm {
+  const swarm = new EventEmitter() as StubSwarm
   swarm.join = (topic, options) => {
     events.push({ type: 'join', topic, options })
     return {
@@ -144,7 +214,7 @@ function createStubSwarm(events) {
 
 test('Server validates required upload limits', (t) => {
   const allowedKey = keyPairFromSeed(ALLOWED_SEED).publicKey
-  const options = {
+  const options: ServerOptions = {
     seed: SERVER_SEED,
     storageDir: '/tmp/swarm-deploy-validation',
     allowedKeys: [allowedKey],
@@ -152,7 +222,7 @@ test('Server validates required upload limits', (t) => {
     maxStagingBytes: 1024 * 1024
   }
 
-  for (const invalid of [
+  const invalidOptions: IncompleteServerOptions[] = [
     { ...options, seed: undefined },
     { ...options, storageDir: '' },
     { ...options, allowedKeys: undefined },
@@ -163,8 +233,12 @@ test('Server validates required upload limits', (t) => {
     { ...options, maxConnections: 0 },
     { ...options, maxActiveUploads: 1.5 },
     { ...options, idleTimeout: 0 }
-  ]) {
-    t.exception(() => new Server(invalid), { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
+  ]
+  for (const invalid of invalidOptions) {
+    t.exception(() => new Server(invalid as ServerOptions), {
+      name: 'SwarmDeployError',
+      code: 'PROTOCOL_INVALID'
+    })
   }
 })
 
@@ -172,8 +246,8 @@ test('Server firewalls unknown keys before protocol and allows authenticated upl
   const testnet = await createLocalTestnet(t)
   const allowedKey = keyPairFromSeed(ALLOWED_SEED).publicKey
   const unknownKey = keyPairFromSeed(UNKNOWN_SEED).publicKey
-  const events = []
-  const logs = []
+  const events: unknown[] = []
+  const logs: LoggedInfo[] = []
   const server = new Server({
     seed: SERVER_SEED,
     storageDir: await createTempDir(t),
@@ -187,12 +261,13 @@ test('Server firewalls unknown keys before protocol and allows authenticated upl
       }
     }
   })
+  const internal = serverInternals(server)
   t.teardown(() => server.close())
-  server.on('connection', (event) => events.push(event))
+  server.on('connection', (event: unknown) => events.push(event))
   const firewallAttempt = deferred()
-  const originalFirewall = server._firewall.bind(server)
-  server._firewall = (key) => {
-    if (b4a.equals(key, unknownKey)) firewallAttempt.resolve()
+  const originalFirewall = internal._firewall.bind(server)
+  internal._firewall = (key) => {
+    if (b4a.equals(key as Uint8Array, unknownKey)) firewallAttempt.resolve()
     return originalFirewall(key)
   }
   await server.listen()
@@ -201,9 +276,9 @@ test('Server firewalls unknown keys before protocol and allows authenticated upl
   unknown.join(server.topic, { server: false, client: true })
   await firewallAttempt.promise
   t.is(events.length, 0)
-  t.is(server._connections.size, 0)
-  t.is(server._sessions.size, 0)
-  t.is(server.sessionStore.sessions.size, 0)
+  t.is(internal._connections.size, 0)
+  t.is(internal._sessions.size, 0)
+  t.is(internal.sessionStore.sessions.size, 0)
 
   const allowed = createClient(t, testnet, ALLOWED_SEED)
   const socket = await connect(allowed, server.topic)
@@ -213,7 +288,7 @@ test('Server firewalls unknown keys before protocol and allows authenticated upl
   await waitFor(() => channel.received.ready.length === 1)
 
   t.is(channel.received.status[0].code, STATUS_CODE.ACCEPT)
-  t.is(server.sessionStore.sessions.size, 1)
+  t.is(internal.sessionStore.sessions.size, 1)
   t.is(events.length, 1)
   const serialized = JSON.stringify({ events, logs })
   t.ok(serialized.includes(fingerprint(allowedKey)))
@@ -232,9 +307,9 @@ test('Server firewalls unknown keys before protocol and allows authenticated upl
   await waitFor(() => channel.received.result.length === 1)
 
   t.is(channel.received.result[0].code, 0)
-  t.is(server.sessionStore.sessions.size, 0)
+  t.is(internal.sessionStore.sessions.size, 0)
   t.alike(
-    await fs.promises.readFile(path.join(server.layout.root, upload.name)),
+    await fs.promises.readFile(path.join(internal.layout.root, upload.name)),
     b4a.from('authenticated upload')
   )
 })
@@ -250,6 +325,7 @@ test('Server revocation closes sockets and deletes authenticated resumable sessi
     maxStagingBytes: 2 * 1024 * 1024,
     dht: testnet.createNode()
   })
+  const internal = serverInternals(server)
   t.teardown(() => server.close())
   await server.listen()
 
@@ -257,20 +333,20 @@ test('Server revocation closes sockets and deletes authenticated resumable sessi
   const socket = await connect(allowed, server.topic)
   const channel = openClientChannel(socket)
   channel.messages[OFFER].send(uploadFor(allowedKey))
-  await waitFor(() => server.sessionStore.sessions.size === 1)
+  await waitFor(() => internal.sessionStore.sessions.size === 1)
 
   await server.reloadAllowlist([])
-  await waitFor(() => socket.destroyed)
+  await waitFor(() => socket.destroyed === true)
 
-  t.is(server.sessionStore.sessions.size, 0)
+  t.is(internal.sessionStore.sessions.size, 0)
 })
 
 test('Server starts recovery and retention before networking and rechecks revoked connections', async (t) => {
   const allowedKey = keyPairFromSeed(ALLOWED_SEED).publicKey
   const unknownKey = keyPairFromSeed(UNKNOWN_SEED).publicKey
   const scheduler = createScheduler()
-  const events = []
-  let server = null
+  const events: StubSwarmEvent[] = []
+  let server!: Server
   server = new Server({
     seed: SERVER_SEED,
     storageDir: await createTempDir(t),
@@ -279,22 +355,24 @@ test('Server starts recovery and retention before networking and rechecks revoke
     maxStagingBytes: 2 * 1024 * 1024,
     scheduler,
     swarmFactory() {
-      t.ok(server.sessionStore.initialized)
-      t.ok(server.retentionManager.timer)
+      const internal = serverInternals(server)
+      t.ok(internal.sessionStore.initialized)
+      t.ok(internal.retentionManager.timer)
       events.push({ type: 'swarm' })
       return createStubSwarm(events)
     }
   })
+  const internal = serverInternals(server)
   t.teardown(() => server.close())
-  const allowlistEvents = []
-  server.on('allowlist', (event) => allowlistEvents.push(event))
+  const allowlistEvents: unknown[] = []
+  server.on('allowlist', (event: unknown) => allowlistEvents.push(event))
   server.on('allowlist', () => {
     throw new Error('throwing allowlist listener')
   })
 
   await server.listen()
-  t.is(server._firewall(unknownKey), true)
-  t.is(server._firewall(allowedKey), false)
+  t.is(internal._firewall(unknownKey), true)
+  t.is(internal._firewall(allowedKey), false)
   await t.exception(() => server.reloadAllowlist(['not-a-public-key']))
   t.alike(server.allowedKeys, new Set([b4a.toString(allowedKey, 'hex')]))
   await server.reloadAllowlist([])
@@ -308,14 +386,14 @@ test('Server starts recovery and retention before networking and rechecks revoke
     { status: 'completed', appliedCount: 0, pendingCount: 0 }
   ])
 
-  let destroyed = null
-  server._onConnection({
+  let destroyed: ErrnoError | null = null
+  internal._onConnection({
     remotePublicKey: allowedKey,
     destroy(error) {
-      destroyed = error
+      destroyed = error as ErrnoError
     }
   })
-  t.is(destroyed.code, 'AUTH_REJECTED')
+  t.is(destroyed!.code, 'AUTH_REJECTED')
   await server.close()
 
   t.alike(
@@ -336,7 +414,7 @@ test('Server reports live allowlist read and parse failures then applies the nex
   const storage = createStorage({
     beforeOperation(name, filePath) {
       if (unreadable && name === 'readFile' && filePath === allowlistPath) {
-        const error = new Error(`cannot read ${allowlistPath}`)
+        const error: ErrnoError = new Error(`cannot read ${allowlistPath}`)
         error.code = 'EACCES'
         throw error
       }
@@ -359,29 +437,31 @@ test('Server reports live allowlist read and parse failures then applies the nex
       }
     }
   })
-  const events = []
-  server.on('allowlist', (event) => events.push(event))
+  const internal = serverInternals(server)
+  const events: unknown[] = []
+  server.on('allowlist', (event: unknown) => events.push(event))
   server.on('allowlist', () => {
     throw new Error('throwing server listener')
   })
   await server.listen()
   events.length = 0
+  const watcher = watcherInternals(internal.allowlistWatcher)
 
   await fs.promises.writeFile(allowlistPath, 'PRIVATE-CONTENT\n')
-  await server.allowlistWatcher.timer.callback()
-  t.is(server._firewall(allowedKey), false)
+  await watcher.timer!.callback()
+  t.is(internal._firewall(allowedKey), false)
   t.alike(server.allowedKeys, new Set([b4a.toString(allowedKey, 'hex')]))
-  t.alike(server.allowlistWatcher.keys, new Set([b4a.toString(allowedKey, 'hex')]))
+  t.alike(watcher.keys, new Set([b4a.toString(allowedKey, 'hex')]))
 
   unreadable = true
-  await server.allowlistWatcher.timer.callback()
-  t.is(server._firewall(allowedKey), false)
+  await watcher.timer!.callback()
+  t.is(internal._firewall(allowedKey), false)
 
   unreadable = false
   await fs.promises.writeFile(allowlistPath, `${b4a.toString(nextKey, 'hex')}\n`)
-  await server.allowlistWatcher.timer.callback()
-  t.is(server._firewall(allowedKey), true)
-  t.is(server._firewall(nextKey), false)
+  await watcher.timer!.callback()
+  t.is(internal._firewall(allowedKey), true)
+  t.is(internal._firewall(nextKey), false)
   t.alike(events, [
     {
       status: 'failed',
@@ -419,8 +499,8 @@ test('Server initial allowlist failure emits safely and remains startup-fatal', 
       return createStubSwarm([])
     }
   })
-  const events = []
-  server.on('allowlist', (event) => events.push(event))
+  const events: unknown[] = []
+  server.on('allowlist', (event: unknown) => events.push(event))
   server.on('allowlist', () => {
     throw new Error('throwing initial failure listener')
   })
@@ -445,7 +525,7 @@ test('Server initial allowlist failure emits safely and remains startup-fatal', 
 
 test('Server startup failure releases the storage lock', async (t) => {
   const storageDir = await createTempDir(t)
-  const options = {
+  const options: ServerOptions = {
     seed: SERVER_SEED,
     storageDir,
     allowedKeys: [keyPairFromSeed(ALLOWED_SEED).publicKey],
@@ -486,15 +566,15 @@ test('Server reloadAllowlist revokes removed keys before listen', async (t) => {
   })
   t.teardown(() => server.close())
 
-  const events = []
-  server.on('allowlist', (event) => events.push(event))
+  const events: unknown[] = []
+  server.on('allowlist', (event: unknown) => events.push(event))
 
   const reloaded = await server.reloadAllowlist([])
 
   t.alike(reloaded, new Set())
   t.alike(server.allowedKeys, new Set())
   t.alike(events, [{ status: 'completed', appliedCount: 0, pendingCount: 0 }])
-  t.is(server.pendingRevocations.size, 0)
+  t.is(serverInternals(server).pendingRevocations.size, 0)
 })
 
 test('Server contains logger failures', async (t) => {
@@ -522,5 +602,5 @@ test('Server contains logger failures', async (t) => {
   t.teardown(() => server.close())
 
   await server.listen()
-  t.is(server._firewall(keyPairFromSeed(UNKNOWN_SEED).publicKey), true)
+  t.is(serverInternals(server)._firewall(keyPairFromSeed(UNKNOWN_SEED).publicKey), true)
 })

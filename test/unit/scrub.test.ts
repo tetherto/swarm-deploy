@@ -1,33 +1,82 @@
-'use strict'
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
 
-const test = require('brittle')
-const b4a = require('b4a')
-const crypto = require('#crypto')
-const fs = require('#fs')
-const path = require('#path')
-const { ERRORS } = require('../../dist/errors')
-const { transferId } = require('../../dist/protocol/transfer-id')
-const { initLayout } = require('../../dist/storage/layout')
-const { SessionStore } = require('../../dist/storage/session-store')
-const { CommitStore } = require('../../dist/storage/commit-store')
-const { RetentionManager } = require('../../dist/storage/retention')
-const { recoverStorage } = require('../../dist/storage/recovery')
-const { createClock } = require('../helpers/clock')
-const { createTempDir } = require('../helpers/files')
-const { createStorage } = require('../helpers/storage')
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import fs from '#fs'
+import path from '#path'
+import { ERRORS } from '../../dist/errors.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type { Chunk, Digest, Offer } from '../../dist/protocol/types.js'
+import { initLayout } from '../../dist/storage/layout.js'
+import { SessionStore } from '../../dist/storage/session-store.js'
+import { CommitStore } from '../../dist/storage/commit-store.js'
+import { RetentionManager } from '../../dist/storage/retention.js'
+import { recoverStorage } from '../../dist/storage/recovery.js'
+import type { CommitRecord } from '../../dist/storage/commit-journal.js'
+import type { StorageLayout } from '../../dist/storage/types.js'
+import { createClock, type TestClock } from '../helpers/clock.js'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage, type TestStorage } from '../helpers/storage.js'
 
 const OWNER = b4a.alloc(32, 7)
 const CHUNK_SIZE = 1024 * 1024
 
-function sha256(bytes) {
+interface ErrnoError extends Error {
+  code?: string
+}
+
+interface TestLogger {
+  info?: (message: string, details: Record<string, unknown>) => void
+  warn?: (message: string, details: Record<string, unknown>) => void
+  error?: (message: string, details: Record<string, unknown>) => void
+}
+
+interface LoggedWarning {
+  message: string
+  details: Record<string, unknown>
+}
+
+/** The chunk fields the stores read; the transfer ID is passed separately. */
+interface HarnessChunk {
+  index: number
+  data: Buffer
+  digest: Digest
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunk: HarnessChunk
+}
+
+interface CreateStoresOptions {
+  storage?: TestStorage
+  isSessionActive?: (session: { state: string }) => boolean
+  logger?: TestLogger
+}
+
+interface Stores {
+  layout: StorageLayout
+  clock: TestClock
+  sessionStore: SessionStore
+  commitStore: CommitStore
+  manager: RetentionManager
+}
+
+function asChunk(chunk: HarnessChunk): Chunk {
+  return chunk as unknown as Chunk
+}
+
+function sha256(bytes: Uint8Array): Digest {
   return crypto.createHash('sha256').update(bytes).digest()
 }
 
-function hex(bytes) {
+function hex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
 
-function makeUpload(name, data) {
+function makeUpload(name: string, data: Buffer): HarnessUpload {
   const offer = {
     version: 1,
     name,
@@ -36,37 +85,39 @@ function makeUpload(name, data) {
     chunkSize: CHUNK_SIZE,
     chunkCount: 1
   }
-  offer.transferId = transferId({
-    clientPublicKey: OWNER,
-    name,
-    size: offer.size,
-    digest: offer.digest,
-    chunkSize: CHUNK_SIZE
-  })
   return {
-    offer,
+    offer: {
+      ...offer,
+      transferId: transferId({
+        clientPublicKey: OWNER,
+        name,
+        size: offer.size,
+        digest: offer.digest,
+        chunkSize: CHUNK_SIZE
+      })
+    },
     chunk: { index: 0, data, digest: sha256(data) }
   }
 }
 
-async function pathExists(filePath) {
+async function pathExists(filePath: string): Promise<boolean> {
   try {
     await fs.promises.lstat(filePath)
     return true
   } catch (err) {
-    if (err.code === 'ENOENT') return false
+    if ((err as ErrnoError).code === 'ENOENT') return false
     throw err
   }
 }
 
-async function createFifo(filePath) {
-  let execFile
+async function createFifo(filePath: string): Promise<boolean> {
+  let execFile!: typeof import('node:child_process').execFile
   try {
-    ;({ execFile } = require('child_process'))
+    ;({ execFile } = require('child_process') as typeof import('node:child_process'))
   } catch {
     return false
   }
-  await new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     execFile('mkfifo', [filePath], (err) => {
       if (err) reject(err)
       else resolve()
@@ -75,7 +126,10 @@ async function createFifo(filePath) {
   return true
 }
 
-async function createStores(t, { storage, isSessionActive = () => false, logger } = {}) {
+async function createStores(
+  t: Assert,
+  { storage, isSessionActive = () => false, logger }: CreateStoresOptions = {}
+): Promise<Stores> {
   const layout = initLayout(await createTempDir(t))
   const clock = createClock()
   const sessionStore = new SessionStore({
@@ -100,20 +154,25 @@ async function createStores(t, { storage, isSessionActive = () => false, logger 
   return { layout, clock, sessionStore, commitStore, manager }
 }
 
-async function commit(t, stores, name, data) {
+async function commit(
+  t: Assert,
+  stores: Stores,
+  name: string,
+  data: Buffer
+): Promise<{ record: CommitRecord; finalPath: string }> {
   const upload = makeUpload(name, data)
   await stores.sessionStore.offer(OWNER, upload.offer)
-  await stores.sessionStore.writeChunk(upload.offer.transferId, upload.chunk)
+  await stores.sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))
   await stores.sessionStore.finish(upload.offer.transferId)
   const record = await stores.commitStore.commit(
-    stores.sessionStore.sessions.get(hex(upload.offer.transferId))
+    stores.sessionStore.sessions.get(hex(upload.offer.transferId))!
   )
   return { record, finalPath: path.join(stores.layout.root, name) }
 }
 
 test('startup recovery fully hashes valid managed finals and reports unknown roots', async (t) => {
   let reads = 0
-  let finalPath = null
+  let finalPath: string | null = null
   const storage = createStorage({
     async beforeOperation(name, filePath) {
       if (name === 'read' && filePath === finalPath) reads++
@@ -124,7 +183,7 @@ test('startup recovery fully hashes valid managed finals and reports unknown roo
   finalPath = valid.finalPath
   const unknown = path.join(stores.layout.root, 'operator-note.txt')
   await fs.promises.writeFile(unknown, b4a.from('preserve me'))
-  const warnings = []
+  const warnings: LoggedWarning[] = []
 
   await recoverStorage({
     layout: stores.layout,
@@ -188,7 +247,7 @@ test('startup scrub removes managed FIFOs where supported', async (t) => {
 })
 
 test('startup scrub removes empty managed directories and preserves non-empty ones', async (t) => {
-  const warnings = []
+  const warnings: LoggedWarning[] = []
   const stores = await createStores(t, {
     logger: {
       warn(message, details) {
@@ -225,23 +284,25 @@ test('startup scrub removes empty managed directories and preserves non-empty on
 })
 
 test('startup scrub fails closed when the storage root changes during hashing', async (t) => {
-  let finalPath = null
+  let finalPath: string | null = null
   let replaced = false
-  let displacedRoot = null
+  let displacedRoot: string | null = null
   const storage = createStorage({
     async beforeOperation(name, filePath) {
       if (replaced || name !== 'open' || filePath !== finalPath) return
       replaced = true
-      displacedRoot = `${path.dirname(finalPath)}-displaced`
-      await fs.promises.rename(path.dirname(finalPath), displacedRoot)
-      await fs.promises.mkdir(path.dirname(finalPath))
-      await fs.promises.link(path.join(displacedRoot, path.basename(finalPath)), finalPath)
+      displacedRoot = `${path.dirname(filePath)}-displaced`
+      await fs.promises.rename(path.dirname(filePath), displacedRoot)
+      await fs.promises.mkdir(path.dirname(filePath))
+      await fs.promises.link(path.join(displacedRoot, path.basename(filePath)), filePath)
     }
   })
   const stores = await createStores(t, { storage })
   const valid = await commit(t, stores, 'valid.bin', b4a.from('valid'))
   finalPath = valid.finalPath
-  t.teardown(() => fs.promises.rm(displacedRoot, { recursive: true, force: true }))
+  t.teardown(() =>
+    fs.promises.rm(displacedRoot as unknown as string, { recursive: true, force: true })
+  )
 
   await t.exception(() => stores.manager.scrubCommitted(), {
     name: 'SwarmDeployError',
@@ -251,7 +312,7 @@ test('startup scrub fails closed when the storage root changes during hashing', 
 
 test('scheduled retention uses lstat metadata without rehashing healthy finals', async (t) => {
   let reads = 0
-  let finalPath = null
+  let finalPath: string | null = null
   const storage = createStorage({
     async beforeOperation(name, filePath) {
       if (name === 'read' && filePath === finalPath) reads++
