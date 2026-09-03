@@ -2,6 +2,17 @@
   "name": "@tetherto/swarm-deploy",
   "version": "0.1.0",
   "description": "Secure resumable artifact uploads over Hyperswarm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tetherto/swarm-deploy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tetherto/swarm-deploy/issues"
+  },
+  "homepage": "https://github.com/tetherto/swarm-deploy#readme",
+  "engines": {
+    "node": ">=22 <25"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
@@ -25,7 +36,9 @@
     "test:node": "npm run build && npm run build:test && brittle-node .test-dist/run.js",
     "test:bare": "npm run build && npm run build:test && brittle-bare .test-dist/run.js",
     "test": "npm run test:node && npm run test:bare",
-    "validate:package": "node -e \"const a = require('node:assert/strict'); const f = require('node:fs'); const p = require('./package.json'); a.equal(p.name, '@tetherto/swarm-deploy'); a.equal(p.version, '0.1.0'); a.equal(p.private, undefined); a.deepEqual(p.publishConfig, { access: 'public' }); a.equal(p.scripts.prepare, undefined); for (const value of [p.main, p.types, p.bin['swarm-deploy'], ...Object.values(p.exports['.'])]) a.match(value, /^\\.\\/dist\\//); for (const file of [p.main, p.types, p.bin['swarm-deploy']]) a.ok(f.existsSync(file), file); f.accessSync(p.bin['swarm-deploy'], f.constants.X_OK)\"",
+    "test:package": "node scripts/package-smoke.mjs",
+    "test:release-tag": "node scripts/test-release-tag.mjs",
+    "validate:package": "node -e \"const a = require('node:assert/strict'); const f = require('node:fs'); const p = require('./package.json'); a.equal(p.name, '@tetherto/swarm-deploy'); a.equal(p.version, '0.1.0'); a.equal(p.private, undefined); a.deepEqual(p.publishConfig, { access: 'public' }); a.deepEqual(p.engines, { node: '>=22 <25' }); a.equal(p.repository.url, 'git+https://github.com/tetherto/swarm-deploy.git'); a.equal(p.scripts.prepare, undefined); for (const value of [p.main, p.types, p.bin['swarm-deploy'], ...Object.values(p.exports['.'])]) a.match(value, /^\\.\\/dist\\//); for (const file of [p.main, p.types, p.bin['swarm-deploy']]) a.ok(f.existsSync(file), file); f.accessSync(p.bin['swarm-deploy'], f.constants.X_OK)\"",
     "prepack": "npm run build && npm run test:types && npm run validate:package"
   },
   "publishConfig": {
@@ -59,7 +72,9 @@
   },
   "files": [
     "dist",
+    "CHANGELOG.md",
     "README.md",
+    "RELEASING.md",
     "LICENSE.md",
     "NOTICE.md",
     "SECURITY.md"

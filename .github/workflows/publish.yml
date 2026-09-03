@@ -5,36 +5,35 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
     name: Publish npm package
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: holepunchto/actions/checkout@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
         with:
-          node-version: lts/*
+          version: 24.x
           registry-url: https://registry.npmjs.org
-      - uses: holepunchto/actions/setup-bare@v1
+      - uses: holepunchto/actions/setup-bare@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
       - name: Validate release tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          package_version="$(node -p "require('./package.json').version")"
-          test "$GITHUB_REF_NAME" = "v$package_version"
-      - run: npm install --global npm@latest
+        run: node scripts/validate-release-tag.mjs
       - run: npm ci
-      - run: npm run build
-      - run: npm run build:test
-      - run: npm run test:types
-      - run: npm run format:check
+      - run: node --version && npm --version && bare --version
+      - run: npm run build && npm run build:test && npm run test:types
       - run: npm run lint
+      - run: npm run test:release-tag
       - run: npm run test:node
       - run: npm run test:bare
       - run: npx brittle-node .test-dist/unit/protocol-property.test.js
@@ -44,5 +43,5 @@ jobs:
           bare dist/bin/swarm-deploy.js --help
       - name: Verify replacement CLI end to end
         run: npx brittle-node .test-dist/integration/cli.test.js
-      - run: npm pack --dry-run
+      - run: npm run test:package
       - run: npm publish --provenance --access public

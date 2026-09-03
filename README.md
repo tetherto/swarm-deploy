@@ -2,7 +2,10 @@
 
 Secure, resumable artifact uploads from CI clients to one receiving server over Hyperswarm.
 
-Swarm Deploy supports Node.js and Bare on Linux and macOS. It receives and stores files only; it never executes, unpacks, installs, or serves them.
+Swarm Deploy supports Node.js 22 and 24, plus the current stable Bare runtime,
+on Linux and macOS. Older Node.js lines and Windows are not supported. It
+receives and stores files only; it never executes, unpacks, installs, or serves
+them.
 
 ## Security model
 
@@ -210,6 +213,11 @@ Client events:
 The exact discriminated payload types are `ServerEventMap` and `ClientEventMap`
 in `dist/index.d.ts`.
 
+The CLI writes human-readable messages followed by JSON details to stderr. Use
+the typed API events when diagnostics must be ingested as structured records.
+Treat `reason` as a stable error code where the event type documents one; do
+not parse exception messages or use fingerprints as credentials.
+
 ## CLI exit codes
 
 - `0`: every selected file was committed or already committed.
@@ -217,6 +225,27 @@ in `dist/index.d.ts`.
 - `2`: usage or configuration error.
 
 Parsing, configuration, and object-construction failures exit `2`. Once `server.listen()` or `client.upload()` begins, malformed protocol frames, `PROTOCOL_INVALID`, network, storage, and other runtime failures exit `1`.
+
+## Production operations
+
+- Run the server under a dedicated, non-root OS account. Restrict the seed,
+  allowlist, and storage root to that account; keep seeds out of arguments,
+  logs, backups shared with other services, and diagnostic bundles.
+- Supervise the CLI process and wait for its final `ready` line before marking
+  it healthy. A startup recovery or scrub failure is fatal and prevents
+  readiness. On an unexpected exit, restart with the same seed, allowlist,
+  limits, replacement names, and storage root; recovery is automatic.
+- Alert on nonzero exits and failed authentication, recovery, scrub,
+  verification, commit, retention, and cleanup events. Correlate peers and
+  transfers by their safe fingerprints. Preserve stderr around startup and
+  shutdown without adding seed environment variables to logs.
+- Never edit `.swarm-deploy/` while the server is running. Back up the complete
+  dedicated storage root only after a clean shutdown so visible artifacts and
+  journals/sidecars remain consistent.
+- Roll out an exact package version to one canary before wider deployment.
+  Follow [RELEASING.md](RELEASING.md) for publication, verification, and
+  rollback. In particular, drain or recover in-flight v2 replacement journals
+  before running an older server.
 
 ## Test
 
@@ -251,4 +280,5 @@ Before the first release, configure npm trusted publishing for
 owner/name, workflow filename `publish.yml`, and GitHub environment `npm`.
 Protect that environment as appropriate. The workflow needs no npm token:
 GitHub grants the configured OIDC identity through `id-token: write`. Local
-builds, tests, and this migration task do not publish anything.
+builds, tests, and this migration task do not publish anything. See
+[RELEASING.md](RELEASING.md) for the complete preflight and rollback runbook.

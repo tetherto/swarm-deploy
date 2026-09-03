@@ -171,15 +171,18 @@ failures cannot change transfer or lifecycle correctness.
 Production code and tests are strict TypeScript: production sources live under
 `src/`, and tests are `test/**/*.ts`. TypeScript targets ES2022 with
 Node16 module and resolution behavior, while the published package remains
-CommonJS. Production JavaScript, declarations, and source maps are generated
-under untracked `dist/`; test output is generated under untracked
-`.test-dist/` and executed with Node and Bare.
+CommonJS. Supported production runtimes are Node.js 22 and 24 and the current
+stable Bare runtime on Linux and macOS. Production JavaScript, declarations,
+and source maps are generated under untracked `dist/`; test output is generated
+under untracked `.test-dist/` and executed with Node and Bare.
 
 Generated declarations are emitted under `dist/`. `main`, `types`, `bin`, and
 public `exports` point only at `dist/`; internal modules are not public
 exports. `npm test` builds before executing compiled Node and Bare tests.
-`prepack` performs a clean build and validates the types and package. There is
-no `prepare` script.
+`prepack` performs a clean build and validates the types and package. An
+installed-tarball gate loads CommonJS and ESM under Node, require and import
+under Bare, executes the CLI, and verifies key generation does not overwrite or
+print seed material. There is no `prepare` script.
 
 The public package is `@tetherto/swarm-deploy` version `0.1.0` with
 `publishConfig.access` set to `public`. CI first builds and type-checks, then
@@ -187,4 +190,6 @@ runs compiled Node and Bare tests. A tag-triggered release workflow publishes
 to npm using OIDC and provenance only for tags matching `vX.Y.Z` whose version
 matches `package.json`. npm trusted publishing is configured externally for
 the GitHub workflow and its `npm` environment; the repository stores no npm
-publication token.
+publication token. Rollback installs a previous immutable package version; a
+server must not be downgraded across an in-flight v2 replacement journal, which
+the current version must drain or recover first.
