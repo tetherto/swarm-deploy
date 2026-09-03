@@ -9,6 +9,7 @@ import b4a from 'b4a'
 import Hyperswarm from 'hyperswarm'
 import Protomux from 'protomux'
 import {
+  Server,
   parseSeed,
   publicKeyFromSeed,
   keyPairFromSeed,
@@ -24,6 +25,7 @@ import {
 } from '../../dist/index.js'
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
+import { serverInternals } from '../helpers/internals.js'
 import { fingerprint } from '../../dist/server.js'
 import { topicFromServerPublicKey } from '../../dist/topic.js'
 import { main } from '../../dist/cli.js'
@@ -40,6 +42,7 @@ interface CapturedStream {
 /** The CLI seams these scenarios inject alongside the captured streams. */
 interface IoOverrides {
   process?: EventEmitter
+  Server?: NonNullable<CliIo['Server']>
   dht?: unknown
   connectTimeout?: number
   idleTimeout?: number
@@ -228,6 +231,97 @@ test('CLI server becomes ready then uploads a file and a directory batch', async
   t.ok(batchIo.text('stdout').includes('keep.bin COMMITTED'))
   t.ok(batchIo.text('stdout').includes('ignored skipped directory'))
   t.alike(await fs.promises.readFile(path.join(storage, 'keep.bin'), 'utf8'), 'keep')
+
+  proc.emit('SIGTERM')
+  t.is(await serving, 0)
+})
+
+test('CLI replaces an exact mutable name and keeps managed history idempotently', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const dir = await createTempDir(t)
+  const serverSeedPath = path.join(dir, 'server.seed')
+  const clientSeedPath = path.join(dir, 'client.seed')
+  const allowlist = path.join(dir, 'allowlist')
+  const storage = path.join(dir, 'storage')
+  const source = path.join(dir, 'release.tar.gz')
+  await fs.promises.mkdir(storage)
+  t.is(await main(['keygen', '--out', serverSeedPath], {}, createIo()), 0)
+  t.is(await main(['keygen', '--out', clientSeedPath], {}, createIo()), 0)
+  const serverSeed = (await fs.promises.readFile(serverSeedPath, 'utf8')).trim()
+  const clientSeed = (await fs.promises.readFile(clientSeedPath, 'utf8')).trim()
+  const serverKey = b4a.toString(publicKeyFromSeed(parseSeed(serverSeed)), 'hex')
+  const clientKey = b4a.toString(publicKeyFromSeed(parseSeed(clientSeed)), 'hex')
+  await fs.promises.writeFile(allowlist, `${clientKey}\n`)
+
+  class CapturingServer extends Server {
+    static last: CapturingServer | null = null
+
+    constructor(options: ConstructorParameters<typeof Server>[0]) {
+      super(options)
+      CapturingServer.last = this
+    }
+  }
+
+  const proc = new EventEmitter()
+  const serverIo = createIo({
+    process: proc,
+    Server: CapturingServer,
+    dht: testnet.createNode()
+  })
+  const serving = main(
+    [
+      'server',
+      '--seed-file',
+      serverSeedPath,
+      '--storage',
+      storage,
+      '--allowlist',
+      allowlist,
+      '--max-file-bytes',
+      '1048576',
+      '--max-staging-bytes',
+      '2097152',
+      '--replace-name',
+      'release.tar.gz'
+    ],
+    {},
+    serverIo
+  )
+  await waitForText(serverIo, 'stdout', 'ready')
+
+  const upload = async () => {
+    const io = createIo({ dht: testnet.createNode(), connectTimeout: 10_000 })
+    const code = await main(
+      ['upload', '--seed-file', clientSeedPath, '--server-key', serverKey, source],
+      {},
+      io
+    )
+    return { code, output: io.text('stdout') }
+  }
+
+  await fs.promises.writeFile(source, 'release A')
+  const first = await upload()
+  t.is(first.code, 0)
+  t.ok(first.output.includes('release.tar.gz COMMITTED'))
+
+  await fs.promises.writeFile(source, 'release B')
+  const second = await upload()
+  t.is(second.code, 0)
+  t.ok(second.output.includes('release.tar.gz COMMITTED'))
+
+  const retry = await upload()
+  t.is(retry.code, 0)
+  t.ok(retry.output.includes('release.tar.gz ALREADY_COMMITTED'))
+
+  const records = await serverInternals(CapturingServer.last!).commitStore.list()
+  const current = records.find((record) => record.name === 'release.tar.gz')!
+  const history = records.find((record) => record.name.startsWith('history-'))!
+  t.is(records.length, 2)
+  t.is(history.name, `history-${history.transferId}`)
+  t.is(current.replaces?.transferId, history.transferId)
+  t.is(current.replaces?.historyName, history.name)
+  t.is(await fs.promises.readFile(path.join(storage, 'release.tar.gz'), 'utf8'), 'release B')
+  t.is(await fs.promises.readFile(path.join(storage, history.name), 'utf8'), 'release A')
 
   proc.emit('SIGTERM')
   t.is(await serving, 0)

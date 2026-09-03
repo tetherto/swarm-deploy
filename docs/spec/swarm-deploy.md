@@ -70,7 +70,7 @@ current managed content has the same size and digest is
 an unmanaged path is never replaced and returns the existing-name conflict.
 
 `history-` paths are server-managed historical artifacts, not a restore
-interface. No restore API or CLI operation is required.
+interface. The package has no restore API or CLI operation.
 
 ## Storage, replacement, and accounting
 
@@ -175,25 +175,16 @@ CommonJS. Production JavaScript, declarations, and source maps are generated
 under untracked `dist/`; test output is generated under untracked
 `.test-dist/` and executed with Node and Bare.
 
-Generated declarations replace the handwritten `index.d.ts`. `main`, `types`,
-`bin`, and public `exports` point only at `dist/`; internal modules are not
-public exports. `npm test` builds before executing compiled Node and Bare
-tests. `prepack` builds and validates the package. There is no `prepare`
-script.
+Generated declarations are emitted under `dist/`. `main`, `types`, `bin`, and
+public `exports` point only at `dist/`; internal modules are not public
+exports. `npm test` builds before executing compiled Node and Bare tests.
+`prepack` performs a clean build and validates the types and package. There is
+no `prepare` script.
 
 The public package is `@tetherto/swarm-deploy` version `0.1.0` with
 `publishConfig.access` set to `public`. CI first builds and type-checks, then
 runs compiled Node and Bare tests. A tag-triggered release workflow publishes
 to npm using OIDC and provenance only for tags matching `vX.Y.Z` whose version
-matches `package.json`, following the Barevisor release pattern. Repository
-documentation explains the required external npm trusted-publisher
-configuration.
-
-## Superseded decisions
-
-This specification supersedes prior decisions that every name is create-only,
-that source and tests remain JavaScript, that the package remains private, and
-that an implementation-plan document is authoritative. Existing security,
-idempotency, retention, revocation, crash recovery, startup scrub, and
-unmanaged-path preservation guarantees remain in force except where the
-explicit mutable-name replacement semantics above refine create-only commits.
+matches `package.json`. npm trusted publishing is configured externally for
+the GitHub workflow and its `npm` environment; the repository stores no npm
+publication token.

@@ -1,0 +1,48 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish npm package
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          registry-url: https://registry.npmjs.org
+      - uses: holepunchto/actions/setup-bare@v1
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          package_version="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$package_version"
+      - run: npm install --global npm@latest
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:test
+      - run: npm run test:types
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run test:node
+      - run: npm run test:bare
+      - run: npx brittle-node .test-dist/unit/protocol-property.test.js
+      - name: Probe CLI help
+        run: |
+          node dist/bin/swarm-deploy.js --help
+          bare dist/bin/swarm-deploy.js --help
+      - name: Verify replacement CLI end to end
+        run: npx brittle-node .test-dist/integration/cli.test.js
+      - run: npm pack --dry-run
+      - run: npm publish --provenance --access public

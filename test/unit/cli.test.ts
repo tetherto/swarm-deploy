@@ -248,6 +248,7 @@ test('main never calls process.exit and --help exits 0', async (t) => {
   t.ok(help.includes('server'))
   t.ok(help.includes('upload'))
   t.ok(help.includes('--seed-file'))
+  t.ok(help.includes('[--replace-name <safe-basename>]...'))
   t.absent(help.includes('SWARM_DEPLOY_SERVER_SEED'))
   t.absent(help.includes('SWARM_DEPLOY_CLIENT_SEED'))
   t.absent(/(^|\s)--seed(\s|=|$)/.test(help))
@@ -496,6 +497,88 @@ test('server requires options and accepts file or env seed but not both', async 
   )
   assertNoSecret(t, conflict.text('stdout') + conflict.text('stderr'), SEED_A)
   assertNoSecret(t, conflict.text('stdout') + conflict.text('stderr'), SEED_B)
+})
+
+test('server accepts repeatable replacement names and passes an exact set', async (t) => {
+  const dir = await createTempDir(t)
+  const seedPath = path.join(dir, 'server.seed')
+  const allowlist = path.join(dir, 'allowlist')
+  const storage = path.join(dir, 'storage')
+  await writeSeedFile(seedPath, SEED_A)
+  await writeAllowlist(allowlist, [PUBLIC_A])
+  await fs.promises.mkdir(storage)
+  const base = [
+    '--seed-file',
+    seedPath,
+    '--storage',
+    storage,
+    '--allowlist',
+    allowlist,
+    '--max-file-bytes',
+    '1024',
+    '--max-staging-bytes',
+    '2048'
+  ]
+
+  const configured = await runServerCommand([
+    ...base,
+    '--replace-name',
+    'release.tar.gz',
+    '--replace-name',
+    'latest.bin'
+  ])
+  t.is(configured.code, 0)
+  t.alike(configured.server.options.replaceNames, new Set(['release.tar.gz', 'latest.bin']))
+
+  const defaults = await runServerCommand(base)
+  t.is(defaults.code, 0)
+  t.alike(defaults.server.options.replaceNames, new Set())
+})
+
+test('replacement flag validates names without relaxing strict option parsing', async (t) => {
+  const dir = await createTempDir(t)
+  const seedPath = path.join(dir, 'server.seed')
+  const allowlist = path.join(dir, 'allowlist')
+  const storage = path.join(dir, 'storage')
+  await writeSeedFile(seedPath, SEED_A)
+  await writeAllowlist(allowlist, [PUBLIC_A])
+  await fs.promises.mkdir(storage)
+  const base = [
+    'server',
+    '--seed-file',
+    seedPath,
+    '--storage',
+    storage,
+    '--allowlist',
+    allowlist,
+    '--max-file-bytes',
+    '1024',
+    '--max-staging-bytes',
+    '2048'
+  ]
+
+  const invalid = [
+    [...base, '--replace-name', '../release.tar.gz'],
+    [...base, '--replace-name', 'history-release.tar.gz'],
+    [...base, '--replace-name', 'release.tar.gz', '--replace-name', 'release.tar.gz'],
+    [...base, '--max-file-bytes', '4096'],
+    [
+      'upload',
+      '--seed-file',
+      seedPath,
+      '--server-key',
+      PUBLIC_A,
+      '--replace-name',
+      'release.tar.gz',
+      path.join(dir, 'artifact.bin')
+    ]
+  ]
+
+  for (const argv of invalid) {
+    const io = createIo({ Server: fakeServer, Client: fakeClient })
+    t.is(await main(argv, {}, io), 2, argv.join(' '))
+    assertNoSecret(t, io.text('stdout') + io.text('stderr'), SEED_A)
+  }
 })
 
 test('server rejects non-canonical byte and day options', async (t) => {

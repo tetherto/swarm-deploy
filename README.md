@@ -18,30 +18,38 @@ The server OS account and dedicated storage root are trusted against concurrent 
 
 ## Install
 
-The public npm package is `@tetherto/swarm-deploy`. From a checkout:
+Install the public npm package:
+
+```sh
+npm install @tetherto/swarm-deploy
+npx swarm-deploy --help
+```
+
+To build and run a checkout:
 
 ```sh
 npm ci
-node bin/swarm-deploy.js --help
-npx bare bin/swarm-deploy.js --help
+npm run build
+node dist/bin/swarm-deploy.js --help
+bare dist/bin/swarm-deploy.js --help
 ```
 
-The examples below use `node bin/swarm-deploy.js`. Replace `node` with `bare` when running the CLI in Bare.
+The examples below use the installed `swarm-deploy` binary through `npx`.
 
 ## Provision identities
 
 Generate one server seed and one separate client seed:
 
 ```sh
-node bin/swarm-deploy.js keygen --out server.seed
-node bin/swarm-deploy.js keygen --out client.seed
+npx swarm-deploy keygen --out server.seed
+npx swarm-deploy keygen --out client.seed
 ```
 
 Each command creates an owner-only seed file, refuses to overwrite an existing path, and prints only its public key. Recover a public key later with:
 
 ```sh
-node bin/swarm-deploy.js public-key --seed-file server.seed
-node bin/swarm-deploy.js public-key --seed-file client.seed
+npx swarm-deploy public-key --seed-file server.seed
+npx swarm-deploy public-key --seed-file client.seed
 ```
 
 Put the client public key in an allowlist file:
@@ -58,7 +66,7 @@ The file accepts one lowercase 64-character public key per line, blank lines, an
 The storage directory must be dedicated to Swarm Deploy:
 
 ```sh
-node bin/swarm-deploy.js server \
+npx swarm-deploy server \
   --seed-file server.seed \
   --storage ./artifacts \
   --allowlist ./allowlist.txt \
@@ -66,11 +74,14 @@ node bin/swarm-deploy.js server \
   --max-staging-bytes 42949672960
 ```
 
-`max-file-bytes` and `max-staging-bytes` are required. Optional rotation:
+`max-file-bytes` and `max-staging-bytes` are required. Optional rotation and
+exact mutable names:
 
 ```sh
   --max-storage-bytes 107374182400 \
-  --max-age-days 15
+  --max-age-days 15 \
+  --replace-name release.tar.gz \
+  --replace-name latest.json
 ```
 
 Defaults:
@@ -91,7 +102,7 @@ The server prints its full public key, a topic fingerprint, and `ready` only aft
 Expose the pinned public value as `SWARM_DEPLOY_SERVER_KEY`, then pass it with a file:
 
 ```sh
-node bin/swarm-deploy.js upload \
+npx swarm-deploy upload \
   --seed-file client.seed \
   --server-key "$SWARM_DEPLOY_SERVER_KEY" \
   ./dist/artifact-linux-x64.tar.gz
@@ -105,12 +116,17 @@ Accepted basenames match:
 ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$
 ```
 
-Files retain their original basename. Names are create-only by default. A server
-may explicitly configure exact mutable names with repeatable
-`--replace-name <name>` options; matching content is idempotent, while
-different content replaces the configured current artifact and preserves the
-prior managed version under `history-<transfer-id>`. See the specification for
-the exact retention and recovery semantics.
+Files retain their original basename. Names are create-only by default.
+`--replace-name <safe-basename>` is a server-only option and may be repeated
+for distinct exact names. Invalid basenames, duplicate values, and every name
+beginning with reserved `history-` are rejected. For a configured mutable name,
+matching content is idempotent. Different content atomically replaces the
+current managed artifact and preserves its prior bytes and managed record at
+top-level `history-<full-old-transfer-id>`.
+
+Only the configured current mutable name is pinned against age and quota
+retention. Historical versions and ordinary create-only artifacts remain
+eligible for normal retention. An unmanaged path is never replaced.
 
 Files use fixed 1 MiB SHA-256 chunks. Verified chunks are hidden under `.swarm-deploy/` and resume after reconnect. A final file becomes visible only after exact size and whole-file SHA-256 verification plus an atomic no-replace commit.
 
@@ -126,7 +142,7 @@ Store the contents of `client.seed` in the CI system as a protected secret named
     SWARM_DEPLOY_CLIENT_SEED: ${{ secrets.SWARM_DEPLOY_CLIENT_SEED }}
     SWARM_DEPLOY_SERVER_KEY: ${{ vars.SWARM_DEPLOY_SERVER_KEY }}
   run: |
-    node bin/swarm-deploy.js upload \
+    npx swarm-deploy upload \
       --server-key "$SWARM_DEPLOY_SERVER_KEY" \
       ./dist/artifact-linux-x64.tar.gz
 ```
@@ -144,7 +160,8 @@ const server = new Server({
   allowedKeys: [parsePublicKey('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')],
   maxFileBytes: 20 * 1024 ** 3,
   maxStagingBytes: 40 * 1024 ** 3,
-  allowlistPath: './allowlist.txt'
+  allowlistPath: './allowlist.txt',
+  replaceNames: ['release.tar.gz']
 })
 
 await server.listen()
@@ -161,7 +178,7 @@ await client.close()
 await server.close()
 ```
 
-The CommonJS entrypoint also exports identity/topic helpers, file-selection/manifest helpers, bounded protocol codecs/constants, `AllowlistWatcher`, `SwarmDeployError`, and `ERRORS`. See `index.d.ts` for the complete API.
+The package works through CommonJS `require` and ESM `import`. Its root entrypoint also exports identity/topic helpers, file-selection/manifest helpers, bounded protocol codecs/constants, `AllowlistWatcher`, `SwarmDeployError`, and `ERRORS`. See the generated `dist/index.d.ts` for the complete API.
 
 ## Events and logging
 
@@ -190,7 +207,8 @@ Client events:
 - `result`: directory member outcomes always have `final: false`; only a direct-file result or one aggregate batch result has `final: true`. Batch aggregates include `files`, `committed`, `failed`, and `skipped` counts.
 - `skipped` and `close`: directory selection and lifecycle completion.
 
-The exact discriminated payload types are `ServerEventMap` and `ClientEventMap` in `index.d.ts`.
+The exact discriminated payload types are `ServerEventMap` and `ClientEventMap`
+in `dist/index.d.ts`.
 
 ## CLI exit codes
 
@@ -202,9 +220,16 @@ Parsing, configuration, and object-construction failures exit `2`. Once `server.
 
 ## Test
 
-All binary test content is generated in temporary directories. Integration tests use an isolated local HyperDHT testnet, never the public DHT:
+Production sources are strict TypeScript under `src/`; tests are strict
+TypeScript under `test/`. Builds generate untracked `dist/` and
+`.test-dist/`. All binary test content is generated in temporary directories.
+Integration tests use an isolated local HyperDHT testnet, never the public DHT:
 
 ```sh
+npm ci
+npm run build
+npm run build:test
+npm run test:types
 npm run format:check
 npm run lint
 npm run test:node
@@ -213,3 +238,17 @@ npm run test:bare
 
 See [the Swarm Deploy specification](docs/spec/swarm-deploy.md) for the
 complete protocol, replacement, package, and threat-model requirements.
+
+## Publish
+
+Publishing is tag-driven through `.github/workflows/publish.yml`. The tag must
+be exactly `vX.Y.Z` and equal the version in `package.json`; the workflow runs
+the build, type, format, lint, Node, Bare, property, CLI, replacement, and
+package gates before `npm publish --provenance --access public`.
+
+Before the first release, configure npm trusted publishing for
+`@tetherto/swarm-deploy` with GitHub Actions as the provider, this repository
+owner/name, workflow filename `publish.yml`, and GitHub environment `npm`.
+Protect that environment as appropriate. The workflow needs no npm token:
+GitHub grants the configured OIDC identity through `id-token: write`. Local
+builds, tests, and this migration task do not publish anything.

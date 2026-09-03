@@ -7,6 +7,7 @@ import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS } from './errors.js'
 import { parseSeed, parsePublicKey, generateSeed, publicKeyFromSeed } from './identity.js'
 import { parseAllowlist } from './allowlist.js'
+import { validateReplaceNames } from './files.js'
 import {
   Server,
   fingerprint,
@@ -53,7 +54,7 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key --seed-file <seed-file>',
-  '  swarm-deploy server --seed-file <seed-file> --storage <dir> --allowlist <file> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--max-storage-bytes <bytes>] [--max-age-days <days>]',
+  '  swarm-deploy server --seed-file <seed-file> --storage <dir> --allowlist <file> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
   '  swarm-deploy upload --seed-file <seed-file> --server-key <64-lower-hex> <file-or-directory>',
   '',
   'Use --seed-file. A command-specific environment variable is also accepted.'
@@ -329,11 +330,20 @@ function rejectRawSeed() {
 
 function parseOptions(
   args: string[],
-  allowed: ReadonlySet<string>
-): { options: Record<string, string | undefined>; positionals: string[] } {
+  allowed: ReadonlySet<string>,
+  repeatable: ReadonlySet<string> = new Set()
+): {
+  options: Record<string, string | undefined>
+  repeatedOptions: Record<string, string[] | undefined>
+  positionals: string[]
+} {
   const options: Record<string, string | undefined> = Object.create(null) as Record<
     string,
     string | undefined
+  >
+  const repeatedOptions: Record<string, string[] | undefined> = Object.create(null) as Record<
+    string,
+    string[] | undefined
   >
   const positionals: string[] = []
   for (let i = 0; i < args.length; i++) {
@@ -341,7 +351,13 @@ function parseOptions(
     if (isRawSeedOption(arg) || isCanonicalHexToken(arg)) rejectRawSeed()
     if (arg.startsWith('-')) {
       if (arg.includes('=') || !allowed.has(arg)) throw usageError('Unknown option')
-      if (Object.prototype.hasOwnProperty.call(options, arg)) throw usageError('Duplicate option')
+      if (
+        !repeatable.has(arg) &&
+        (Object.prototype.hasOwnProperty.call(options, arg) ||
+          Object.prototype.hasOwnProperty.call(repeatedOptions, arg))
+      ) {
+        throw usageError('Duplicate option')
+      }
       const value = args[i + 1]
       if (value === undefined || value.startsWith('-')) {
         if (value !== undefined && (isRawSeedOption(value) || isCanonicalHexToken(value))) {
@@ -349,13 +365,19 @@ function parseOptions(
         }
         throw usageError('Missing option value')
       }
-      options[arg] = value
+      if (repeatable.has(arg)) {
+        const values = repeatedOptions[arg] || []
+        values.push(value)
+        repeatedOptions[arg] = values
+      } else {
+        options[arg] = value
+      }
       i++
       continue
     }
     positionals.push(arg)
   }
-  return { options, positionals }
+  return { options, repeatedOptions, positionals }
 }
 
 function requireOption(options: Record<string, string | undefined>, name: string): string {
@@ -510,7 +532,7 @@ async function runPublicKey(args: string[]): Promise<string> {
 }
 
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, positionals } = parseOptions(
+  const { options, repeatedOptions, positionals } = parseOptions(
     args,
     new Set([
       '--seed-file',
@@ -519,8 +541,10 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--max-file-bytes',
       '--max-staging-bytes',
       '--max-storage-bytes',
-      '--max-age-days'
-    ])
+      '--max-age-days',
+      '--replace-name'
+    ]),
+    new Set(['--replace-name'])
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
@@ -539,6 +563,12 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       : parsePositiveSafeInteger(options['--max-storage-bytes'], 'max-storage-bytes')
   const maxAge =
     options['--max-age-days'] === undefined ? undefined : parseMaxAgeDays(options['--max-age-days'])
+  let replaceNames: Set<string>
+  try {
+    replaceNames = validateReplaceNames(repeatedOptions['--replace-name'] || [])
+  } catch {
+    throw usageError('Invalid --replace-name')
+  }
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
     env,
@@ -569,6 +599,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       maxStagingBytes,
       maxStorageBytes,
       maxAge,
+      replaceNames,
       dht: io.dht,
       swarmFactory: io.swarmFactory,
       logger: createLogger(io)
