@@ -11,3 +11,10 @@ export function topicFromServerPublicKey(serverPublicKey: PublicKeyInput): Topic
   }
   return b4a.from(crypto.createHash('sha256').update(TOPIC_PREFIX).update(serverPublicKey).digest())
 }
+
+export function parseTopic(value: string): Topic {
+  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Expected canonical 32-byte topic')
+  }
+  return b4a.from(value, 'hex')
+}

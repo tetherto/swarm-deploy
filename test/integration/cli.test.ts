@@ -26,7 +26,6 @@ import {
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 import { serverInternals } from '../helpers/internals.js'
-import { fingerprint } from '../../dist/server.js'
 import { topicFromServerPublicKey } from '../../dist/topic.js'
 import { main } from '../../dist/cli.js'
 
@@ -131,7 +130,7 @@ function runtimeLabel(): string {
   return typeof Bare !== 'undefined' ? 'bare' : 'node'
 }
 
-test('keygen and public-key work through main without leaking the seed', async (t) => {
+test('keygen, public-key, and topic work through main without leaking the seed', async (t) => {
   const dir = await createTempDir(t)
   const seedPath = path.join(dir, 'ci.seed')
   const generated = createIo()
@@ -145,6 +144,14 @@ test('keygen and public-key work through main without leaking the seed', async (
   t.is(await main(['public-key', '--seed-file', seedPath], {}, published), 0)
   t.is(published.text('stdout'), generated.text('stdout'))
   assertNoSecret(t, published.text('stdout') + published.text('stderr'), seed)
+
+  const topic = createIo()
+  t.is(await main(['topic', '--seed-file', seedPath], {}, topic), 0)
+  t.is(
+    topic.text('stdout'),
+    `${b4a.toString(topicFromServerPublicKey(publicKeyFromSeed(parseSeed(seed))), 'hex')}\n`
+  )
+  assertNoSecret(t, topic.text('stdout') + topic.text('stderr'), seed)
 })
 
 test('CLI server becomes ready then uploads a file and a directory batch', async (t) => {
@@ -164,6 +171,7 @@ test('CLI server becomes ready then uploads a file and a directory batch', async
   const serverSeed = (await fs.promises.readFile(serverSeedPath, 'utf8')).trim()
   const clientSeed = (await fs.promises.readFile(clientSeedPath, 'utf8')).trim()
   const serverKey = b4a.toString(publicKeyFromSeed(parseSeed(serverSeed)), 'hex')
+  const serverTopic = b4a.toString(topicFromServerPublicKey(parseSeed(serverKey)), 'hex')
   const clientKey = b4a.toString(publicKeyFromSeed(parseSeed(clientSeed)), 'hex')
   await fs.promises.writeFile(allowlist, `${clientKey}\n`)
   await fs.promises.writeFile(artifact, 'hello from cli')
@@ -193,10 +201,7 @@ test('CLI server becomes ready then uploads a file and a directory batch', async
     serverIo
   )
   await waitForText(serverIo, 'stdout', 'ready')
-  t.is(
-    serverIo.text('stdout'),
-    `${serverKey}\n${fingerprint(topicFromServerPublicKey(parseSeed(serverKey)))}\nready\n`
-  )
+  t.is(serverIo.text('stdout'), `${serverKey}\n${serverTopic}\nready\n`)
   assertNoSecret(t, serverIo.text('stdout') + serverIo.text('stderr'), serverSeed)
 
   const uploadIo = createIo({
@@ -205,7 +210,7 @@ test('CLI server becomes ready then uploads a file and a directory batch', async
   })
   t.is(
     await main(
-      ['upload', '--seed-file', clientSeedPath, '--server-key', serverKey, artifact],
+      ['upload', '--seed-file', clientSeedPath, '--topic', serverTopic, artifact],
       {},
       uploadIo
     ),
@@ -222,7 +227,7 @@ test('CLI server becomes ready then uploads a file and a directory batch', async
   })
   t.is(
     await main(
-      ['upload', '--seed-file', clientSeedPath, '--server-key', serverKey, batch],
+      ['upload', '--seed-file', clientSeedPath, '--topic', serverTopic, batch],
       {},
       batchIo
     ),
@@ -250,6 +255,7 @@ test('CLI replaces an exact mutable name and keeps managed history idempotently'
   const serverSeed = (await fs.promises.readFile(serverSeedPath, 'utf8')).trim()
   const clientSeed = (await fs.promises.readFile(clientSeedPath, 'utf8')).trim()
   const serverKey = b4a.toString(publicKeyFromSeed(parseSeed(serverSeed)), 'hex')
+  const serverTopic = b4a.toString(topicFromServerPublicKey(parseSeed(serverKey)), 'hex')
   const clientKey = b4a.toString(publicKeyFromSeed(parseSeed(clientSeed)), 'hex')
   await fs.promises.writeFile(allowlist, `${clientKey}\n`)
 
@@ -292,7 +298,7 @@ test('CLI replaces an exact mutable name and keeps managed history idempotently'
   const upload = async () => {
     const io = createIo({ dht: testnet.createNode(), connectTimeout: 10_000 })
     const code = await main(
-      ['upload', '--seed-file', clientSeedPath, '--server-key', serverKey, source],
+      ['upload', '--seed-file', clientSeedPath, '--topic', serverTopic, source],
       {},
       io
     )
@@ -332,18 +338,14 @@ test('upload discovery errors exit 1 without leaking the client seed', async (t)
   const clientSeedPath = path.join(dir, 'client.seed')
   t.is(await main(['keygen', '--out', clientSeedPath], {}, createIo()), 0)
   const clientSeed = (await fs.promises.readFile(clientSeedPath, 'utf8')).trim()
-  const serverKey = b4a.toString(publicKeyFromSeed(parseSeed('11'.repeat(32))), 'hex')
+  const topic = b4a.toString(
+    topicFromServerPublicKey(publicKeyFromSeed(parseSeed('11'.repeat(32)))),
+    'hex'
+  )
   const io = createIo()
   t.is(
     await main(
-      [
-        'upload',
-        '--seed-file',
-        clientSeedPath,
-        '--server-key',
-        serverKey,
-        path.join(dir, 'missing.bin')
-      ],
+      ['upload', '--seed-file', clientSeedPath, '--topic', topic, path.join(dir, 'missing.bin')],
       {},
       io
     ),
@@ -403,8 +405,8 @@ test('CLI classifies a malformed server frame as runtime exit 1', async (t) => {
         'upload',
         '--seed-file',
         clientSeedPath,
-        '--server-key',
-        b4a.toString(serverKey, 'hex'),
+        '--topic',
+        b4a.toString(topicFromServerPublicKey(serverKey), 'hex'),
         artifact
       ],
       {},
@@ -449,6 +451,18 @@ if (spawnSync) {
       t.ok(HEX64.test(first.stdout.trim()))
       t.absent(first.stdout.includes(seed))
       t.absent(first.stderr.includes(seed))
+
+      const topic = spawnSync(runtime.bin, [cliBin(), 'topic', '--seed-file', out], {
+        encoding: 'utf8'
+      })
+      const expectedTopic = b4a.toString(
+        topicFromServerPublicKey(publicKeyFromSeed(parseSeed(seed))),
+        'hex'
+      )
+      t.is(topic.status, 0, `${runtime.name} topic`)
+      t.is(topic.stdout, `${expectedTopic}\n`)
+      t.absent(topic.stdout.includes(seed))
+      t.absent(topic.stderr.includes(seed))
 
       const second = spawnSync(runtime.bin, [cliBin(), 'keygen', '--out', out], {
         encoding: 'utf8'

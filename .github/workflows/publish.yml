@@ -17,31 +17,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: npm
+    env:
+      NPM_CONFIG_PROVENANCE: 'true'
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - uses: holepunchto/actions/checkout@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+        with:
+          fetch-depth: 0
       - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
         with:
           version: 24.x
           registry-url: https://registry.npmjs.org
-      - uses: holepunchto/actions/setup-bare@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
       - name: Validate release tag
         run: node scripts/validate-release-tag.mjs
-      - run: npm ci
-      - run: node --version && npm --version && bare --version
-      - run: npm run build && npm run build:test && npm run test:types
-      - run: npm run lint
-      - run: npm run test:release-tag
-      - run: npm run test:node
-      - run: npm run test:bare
-      - run: npx brittle-node .test-dist/unit/protocol-property.test.js
-      - name: Probe CLI help
+      - name: Verify tagged commit is on main
         run: |
-          node dist/bin/swarm-deploy.js --help
-          bare dist/bin/swarm-deploy.js --help
-      - name: Verify replacement CLI end to end
-        run: npx brittle-node .test-dist/integration/cli.test.js
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - run: npm ci
+      - name: Build untracked distribution
+        run: |
+          test ! -e dist
+          npm run build
+      - run: npm run test:types
+      - run: npm run validate:package
       - run: npm run test:package
-      - run: npm publish --provenance --access public
+      - uses: holepunchto/actions/publish@v1

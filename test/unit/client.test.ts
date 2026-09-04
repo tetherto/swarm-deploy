@@ -5,7 +5,7 @@ import test from 'brittle'
 import b4a from 'b4a'
 import path from '#path'
 import { EventEmitter } from '#events'
-import { Client, ERRORS, keyPairFromSeed } from '../../dist/index.js'
+import { Client, ERRORS, keyPairFromSeed, topicFromServerPublicKey } from '../../dist/index.js'
 import type { Swarm } from '../../dist/types.js'
 import {
   blockManifestAfterFirstRead,
@@ -57,7 +57,7 @@ test('Client close aborts a stalled discovery flush and destroys its swarm', asy
   const swarm = createStalledSwarm()
   const client = new Client({
     seed: CLIENT_SEED,
-    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
     swarmFactory: () => swarm
   })
   const starting = internals(client)._ensureStarted()
@@ -72,7 +72,7 @@ test('Client close rejects a pending reconnect delay and clears its timer', asyn
   const timers = new Set<FakeTimer>()
   const client = new Client({
     seed: CLIENT_SEED,
-    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
     scheduler: {
       setTimeout(callback) {
         const timer = { callback }
@@ -101,7 +101,7 @@ test('Client close stops directory processing during the first active hash', asy
   let uploadStarts = 0
   const client = new Client({
     seed: CLIENT_SEED,
-    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
     swarmFactory() {
       throw new Error('networking must not start while the first hash is blocked')
     }
@@ -146,7 +146,7 @@ test('Client close rejects an active upload and its queued successor before star
   let uploadStarts = 0
   const client = new Client({
     seed: CLIENT_SEED,
-    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
     swarmFactory() {
       swarmStarts++
       return createStalledSwarm()

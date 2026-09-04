@@ -24,6 +24,22 @@ function run(command, args, options = {}) {
 }
 
 try {
+  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8')
+  for (const snippet of [
+    'npm install @tetherto/swarm-deploy',
+    'npm install --global @tetherto/swarm-deploy',
+    'swarm-deploy topic --seed-file server.seed',
+    'swarm-deploy upload',
+    "require('@tetherto/swarm-deploy')",
+    "from '@tetherto/swarm-deploy'"
+  ]) {
+    assert.ok(readme.includes(snippet), `README missing installed-package example: ${snippet}`)
+  }
+  assert.ok(!readme.includes('npx swarm-deploy'), 'README must use the installed global CLI')
+  const primaryReadme = readme.split('## Contributor development')[0]
+  assert.ok(!primaryReadme.includes('node dist/'), 'primary README must not invoke checkout dist')
+  assert.ok(!primaryReadme.includes('bare dist/'), 'primary README must not invoke checkout dist')
+
   const packed = run('npm', ['pack', '--json'], { cwd: root })
   const [manifest] = JSON.parse(packed.stdout)
   assert.equal(manifest.name, '@tetherto/swarm-deploy')
@@ -104,6 +120,10 @@ try {
   )
   assert.equal(fs.statSync(seedFile).mode & 0o777, 0o600, 'seed permissions are not owner-only')
 
+  const topic = run(executable, ['topic', '--seed-file', seedFile])
+  assert.match(topic.stdout, /^[0-9a-f]{64}\n$/)
+  assert.ok(!`${topic.stdout}${topic.stderr}`.includes(secret), 'topic printed seed material')
+
   const before = fs.readFileSync(seedFile)
   const overwrite = spawnSync(executable, ['keygen', '--out', seedFile], {
     cwd: consumer,
@@ -115,6 +135,22 @@ try {
     !`${overwrite.stdout}${overwrite.stderr}`.includes(secret),
     'overwrite failure printed seed material'
   )
+
+  const globalPrefix = path.join(consumer, 'global')
+  run('npm', [
+    'install',
+    '--global',
+    '--prefix',
+    globalPrefix,
+    tarball,
+    '--ignore-scripts',
+    '--no-audit',
+    '--no-fund'
+  ])
+  const globalBin = path.join(globalPrefix, 'bin/swarm-deploy')
+  run(globalBin, ['--help'])
+  const globalTopic = run(globalBin, ['topic', '--seed-file', seedFile])
+  assert.equal(globalTopic.stdout, topic.stdout)
 
   console.log(
     `package smoke: ${manifest.entryCount} files, ${manifest.size} packed bytes, ${manifest.unpackedSize} unpacked bytes`

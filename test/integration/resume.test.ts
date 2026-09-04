@@ -5,7 +5,7 @@ import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import { Client, Server, keyPairFromSeed } from '../../dist/index.js'
+import { Client, Server, keyPairFromSeed, topicFromServerPublicKey } from '../../dist/index.js'
 import { SwarmDeployError, ERRORS } from '../../dist/errors.js'
 import { createTempDir, writeDeterministicFile, CHUNK_SIZE } from '../helpers/files.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
@@ -38,7 +38,7 @@ async function setup(t: Assert): Promise<Harness> {
   await server.listen()
   const client = new Client({
     seed: CLIENT_SEED,
-    serverPublicKey: server.publicKey,
+    topic: server.topic,
     dht: testnet.createNode(),
     connectTimeout: 5_000,
     idleTimeout: 10_000
@@ -101,7 +101,7 @@ test('Client starts a fresh reconnect window after an active transport loss', as
   let now = 0
   const client = new Client({
     seed: CLIENT_SEED,
-    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
     clock: { now: () => now }
   })
   const deadlines: number[] = []

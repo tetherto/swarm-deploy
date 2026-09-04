@@ -265,7 +265,7 @@ test('Node and Bare lifecycle closes swarms, timers, descriptors, and testnet', 
     await server.listen()
     client = new Client({
       seed: CLIENT_SEED,
-      serverPublicKey: server.publicKey,
+      topic: server.topic,
       connectTimeout: 5_000,
       idleTimeout: 5_000,
       dht: testnet.createNode()

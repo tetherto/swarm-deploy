@@ -20,12 +20,12 @@ import { topicFromServerPublicKey } from './topic.js'
 import type {
   AuthenticationEvent,
   Clock,
+  BinaryInput,
   Digest,
   FingerprintEvent,
   KeyPair,
   Logger,
   PublicKey,
-  PublicKeyInput,
   Scheduler,
   SeedInput,
   Swarm,
@@ -61,8 +61,8 @@ export type ClientSwarmFactory = SwarmFactory
 export interface ClientOptions {
   /** Required 32-byte persistent client seed. */
   seed: SeedInput
-  /** Required, pinned 32-byte server public key. It must differ from the client public key. */
-  serverPublicKey: PublicKeyInput
+  /** Required 32-byte topic committed to the intended server identity. */
+  topic: BinaryInput
   /** Discovery/reconnect window in milliseconds; defaults to 30,000 and is at most 30,000. */
   connectTimeout?: number
   /** Per-upload idle timeout in milliseconds; defaults to 60,000. */
@@ -200,9 +200,9 @@ function assertSeed(seed: unknown): asserts seed is Uint8Array {
   }
 }
 
-function assertPublicKey(key: unknown): asserts key is Uint8Array {
-  if (!b4a.isBuffer(key) || key.byteLength !== 32) {
-    throw configurationError(ERRORS.INVALID_PUBLIC_KEY, 'Invalid server public key')
+function assertTopic(topic: unknown): asserts topic is Uint8Array {
+  if (!b4a.isBuffer(topic) || topic.byteLength !== 32) {
+    throw configurationError(ERRORS.PROTOCOL_INVALID, 'Invalid topic')
   }
 }
 
@@ -303,7 +303,6 @@ export interface Client {
 export class Client extends EventEmitter {
   private readonly _keyPair: KeyPair
   readonly publicKey: PublicKey
-  readonly serverPublicKey: PublicKey
   readonly topic: Topic
   readonly connectTimeout: number
   readonly idleTimeout: number
@@ -335,7 +334,7 @@ export class Client extends EventEmitter {
       throw configurationError(ERRORS.PROTOCOL_INVALID, 'Invalid client options')
     }
     assertSeed(options.seed)
-    assertPublicKey(options.serverPublicKey)
+    assertTopic(options.topic)
     const connectTimeout = options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
     const idleTimeout = options.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
     assertDuration(connectTimeout, 'connect timeout', MAX_CONNECT_TIMEOUT)
@@ -353,14 +352,13 @@ export class Client extends EventEmitter {
 
     this._keyPair = keyPairFromSeed(b4a.from(options.seed))
     this.publicKey = b4a.from(this._keyPair.publicKey)
-    this.serverPublicKey = b4a.from(options.serverPublicKey)
-    if (crypto.timingSafeEqual(this.publicKey, this.serverPublicKey)) {
+    this.topic = b4a.from(options.topic)
+    if (crypto.timingSafeEqual(topicFromServerPublicKey(this.publicKey), this.topic)) {
       throw configurationError(
         ERRORS.SERVER_KEY_MISMATCH,
-        'Client and pinned server identities must be different'
+        'Client identity cannot be committed as its own server topic'
       )
     }
-    this.topic = topicFromServerPublicKey(this.serverPublicKey)
     this.connectTimeout = connectTimeout
     this.idleTimeout = idleTimeout
     this.dht = options.dht
@@ -451,16 +449,13 @@ export class Client extends EventEmitter {
 
   private _onConnection(socket: SwarmSocket, peerInfo: SwarmPeerInfo | null = null): void {
     if (socket && typeof socket.on === 'function') socket.on('error', () => {})
-    const peerKey = peerInfo?.publicKey || socket?.remotePublicKey
-    if (
-      this.closed ||
-      !b4a.isBuffer(peerKey) ||
-      peerKey.byteLength !== 32 ||
-      !crypto.timingSafeEqual(peerKey, this.serverPublicKey)
-    ) {
+    const peerKey = peerInfo?.publicKey
+    const peerTopic =
+      b4a.isBuffer(peerKey) && peerKey.byteLength === 32 ? topicFromServerPublicKey(peerKey) : null
+    if (this.closed || peerTopic === null || !crypto.timingSafeEqual(peerTopic, this.topic)) {
       try {
         socket.destroy(
-          configurationError(ERRORS.SERVER_KEY_MISMATCH, 'Peer did not match pinned server key')
+          configurationError(ERRORS.SERVER_KEY_MISMATCH, 'Peer did not match committed topic')
         )
       } catch {}
       const details = {
@@ -468,7 +463,7 @@ export class Client extends EventEmitter {
         fingerprint: fingerprint(peerKey),
         reason: ERRORS.SERVER_KEY_MISMATCH
       }
-      this.logger.warn('Rejected unpinned server connection', details)
+      this.logger.warn('Rejected server with mismatched topic commitment', details)
       this._emitSafe('authentication', details)
       this._emitSafe('rejected-peer', { fingerprint: details.fingerprint })
       return
@@ -488,7 +483,7 @@ export class Client extends EventEmitter {
     })
     const details = { fingerprint: fingerprint(peerKey) }
     this._emitSafe('authentication', { status: 'accepted', fingerprint: details.fingerprint })
-    this.logger.info('Pinned server connected', details)
+    this.logger.info('Committed server connected', details)
     this._emitSafe('connection', details)
     this._emitSafe('connection-open', details)
     this._resolveSocketWaiters(socket)
@@ -500,7 +495,7 @@ export class Client extends EventEmitter {
     const remaining = deadline - this.clock.now()
     if (remaining <= 0) {
       return Promise.reject(
-        new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'Timed out waiting for pinned server')
+        new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'Timed out waiting for committed server')
       )
     }
     return new Promise((resolve, reject) => {
@@ -518,7 +513,10 @@ export class Client extends EventEmitter {
         timer: this.scheduler.setTimeout(() => {
           finish(
             reject,
-            new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'Timed out waiting for pinned server')
+            new SwarmDeployError(
+              ERRORS.UPLOAD_IDLE_TIMEOUT,
+              'Timed out waiting for committed server'
+            )
           )
         }, remaining)
       }

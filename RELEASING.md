@@ -42,9 +42,16 @@ Approve the protected `npm` environment if required. Confirm the workflow used p
 
 ```sh
 npm view @tetherto/swarm-deploy@X.Y.Z version dist.integrity
-npm install --save-exact @tetherto/swarm-deploy@X.Y.Z
-npx swarm-deploy --help
+npm install --global @tetherto/swarm-deploy@X.Y.Z
+swarm-deploy --help
 ```
+
+PR/main CI is the full test authority. The tag workflow verifies the exact
+stable tag and package version, confirms the tagged commit is on `main`, builds
+the untracked `dist/`, and validates the package before delegating to
+`holepunchto/actions/publish@v1`. That action publishes with
+`npm publish --ignore-scripts` and creates the GitHub release, so the workflow
+must build `dist/` before invoking it.
 
 Roll the package into one canary client/server pair first. Confirm `ready`, authentication, offer, progress, verification, commit, recovery, scrub, retention, and cleanup diagnostics before broader rollout.
 

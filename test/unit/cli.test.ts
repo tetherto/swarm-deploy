@@ -6,12 +6,17 @@ import { EventEmitter } from '#events'
 import fs from '#fs'
 import path from '#path'
 import b4a from 'b4a'
-import { SwarmDeployError, ERRORS, parseSeed, publicKeyFromSeed } from '../../dist/index.js'
+import {
+  SwarmDeployError,
+  ERRORS,
+  parseSeed,
+  parseTopic,
+  publicKeyFromSeed
+} from '../../dist/index.js'
 import type { PublicKey, Topic } from '../../dist/types.js'
 import type { ServerOptions } from '../../dist/server.js'
 import type { ClientOptions } from '../../dist/client.js'
 import { createTempDir } from '../helpers/files.js'
-import { fingerprint } from '../../dist/server.js'
 import { topicFromServerPublicKey } from '../../dist/topic.js'
 import { main } from '../../dist/cli.js'
 
@@ -19,6 +24,7 @@ const HEX64 = /^[0-9a-f]{64}$/
 const SEED_A = 'ab'.repeat(32)
 const SEED_B = 'cd'.repeat(32)
 const PUBLIC_A = b4a.toString(publicKeyFromSeed(parseSeed(SEED_A)), 'hex')
+const TOPIC_A = b4a.toString(topicFromServerPublicKey(parseSeed(PUBLIC_A)), 'hex')
 
 type CliIo = NonNullable<Parameters<typeof main>[2]>
 type ServerConstructor = NonNullable<CliIo['Server']>
@@ -119,8 +125,8 @@ async function writeAllowlist(filePath: string, keys: string[]): Promise<void> {
   await fs.promises.writeFile(filePath, keys.map((key) => `${key}\n`).join(''))
 }
 
-function topicFingerprint(seedHex: string): string {
-  return fingerprint(topicFromServerPublicKey(publicKeyFromSeed(parseSeed(seedHex))))
+function topicHex(seedHex: string): string {
+  return b4a.toString(topicFromServerPublicKey(publicKeyFromSeed(parseSeed(seedHex))), 'hex')
 }
 
 class FakeServer {
@@ -245,8 +251,11 @@ test('main never calls process.exit and --help exits 0', async (t) => {
   const help = io.text('stdout')
   t.ok(help.includes('keygen'))
   t.ok(help.includes('public-key'))
+  t.ok(help.includes('topic'))
   t.ok(help.includes('server'))
   t.ok(help.includes('upload'))
+  t.ok(help.includes('--topic <64-lower-hex>'))
+  t.absent(help.includes('--server-key'))
   t.ok(help.includes('--seed-file'))
   t.ok(help.includes('[--replace-name <safe-basename>]...'))
   t.absent(help.includes('SWARM_DEPLOY_SERVER_SEED'))
@@ -275,7 +284,7 @@ test('unknown commands, unknown options, and raw --seed fail with usage', async 
       '--max-staging-bytes',
       '1'
     ],
-    ['upload', '--seed', SEED_A, '--server-key', PUBLIC_A, path.join(dir, 'file.bin')],
+    ['upload', '--seed', SEED_A, '--topic', TOPIC_A, path.join(dir, 'file.bin')],
     ['keygen', '--out=file.seed'],
     [
       'upload',
@@ -350,6 +359,40 @@ test('public-key accepts a seed file without a trailing newline', async (t) => {
   t.is(await main(['public-key', '--seed-file', seedPath], {}, io), 0)
   t.is(io.text('stdout'), `${publicKeyHex(SEED_B)}\n`)
   assertNoSecret(t, io.text('stdout') + io.text('stderr'), SEED_B)
+})
+
+test('topic safely derives and prints only the full committed topic', async (t) => {
+  const dir = await createTempDir(t)
+  const seedPath = path.join(dir, 'server.seed')
+  await writeSeedFile(seedPath, SEED_A)
+  const before = await fs.promises.readFile(seedPath)
+  const io = createIo()
+
+  t.is(await main(['topic', '--seed-file', seedPath], {}, io), 0)
+  t.is(io.text('stdout'), `${TOPIC_A}\n`)
+  t.alike(parseTopic(io.text('stdout').trim()), parseTopic(TOPIC_A))
+  assertNoSecret(t, io.text('stdout') + io.text('stderr'), SEED_A)
+  t.alike(await fs.promises.readFile(seedPath), before)
+})
+
+test('topic rejects unsafe seed inputs and has no seed environment source', async (t) => {
+  const dir = await createTempDir(t)
+  const seedPath = path.join(dir, 'server.seed')
+  const linkPath = path.join(dir, 'server-link.seed')
+  await writeSeedFile(seedPath, SEED_A)
+  await fs.promises.symlink(seedPath, linkPath)
+
+  for (const args of [
+    ['topic'],
+    ['topic', '--seed-file', linkPath],
+    ['topic', '--seed-file', seedPath, 'extra'],
+    ['topic', '--seed-file', seedPath, '--server-key', PUBLIC_A]
+  ]) {
+    const io = createIo()
+    t.is(await main(args, { SWARM_DEPLOY_SERVER_SEED: SEED_B }, io), 2)
+    assertNoSecret(t, io.text('stdout') + io.text('stderr'), SEED_A)
+    assertNoSecret(t, io.text('stdout') + io.text('stderr'), SEED_B)
+  }
 })
 
 test('public-key rejects non-canonical, oversized, linked, and missing seed files', async (t) => {
@@ -478,7 +521,7 @@ test('server requires options and accepts file or env seed but not both', async 
   t.is(fileOnly.server.options.maxAge, 7 * 24 * 60 * 60 * 1000)
   t.is(fileOnly.server.options.allowlistPath, allowlist)
   t.ok(allowedKeys(fileOnly.server.options).has(PUBLIC_A))
-  t.is(fileOnly.io.text('stdout'), `${PUBLIC_A}\n${topicFingerprint(SEED_A)}\nready\n`)
+  t.is(fileOnly.io.text('stdout'), `${PUBLIC_A}\n${topicHex(SEED_A)}\nready\n`)
   assertNoSecret(t, fileOnly.io.text('stdout') + fileOnly.io.text('stderr'), SEED_A)
 
   const envOnly = await runServerCommand(required, { SWARM_DEPLOY_SERVER_SEED: SEED_B })
@@ -566,8 +609,8 @@ test('replacement flag validates names without relaxing strict option parsing', 
       'upload',
       '--seed-file',
       seedPath,
-      '--server-key',
-      PUBLIC_A,
+      '--topic',
+      TOPIC_A,
       '--replace-name',
       'release.tar.gz',
       path.join(dir, 'artifact.bin')
@@ -774,11 +817,7 @@ test('upload requires options and accepts file or env seed but not both', async 
   await fs.promises.writeFile(artifact, 'bytes')
 
   t.is(
-    await main(
-      ['upload', '--server-key', PUBLIC_A, artifact],
-      {},
-      createIo({ Client: fakeClient })
-    ),
+    await main(['upload', '--topic', TOPIC_A, artifact], {}, createIo({ Client: fakeClient })),
     2
   )
   t.is(
@@ -787,7 +826,7 @@ test('upload requires options and accepts file or env seed but not both', async 
   )
   t.is(
     await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A],
+      ['upload', '--seed-file', seedPath, '--topic', TOPIC_A],
       {},
       createIo({ Client: fakeClient })
     ),
@@ -795,7 +834,7 @@ test('upload requires options and accepts file or env seed but not both', async 
   )
   t.is(
     await main(
-      ['upload', '--seed-file', seedPath, '--server-key', 'AA'.repeat(32), artifact],
+      ['upload', '--seed-file', seedPath, '--topic', 'AA'.repeat(32), artifact],
       {},
       createIo({ Client: fakeClient })
     ),
@@ -803,7 +842,7 @@ test('upload requires options and accepts file or env seed but not both', async 
   )
   t.is(
     await main(
-      ['upload', '--seed-file', seedPath, '--server-key', 'ab', artifact],
+      ['upload', '--seed-file', seedPath, '--topic', 'ab', artifact],
       {},
       createIo({ Client: fakeClient })
     ),
@@ -813,25 +852,21 @@ test('upload requires options and accepts file or env seed but not both', async 
   FakeClient.last = null
   const fileOnly = createIo({ Client: fakeClient })
   t.is(
-    await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
-      {},
-      fileOnly
-    ),
+    await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, fileOnly),
     0
   )
   t.alike(FakeClient.last!.options.seed, parseSeed(SEED_A))
-  t.alike(FakeClient.last!.options.serverPublicKey, parseSeed(PUBLIC_A))
+  t.alike(FakeClient.last!.options.topic, parseTopic(TOPIC_A))
   t.is(fileOnly.text('stdout'), 'artifact.bin COMMITTED\n')
   t.is(FakeClient.last!.closeCount, 1)
   assertNoSecret(t, fileOnly.text('stdout') + fileOnly.text('stderr'), SEED_A)
-  t.absent(fileOnly.text('stdout').includes(PUBLIC_A))
+  t.absent(fileOnly.text('stdout').includes(TOPIC_A))
 
   FakeClient.last = null
   const envOnly = createIo({ Client: fakeClient })
   t.is(
     await main(
-      ['upload', '--server-key', PUBLIC_A, artifact],
+      ['upload', '--topic', TOPIC_A, artifact],
       { SWARM_DEPLOY_CLIENT_SEED: SEED_B },
       envOnly
     ),
@@ -843,7 +878,7 @@ test('upload requires options and accepts file or env seed but not both', async 
   const conflict = createIo({ Client: fakeClient })
   t.is(
     await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
+      ['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact],
       { SWARM_DEPLOY_CLIENT_SEED: SEED_B },
       conflict
     ),
@@ -851,6 +886,16 @@ test('upload requires options and accepts file or env seed but not both', async 
   )
   assertNoSecret(t, conflict.text('stdout') + conflict.text('stderr'), SEED_A)
   assertNoSecret(t, conflict.text('stdout') + conflict.text('stderr'), SEED_B)
+
+  const obsolete = createIo({ Client: fakeClient })
+  t.is(
+    await main(
+      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
+      {},
+      obsolete
+    ),
+    2
+  )
 })
 
 test('upload exits 0 for committed batches, 1 for transfer or discovery failure, and 2 for identity mismatch', async (t) => {
@@ -868,10 +913,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
     skipped: [{ name: 'nested', reason: 'directory' }]
   })
   const ok = createIo({ Client: fakeClient })
-  t.is(
-    await main(['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact], {}, ok),
-    0
-  )
+  t.is(await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, ok), 0)
   t.ok(ok.text('stdout').includes('ok.bin COMMITTED'))
   t.ok(ok.text('stdout').includes('again.bin ALREADY_COMMITTED'))
   t.ok(ok.text('stdout').includes('nested skipped directory'))
@@ -886,11 +928,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   })
   const partial = createIo({ Client: fakeClient })
   t.is(
-    await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
-      {},
-      partial
-    ),
+    await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, partial),
     1
   )
   t.ok(partial.text('stdout').includes('ok.bin COMMITTED'))
@@ -903,11 +941,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   }
   const discovery = createIo({ Client: fakeClient })
   t.is(
-    await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
-      {},
-      discovery
-    ),
+    await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, discovery),
     1
   )
 
@@ -916,11 +950,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   }
   const malformed = createIo({ Client: fakeClient })
   t.is(
-    await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
-      {},
-      malformed
-    ),
+    await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, malformed),
     1
   )
   assertNoSecret(t, malformed.text('stdout') + malformed.text('stderr'), SEED_A)
@@ -928,11 +958,7 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   FakeClient.uploadImpl = null
   const mismatch = createIo()
   t.is(
-    await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
-      {},
-      mismatch
-    ),
+    await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, mismatch),
     2
   )
 })
@@ -970,7 +996,7 @@ test('client-only env is ignored by server and server-only env is ignored by upl
   const upload = createIo({ Client: fakeClient })
   t.is(
     await main(
-      ['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact],
+      ['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact],
       { SWARM_DEPLOY_SERVER_SEED: SEED_B },
       upload
     ),
@@ -1048,7 +1074,7 @@ test('wrong-role env alone is a missing seed source', async (t) => {
   const upload = createIo({ Client: fakeClient })
   t.is(
     await main(
-      ['upload', '--server-key', PUBLIC_A, artifact],
+      ['upload', '--topic', TOPIC_A, artifact],
       { SWARM_DEPLOY_SERVER_SEED: wrongClient },
       upload
     ),
@@ -1210,10 +1236,7 @@ test('upload success with a rejecting client close exits 1', async (t) => {
   }
 
   const io = createIo({ Client: asClientConstructor(CloseFailClient) })
-  t.is(
-    await main(['upload', '--seed-file', seedPath, '--server-key', PUBLIC_A, artifact], {}, io),
-    1
-  )
+  t.is(await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, io), 1)
   t.is(CloseFailClient.last!.closeCount, 1)
   t.ok(io.text('stdout').includes('artifact.bin COMMITTED'))
   t.ok(io.text('stderr').includes('Cleanup failed'))

@@ -12,8 +12,19 @@ them.
 Three different 32-byte values have different jobs:
 
 - **Seed:** secret identity material. Generate separate persistent seeds for the server and client. Never put a seed in an allowlist, log, or command-line argument.
-- **Public key:** derived from a seed. The server allowlists client public keys, and every client pins the server public key.
-- **Topic:** `SHA-256("swarm-deploy/topic/v1\0" || serverPublicKey)`. It finds peers but grants no authorization.
+- **Public key:** derived from a seed. The server allowlists client public keys.
+- **Topic:** a nonsecret 32-byte commitment to the server identity: `SHA-256("swarm-deploy/topic/v1\0" || serverPublicKey)`.
+
+Clients join the configured topic, then verify that the authenticated HyperDHT
+Noise peer key derives that exact topic before sending protocol or upload
+metadata. An arbitrary peer announcing the topic receives no application data.
+Keep the server seed stable: rotating it changes the server key and topic, so
+every client configuration must be updated.
+
+Knowing the topic does not expose stored files. Swarm Deploy is receive-only:
+the server does not provide a download protocol, execute content, or serve a
+website. Publish stored files through a separately configured web server or
+artifact service when needed.
 
 HyperDHT Noise authenticates both transport keys and encrypts the connection. SHA-256 verifies transferred bytes; it does not prove that an authorized client uploaded safe software.
 
@@ -21,39 +32,39 @@ The server OS account and dedicated storage root are trusted against concurrent 
 
 ## Install
 
-Install the public npm package:
+Install the runtime API in an application:
 
 ```sh
 npm install @tetherto/swarm-deploy
-npx swarm-deploy --help
 ```
 
-To build and run a checkout:
+Install the command globally for server and CI use:
 
 ```sh
-npm ci
-npm run build
-node dist/bin/swarm-deploy.js --help
-bare dist/bin/swarm-deploy.js --help
+npm install --global @tetherto/swarm-deploy
+swarm-deploy --help
 ```
-
-The examples below use the installed `swarm-deploy` binary through `npx`.
 
 ## Provision identities
 
 Generate one server seed and one separate client seed:
 
 ```sh
-npx swarm-deploy keygen --out server.seed
-npx swarm-deploy keygen --out client.seed
+swarm-deploy keygen --out server.seed
+swarm-deploy keygen --out client.seed
 ```
 
 Each command creates an owner-only seed file, refuses to overwrite an existing path, and prints only its public key. Recover a public key later with:
 
 ```sh
-npx swarm-deploy public-key --seed-file server.seed
-npx swarm-deploy public-key --seed-file client.seed
+swarm-deploy public-key --seed-file server.seed
+swarm-deploy public-key --seed-file client.seed
+swarm-deploy topic --seed-file server.seed
 ```
+
+The `topic` command safely reads the server seed file and prints only the full
+64-character lowercase topic. Commit that nonsecret value to receiver
+configuration; never copy the server seed into CI.
 
 Put the client public key in an allowlist file:
 
@@ -69,7 +80,7 @@ The file accepts one lowercase 64-character public key per line, blank lines, an
 The storage directory must be dedicated to Swarm Deploy:
 
 ```sh
-npx swarm-deploy server \
+swarm-deploy server \
   --seed-file server.seed \
   --storage ./artifacts \
   --allowlist ./allowlist.txt \
@@ -98,16 +109,18 @@ Defaults:
 
 At startup the server recovers commit journals, purges resumable state owned by keys absent from the effective allowlist, and fully re-hashes managed committed files. Re-adding a key cannot resurrect a partial upload removed while it was offline. Scheduled cleanup checks metadata and size, removes expired resumable uploads, applies age retention, then deletes oldest committed files until under the storage limit. Age and quota deletion is deferred while an upload is receiving chunks; verified commit-time capacity eviction is still allowed.
 
-The server prints its full public key, a topic fingerprint, and `ready` only after recovery, retention initialization, and Hyperswarm announcement complete.
+The server prints its full public key, the full committed topic, and `ready`
+only after recovery, retention initialization, and Hyperswarm announcement
+complete.
 
 ## Upload
 
-Expose the pinned public value as `SWARM_DEPLOY_SERVER_KEY`, then pass it with a file:
+Expose the committed nonsecret value as `SWARM_DEPLOY_TOPIC`, then pass it with a file:
 
 ```sh
-npx swarm-deploy upload \
+swarm-deploy upload \
   --seed-file client.seed \
-  --server-key "$SWARM_DEPLOY_SERVER_KEY" \
+  --topic "$SWARM_DEPLOY_TOPIC" \
   ./dist/artifact-linux-x64.tar.gz
 ```
 
@@ -143,10 +156,10 @@ Store the contents of `client.seed` in the CI system as a protected secret named
 - name: Upload artifact
   env:
     SWARM_DEPLOY_CLIENT_SEED: ${{ secrets.SWARM_DEPLOY_CLIENT_SEED }}
-    SWARM_DEPLOY_SERVER_KEY: ${{ vars.SWARM_DEPLOY_SERVER_KEY }}
+    SWARM_DEPLOY_TOPIC: ${{ vars.SWARM_DEPLOY_TOPIC }}
   run: |
-    npx swarm-deploy upload \
-      --server-key "$SWARM_DEPLOY_SERVER_KEY" \
+    swarm-deploy upload \
+      --topic "$SWARM_DEPLOY_TOPIC" \
       ./dist/artifact-linux-x64.tar.gz
 ```
 
@@ -154,8 +167,10 @@ The server command similarly accepts `SWARM_DEPLOY_SERVER_SEED`. Supplying both 
 
 ## JavaScript API
 
+ESM:
+
 ```js
-const { Client, Server, parsePublicKey, parseSeed } = require('@tetherto/swarm-deploy')
+import { Client, Server, parsePublicKey, parseSeed, parseTopic } from '@tetherto/swarm-deploy'
 
 const server = new Server({
   seed: parseSeed(process.env.SWARM_DEPLOY_SERVER_SEED),
@@ -171,7 +186,7 @@ await server.listen()
 
 const client = new Client({
   seed: parseSeed(process.env.SWARM_DEPLOY_CLIENT_SEED),
-  serverPublicKey: parsePublicKey(process.env.SWARM_DEPLOY_SERVER_KEY)
+  topic: parseTopic(process.env.SWARM_DEPLOY_TOPIC)
 })
 
 const result = await client.upload('./dist/artifact-linux-x64.tar.gz')
@@ -181,7 +196,13 @@ await client.close()
 await server.close()
 ```
 
-The package works through CommonJS `require` and ESM `import`. Its root entrypoint also exports identity/topic helpers, file-selection/manifest helpers, bounded protocol codecs/constants, `AllowlistWatcher`, `SwarmDeployError`, and `ERRORS`. See the generated `dist/index.d.ts` for the complete API.
+CommonJS uses the same API:
+
+```js
+const { Client, Server, parseTopic } = require('@tetherto/swarm-deploy')
+```
+
+Its root entrypoint also exports identity/topic helpers, file-selection/manifest helpers, bounded protocol codecs/constants, `AllowlistWatcher`, `SwarmDeployError`, and `ERRORS`. See the generated `dist/index.d.ts` for the complete API.
 
 ## Events and logging
 
@@ -203,7 +224,7 @@ Server events:
 
 Client events:
 
-- `authentication`, `connection-open`, `connection-close`, and `rejected-peer`: pinning and transport lifecycle.
+- `authentication`, `connection-open`, `connection-close`, and `rejected-peer`: topic-commitment and transport lifecycle.
 - `offer`: offered, accepted, resumed, rejected, or already-committed state.
 - `progress`: acknowledged chunk and cumulative byte counts, including resumed verified bytes.
 - `verification` and `commit`: transfer completion phases.
@@ -247,7 +268,7 @@ Parsing, configuration, and object-construction failures exit `2`. Once `server.
   rollback. In particular, drain or recover in-flight v2 replacement journals
   before running an older server.
 
-## Test
+## Contributor development
 
 Production sources are strict TypeScript under `src/`; tests are strict
 TypeScript under `test/`. Builds generate untracked `dist/` and
@@ -265,15 +286,25 @@ npm run test:node
 npm run test:bare
 ```
 
+To exercise checkout artifacts directly after `npm run build`:
+
+```sh
+node dist/bin/swarm-deploy.js --help
+bare dist/bin/swarm-deploy.js --help
+```
+
 See [the Swarm Deploy specification](docs/spec/swarm-deploy.md) for the
 complete protocol, replacement, package, and threat-model requirements.
 
 ## Publish
 
 Publishing is tag-driven through `.github/workflows/publish.yml`. The tag must
-be exactly `vX.Y.Z` and equal the version in `package.json`; the workflow runs
-the build, type, format, lint, Node, Bare, property, CLI, replacement, and
-package gates before `npm publish --provenance --access public`.
+be exactly `vX.Y.Z`, equal the version in `package.json`, and point to a commit
+on `main`. Full Node, Bare, property, CLI, and quality tests run exclusively in
+PR/main CI. The tag workflow builds an untracked `dist/`, validates and smokes
+the package, then delegates npm publication and GitHub release creation to
+`holepunchto/actions/publish@v1`. The action publishes with
+`npm publish --ignore-scripts`, so the workflow creates `dist/` first.
 
 Before the first release, configure npm trusted publishing for
 `@tetherto/swarm-deploy` with GitHub Actions as the provider, this repository

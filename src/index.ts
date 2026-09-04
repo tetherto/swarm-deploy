@@ -32,7 +32,7 @@ export {
   keyPairFromSeed,
   publicKeyFromSeed
 } from './identity.js'
-export { topicFromServerPublicKey } from './topic.js'
+export { parseTopic, topicFromServerPublicKey } from './topic.js'
 export {
   validateBasename,
   selectUploadPaths,

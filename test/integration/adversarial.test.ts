@@ -670,7 +670,7 @@ test('disconnect boundaries resume without exposing partial uploads', async (t) 
   for (const entry of cases) {
     const client = new Client({
       seed: clientSeed,
-      serverPublicKey: server.publicKey,
+      topic: server.topic,
       connectTimeout: 5_000,
       idleTimeout: 5_000,
       dht: testnet.createNode()

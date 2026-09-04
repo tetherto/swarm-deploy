@@ -7,7 +7,13 @@ import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
 import Hyperswarm from 'hyperswarm'
-import { Client, Server, keyPairFromSeed, topicFromServerPublicKey } from '../../dist/index.js'
+import {
+  Client,
+  Server,
+  keyPairFromSeed,
+  parseTopic,
+  topicFromServerPublicKey
+} from '../../dist/index.js'
 import type {
   BatchUploadResult,
   ClientOptions,
@@ -89,7 +95,7 @@ async function setupServer(
 function createClient(t: Assert, testnet: Testnet, server: Server, seed: Buffer): Client {
   const client = new Client({
     seed,
-    serverPublicKey: server.publicKey,
+    topic: server.topic,
     dht: testnet.createNode(),
     connectTimeout: 5_000,
     idleTimeout: 10_000
@@ -98,11 +104,26 @@ function createClient(t: Assert, testnet: Testnet, server: Server, seed: Buffer)
   return client
 }
 
-test('Client validates identities and bounded timeouts before networking', (t) => {
+test('parseTopic accepts only canonical lowercase 64-hex topics', (t) => {
+  const topic = topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey)
+  const canonical = b4a.toString(topic, 'hex')
+  t.alike(parseTopic(canonical), topic)
+  for (const invalid of [
+    '',
+    'ab',
+    canonical.toUpperCase(),
+    `${canonical}0`,
+    `${canonical.slice(0, 63)}g`
+  ]) {
+    t.exception(() => parseTopic(invalid), { name: 'SwarmDeployError' })
+  }
+})
+
+test('Client validates identity commitment and bounded timeouts before networking', (t) => {
   const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
   const options: ClientOptions = {
     seed: CLIENT_A_SEED,
-    serverPublicKey: serverKey,
+    topic: topicFromServerPublicKey(serverKey),
     connectTimeout: 5_000,
     idleTimeout: 10_000,
     swarmFactory() {
@@ -112,8 +133,11 @@ test('Client validates identities and bounded timeouts before networking', (t) =
 
   for (const invalid of [
     { ...options, seed: b4a.alloc(31) },
-    { ...options, serverPublicKey: b4a.alloc(31) },
-    { ...options, seed: SERVER_SEED },
+    { ...options, topic: b4a.alloc(31) },
+    {
+      ...options,
+      topic: topicFromServerPublicKey(keyPairFromSeed(CLIENT_A_SEED).publicKey)
+    },
     { ...options, connectTimeout: 0 },
     { ...options, connectTimeout: 30_001 },
     { ...options, idleTimeout: 0 }
@@ -128,7 +152,7 @@ test('Client close aborts pending discovery promptly', async (t) => {
   await fs.promises.writeFile(source, b4a.from('wait for an unavailable server'))
   const client = new Client({
     seed: CLIENT_A_SEED,
-    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
     dht: testnet.createNode(),
     connectTimeout: 30_000
   })
@@ -331,7 +355,7 @@ test('Client directory results have one accurate final aggregate for success and
   })
 })
 
-test('Client pins the expected server before Protomux metadata and continues past rogue peers', async (t) => {
+test('Client binds a committed topic before Protomux metadata and continues past rogue peers', async (t) => {
   const testnet = await createLocalTestnet(t)
   const server = await setupServer(t, testnet, [CLIENT_A_SEED])
   const client = createClient(t, testnet, server, CLIENT_A_SEED)

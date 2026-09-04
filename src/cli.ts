@@ -5,16 +5,11 @@ import path from '#path'
 import process from '#process'
 import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS } from './errors.js'
-import { parseSeed, parsePublicKey, generateSeed, publicKeyFromSeed } from './identity.js'
+import { parseSeed, generateSeed, publicKeyFromSeed } from './identity.js'
+import { parseTopic, topicFromServerPublicKey } from './topic.js'
 import { parseAllowlist } from './allowlist.js'
 import { validateReplaceNames } from './files.js'
-import {
-  Server,
-  fingerprint,
-  type ServerLogger,
-  type ServerOptions,
-  type ServerSwarmFactory
-} from './server.js'
+import { Server, type ServerLogger, type ServerOptions, type ServerSwarmFactory } from './server.js'
 import {
   Client,
   type ClientOptions,
@@ -42,7 +37,7 @@ type CliIo = {
 }
 type FileIdentity = Pick<fs.Stats, 'dev' | 'ino'>
 
-const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload'])
+const COMMANDS = new Set(['keygen', 'public-key', 'topic', 'server', 'upload'])
 const HELP_ARGS = new Set(['--help', '-h'])
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MAX_SEED_FILE_BYTES = 65
@@ -54,8 +49,9 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key --seed-file <seed-file>',
+  '  swarm-deploy topic --seed-file <server-seed-file>',
   '  swarm-deploy server --seed-file <seed-file> --storage <dir> --allowlist <file> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
-  '  swarm-deploy upload --seed-file <seed-file> --server-key <64-lower-hex> <file-or-directory>',
+  '  swarm-deploy upload --seed-file <seed-file> --topic <64-lower-hex> <file-or-directory>',
   '',
   'Use --seed-file. A command-specific environment variable is also accepted.'
 ].join('\n')
@@ -531,6 +527,13 @@ async function runPublicKey(args: string[]): Promise<string> {
   return b4a.toString(publicKeyFromSeed(seed), 'hex')
 }
 
+async function runTopic(args: string[]): Promise<string> {
+  const { options, positionals } = parseOptions(args, new Set(['--seed-file']))
+  requirePositionals(positionals, 0, 'topic does not accept positional arguments')
+  const seed = await readSeedFile(requireOption(options, '--seed-file'))
+  return b4a.toString(topicFromServerPublicKey(publicKeyFromSeed(seed)), 'hex')
+}
+
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, repeatedOptions, positionals } = parseOptions(
     args,
@@ -628,7 +631,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     }
     if (!runError) {
       writeLine(io.stdout, b4a.toString(server.publicKey, 'hex'))
-      writeLine(io.stdout, fingerprint(server.topic))
+      writeLine(io.stdout, b4a.toString(server.topic, 'hex'))
       writeLine(io.stdout, 'ready')
       await stopped
     }
@@ -661,7 +664,7 @@ function printUploadResult(result: ClientUploadResult, io: CliIo): number {
 }
 
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, positionals } = parseOptions(args, new Set(['--seed-file', '--server-key']))
+  const { options, positionals } = parseOptions(args, new Set(['--seed-file', '--topic']))
   const [inputPath] = requirePositionals(positionals, 1, 'upload requires a file or directory')
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
@@ -669,11 +672,11 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
     envName: CLIENT_SEED_ENV,
     role: 'client'
   })
-  let serverPublicKey: Buffer
+  let topic: Buffer
   try {
-    serverPublicKey = parsePublicKey(requireOption(options, '--server-key'))
+    topic = parseTopic(requireOption(options, '--topic'))
   } catch {
-    throw usageError('Invalid --server-key')
+    throw usageError('Invalid --topic')
   }
 
   const ClientImpl = io.Client || Client
@@ -681,7 +684,7 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   try {
     client = new ClientImpl({
       seed,
-      serverPublicKey,
+      topic,
       dht: io.dht,
       connectTimeout: io.connectTimeout,
       idleTimeout: io.idleTimeout,
@@ -737,6 +740,10 @@ async function dispatch(argv: string[], env: Env, io: CliIo): Promise<number> {
   }
   if (command === 'public-key') {
     writeLine(io.stdout, await runPublicKey(args))
+    return 0
+  }
+  if (command === 'topic') {
+    writeLine(io.stdout, await runTopic(args))
     return 0
   }
   if (command === 'server') return runServer(args, env, io)

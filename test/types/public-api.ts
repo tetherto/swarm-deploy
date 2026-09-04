@@ -98,6 +98,7 @@ import {
   parseAllowlist,
   parsePublicKey,
   parseSeed,
+  parseTopic,
   PROTOCOL_VERSION,
   publicKeyFromSeed,
   READY,
@@ -199,12 +200,16 @@ const serverOptions: ServerOptions = {
 }
 const clientOptions: ClientOptions = {
   seed: binaryInput,
-  serverPublicKey: new Uint8Array(serverKey),
+  topic: new Uint8Array(binaryTopic),
   logger
 }
 
 const server = new Server(serverOptions)
 const client = new Client(clientOptions)
+// @ts-expect-error serverPublicKey was removed before the initial release
+new Client({ seed: binaryInput, serverPublicKey: serverKey })
+// @ts-expect-error clients expose only the committed topic
+void client.serverPublicKey
 const recoveryFileExists: RecoveryEvent['status'] = 'FILE_EXISTS'
 const allowlistWatcher = new AllowlistWatcher({
   filePath: '/var/lib/swarm-deploy/allowlist',
@@ -396,6 +401,7 @@ void [
   parseAllowlist(''),
   parsePublicKey(serverKey.toString('hex')),
   parseSeed(seed.toString('hex')),
+  parseTopic(binaryTopic.toString('hex')),
   protocolChunkAck,
   protocolFinish,
   protocolReady,

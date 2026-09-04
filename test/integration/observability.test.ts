@@ -155,7 +155,7 @@ test('typed observability covers resume reject recovery retention auth and priva
 
   const client = new Client({
     seed: CLIENT_SEED,
-    serverPublicKey: server.publicKey,
+    topic: server.topic,
     connectTimeout: 5_000,
     idleTimeout: 5_000,
     dht: testnet.createNode()
