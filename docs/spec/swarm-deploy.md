@@ -24,8 +24,10 @@ malicious local writer is outside this version's scope.
 Server and client identities use separate random persistent 32-byte seeds.
 Seeds are represented as lowercase 64-character hexadecimal values in files
 and environment variables, are never command-line arguments, and are never
-logged. A public key is derived from each seed. The server allowlists client
-public keys; every client pins the server public key.
+logged. A public key is derived from each seed. The server identity remains
+explicitly configured through its seed file or role-specific environment
+variable. Operators must preserve that seed for the lifetime of a deployment:
+a stable server seed produces a stable public key and topic.
 
 The discovery topic is:
 
@@ -33,12 +35,28 @@ The discovery topic is:
 SHA-256(UTF8("swarm-deploy/topic/v1\0") || serverPublicKey)
 ```
 
-It is a discovery value, not a secret or authorization capability. HyperDHT
-Noise authenticates transport identities and encrypts the connection. The
-server firewall and connection handler both check the current allowlist. The
-client rejects an unpinned peer before sending application data. An allowlist
-reload is all-or-nothing; removing a key closes its connections and deletes
-its active or resumable uploads, but does not delete committed artifacts.
+The topic is one 32-byte value, represented to operators as lowercase
+64-character hexadecimal. It is both the discovery value and a cryptographic
+commitment to the intended server public key; it is not a secret or an
+authorization capability. The client is configured with this topic and does
+not receive or pin a separate server public key. After discovery, it recomputes
+the topic from `peerInfo.publicKey` and rejects any mismatch before creating a
+Protomux channel or sending metadata or application data.
+
+Changing the server seed changes its public key and topic, so every client
+configuration must be updated. An arbitrary topic combined with an ephemeral
+server identity is not supported: that design would let a rogue receiver join
+the advertised topic and report fake upload success. Knowledge of the committed
+topic does not enable receiver impersonation under SHA-256 preimage-resistance
+assumptions because an attacker must find a transport public key that hashes to
+the committed topic.
+
+HyperDHT Noise authenticates transport identities and encrypts the connection.
+The server allowlists client public keys; its firewall and connection handler
+both check the current allowlist. The receiver never serves stored binaries.
+An allowlist reload is all-or-nothing; removing a key closes its connections
+and deletes its active or resumable uploads, but does not delete committed
+artifacts.
 
 The protocol is `swarm-deploy/upload/1`. It uses SHA-256 whole-file and 1 MiB
 chunk hashes, bounded compact-encoding control frames, a maximum of four
@@ -47,6 +65,11 @@ key, name, size, digest, and chunk size. There is no wire-protocol change for
 replacement support.
 
 ## Public interface and CLI
+
+`ClientOptions` requires `seed: SeedInput` and `topic: BinaryInput`, where
+`topic` is exactly 32 bytes. It has no `serverPublicKey` option. The existing
+connection timeout, idle timeout, DHT, scheduler, clock, swarm factory, and
+logger options remain optional.
 
 `ServerOptions` includes all existing required identity, storage, allowlist,
 limit, lifecycle, retention, logging, timer, filesystem, and swarm options,
@@ -71,6 +94,13 @@ an unmanaged path is never replaced and returns the existing-name conflict.
 
 `history-` paths are server-managed historical artifacts, not a restore
 interface. The package has no restore API or CLI operation.
+
+The CLI provides `topic --seed-file <server.seed>`, which derives and prints
+the full lowercase 64-character topic without printing the seed. The server
+startup output includes that full topic rather than a topic fingerprint before
+printing `ready`. The upload command accepts `--topic <64-lower-hex>` and does
+not accept `--server-key`. Seed files and the role-specific seed environment
+variables retain their existing precedence and secrecy rules.
 
 ## Storage, replacement, and accounting
 
@@ -185,11 +215,26 @@ under Bare, executes the CLI, and verifies key generation does not overwrite or
 print seed material. There is no `prepare` script.
 
 The public package is `@tetherto/swarm-deploy` version `0.1.0` with
-`publishConfig.access` set to `public`. CI first builds and type-checks, then
-runs compiled Node and Bare tests. A tag-triggered release workflow publishes
-to npm using OIDC and provenance only for tags matching `vX.Y.Z` whose version
-matches `package.json`. npm trusted publishing is configured externally for
-the GitHub workflow and its `npm` environment; the repository stores no npm
-publication token. Rollback installs a previous immutable package version; a
-server must not be downgraded across an in-flight v2 replacement journal, which
-the current version must drain or recover first.
+`publishConfig.access` set to `public` and `publishConfig.provenance` set to
+`true`. The README's primary API installation command is
+`npm install @tetherto/swarm-deploy`; its primary CLI installation command is
+`npm install --global @tetherto/swarm-deploy`. Primary user instructions do not
+use `npx` or invoke `dist/` directly. Checkout build and direct-runtime commands
+are contributor-only instructions.
+
+CI owns the full pull-request and `main` test matrix: build, types, lint,
+package, supported Node versions and operating systems, Bare operating systems,
+and protocol property tests. The tag-triggered workflow performs only the
+explicit release checks for an exact `vX.Y.Z` tag, a tag commit on `main`, a
+matching `package.json` version, a clean distribution build, and a valid
+package. It then invokes `holepunchto/actions/publish@v1`; it does not duplicate
+the full CI test matrix. The workflow must build `dist/` before invoking the
+action because the action publishes with `npm publish --ignore-scripts`. The
+publish job grants `id-token: write` for npm trusted publishing and
+`contents: write` for the GitHub release the action creates.
+
+npm trusted publishing is configured externally for the GitHub workflow and
+its `npm` environment; the repository stores no npm publication token.
+Rollback installs a previous immutable package version; a server must not be
+downgraded across an in-flight v2 replacement journal, which the current
+version must drain or recover first.
