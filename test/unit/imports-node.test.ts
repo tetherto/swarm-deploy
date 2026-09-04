@@ -68,7 +68,7 @@ test('package exports and entry fields target dist only', (t) => {
   }
   t.is(pkg.main, './dist/index.js')
   t.is(pkg.types, './dist/index.d.ts')
-  t.is(pkg.bin['swarm-deploy'], './dist/bin/swarm-deploy.js')
+  t.is(pkg.bin['swarm-deploy'], 'dist/bin/swarm-deploy.js')
   t.is(pkg.exports['.'].types, './dist/index.d.ts')
   t.is(pkg.exports['.'].import, './dist/index.js')
   t.is(pkg.exports['.'].require, './dist/index.js')

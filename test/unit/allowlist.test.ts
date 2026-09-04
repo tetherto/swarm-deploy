@@ -56,8 +56,8 @@ test('allowlist watcher applies a valid replacement atomically', async (t) => {
   const applied: Array<Set<string>> = []
   const watcher = new AllowlistWatcher({
     filePath: 'allowed.txt',
-    storage: { readFile: async () => source },
-    onReload: async (keys) => {
+    storage: { readFile: () => Promise.resolve(source) },
+    onReload: (keys) => {
       applied.push(new Set(keys))
     }
   })
@@ -74,8 +74,8 @@ test('allowlist watcher emits fingerprint-only removal events', async (t) => {
   let source = `${KEY_A}\n${KEY_B}\n`
   const watcher = new AllowlistWatcher({
     filePath: 'allowed.txt',
-    storage: { readFile: async () => source },
-    onReload: async () => {}
+    storage: { readFile: () => Promise.resolve(source) },
+    onReload: () => {}
   })
   const removed: AllowlistRemovedEvent[] = []
   watcher.on('removed', (details) => removed.push(details))
@@ -92,8 +92,8 @@ test('allowlist watcher retries unchanged applied cleanup failures', async (t) =
   let attempts = 0
   const watcher = new AllowlistWatcher({
     filePath: 'allowed.txt',
-    storage: { readFile: async () => `${KEY_A}\n` },
-    onReload: async () => {
+    storage: { readFile: () => Promise.resolve(`${KEY_A}\n`) },
+    onReload: () => {
       if (++attempts === 1) {
         const error: AppliedAggregateError = new AggregateError([new Error('cleanup failed')])
         error.allowlistApplied = true

@@ -346,7 +346,7 @@ test('inspect recognizes only matching managed committed records', async (t) => 
 
 test('link failure preserves verified session state without a final file', async (t) => {
   const storage = createStorage({
-    async beforeOperation(name) {
+    beforeOperation(name) {
       if (name === 'link') throw new Error('Injected link failure')
     }
   })
@@ -366,7 +366,7 @@ test('sidecar persistence failures roll back before commit linearization', async
     let layout!: StorageLayout
     let record: string | null = null
     const storage = createStorage({
-      async beforeOperation(name, source, destination) {
+      beforeOperation(name, source, destination) {
         if (!armed) return
         const temporary =
           typeof source === 'string' &&
@@ -412,7 +412,7 @@ test('post-linearization cleanup failures return success and recover leftovers',
     let sidecarDurable = false
     const warnings: LoggedWarning[] = []
     const storage = createStorage({
-      async beforeOperation(name, source) {
+      beforeOperation(name, source) {
         if (!armed) return
         const fail =
           (boundary === 'session-unlink' && name === 'unlink' && source === expected.session) ||
@@ -431,7 +431,7 @@ test('post-linearization cleanup failures return success and recover leftovers',
         armed = false
         throw noSpace(`No space at cleanup ${boundary}`)
       },
-      async afterOperation(name, source) {
+      afterOperation(name, source) {
         if (armed && name === 'sync' && source === layout.commits) sidecarDurable = true
       }
     })
@@ -495,7 +495,7 @@ test('revocation after sidecar durability preserves committed publication', asyn
   let armed = false
   let layout!: StorageLayout
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (!armed || name !== 'sync' || filePath !== layout.commits) return
       armed = false
       signal.aborted = true
@@ -532,7 +532,7 @@ test('commit durably journals a unique attempt and staging inode before linking'
   let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
         armed = false
         throw new Error('Injected journal parent sync failure')
@@ -559,7 +559,7 @@ test('commit durably journals a unique attempt and staging inode before linking'
 test('delete removes only its managed object and durably removes its sidecar', async (t) => {
   const events: string[] = []
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (name === 'unlink' || name === 'sync') events.push(`${name}:${filePath}`)
     }
   })
@@ -597,7 +597,7 @@ test('commit removes its publication when revoked during final link', async (t) 
   const signal = { aborted: false }
   let staging: string | null = null
   const storage = createStorage({
-    async afterOperation(name, sourcePath) {
+    afterOperation(name, sourcePath) {
       if (name === 'link' && sourcePath === staging) signal.aborted = true
     }
   })
@@ -637,7 +637,7 @@ test('assertCommitRecord preserves unknown persisted fields', (t) => {
 test('commit routes plain revoked errors through revoked cleanup', async (t) => {
   let staging: string | null = null
   const storage = createStorage({
-    async beforeOperation(name, sourcePath) {
+    beforeOperation(name, sourcePath) {
       if (name === 'link' && sourcePath === staging) {
         const error: ErrnoError = new Error('Uploader access revoked')
         error.code = ERRORS.REVOKED
@@ -666,10 +666,10 @@ test('retryAbortedAttempt removes only a failed revoked attempt before owner del
   let finalPath: string | null = null
   let failRollback = true
   const storage = createStorage({
-    async afterOperation(name, sourcePath) {
+    afterOperation(name, sourcePath) {
       if (name === 'link' && sourcePath === staging) signal.aborted = true
     },
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (failRollback && name === 'unlink' && filePath === finalPath) {
         throw new Error('Injected rollback failure')
       }
@@ -699,7 +699,7 @@ test('retryAbortedAttempt cleans a linearized commit without a live session', as
   let failCleanup = false
   let sessionMetadata: string | null = null
   const storage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (!failCleanup || name !== 'unlink' || filePath !== sessionMetadata) return
       failCleanup = false
       throw new Error('Injected post-linearization cleanup failure')
@@ -740,7 +740,7 @@ test('retryAbortedAttempt leaves foreign final and sidecar state untouched', asy
     let failCleanup = false
     let sessionMetadata: string | null = null
     const storage = createStorage({
-      async beforeOperation(name, filePath) {
+      beforeOperation(name, filePath) {
         if (!failCleanup || name !== 'unlink' || filePath !== sessionMetadata) return
         failCleanup = false
         throw new Error('Injected post-linearization cleanup failure')
@@ -817,10 +817,10 @@ test('withNameLease serializes one name while distinct names proceed', async (t)
     await first
     order.push('first-end')
   })
-  const queued = withNameLease(root, MUTABLE, async () => {
+  const queued = withNameLease(root, MUTABLE, () => {
     order.push('second-start')
   })
-  const concurrent = withNameLease(root, 'manifest.json', async () => {
+  const concurrent = withNameLease(root, 'manifest.json', () => {
     order.push('other')
   })
 
@@ -917,8 +917,8 @@ test('replacement preserves the old inode as history and publishes the new inode
   const staging = stagingPath(layout, upload.offer)
   const stagingInode = await inode(staging)
   const retentionManager = {
-    async run() {},
-    async afterCommit() {},
+    run: () => Promise.resolve(),
+    afterCommit: () => Promise.resolve(),
     async _runUnlocked(options: { incomingBytes: number; trigger: string }) {
       retention.push({
         incomingBytes: options.incomingBytes,
@@ -1104,7 +1104,7 @@ test('replacement revoked before its history link restores the pinned old artifa
   const signal = { aborted: false }
   let historyPath: string | null = null
   const storage = createStorage({
-    async afterOperation(name, source, destination) {
+    afterOperation(name, source, destination) {
       if (name === 'link' && destination === historyPath) signal.aborted = true
     }
   })
@@ -1135,7 +1135,7 @@ test('replacement revoked after its final rename restores the old inode from his
   const signal = { aborted: false }
   let finalPath: string | null = null
   const storage = createStorage({
-    async afterOperation(name, source, destination) {
+    afterOperation(name, source, destination) {
       if (name === 'rename' && destination === finalPath) signal.aborted = true
     }
   })
@@ -1167,7 +1167,7 @@ test('revocation after the new sidecar cannot unpublish the replacement', async 
   let armed = false
   let commitsDir: string | null = null
   const storage = createStorage({
-    async afterOperation(name, source) {
+    afterOperation(name, source) {
       if (armed && name === 'sync' && source === commitsDir) signal.aborted = true
     }
   })

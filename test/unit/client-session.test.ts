@@ -198,9 +198,7 @@ function createPair({
   const session = new ClientSession({
     channel: channel as unknown as ProtocolChannel,
     clientPublicKey: CLIENT_KEY,
-    readChunk: useFileReader
-      ? null
-      : readChunk || (async (_manifest, index) => manifest.chunks![index]),
+    readChunk: useFileReader ? null : readChunk || ((_manifest, index) => manifest.chunks![index]),
     ...(scheduler ? { scheduler } : {})
   })
 
@@ -458,7 +456,7 @@ test('client session turns terminal statuses, local checksums, timeouts, and bad
 
   const checksum = createPair({
     manifest,
-    readChunk: async () => b4a.alloc(manifest.chunkSize, 99)
+    readChunk: () => Promise.resolve(b4a.alloc(manifest.chunkSize, 99))
   })
   const { uploading: checksumUpload } = await openAndOffer(checksum, manifest)
   checksum.accept()
@@ -516,7 +514,7 @@ test('client session closes its channel when source descriptor cleanup fails', a
   pair.accept()
   await waitFor(() => pair.received.finish.length === 1)
   pair.session.file = {
-    async close() {
+    close() {
       throw new Error('injected close failure')
     }
   } as unknown as NonNullable<ClientSession['file']>

@@ -247,7 +247,7 @@ async function syncDirectory(directory: string, storage: StorageAdapter): Promis
   }
 }
 
-async function digestExactFile(
+function digestExactFile(
   filePath: string,
   size: number,
   storage: StorageAdapter,
@@ -338,7 +338,7 @@ class CommitStore {
   }
 
   /** Inspects one top-level path without following or trusting symlinks. */
-  async _rootPathState(name: string): Promise<RootPathState> {
+  _rootPathState(name: string): Promise<RootPathState> {
     const filePath = this._finalPath(name)
     return withSafeDirectoryIdentity(this.layout.root, this.storage, async () => {
       let stat: StorageStat
@@ -621,7 +621,7 @@ class CommitStore {
     return marked
   }
 
-  async _linkStaging(
+  _linkStaging(
     stagingPath: string,
     finalPath: string,
     expectedIdentity: FileIdentity,
@@ -899,9 +899,7 @@ class CommitStore {
       throw err
     })
     const leaseName = isReplacementJournal(pending) ? pending.name : null
-    const run = async (): Promise<
-      false | { status: 'COMMITTED' | 'ABORTED'; record: CommitRecord }
-    > =>
+    const run = (): Promise<false | { status: 'COMMITTED' | 'ABORTED'; record: CommitRecord }> =>
       withRootLease(this.layout.root, async () => {
         await this._assertLayout()
         const journal = await this._readJournal(id)
@@ -959,7 +957,7 @@ class CommitStore {
     }
   }
 
-  async commit(
+  commit(
     session: CommitSession,
     {
       retentionManager = null,
@@ -971,25 +969,29 @@ class CommitStore {
       replaceNames?: Iterable<string>
     } = {}
   ): Promise<CommitRecord> {
-    assertSession(session)
-    if (
-      retentionManager !== null &&
-      (typeof retentionManager.run !== 'function' ||
-        typeof retentionManager.afterCommit !== 'function' ||
-        typeof retentionManager._runUnlocked !== 'function' ||
-        typeof retentionManager._afterCommitUnlocked !== 'function')
-    ) {
-      throw storageError('Invalid retention manager')
-    }
-    if (signal !== null && (typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
-      throw storageError('Invalid commit abort signal')
-    }
-    const mutable = validateReplaceNames(replaceNames)
-    return withNameLease(this.layout.root, session.name, () =>
-      withRootLease(this.layout.root, () =>
-        this._commit(session, retentionManager, signal, mutable)
+    try {
+      assertSession(session)
+      if (
+        retentionManager !== null &&
+        (typeof retentionManager.run !== 'function' ||
+          typeof retentionManager.afterCommit !== 'function' ||
+          typeof retentionManager._runUnlocked !== 'function' ||
+          typeof retentionManager._afterCommitUnlocked !== 'function')
+      ) {
+        return Promise.reject(storageError('Invalid retention manager'))
+      }
+      if (signal !== null && (typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
+        return Promise.reject(storageError('Invalid commit abort signal'))
+      }
+      const mutable = validateReplaceNames(replaceNames)
+      return withNameLease(this.layout.root, session.name, () =>
+        withRootLease(this.layout.root, () =>
+          this._commit(session, retentionManager, signal, mutable)
+        )
       )
-    )
+    } catch (error) {
+      return Promise.reject(error)
+    }
   }
 
   async _commit(
@@ -1310,7 +1312,7 @@ class CommitStore {
     }
   }
 
-  async _readJournal(id: string): Promise<AnyCommitJournal | null> {
+  _readJournal(id: string): Promise<AnyCommitJournal | null> {
     return readCommitJournal(id, this.layout, this.storage)
   }
 
@@ -1388,7 +1390,7 @@ class CommitStore {
    * Startup recovery for one v2 attempt. Revocation of a still-live session
    * aborts the attempt first so the same rollback path converges.
    */
-  async _recoverReplacementJournal(
+  _recoverReplacementJournal(
     id: string,
     journal: ReplacementJournal,
     sessionStore: SessionStore,

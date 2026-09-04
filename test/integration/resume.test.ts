@@ -107,19 +107,19 @@ test('Client starts a fresh reconnect window after an active transport loss', as
   const deadlines: number[] = []
   const socket = {}
   const internal = clientInternals(client)
-  internal._ensureStarted = async () => client
-  internal._delay = async () => true
-  internal._waitForSocket = async (deadline) => {
+  internal._ensureStarted = () => Promise.resolve(client)
+  internal._delay = () => Promise.resolve(true)
+  internal._waitForSocket = (deadline) => {
     deadlines.push(deadline)
-    if (deadlines.length === 1) return socket
+    if (deadlines.length === 1) return Promise.resolve(socket)
     now = deadline
-    throw new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'unavailable')
+    return Promise.reject(new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'unavailable'))
   }
-  internal._startSession = async () => {
+  internal._startSession = () => {
     now = 60_000
     const error: TransportError = new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'lost')
     error.transport = true
-    throw error
+    return Promise.reject(error)
   }
 
   await t.exception(() => internal._uploadManifest({}), {

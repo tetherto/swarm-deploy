@@ -540,29 +540,39 @@ export class ServerSession {
     } catch {}
   }
 
-  async _terminal(): Promise<void> {
-    if (this.state === 'TERMINAL') return
-    this.state = 'TERMINAL'
-    this._clearTimer()
-    this._releaseReservation()
-    this._notifyTerminal()
-    this._resolveDrain()
-    this._closeChannel()
+  _terminal(): Promise<void> {
+    try {
+      if (this.state === 'TERMINAL') return Promise.resolve()
+      this.state = 'TERMINAL'
+      this._clearTimer()
+      this._releaseReservation()
+      this._notifyTerminal()
+      this._resolveDrain()
+      this._closeChannel()
+      return Promise.resolve()
+    } catch (error) {
+      return Promise.reject(error)
+    }
   }
 
-  async _failClosed(error: unknown): Promise<void> {
-    if (this.state === 'TERMINAL') {
-      this._recordFailure(error)
-      return
-    }
-    this.state = 'TERMINAL'
-    this._clearTimer()
-    this._releaseReservation()
-    this._notifyTerminal()
-    this._resolveDrain()
+  _failClosed(error: unknown): Promise<void> {
     try {
-      this.destroy(error)
-    } catch {}
+      if (this.state === 'TERMINAL') {
+        this._recordFailure(error)
+        return Promise.resolve()
+      }
+      this.state = 'TERMINAL'
+      this._clearTimer()
+      this._releaseReservation()
+      this._notifyTerminal()
+      this._resolveDrain()
+      try {
+        this.destroy(error)
+      } catch {}
+      return Promise.resolve()
+    } catch (failure) {
+      return Promise.reject(failure)
+    }
   }
 
   _invalidInboundMessage(): Promise<void> {

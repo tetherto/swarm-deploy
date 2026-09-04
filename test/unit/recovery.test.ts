@@ -187,7 +187,7 @@ for (const point of [
     let layout: StorageLayout | null = null
     let upload: HarnessUpload | null = null
     let armed = true
-    const afterOperation: StorageOperationHook = async (name, source, destination) => {
+    const afterOperation: StorageOperationHook = (name, source, destination) => {
       if (!armed || !layout || !upload) return
       const expected = paths(layout, upload.offer)
       const crash =
@@ -271,7 +271,7 @@ test('recovery leaves a same-content foreign final unmanaged', async (t) => {
   let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
         armed = false
         throw new Error('Injected journal parent sync failure')
@@ -305,7 +305,7 @@ test('recovery rejects a shape-valid journal fingerprint that disagrees with the
   let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
         armed = false
         throw new Error('Injected journal parent sync failure')
@@ -341,7 +341,7 @@ test('recovery reports corrupt journals and continues valid journals', async (t)
   let armed = false
   const warnings: LoggedWarning[] = []
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
         armed = false
         throw new Error('Injected journal parent sync failure')
@@ -386,7 +386,7 @@ test('recovery propagates corrupt resumable metadata from SessionStore', async (
   let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
         armed = false
         throw new Error('Injected journal parent sync failure')
@@ -419,7 +419,7 @@ test('recoverStorage invoked twice after cleanup-pending commit preserves final 
   let layout!: StorageLayout
   let armed = false
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'unlink' && filePath === expected.session) {
         armed = false
         throw new Error('Injected cleanup failure after commit linearization')
@@ -492,7 +492,7 @@ test('concurrent same-transfer commits cannot let the journal loser remove the w
       await winnerAtPublication.promise
       await winnerPublished.promise
     },
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (name === 'unlink' && filePath === loserTemporary) loserCleaned.resolve()
     }
   })
@@ -541,7 +541,7 @@ test('recovery converges after session metadata unlink before staging cleanup', 
   let expected!: TransferPaths
   let armed = false
   const storage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'unlink' && filePath === expected.session) {
         armed = false
         throw new Error('Injected crash after session metadata unlink')
@@ -588,7 +588,7 @@ test('recovery propagates cleanup directory fsync failure and a retry converges'
   let failCleanupSync = false
   const cleanupFailure = new Error('Injected cleanup parent fsync failure')
   const storage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (crashCommit && name === 'unlink' && filePath === expected.session) {
         crashCommit = false
         throw new Error('Injected cleanup failure after commit linearization')
@@ -642,7 +642,7 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
   let layout!: StorageLayout
   let armed = false
   const setupStorage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
         armed = false
         throw new Error('Injected crash after journal publication')
@@ -658,7 +658,7 @@ test('recovery aborts on journal EIO without continuing to a later valid journal
   const warnings: LoggedWarning[] = []
   const events: unknown[] = []
   const recoveryStorage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (name === 'read' && filePath === earlierJournal) throw eio
     }
   })
@@ -760,7 +760,7 @@ test('recovery aborts on uncoded storage-safety errors without reporting corrupt
   let layout!: StorageLayout
   let armed = false
   const setupStorage = createStorage({
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
         armed = false
         throw new Error('Injected crash after journal publication')
@@ -774,7 +774,7 @@ test('recovery aborts on uncoded storage-safety errors without reporting corrupt
   const warnings: LoggedWarning[] = []
   let journalStats = 0
   const recoveryStorage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (name !== 'stat' || filePath !== expected.journal) return
       journalStats++
       if (journalStats === 2) throw storageSafetyFailure
@@ -931,10 +931,10 @@ async function crashDuringReplacement(
   let stagingFile = ''
 
   const storage = createStorage({
-    async beforeOperation(name) {
+    beforeOperation(name) {
       if (crashed && MUTATIONS.has(name)) throw new Error('Storage stopped at crash point')
     },
-    async afterOperation(name, source, destination) {
+    afterOperation(name, source, destination) {
       if (!armed || crashed) return
       const publication =
         typeof destination === 'string' &&

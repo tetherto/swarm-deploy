@@ -154,10 +154,10 @@ class FakeServer {
     }
   }
 
-  async listen(): Promise<this> {
-    if (this.closed) throw new Error('server already closed')
+  listen(): Promise<this> {
+    if (this.closed) return Promise.reject(new Error('server already closed'))
     this.listening = true
-    return this
+    return Promise.resolve(this)
   }
 
   close(): Promise<void> {
@@ -182,9 +182,9 @@ class FakeClient {
     this.closed = false
   }
 
-  async upload(inputPath: string): Promise<unknown> {
+  upload(inputPath: string): Promise<unknown> {
     if (typeof FakeClient.uploadImpl === 'function') return FakeClient.uploadImpl(inputPath, this)
-    return { name: path.basename(inputPath), status: 'COMMITTED' }
+    return Promise.resolve({ name: path.basename(inputPath), status: 'COMMITTED' })
   }
 
   close(): Promise<void> {
@@ -710,7 +710,7 @@ test('server config failures exit 2 and listen failures exit 1', async (t) => {
   t.is(await main(['server', ...args], {}, ctor), 2)
 
   class ListenFail extends FakeServer {
-    async listen(): Promise<this> {
+    listen(): Promise<this> {
       throw new Error('swarm bind failed')
     }
   }
@@ -721,7 +721,7 @@ test('server config failures exit 2 and listen failures exit 1', async (t) => {
   t.absent(listen.text('stdout').includes('ready'))
 
   class ProtocolListenFail extends FakeServer {
-    async listen(): Promise<this> {
+    listen(): Promise<this> {
       throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Malformed runtime frame')
     }
   }
@@ -904,28 +904,30 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   const artifact = path.join(dir, 'batch')
   await writeSeedFile(seedPath, SEED_A)
 
-  FakeClient.uploadImpl = async () => ({
-    status: 'COMMITTED',
-    results: [
-      { name: 'ok.bin', status: 'COMMITTED' },
-      { name: 'again.bin', status: 'ALREADY_COMMITTED' }
-    ],
-    skipped: [{ name: 'nested', reason: 'directory' }]
-  })
+  FakeClient.uploadImpl = () =>
+    Promise.resolve({
+      status: 'COMMITTED',
+      results: [
+        { name: 'ok.bin', status: 'COMMITTED' },
+        { name: 'again.bin', status: 'ALREADY_COMMITTED' }
+      ],
+      skipped: [{ name: 'nested', reason: 'directory' }]
+    })
   const ok = createIo({ Client: fakeClient })
   t.is(await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, ok), 0)
   t.ok(ok.text('stdout').includes('ok.bin COMMITTED'))
   t.ok(ok.text('stdout').includes('again.bin ALREADY_COMMITTED'))
   t.ok(ok.text('stdout').includes('nested skipped directory'))
 
-  FakeClient.uploadImpl = async () => ({
-    status: 'FAILED',
-    results: [
-      { name: 'ok.bin', status: 'COMMITTED' },
-      { name: 'bad.bin', status: 'FILE_EXISTS' }
-    ],
-    skipped: [{ name: 'link', reason: 'symlink' }]
-  })
+  FakeClient.uploadImpl = () =>
+    Promise.resolve({
+      status: 'FAILED',
+      results: [
+        { name: 'ok.bin', status: 'COMMITTED' },
+        { name: 'bad.bin', status: 'FILE_EXISTS' }
+      ],
+      skipped: [{ name: 'link', reason: 'symlink' }]
+    })
   const partial = createIo({ Client: fakeClient })
   t.is(
     await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, partial),
@@ -936,18 +938,16 @@ test('upload exits 0 for committed batches, 1 for transfer or discovery failure,
   t.ok(partial.text('stdout').includes('link skipped symlink'))
   assertNoSecret(t, partial.text('stdout') + partial.text('stderr'), SEED_A)
 
-  FakeClient.uploadImpl = async () => {
-    throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Path must be a regular file')
-  }
+  FakeClient.uploadImpl = () =>
+    Promise.reject(new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Path must be a regular file'))
   const discovery = createIo({ Client: fakeClient })
   t.is(
     await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, discovery),
     1
   )
 
-  FakeClient.uploadImpl = async () => {
-    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Malformed server frame')
-  }
+  FakeClient.uploadImpl = () =>
+    Promise.reject(new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Malformed server frame'))
   const malformed = createIo({ Client: fakeClient })
   t.is(
     await main(['upload', '--seed-file', seedPath, '--topic', TOPIC_A, artifact], {}, malformed),

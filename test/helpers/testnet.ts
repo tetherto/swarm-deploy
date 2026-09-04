@@ -4,7 +4,7 @@
 import type { Assert } from 'brittle'
 import createTestnet, { type Testnet } from 'hyperdht/testnet'
 
-export async function createLocalTestnet(t: Assert, size = 3): Promise<Testnet> {
+export function createLocalTestnet(t: Assert, size = 3): Promise<Testnet> {
   return createTestnet(size, t)
 }
 

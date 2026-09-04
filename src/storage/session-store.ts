@@ -390,7 +390,7 @@ class SessionStore {
     return withSafeDirectoryIdentity(this.layout.staging, this.storage, operation)
   }
 
-  async _withStagingFile<T>(
+  _withStagingFile<T>(
     session: Session,
     access: 'create' | 'write' | 'read',
     operation: (handle: StorageFileHandle) => Promise<T> | T
@@ -544,7 +544,7 @@ class SessionStore {
     })
   }
 
-  async _verifyWholeStaging(session: Session): Promise<boolean> {
+  _verifyWholeStaging(session: Session): Promise<boolean> {
     return this._withStagingFile(session, 'read', async (handle) => {
       const before = await handle.stat()
       if (!before.isFile() || before.size !== session.size) return false
@@ -747,7 +747,7 @@ class SessionStore {
     }
   }
 
-  async init(): Promise<void> {
+  init(): Promise<void> {
     return this._run(async () => {
       if (this.initialized) return
       if (this.closed) throw storageError('Session store is closed')
@@ -831,7 +831,7 @@ class SessionStore {
     })
   }
 
-  async readVerified(transferId: Uint8Array): Promise<Session> {
+  readVerified(transferId: Uint8Array): Promise<Session> {
     return this._run(async () => {
       assertFixed32(transferId, 'transferId')
       await this._assertLayout()
@@ -848,7 +848,7 @@ class SessionStore {
     })
   }
 
-  async offer(ownerKey: Uint8Array, offer: Offer): Promise<SessionSnapshot> {
+  offer(ownerKey: Uint8Array, offer: Offer): Promise<SessionSnapshot> {
     return this._run(async () => {
       this._assertReady()
       await this._assertLayout()
@@ -903,7 +903,7 @@ class SessionStore {
     })
   }
 
-  async writeChunk(transferId: Uint8Array, chunk: Chunk): Promise<SessionSnapshot> {
+  writeChunk(transferId: Uint8Array, chunk: Chunk): Promise<SessionSnapshot> {
     return this._run(async () => {
       this._assertReady()
       assertFixed32(transferId, 'transferId')
@@ -946,7 +946,7 @@ class SessionStore {
     })
   }
 
-  async checkpoint(transferId: Uint8Array): Promise<SessionSnapshot> {
+  checkpoint(transferId: Uint8Array): Promise<SessionSnapshot> {
     return this._run(async () => {
       this._assertReady()
       assertFixed32(transferId, 'transferId')
@@ -957,7 +957,7 @@ class SessionStore {
     })
   }
 
-  async finish(transferId: Uint8Array): Promise<SessionSnapshot> {
+  finish(transferId: Uint8Array): Promise<SessionSnapshot> {
     return this._run(async () => {
       this._assertReady()
       assertFixed32(transferId, 'transferId')
@@ -978,21 +978,21 @@ class SessionStore {
     })
   }
 
-  async retireCommitted(transferId: Uint8Array): Promise<boolean> {
-    return this._run(async () => {
+  retireCommitted(transferId: Uint8Array): Promise<boolean> {
+    return this._run(() => {
       this._assertReady()
       assertFixed32(transferId, 'transferId')
       const id = toHex(transferId)
       const session = this.sessions.get(id)
-      if (!session) return false
+      if (!session) return Promise.resolve(false)
       if (session.state !== VERIFIED) throw storageError('Session is not verified')
       this.sessions.delete(id)
       this.reservedBytes -= session.size
-      return true
+      return Promise.resolve(true)
     })
   }
 
-  async delete(transferId: Uint8Array): Promise<boolean> {
+  delete(transferId: Uint8Array): Promise<boolean> {
     return this._run(async () => {
       this._assertReady()
       assertFixed32(transferId, 'transferId')
@@ -1010,7 +1010,7 @@ class SessionStore {
     })
   }
 
-  async deleteByOwner(ownerKey: Uint8Array): Promise<number> {
+  deleteByOwner(ownerKey: Uint8Array): Promise<number> {
     return this._run(async () => {
       this._assertReady()
       assertFixed32(ownerKey, 'ownerKey')
@@ -1024,7 +1024,7 @@ class SessionStore {
     })
   }
 
-  async deleteUnauthorized(isAuthorized: (ownerKey: Uint8Array) => boolean): Promise<number> {
+  deleteUnauthorized(isAuthorized: (ownerKey: Uint8Array) => boolean): Promise<number> {
     return this._run(async () => {
       this._assertReady()
       if (typeof isAuthorized !== 'function') {
@@ -1040,10 +1040,7 @@ class SessionStore {
     })
   }
 
-  async expire(
-    ttl: number,
-    shouldExpire: (session: Session) => boolean = () => true
-  ): Promise<number> {
+  expire(ttl: number, shouldExpire: (session: Session) => boolean = () => true): Promise<number> {
     return this._run(async () => {
       this._assertReady()
       assertSafeUint(ttl, 'session ttl')
@@ -1062,7 +1059,7 @@ class SessionStore {
     })
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     return this._run(async () => {
       if (this.closed) return
       for (const session of this.sessions.values()) {

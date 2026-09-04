@@ -325,7 +325,7 @@ test('commits serialize different names through capacity reservation', async (t)
       alphaAtPublication.resolve()
       await allowAlphaPublication.promise
     },
-    async afterOperation(name, source, destination) {
+    afterOperation(name, source, destination) {
       if (name === 'link' && destination === bravoFinal) bravoLinked = true
     }
   })
@@ -376,10 +376,10 @@ test('commit succeeds when post-commit cleanup fails and retries cleanup later',
   const errors: LoggedEntry[] = []
   let stores!: Stores
   const storage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (failCleanup && name === 'unlink' && filePath === firstFinal) throw cleanupFailure
     },
-    async afterOperation(name, source, destination) {
+    afterOperation(name, source, destination) {
       if (!advanceAfterPublication || name !== 'link' || destination !== secondFinal) return
       advanceAfterPublication = false
       stores.clock.advance(11)
@@ -476,7 +476,7 @@ test('retention propagates deletion failure before accepting capacity-dependent 
   let failDelete = false
   let protectedPath: string | null = null
   const storage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (failDelete && name === 'unlink' && filePath === protectedPath) {
         throw new Error('Injected retention deletion failure')
       }

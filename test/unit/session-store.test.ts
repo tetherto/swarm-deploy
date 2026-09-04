@@ -229,6 +229,12 @@ test('atomic metadata writes replace regular files and reject symlinks', async (
   await writeAtomic(metadata, b4a.from('{"generation":1}'))
   await writeAtomic(metadata, b4a.from('{"generation":2}'))
   t.alike(await readJson(metadata), { generation: 2 })
+  const invalidLimit = readJson(metadata, fs.promises, -1)
+  t.ok(invalidLimit instanceof Promise)
+  await t.exception(() => invalidLimit, {
+    name: 'SwarmDeployError',
+    code: ERRORS.PROTOCOL_INVALID
+  })
 
   const outside = path.join(root, 'outside.json')
   await fs.promises.writeFile(outside, '{"outside":true}')
@@ -301,10 +307,10 @@ test('metadata descriptors close after read, write, and sync failures', async (t
   const storage = createStorage({
     failWriteFor: (filePath) => mode === 'write' && filePath.endsWith('.tmp'),
     failSyncFor: (filePath) => mode === 'sync' && filePath.endsWith('.tmp'),
-    async beforeOperation(name) {
+    beforeOperation(name) {
       if (mode === 'read' && name === 'read') throw new Error('Injected read failure')
     },
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (name === 'open' || name === 'close') events.push(`${name}:${filePath}`)
     }
   })
@@ -339,7 +345,7 @@ test('metadata reads reject sparse session-sized files before allocating or read
 
   let readAttempted = false
   const storage = createStorage({
-    async beforeOperation(name) {
+    beforeOperation(name) {
       if (name === 'read') readAttempted = true
     }
   })
@@ -658,7 +664,7 @@ test('offer rejects protected staging-parent replacement', async (t) => {
       await fs.promises.rename(layout.staging, retired)
       await fs.promises.mkdir(layout.staging, { mode: 0o700 })
     },
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (!layout || !upload) return
       if (filePath === stagingPath(layout, upload.offer) && (name === 'open' || name === 'close')) {
         events.push(`${name}:${filePath}`)
@@ -688,7 +694,7 @@ test('staging opens require regular no-follow descriptors', async (t) => {
   let layout!: StorageLayout
   let upload!: HarnessUpload
   const storage = createStorage({
-    async afterOperation(name, filePath, flags) {
+    afterOperation(name, filePath, flags) {
       if (!layout || !upload) return
       if (filePath !== stagingPath(layout, upload.offer)) return
       if (name === 'open') opened.push(flags)
@@ -799,7 +805,7 @@ test('writeChunk writes exact offsets, verifies digests, and checkpoints metadat
 test('offer syncs durable staging before publishing its session metadata', async (t) => {
   const events: string[] = []
   const storage = createStorage({
-    async afterOperation(name, source, destination) {
+    afterOperation(name, source, destination) {
       if (name === 'sync' || name === 'rename') {
         events.push(`${name}:${source}->${(destination as string | undefined) ?? ''}`)
       }
@@ -829,10 +835,10 @@ test('offer cleans and syncs staging after its parent sync fails', async (t) => 
       failNextStagingSync = false
       return true
     },
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (name === 'sync' && filePath === layout.staging) events.push(`sync-attempt:${filePath}`)
     },
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (
         (name === 'sync' && filePath === layout.staging) ||
         (name === 'unlink' && filePath === stagingPath(layout, upload.offer))
@@ -873,7 +879,7 @@ test('offer removes staging after metadata fails before rename', async (t) => {
   const events: string[] = []
   const storage = createStorage({
     failWriteFor: (filePath) => failMetadataWrite && filePath.includes('.json.'),
-    async afterOperation(name, filePath) {
+    afterOperation(name, filePath) {
       if (
         (name === 'sync' &&
           (filePath === layout.staging || filePath === stagingPath(layout, upload.offer))) ||
@@ -963,7 +969,7 @@ test('offer preserves primary and cleanup failures', async (t) => {
 test('deletion persists intent before removing staging and metadata names', async (t) => {
   const events: string[] = []
   const storage = createStorage({
-    async afterOperation(name, source) {
+    afterOperation(name, source) {
       if (name === 'unlink' || name === 'sync') events.push(`${name}:${source}`)
     }
   })

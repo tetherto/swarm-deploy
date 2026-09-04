@@ -47,7 +47,7 @@ function createStalledSwarm(): StalledSwarm {
   const swarm = new EventEmitter() as unknown as StalledSwarm
   swarm.destroyed = false
   swarm.join = () => ({ flushed: () => new Promise<never>(() => {}) })
-  swarm.destroy = async () => {
+  swarm.destroy = () => {
     swarm.destroyed = true
   }
   return swarm
@@ -108,7 +108,7 @@ test('Client close stops directory processing during the first active hash', asy
   })
   const client_ = internals(client)
   const originalUploadManifest = client_._uploadManifest.bind(client_)
-  client_._uploadManifest = async (...args: unknown[]) => {
+  client_._uploadManifest = (...args: unknown[]) => {
     uploadStarts++
     return originalUploadManifest(...args)
   }
@@ -154,7 +154,7 @@ test('Client close rejects an active upload and its queued successor before star
   })
   const client_ = internals(client)
   const originalUploadManifest = client_._uploadManifest.bind(client_)
-  client_._uploadManifest = async (...args: unknown[]) => {
+  client_._uploadManifest = (...args: unknown[]) => {
     uploadStarts++
     return originalUploadManifest(...args)
   }

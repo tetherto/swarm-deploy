@@ -330,8 +330,8 @@ interface StubSwarm extends EventEmitter {
 
 function createStubSwarm(): StubSwarm {
   const swarm = new EventEmitter() as StubSwarm
-  swarm.join = () => ({ flushed: async () => {} })
-  swarm.destroy = async () => {}
+  swarm.join = () => ({ flushed: () => Promise.resolve() })
+  swarm.destroy = () => Promise.resolve()
   return swarm
 }
 
@@ -425,7 +425,7 @@ async function runLinearizedServerRevocation(
   const finishing = attached.messages[FINISH].onmessage!({ transferId: upload.offer.transferId })
   await diagnosticTimeout(cleanupStarted.promise, `${name} cleanup barrier`)
   if (deferRetry) {
-    internal.commitStore.retryAbortedAttempt = async () => {
+    internal.commitStore.retryAbortedAttempt = () => {
       throw new Error('Simulated restart before pending retry')
     }
   }
@@ -529,7 +529,7 @@ test('an unchanged allowlist reload retries failed revocation cleanup', async (t
   let sessionPath: string | null = null
   let failures = 0
   const storage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (!armed || failures > 0 || name !== 'unlink' || filePath !== sessionPath) return
       failures++
       throw new Error('Injected revocation cleanup failure')

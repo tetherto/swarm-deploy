@@ -140,51 +140,56 @@ const storageStats: StorageStats = {
   isSymbolicLink: () => false
 }
 const storageHandle: StorageFileHandle = {
-  stat: async () => storageStats,
-  read: async () => ({ bytesRead: 0 }),
-  write: async () => ({ bytesWritten: 0 }),
-  sync: async () => {},
-  close: async () => {}
+  stat: () => Promise.resolve(storageStats),
+  read: () => Promise.resolve({ bytesRead: 0 }),
+  write: () => Promise.resolve({ bytesWritten: 0 }),
+  sync: () => Promise.resolve(),
+  close: () => Promise.resolve()
 }
 const storage: StorageAdapter = {
-  open: async (path, flags, mode) => {
+  open: (path, flags, mode) => {
     void [path, flags, mode]
-    return storageHandle
+    return Promise.resolve(storageHandle)
   },
-  lstat: async (path) => {
+  lstat: (path) => {
     void path
-    return storageStats
+    return Promise.resolve(storageStats)
   },
-  readdir: async (path) => {
+  readdir: (path) => {
     void path
-    return []
+    return Promise.resolve([])
   },
-  mkdir: async (path, options) => {
+  mkdir: (path, options) => {
     void [path, options]
-    return undefined
+    return Promise.resolve()
   },
-  rm: async (path, options) => {
+  rm: (path, options) => {
     void [path, options]
+    return Promise.resolve()
   },
-  rename: async (oldPath, newPath) => {
+  rename: (oldPath, newPath) => {
     void [oldPath, newPath]
+    return Promise.resolve()
   },
-  link: async (existingPath, newPath) => {
+  link: (existingPath, newPath) => {
     void [existingPath, newPath]
+    return Promise.resolve()
   },
-  unlink: async (path) => {
+  unlink: (path) => {
     void path
+    return Promise.resolve()
   },
-  rmdir: async (path) => {
+  rmdir: (path) => {
     void path
+    return Promise.resolve()
   },
-  readFile: async (path, encoding) => {
+  readFile: (path, encoding) => {
     void [path, encoding]
-    return ''
+    return Promise.resolve('')
   },
-  statfs: async (path) => {
+  statfs: (path) => {
     void path
-    return { bavail: 0, bsize: 0 }
+    return Promise.resolve({ bavail: 0, bsize: 0 })
   }
 }
 

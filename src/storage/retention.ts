@@ -165,7 +165,7 @@ async function readExactly(
   return true
 }
 
-async function inspectManagedFinal(
+function inspectManagedFinal(
   record: CommitRecord,
   { layout, storage, hash }: { layout: StorageLayout; storage: StorageAdapter; hash: boolean }
 ): Promise<
@@ -339,7 +339,7 @@ class RetentionManager {
     return false
   }
 
-  async expireSessions(): Promise<number> {
+  expireSessions(): Promise<number> {
     return this.sessionStore.expire(this.resumeTtl, (session) => !this.isSessionActive(session))
   }
 
@@ -531,7 +531,7 @@ class RetentionManager {
     return { expiredSessions, scrubbed: scrub.deleted, ageDeleted, storageDeleted }
   }
 
-  async afterCommit(): Promise<boolean> {
+  afterCommit(): Promise<boolean> {
     return withRootLease(this.layout.root, () => this._afterCommitUnlocked())
   }
 

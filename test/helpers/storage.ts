@@ -62,8 +62,8 @@ export interface TestStorage extends StorageAdapter {
 export function createStorage({
   failWriteFor = () => false,
   failSyncFor = () => false,
-  beforeOperation = async () => {},
-  afterOperation = async () => {}
+  beforeOperation = () => {},
+  afterOperation = () => {}
 }: CreateStorageOptions = {}): TestStorage {
   const promises = fs.promises
 

@@ -78,7 +78,7 @@ export function blockManifestAfterFirstRead(t: Assert, filePath: string): Blocke
   const originalOpen = patchable.promises.open
   const originalCreateReadStream = patchable.createReadStream
 
-  patchable.promises.lstat = async function patchedLstat(
+  patchable.promises.lstat = function patchedLstat(
     this: unknown,
     lstatPath: string,
     ...args: unknown[]
@@ -97,7 +97,7 @@ export function blockManifestAfterFirstRead(t: Assert, filePath: string): Blocke
     state.descriptor = handle
     return {
       fd: handle.fd,
-      close: async () => {
+      close: () => {
         state.descriptorCloseAttempted = true
         return handle.close()
       }

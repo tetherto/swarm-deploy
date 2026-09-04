@@ -202,13 +202,15 @@ function createStubSwarm(events: StubSwarmEvent[]): StubSwarm {
   swarm.join = (topic, options) => {
     events.push({ type: 'join', topic, options })
     return {
-      async flushed() {
+      flushed() {
         events.push({ type: 'flushed' })
+        return Promise.resolve()
       }
     }
   }
-  swarm.destroy = async () => {
+  swarm.destroy = () => {
     events.push({ type: 'destroy' })
+    return Promise.resolve()
   }
   return swarm
 }
@@ -450,7 +452,9 @@ test('Server starts recovery and retention before networking and rechecks revoke
   await server.listen()
   t.is(internal._firewall(unknownKey), true)
   t.is(internal._firewall(allowedKey), false)
-  await t.exception(() => server.reloadAllowlist(['not-a-public-key']))
+  const invalidReload = server.reloadAllowlist(['not-a-public-key'])
+  t.ok(invalidReload instanceof Promise)
+  await t.exception(() => invalidReload)
   t.alike(server.allowedKeys, new Set([b4a.toString(allowedKey, 'hex')]))
   await server.reloadAllowlist([])
   t.alike(allowlistEvents, [

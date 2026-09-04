@@ -122,16 +122,18 @@ function stubSwarm(events: string[] = []): StubSwarm {
   swarm.join = () => {
     events.push('join')
     return {
-      async flushed() {
+      flushed() {
         events.push('flushed')
+        return Promise.resolve()
       },
-      async destroy() {
+      destroy() {
         events.push('discovery-destroy')
       }
     }
   }
-  swarm.destroy = async () => {
+  swarm.destroy = () => {
     events.push('swarm-destroy')
+    return Promise.resolve()
   }
   return swarm
 }
@@ -337,13 +339,14 @@ test('Server close aborts a never-resolving discovery flush and releases resourc
       joined.resolve()
       return new Promise(() => {})
     },
-    async destroy() {
+    destroy() {
       events.push('discovery-destroy')
     }
   }
   swarm.join = () => discovery
-  swarm.destroy = async () => {
+  swarm.destroy = () => {
     events.push('swarm-destroy')
+    return Promise.resolve()
   }
   const options: ServerOptions = {
     seed: SERVER_SEED,

@@ -148,41 +148,45 @@ export async function writeAtomic(
   }
 }
 
-export async function readJson(
+export function readJson(
   filePath: string,
   storage: StorageAdapter = fs.promises,
   maxBytes = MAX_SESSION_METADATA_BYTES
 ): Promise<Record<string, unknown>> {
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
-    throw storageError('Invalid metadata size limit')
-  }
-  const directory = path.dirname(filePath)
-  return withSafeDirectoryIdentity(directory, storage, async () => {
-    let handle: StorageFileHandle | null = null
-    try {
-      handle = await openSafeRegularFile(filePath, 'read', storage)
-      const stat = await handle.stat()
-      if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > maxBytes) {
-        throw storageError(`Metadata file exceeds ${maxBytes} byte limit`)
-      }
-      const bytes = await readAll(handle, stat.size)
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(b4a.toString(bytes, 'utf8'))
-      } catch (error: unknown) {
-        throw new MetadataFormatError(`Malformed metadata file: ${filePath}`, error)
-      }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new MetadataFormatError(`Malformed metadata file: ${filePath}`)
-      }
-      return parsed as Record<string, unknown>
-    } catch (error: unknown) {
-      if (error instanceof SwarmDeployError || error instanceof MetadataFormatError) throw error
-      throw error
-    } finally {
-      if (handle) await handle.close()
+  try {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      return Promise.reject(storageError('Invalid metadata size limit'))
     }
-  })
+    const directory = path.dirname(filePath)
+    return withSafeDirectoryIdentity(directory, storage, async () => {
+      let handle: StorageFileHandle | null = null
+      try {
+        handle = await openSafeRegularFile(filePath, 'read', storage)
+        const stat = await handle.stat()
+        if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > maxBytes) {
+          throw storageError(`Metadata file exceeds ${maxBytes} byte limit`)
+        }
+        const bytes = await readAll(handle, stat.size)
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(b4a.toString(bytes, 'utf8'))
+        } catch (error: unknown) {
+          throw new MetadataFormatError(`Malformed metadata file: ${filePath}`, error)
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new MetadataFormatError(`Malformed metadata file: ${filePath}`)
+        }
+        return parsed as Record<string, unknown>
+      } catch (error: unknown) {
+        if (error instanceof SwarmDeployError || error instanceof MetadataFormatError) throw error
+        throw error
+      } finally {
+        if (handle) await handle.close()
+      }
+    })
+  } catch (error) {
+    return Promise.reject(error)
+  }
 }
 
 export { MAX_SESSION_METADATA_BYTES }

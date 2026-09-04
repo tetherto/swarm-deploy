@@ -781,7 +781,7 @@ export class Server extends EventEmitter {
     this._emitSafe('connection-open', details)
   }
 
-  async reloadAllowlist(keys: Iterable<AllowlistKey>): Promise<Set<string>> {
+  reloadAllowlist(keys: Iterable<AllowlistKey>): Promise<Set<string>> {
     let next
     try {
       next = normalizeAllowlist(keys)
@@ -792,7 +792,7 @@ export class Server extends EventEmitter {
         pendingCount: this.pendingRevocations.size,
         reason: eventFailureReason(err)
       })
-      throw err
+      return Promise.reject(err)
     }
     const run = this.reloadPromise.then(
       () => this._applyAllowlist(next),

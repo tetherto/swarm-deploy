@@ -174,7 +174,7 @@ test('startup recovery fully hashes valid managed finals and reports unknown roo
   let reads = 0
   let finalPath: string | null = null
   const storage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (name === 'read' && filePath === finalPath) reads++
     }
   })
@@ -314,7 +314,7 @@ test('scheduled retention uses lstat metadata without rehashing healthy finals',
   let reads = 0
   let finalPath: string | null = null
   const storage = createStorage({
-    async beforeOperation(name, filePath) {
+    beforeOperation(name, filePath) {
       if (name === 'read' && filePath === finalPath) reads++
     }
   })
@@ -343,12 +343,12 @@ async function crashAfterNewSidecar(t: Assert): Promise<{
   let crashed = false
   let armed = false
   const storage = createStorage({
-    async beforeOperation(name) {
+    beforeOperation(name) {
       if (crashed && name !== 'lstat' && name !== 'stat' && name !== 'readdir' && name !== 'open') {
         throw new Error('Storage stopped at crash point')
       }
     },
-    async afterOperation(name, source) {
+    afterOperation(name, source) {
       if (!armed || crashed || name !== 'sync' || source !== layout.commits) return
       crashed = true
       throw new Error('Injected crash after the new current sidecar')

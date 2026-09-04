@@ -252,8 +252,8 @@ function makeUpload(ownerKey: Uint8Array = OWNER, options: UploadOptions = {}): 
 
 function createStubSwarm(): StubSwarm {
   const swarm = new EventEmitter() as StubSwarm
-  swarm.join = () => ({ flushed: async () => {} })
-  swarm.destroy = async () => {}
+  swarm.join = () => ({ flushed: () => Promise.resolve() })
+  swarm.destroy = () => Promise.resolve()
   return swarm
 }
 
@@ -298,7 +298,7 @@ async function createSessionUnlinkFailure(t: Assert, name: string): Promise<Sess
   let armed = false
   let sessionPath: string | null = null
   const storage = createStorage({
-    async afterOperation(operation, filePath) {
+    afterOperation(operation, filePath) {
       if (!armed || operation !== 'unlink' || filePath !== sessionPath) return
       armed = false
       throw new Error('Injected cleanup failure after session unlink')
@@ -525,47 +525,49 @@ test('disconnect boundaries resume without exposing partial uploads', async (t) 
     {
       name: 'before-offer',
       install(trigger) {
-        clientSendHook = async (index, session) => {
-          if (index !== OFFER) return
+        clientSendHook = (index, session) => {
+          if (index !== OFFER) return Promise.resolve()
           clientSendHook = null
           trigger()
           const error = transportFailure()
           session.destroy(error)
-          throw error
+          return Promise.reject(error)
         }
       }
     },
     {
       name: 'after-accept',
       install(trigger) {
-        serverSendHook = async (index) => {
-          if (index !== STATUS) return
+        serverSendHook = (index) => {
+          if (index !== STATUS) return Promise.resolve()
           serverSendHook = null
           trigger()
           destroyServerConnections(server)
+          return Promise.resolve()
         }
       }
     },
     {
       name: 'after-bitmap',
       install(trigger) {
-        serverSendHook = async (index) => {
-          if (index !== BITMAP_PAGE) return
+        serverSendHook = (index) => {
+          if (index !== BITMAP_PAGE) return Promise.resolve()
           serverSendHook = null
           trigger()
           destroyServerConnections(server)
+          return Promise.resolve()
         }
       }
     },
     {
       name: 'after-ready',
       install(trigger) {
-        clientPumpHook = async (session) => {
-          if (session.state !== 'READY' || session.nextMissing !== 0) return
+        clientPumpHook = (session) => {
+          if (session.state !== 'READY' || session.nextMissing !== 0) return Promise.resolve()
           clientPumpHook = null
           trigger()
           session.destroy(transportFailure())
-          return false
+          return Promise.resolve(false)
         }
       }
     },
@@ -588,31 +590,31 @@ test('disconnect boundaries resume without exposing partial uploads', async (t) 
     {
       name: 'after-ack',
       install(trigger) {
-        clientPumpHook = async (session) => {
+        clientPumpHook = (session) => {
           if (
             session.state !== 'READY' ||
             session.inFlight.size !== 0 ||
             session.nextMissing !== session.missing.length
           ) {
-            return
+            return Promise.resolve()
           }
           clientPumpHook = null
           trigger()
           session.destroy(transportFailure())
-          return false
+          return Promise.resolve(false)
         }
       }
     },
     {
       name: 'before-finish',
       install(trigger) {
-        clientSendHook = async (index, session) => {
-          if (index !== FINISH) return
+        clientSendHook = (index, session) => {
+          if (index !== FINISH) return Promise.resolve()
           clientSendHook = null
           trigger()
           const error = transportFailure()
           session.destroy(error)
-          throw error
+          return Promise.reject(error)
         }
       }
     },
@@ -743,7 +745,7 @@ test('staging and minimum free-disk reservations reject before creating state', 
   })
 
   const diskStorage = createStorage()
-  diskStorage.statfs = async () => ({ bavail: 10, bsize: 1 })
+  diskStorage.statfs = () => Promise.resolve({ bavail: 10, bsize: 1 })
   const disk = await createStore(t, {
     storage: diskStorage,
     minFreeBytes: 8,
@@ -840,7 +842,7 @@ test('pre-publication write, sync, and link failures preserve resumable state an
     let layout!: StorageLayout
     let finalPath: string | null = null
     const storage = createStorage({
-      async beforeOperation(name, source, destination) {
+      beforeOperation(name, source, destination) {
         if (!armed) return
         if (failure === 'write' && name === 'write' && source.startsWith(layout.journals)) {
           throw new Error('Injected journal write failure')
@@ -883,7 +885,7 @@ test('coded ENOSPC at staging and publication boundaries preserves safe state', 
   for (const operation of ['write', 'sync']) {
     let armed = false
     const storage = createStorage({
-      async beforeOperation(name, filePath) {
+      beforeOperation(name, filePath) {
         if (!armed || name !== operation || !filePath.endsWith('.part')) return
         armed = false
         throw noSpace(`No space during staging ${operation}`)
@@ -910,7 +912,7 @@ test('coded ENOSPC at staging and publication boundaries preserves safe state', 
     let finalPath: string | null = null
     let root: string | null = null
     const storage = createStorage({
-      async beforeOperation(name, source, destination) {
+      beforeOperation(name, source, destination) {
         if (!armed) return
         if (boundary === 'link' && name === 'link' && destination === finalPath) {
           armed = false
@@ -988,12 +990,11 @@ test('orphan staging requires a bounded canonical same-inode journal', async (t)
   const cases: OrphanCase[] = [
     {
       name: 'malformed',
-      mutate: async (created) => fs.promises.writeFile(created.journalPath, '{')
+      mutate: (created) => fs.promises.writeFile(created.journalPath, '{')
     },
     {
       name: 'oversized',
-      mutate: async (created) =>
-        fs.promises.writeFile(created.journalPath, b4a.alloc(16 * 1024 + 1))
+      mutate: (created) => fs.promises.writeFile(created.journalPath, b4a.alloc(16 * 1024 + 1))
     },
     {
       name: 'journal symlink',

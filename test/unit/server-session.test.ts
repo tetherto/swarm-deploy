@@ -249,13 +249,13 @@ function createClientServer(
 }
 
 function createSessionStore({
-  writeChunk = async () => {},
+  writeChunk = () => Promise.resolve(),
   inspect = null
 }: CreateSessionStoreOptions = {}): FakeSessionStore {
   const sessions = new Map<string, VerifiedSession>()
   return {
     sessions,
-    async offer(ownerKey, value) {
+    offer(ownerKey, value) {
       const session = {
         id: b4a.toString(value.transferId, 'hex'),
         transferId: value.transferId,
@@ -268,27 +268,31 @@ function createSessionStore({
         state: 'receiving'
       }
       sessions.set(session.id, session)
-      return { verified: new Set<number>(), state: 'receiving', resumed: false }
+      return Promise.resolve({
+        verified: new Set<number>(),
+        state: 'receiving',
+        resumed: false
+      })
     },
     async writeChunk(transferId, value) {
       await writeChunk(transferId, value)
       return { verified: new Set([value.index]), resumed: false }
     },
-    async finish(transferId) {
+    finish(transferId) {
       const session = sessions.get(b4a.toString(transferId, 'hex'))!
       session.state = 'verified'
-      return { state: 'verified' }
+      return Promise.resolve({ state: 'verified' })
     },
-    async retireCommitted(transferId) {
-      return sessions.delete(b4a.toString(transferId, 'hex'))
+    retireCommitted(transferId) {
+      return Promise.resolve(sessions.delete(b4a.toString(transferId, 'hex')))
     },
     inspect
   }
 }
 
 function createCommitStore({
-  inspect = async () => ({ status: 'AVAILABLE' }),
-  commit = async () => {}
+  inspect = () => Promise.resolve({ status: 'AVAILABLE' }),
+  commit = () => Promise.resolve()
 }: CreateCommitStoreOptions = {}): CommitStore {
   return { inspect, commit }
 }
@@ -321,9 +325,9 @@ test('server session writes sequential chunks before acknowledging and retires c
   const pair = createClientServer({
     sessionStore,
     commitStore: createCommitStore({
-      async commit(session, options) {
+      commit(session, options) {
         committed.push({ session, options })
-        return { name: session.name }
+        return Promise.resolve({ name: session.name })
       }
     }),
     retentionManager: { marker: 'retention' } as unknown as RetentionManager,
@@ -377,7 +381,7 @@ test('server session returns terminal statuses for unavailable or capacity-rejec
     const pair = createClientServer({
       sessionStore: createSessionStore(),
       commitStore: createCommitStore({
-        inspect: async () => ({ status: inspectStatus }) as InspectResult
+        inspect: () => Promise.resolve({ status: inspectStatus } as InspectResult)
       }),
       maxFileBytes: 1024 * 1024
     })
@@ -403,7 +407,7 @@ test('server session runs non-destructive retention admission before staging off
     let offered = 0
     const sessionStore = createSessionStore()
     const originalOffer = sessionStore.offer
-    sessionStore.offer = async (...args) => {
+    sessionStore.offer = (...args) => {
       offered++
       return originalOffer(...args)
     }
@@ -411,7 +415,7 @@ test('server session runs non-destructive retention admission before staging off
       sessionStore,
       commitStore: createCommitStore(),
       retentionManager: {
-        async admit() {
+        admit() {
           throw new SwarmDeployError(code, 'Rejected before receiving bytes')
         }
       } as unknown as RetentionManager,
@@ -445,7 +449,7 @@ test('server session fails closed when an OFFER transfer ID is noncanonical', as
 
 test('server session limits queued chunks before storage work', async (t) => {
   const writing = deferred()
-  const sessionStore = createSessionStore({ writeChunk: async () => writing.promise })
+  const sessionStore = createSessionStore({ writeChunk: () => writing.promise })
   const pair = createClientServer({
     sessionStore,
     commitStore: createCommitStore(),
@@ -525,14 +529,20 @@ test('server session revocation prevents queued finish commit', async (t) => {
       await release.promise
     }
   })
-  sessionStore.finish = async (transferId) => {
+  sessionStore.finish = (transferId) => {
     finished++
     const session = sessionStore.sessions.get(b4a.toString(transferId, 'hex'))!
     session.state = 'verified'
+    return Promise.resolve()
   }
   const pair = createClientServer({
     sessionStore,
-    commitStore: createCommitStore({ commit: async () => committed++ }),
+    commitStore: createCommitStore({
+      commit: () => {
+        committed++
+        return Promise.resolve()
+      }
+    }),
     maxFileBytes: 1024 * 1024
   })
   const upload = makeUpload()
@@ -554,13 +564,14 @@ test('server session settlement retains cleanup errors raised after revocation',
   const started = deferred()
   const commit = deferred()
   const sessionStore = createSessionStore()
-  sessionStore.finish = async (transferId) => {
+  sessionStore.finish = (transferId) => {
     sessionStore.sessions.get(b4a.toString(transferId, 'hex'))!.state = 'verified'
+    return Promise.resolve()
   }
   const pair = createClientServer({
     sessionStore,
     commitStore: createCommitStore({
-      commit: async () => {
+      commit: () => {
         started.resolve()
         return commit.promise
       }
@@ -587,20 +598,20 @@ test('server session admits a replaceable managed offer and commits it', async (
   const pair = createClientServer({
     sessionStore,
     commitStore: createCommitStore({
-      async inspect(...args) {
+      inspect(...args) {
         inspections.push(args)
-        return { status: 'REPLACEABLE' } as InspectResult
+        return Promise.resolve({ status: 'REPLACEABLE' } as InspectResult)
       },
-      async commit(session, options) {
+      commit(session, options) {
         committed.push({ session, options })
-        return {
+        return Promise.resolve({
           name: session.name,
           replaces: {
             name: session.name,
             transferId: '1'.repeat(64),
             historyName: `history-${'1'.repeat(64)}`
           }
-        }
+        })
       }
     }),
     replaceNames: ['release.tar.gz'],
@@ -638,14 +649,14 @@ test('server session rejects existing empty uploads before staging', async (t) =
   let reservationsReleased = 0
   const sessionStore = createSessionStore()
   const originalOffer = sessionStore.offer
-  sessionStore.offer = async (...args) => {
+  sessionStore.offer = (...args) => {
     offers++
     return originalOffer(...args)
   }
   const pair = createClientServer({
     sessionStore,
     commitStore: createCommitStore({
-      inspect: async () => ({ status: 'FILE_EXISTS' })
+      inspect: () => Promise.resolve({ status: 'FILE_EXISTS' })
     }),
     reserveUpload: () => ({ reserved: true }),
     releaseUpload: () => {
@@ -702,14 +713,14 @@ test('server session holds one destination lease and releases it on close', asyn
 test('server session rejects reserved history offers without staging', async (t) => {
   let offered = false
   const sessionStore = createSessionStore()
-  sessionStore.offer = async (...args) => {
+  sessionStore.offer = (...args) => {
     offered = true
     return createSessionStore().offer(...args)
   }
   const pair = createClientServer({
     sessionStore,
     commitStore: createCommitStore({
-      inspect: async () => {
+      inspect: () => {
         throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
       }
     }),

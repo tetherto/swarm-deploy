@@ -225,23 +225,23 @@ function createProtocolSession(t: Assert): ProtocolSessionHarness {
   }
   const sessionStore: FakeSessionStore = {
     sessions: new Map(),
-    async offer() {
+    offer() {
       offerCalls++
-      return { verified: new Set() }
+      return Promise.resolve({ verified: new Set<number>() })
     },
-    async writeChunk() {},
-    async finish() {},
-    async retireCommitted() {}
+    writeChunk: () => Promise.resolve(),
+    finish: () => Promise.resolve(),
+    retireCommitted: () => Promise.resolve()
   }
   const session = new ServerSession({
     channel: channel as unknown as ProtocolChannel,
     ownerKey: OWNER,
     sessionStore: sessionStore as unknown as ServerSessionStore,
     commitStore: {
-      async inspect() {
-        return { status: 'AVAILABLE' }
+      inspect() {
+        return Promise.resolve({ status: 'AVAILABLE' })
       },
-      async commit() {}
+      commit: () => Promise.resolve()
     } as unknown as CommitStore,
     maxFileBytes: MAX_CHUNK_BYTES,
     destroy(error) {

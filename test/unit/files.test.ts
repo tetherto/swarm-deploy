@@ -360,7 +360,7 @@ test('selectUploadPaths records unreadable directory entries and continues lexic
   await writeDeterministicFile(blocked, 1)
   await writeDeterministicFile(good, 1)
   const original = patchable.promises.lstat
-  patchable.promises.lstat = async function patchedLstat(
+  patchable.promises.lstat = function patchedLstat(
     this: unknown,
     entryPath: string,
     opts?: unknown

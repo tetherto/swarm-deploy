@@ -202,8 +202,8 @@ export class AllowlistWatcher extends EventEmitter {
     this.emit('reloaded', { count: next.size })
   }
 
-  async load(): Promise<boolean> {
-    if (this.closed) return false
+  load(): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false)
     return this.poll()
   }
 
