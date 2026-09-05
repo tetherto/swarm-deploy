@@ -68,6 +68,39 @@ test('Client close aborts a stalled discovery flush and destroys its swarm', asy
   t.ok(swarm.destroyed)
 })
 
+test('Client connect timeout bounds a stalled discovery flush', async (t) => {
+  const timers = new Set<FakeTimer>()
+  const swarm = createStalledSwarm()
+  const client = new Client({
+    seed: CLIENT_SEED,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
+    connectTimeout: 1_000,
+    scheduler: {
+      setTimeout(callback) {
+        const timer = { callback }
+        timers.add(timer)
+        return timer
+      },
+      clearTimeout(timer) {
+        timers.delete(timer as FakeTimer)
+      }
+    },
+    swarmFactory: () => swarm
+  })
+  const starting = internals(client)._ensureStarted()
+  t.is(timers.size, 1)
+
+  ;[...timers][0].callback()
+
+  await t.exception(() => starting, {
+    name: 'SwarmDeployError',
+    code: ERRORS.CONNECT_TIMEOUT
+  })
+  t.is(timers.size, 0)
+  t.ok(swarm.destroyed)
+  await client.close()
+})
+
 test('Client close rejects a pending reconnect delay and clears its timer', async (t) => {
   const timers = new Set<FakeTimer>()
   const client = new Client({

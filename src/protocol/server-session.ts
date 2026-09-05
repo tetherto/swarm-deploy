@@ -212,6 +212,7 @@ export interface ServerSessionOptions {
   /** Names this server may replace; validated and copied on construction. */
   replaceNames?: Iterable<string>
   reserveUpload?: (transferId: Uint8Array, name: string) => unknown
+  activateUpload?: (reservation: unknown) => void
   releaseUpload?: (reservation: unknown) => void
   isAuthorized?: () => boolean
   idleTimeout?: number
@@ -236,6 +237,7 @@ export class ServerSession {
   maxFileBytes: number
   replaceNames: Set<string>
   reserveUpload: (transferId: Uint8Array, name: string) => unknown
+  activateUpload: (reservation: unknown) => void
   releaseUpload: (reservation: unknown) => void
   isAuthorized: () => boolean
   idleTimeout: number
@@ -269,6 +271,7 @@ export class ServerSession {
     maxFileBytes,
     replaceNames,
     reserveUpload = () => true,
+    activateUpload = () => {},
     releaseUpload = () => {},
     isAuthorized = () => true,
     idleTimeout = DEFAULT_IDLE_TIMEOUT,
@@ -306,7 +309,11 @@ export class ServerSession {
     }
     assertSafeUint(maxFileBytes, 'maxFileBytes')
     if (maxFileBytes === 0) throw protocolError('Invalid maxFileBytes')
-    if (typeof reserveUpload !== 'function' || typeof releaseUpload !== 'function') {
+    if (
+      typeof reserveUpload !== 'function' ||
+      typeof activateUpload !== 'function' ||
+      typeof releaseUpload !== 'function'
+    ) {
       throw protocolError('Invalid upload reservation callbacks')
     }
     if (typeof isAuthorized !== 'function') throw protocolError('Invalid authorization callback')
@@ -331,6 +338,7 @@ export class ServerSession {
     this.maxFileBytes = maxFileBytes
     this.replaceNames = validateReplaceNames(replaceNames)
     this.reserveUpload = reserveUpload
+    this.activateUpload = activateUpload
     this.releaseUpload = releaseUpload
     this.isAuthorized = isAuthorized
     this.idleTimeout = idleTimeout
@@ -708,6 +716,7 @@ export class ServerSession {
         await this.retentionManager.admit(value.size)
       }
       const snapshot = await this.sessionStore.offer(this.ownerKey, value)
+      this.activateUpload(this.reservation)
       this.bytesReceived = this._receivedBytes(snapshot.verified)
       this._emit('offer', {
         status: snapshot.resumed ? 'resumed' : 'accepted',

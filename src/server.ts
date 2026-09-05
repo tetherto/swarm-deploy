@@ -245,6 +245,7 @@ type SafeLogger = Required<Logger>
 interface UploadReservation {
   id: string
   name: string
+  active: boolean
 }
 
 interface Connection {
@@ -601,10 +602,23 @@ export class Server extends EventEmitter {
     if (this._activeUploads.size >= this.maxActiveUploads) {
       return { rejected: true, reason: ERRORS.ACTIVE_UPLOAD_LIMIT }
     }
-    const reservation = { id, name }
+    const reservation = { id, name, active: false }
     this._activeUploads.set(id, reservation)
     this._activeNames.set(name, reservation)
     return reservation
+  }
+
+  private _activateUpload(reservation: unknown): void {
+    if (
+      typeof reservation !== 'object' ||
+      reservation === null ||
+      !('id' in reservation) ||
+      typeof reservation.id !== 'string'
+    ) {
+      return
+    }
+    const active = this._activeUploads.get(reservation.id)
+    if (active === reservation) active.active = true
   }
 
   private _releaseUpload(reservation: unknown): void {
@@ -628,7 +642,7 @@ export class Server extends EventEmitter {
       session !== null &&
       'id' in session &&
       typeof session.id === 'string' &&
-      this._activeUploads.has(session.id)
+      this._activeUploads.get(session.id)?.active === true
     )
   }
 
@@ -684,6 +698,7 @@ export class Server extends EventEmitter {
       maxFileBytes: this.maxFileBytes,
       replaceNames: this.replaceNames,
       reserveUpload: (transferId, name) => this._reserveUpload(transferId, name),
+      activateUpload: (reservation) => this._activateUpload(reservation),
       releaseUpload: (reservation) => this._releaseUpload(reservation),
       isAuthorized: () => this._isAllowed(connection.ownerKey),
       idleTimeout: this.idleTimeout,

@@ -206,12 +206,14 @@ artifact.
 
 The serialized SessionStore offer path expires TTL-dead sessions that are not
 active before checking the staging limit, then checks capacity again. Its
-activity predicate is the Server's current upload-reservation map; an active
-session is never expired. Expiration is internal to the store's serialized
-operation, so RetentionManager does not re-enter SessionStore while an offer is
-in progress.
+activity predicate includes only reservations whose staging offer has
+successfully completed; a pending resume cannot make its own expired session
+active before expiration runs. An active accepted session is never expired.
+Expiration is internal to the store's serialized operation, so RetentionManager
+does not re-enter SessionStore while an offer is in progress.
 
-Initial discovery retains one `connectTimeout` window. Every established
+Initial discovery, including the discovery flush itself, is bounded by one
+`connectTimeout` window. Every established
 transport loss starts a fresh window so a long upload can reconnect, but each
 loss consumes the total reconnect-attempt budget. Missing discovery,
 reconnect-window expiry, and budget exhaustion use `CONNECT_TIMEOUT`.

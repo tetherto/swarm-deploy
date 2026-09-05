@@ -262,22 +262,6 @@ function clientClosedError(): SwarmDeployError {
   return configurationError(ERRORS.PROTOCOL_INVALID, 'Client is closed')
 }
 
-function awaitAbortable<T>(promise: PromiseLike<T>, signal: AbortSignalLike | null): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const removeAbort = onAbort(signal, () => reject(abortError()))
-    Promise.resolve(promise).then(
-      (value) => {
-        removeAbort()
-        resolve(value)
-      },
-      (err) => {
-        removeAbort()
-        reject(err)
-      }
-    )
-  })
-}
-
 function isProtocolChannel(value: unknown): value is ProtocolChannel {
   return (
     typeof value === 'object' &&
@@ -408,6 +392,37 @@ export class Client extends EventEmitter {
     } catch {}
   }
 
+  private _awaitDiscoveryFlush(flush: PromiseLike<unknown>): Promise<void> {
+    if (this.signal.aborted) return Promise.reject(abortError())
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let removeAbort = () => {}
+      let timer: unknown = null
+      const finish = <T>(callback: (value: T) => void, value: T): void => {
+        if (settled) return
+        settled = true
+        removeAbort()
+        if (timer !== null) this.scheduler.clearTimeout(timer)
+        callback(value)
+      }
+      timer = this.scheduler.setTimeout(() => {
+        finish(
+          reject,
+          new SwarmDeployError(ERRORS.CONNECT_TIMEOUT, 'Timed out discovering committed server')
+        )
+      }, this.connectTimeout)
+      if (settled) {
+        this.scheduler.clearTimeout(timer)
+        return
+      }
+      removeAbort = onAbort(this.signal, () => finish(reject, abortError()))
+      Promise.resolve(flush).then(
+        () => finish(resolve, undefined),
+        (error: unknown) => finish(reject, error)
+      )
+    })
+  }
+
   private async _start(): Promise<this> {
     try {
       this.swarm = this.swarmFactory({
@@ -432,7 +447,7 @@ export class Client extends EventEmitter {
       if (!this.discovery || typeof this.discovery.flushed !== 'function') {
         throw configurationError(ERRORS.PROTOCOL_INVALID, 'Invalid swarm discovery')
       }
-      await awaitAbortable(this.discovery.flushed(), this.signal)
+      await this._awaitDiscoveryFlush(this.discovery.flushed())
       throwIfAborted(this.signal)
       return this
     } catch (err) {

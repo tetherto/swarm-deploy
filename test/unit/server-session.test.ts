@@ -724,6 +724,33 @@ test('server session holds one destination lease and releases it on close', asyn
   t.is(active.size, 0)
 })
 
+test('server session activates a reservation only after staging offer succeeds', async (t) => {
+  let active = false
+  const reservation = { id: 'reserved', name: 'artifact.bin' }
+  const sessionStore = createSessionStore()
+  const originalOffer = sessionStore.offer
+  sessionStore.offer = (...args) => {
+    t.is(active, false, 'incoming reservation is not yet an active resumable session')
+    return originalOffer(...args)
+  }
+  const pair = createClientServer({
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024,
+    reserveUpload: () => reservation,
+    activateUpload: (candidate) => {
+      t.is(candidate, reservation)
+      active = true
+    }
+  })
+
+  pair.messages[OFFER].send(makeUpload().offer)
+  await waitFor(() => pair.received.ready.length === 1)
+
+  t.is(active, true)
+  await pair.serverSession!.close()
+})
+
 test('server session rejects reserved history offers without staging', async (t) => {
   let offered = false
   const sessionStore = createSessionStore()
