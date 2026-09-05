@@ -98,6 +98,8 @@ interface SessionStoreOptions {
   maxStagingBytes: number
   minFreeBytes?: number
   clock?: Clock
+  resumeTtl?: number
+  isSessionActive?: (session: Session) => boolean
   checkpointChunks?: number
   storage?: StorageAdapter
   /** Exact names whose occupied destinations may be staged for replacement. */
@@ -242,6 +244,8 @@ class SessionStore {
   maxStagingBytes: number
   minFreeBytes: number
   clock: Clock
+  resumeTtl: number | undefined
+  isSessionActive: (session: Session) => boolean
   checkpointChunks: number
   storage: StorageAdapter
   replaceNames: Set<string>
@@ -258,6 +262,8 @@ class SessionStore {
     maxStagingBytes,
     minFreeBytes = 0,
     clock = Date,
+    resumeTtl,
+    isSessionActive = () => false,
     checkpointChunks = 16,
     storage = fs.promises,
     replaceNames,
@@ -267,6 +273,13 @@ class SessionStore {
     assertSafeUint(maxStagingBytes, 'maxStagingBytes')
     assertSafeUint(minFreeBytes, 'minFreeBytes')
     if (!clock || typeof clock.now !== 'function') throw storageError('Invalid clock')
+    if (resumeTtl !== undefined) {
+      assertSafeUint(resumeTtl, 'resumeTtl')
+      if (resumeTtl === 0) throw storageError('Invalid resumeTtl')
+    }
+    if (typeof isSessionActive !== 'function') {
+      throw storageError('Invalid session activity predicate')
+    }
     if (!Number.isSafeInteger(checkpointChunks) || checkpointChunks <= 0) {
       throw storageError('Invalid checkpoint chunk count')
     }
@@ -279,6 +292,8 @@ class SessionStore {
     this.maxStagingBytes = maxStagingBytes
     this.minFreeBytes = minFreeBytes
     this.clock = clock
+    this.resumeTtl = resumeTtl
+    this.isSessionActive = isSessionActive
     this.checkpointChunks = checkpointChunks
     this.storage = storage
     this.replaceNames = validateReplaceNames(replaceNames)
@@ -853,6 +868,9 @@ class SessionStore {
       this._assertReady()
       await this._assertLayout()
       assertOffer(ownerKey, offer)
+      if (this.resumeTtl !== undefined) {
+        await this._expireUnlocked(this.resumeTtl, (session) => !this.isSessionActive(session))
+      }
       const id = toHex(offer.transferId)
       const existing = this.sessions.get(id)
       if (existing) return this._snapshot(existing, true)
@@ -1041,22 +1059,26 @@ class SessionStore {
   }
 
   expire(ttl: number, shouldExpire: (session: Session) => boolean = () => true): Promise<number> {
-    return this._run(async () => {
+    return this._run(() => {
       this._assertReady()
       assertSafeUint(ttl, 'session ttl')
       if (typeof shouldExpire !== 'function') {
         throw storageError('Invalid session expiration predicate')
       }
-      const now = this.clock.now()
-      let deleted = 0
-      for (const session of [...this.sessions.values()]) {
-        if (now - session.updatedAt <= ttl) continue
-        if (!shouldExpire(session)) continue
-        await this._deleteSession(session, 'expiry')
-        deleted++
-      }
-      return deleted
+      return this._expireUnlocked(ttl, shouldExpire)
     })
+  }
+
+  async _expireUnlocked(ttl: number, shouldExpire: (session: Session) => boolean): Promise<number> {
+    const now = this.clock.now()
+    let deleted = 0
+    for (const session of [...this.sessions.values()]) {
+      if (now - session.updatedAt <= ttl) continue
+      if (!shouldExpire(session)) continue
+      await this._deleteSession(session, 'expiry')
+      deleted++
+    }
+    return deleted
   }
 
   close(): Promise<void> {

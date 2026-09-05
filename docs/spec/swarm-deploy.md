@@ -10,9 +10,10 @@ unpacks, installs, serves, scans, downloads, or redistributes them.
 Version 1 supports a file or a lexical, one-shot batch of a directory's
 immediate regular-file children. Names match
 `^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`; directories, symlinks, and unsafe names
-are not uploaded. The internal `.swarm-deploy` path is reserved. The
-top-level `history-` namespace is also reserved: clients cannot upload any
-name beginning with `history-`.
+are not uploaded. The internal `.swarm-deploy` path is reserved. A direct file
+in the top-level `history-` namespace is rejected with `INVALID_FILENAME`; a
+regular child with that prefix in a directory batch is skipped with
+`reserved-history`, and remaining entries continue.
 
 The server OS account and a dedicated storage root are trusted against
 concurrent local tampering. Existing or detected symlinks and parent-directory
@@ -40,8 +41,10 @@ The topic is one 32-byte value, represented to operators as lowercase
 commitment to the intended server public key; it is not a secret or an
 authorization capability. The client is configured with this topic and does
 not receive or pin a separate server public key. After discovery, it recomputes
-the topic from `peerInfo.publicKey` and rejects any mismatch before creating a
-Protomux channel or sending metadata or application data.
+the topic from the authenticated socket's `remotePublicKey` and rejects an
+invalid or missing socket key before creating a Protomux channel or sending
+metadata or application data. If `peerInfo.publicKey` is present, it must be a
+valid 32-byte key equal to `remotePublicKey`.
 
 Changing the server seed changes its public key and topic, so every client
 configuration must be updated. An arbitrary topic combined with an ephemeral
@@ -69,7 +72,8 @@ replacement support.
 `ClientOptions` requires `seed: SeedInput` and `topic: BinaryInput`, where
 `topic` is exactly 32 bytes. It has no `serverPublicKey` option. The existing
 connection timeout, idle timeout, DHT, scheduler, clock, swarm factory, and
-logger options remain optional.
+logger options remain optional. `maxReconnectAttempts` is an optional integer
+from 0 through 100 and defaults to 3.
 
 `ServerOptions` includes all existing required identity, storage, allowlist,
 limit, lifecycle, retention, logging, timer, filesystem, and swarm options,
@@ -94,6 +98,14 @@ an unmanaged path is never replaced and returns the existing-name conflict.
 
 `history-` paths are server-managed historical artifacts, not a restore
 interface. The package has no restore API or CLI operation.
+
+The root runtime API is exactly `Client`, `Server`, `ERRORS`,
+`SwarmDeployError`, `generateSeed`, `keyPairFromSeed`, `parseAllowlist`,
+`parsePublicKey`, `parseSeed`, `parseTopic`, `publicKeyFromSeed`, and
+`topicFromServerPublicKey`, plus the public types needed to construct, inject,
+and observe Client and Server. Storage implementations, file-manifest helpers,
+protocol codecs/constants, and transfer-ID primitives remain internal
+submodules.
 
 The CLI provides `topic --seed-file <server.seed>`, which derives and prints
 the full lowercase 64-character topic without printing the seed. The server
@@ -192,6 +204,21 @@ scheduled cleanup. A committed success contains exactly the declared digest
 and size, and failed or incomplete content never becomes visible as a final
 artifact.
 
+The serialized SessionStore offer path expires TTL-dead sessions that are not
+active before checking the staging limit, then checks capacity again. Its
+activity predicate is the Server's current upload-reservation map; an active
+session is never expired. Expiration is internal to the store's serialized
+operation, so RetentionManager does not re-enter SessionStore while an offer is
+in progress.
+
+Initial discovery retains one `connectTimeout` window. Every established
+transport loss starts a fresh window so a long upload can reconnect, but each
+loss consumes the total reconnect-attempt budget. Missing discovery,
+reconnect-window expiry, and budget exhaustion use `CONNECT_TIMEOUT`.
+`UPLOAD_IDLE_TIMEOUT` applies only to active transfer, response-drain, or
+transport inactivity. Active-upload admission rejection uses
+`ACTIVE_UPLOAD_LIMIT`; invalid textual topic parsing uses `INVALID_TOPIC`.
+
 Events and logs use short SHA-256 fingerprints for peers and transfers; they
 never expose seeds, session keys, or full public keys. Listener and logger
 failures cannot change transfer or lifecycle correctness.
@@ -227,11 +254,15 @@ package, supported Node versions and operating systems, Bare operating systems,
 and protocol property tests. The tag-triggered workflow performs only the
 explicit release checks for an exact `vX.Y.Z` tag, a tag commit on `main`, a
 matching `package.json` version, a clean distribution build, and a valid
-package. It then invokes `holepunchto/actions/publish@v1`; it does not duplicate
+package. It then invokes `holepunchto/actions/publish` at the reviewed immutable
+revision `146b86c4d0237c124df06ecc992ddf2c585b3405`; it does not duplicate
 the full CI test matrix. The workflow must build `dist/` before invoking the
 action because the action publishes with `npm publish --ignore-scripts`. The
 publish job grants `id-token: write` for npm trusted publishing and
-`contents: write` for the GitHub release the action creates.
+`contents: write` for the GitHub release the action creates. The reviewed
+composite action currently references `create-release@v1` internally; this
+repository pins the composite action itself without vendoring that upstream
+implementation.
 
 npm trusted publishing is configured externally for the GitHub workflow and
 its `npm` environment; the repository stores no npm publication token.

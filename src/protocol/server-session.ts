@@ -146,7 +146,7 @@ export interface ServerSessionStore {
  */
 export interface UploadRejection {
   rejected: true
-  reason: 'ACTIVE_UPLOAD_LIMIT' | 'FILE_BUSY'
+  reason: typeof ERRORS.ACTIVE_UPLOAD_LIMIT | typeof ERRORS.FILE_BUSY
 }
 
 function isUploadRejection(value: unknown): value is UploadRejection {
@@ -156,7 +156,7 @@ function isUploadRejection(value: unknown): value is UploadRejection {
     'rejected' in value &&
     value.rejected === true &&
     'reason' in value &&
-    (value.reason === 'ACTIVE_UPLOAD_LIMIT' || value.reason === 'FILE_BUSY')
+    (value.reason === ERRORS.ACTIVE_UPLOAD_LIMIT || value.reason === ERRORS.FILE_BUSY)
   )
 }
 
@@ -674,13 +674,13 @@ export class ServerSession {
       const reservation = this.reserveUpload(this.transferId, value.name)
       if (isUploadRejection(reservation)) {
         await this._rejectOffer(
-          reservation.reason === 'FILE_BUSY' ? STATUS_CODE.FILE_BUSY : STATUS_CODE.REJECTED,
+          reservation.reason === ERRORS.FILE_BUSY ? STATUS_CODE.FILE_BUSY : STATUS_CODE.REJECTED,
           reservation.reason
         )
         return
       }
       if (!reservation) {
-        await this._rejectOffer(STATUS_CODE.REJECTED, 'ACTIVE_UPLOAD_LIMIT')
+        await this._rejectOffer(STATUS_CODE.REJECTED, ERRORS.ACTIVE_UPLOAD_LIMIT)
         return
       }
       this.reservation = reservation

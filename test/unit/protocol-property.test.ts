@@ -5,8 +5,8 @@ import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
 import c from 'compact-encoding'
 import crypto from '#crypto'
+import { ERRORS, type Digest } from '../../dist/index.js'
 import {
-  ERRORS,
   OFFER,
   STATUS,
   BITMAP_PAGE,
@@ -18,7 +18,9 @@ import {
   STATUS_CODE,
   MAX_CONTROL_BYTES,
   MAX_CHUNK_BYTES,
-  MAX_CHUNK_FRAME_BYTES,
+  MAX_CHUNK_FRAME_BYTES
+} from '../../dist/protocol/constants.js'
+import {
   encodeBounded,
   decodeBounded,
   offer,
@@ -29,13 +31,10 @@ import {
   chunkAck,
   finish,
   result,
-  transferId,
-  mergeBitmapPages,
-  type Codec,
-  type Digest,
-  type OfferInput
-} from '../../dist/index.js'
-import type { ProtocolChannel } from '../../dist/protocol/types.js'
+  mergeBitmapPages
+} from '../../dist/protocol/codecs.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type { Codec, OfferInput, ProtocolChannel } from '../../dist/protocol/types.js'
 import {
   ServerSession,
   type CommitStore,

@@ -113,7 +113,7 @@ test('Client starts a fresh reconnect window after an active transport loss', as
     deadlines.push(deadline)
     if (deadlines.length === 1) return Promise.resolve(socket)
     now = deadline
-    return Promise.reject(new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'unavailable'))
+    return Promise.reject(new SwarmDeployError(ERRORS.CONNECT_TIMEOUT, 'unavailable'))
   }
   internal._startSession = () => {
     now = 60_000
@@ -124,7 +124,52 @@ test('Client starts a fresh reconnect window after an active transport loss', as
 
   await t.exception(() => internal._uploadManifest({}), {
     name: 'SwarmDeployError',
-    code: 'UPLOAD_IDLE_TIMEOUT'
+    code: ERRORS.CONNECT_TIMEOUT
   })
   t.alike(deadlines, [30_000, 90_000])
+})
+
+test('Client reports CONNECT_TIMEOUT when the initial server is missing', async (t) => {
+  let now = 0
+  const client = new Client({
+    seed: CLIENT_SEED,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
+    clock: { now: () => now }
+  })
+  const internal = clientInternals(client)
+  internal._ensureStarted = () => Promise.resolve(client)
+  internal._waitForSocket = (deadline) => {
+    now = deadline
+    return Promise.reject(new SwarmDeployError(ERRORS.CONNECT_TIMEOUT, 'missing server'))
+  }
+
+  await t.exception(() => internal._uploadManifest({}), {
+    name: 'SwarmDeployError',
+    code: ERRORS.CONNECT_TIMEOUT
+  })
+})
+
+test('Client bounds repeated transport flapping with a reconnect budget', async (t) => {
+  const client = new Client({
+    seed: CLIENT_SEED,
+    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
+    maxReconnectAttempts: 2
+  })
+  const internal = clientInternals(client)
+  let attempts = 0
+  internal._ensureStarted = () => Promise.resolve(client)
+  internal._waitForSocket = () => Promise.resolve({})
+  internal._delay = () => Promise.resolve(true)
+  internal._startSession = () => {
+    attempts++
+    const error: TransportError = new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'flapped')
+    error.transport = true
+    return Promise.reject(error)
+  }
+
+  await t.exception(() => internal._uploadManifest({}), {
+    name: 'SwarmDeployError',
+    code: ERRORS.CONNECT_TIMEOUT
+  })
+  t.is(attempts, 3)
 })

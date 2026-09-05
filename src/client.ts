@@ -42,6 +42,8 @@ import type {
 
 const DEFAULT_CONNECT_TIMEOUT = 30_000
 const MAX_CONNECT_TIMEOUT = 30_000
+const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3
+const MAX_RECONNECT_ATTEMPTS = 100
 const DEFAULT_IDLE_TIMEOUT = 60_000
 const MAX_IDLE_TIMEOUT = 0x7fffffff
 const INITIAL_RECONNECT_DELAY = 25
@@ -65,6 +67,8 @@ export interface ClientOptions {
   topic: BinaryInput
   /** Discovery/reconnect window in milliseconds; defaults to 30,000 and is at most 30,000. */
   connectTimeout?: number
+  /** Total reconnect attempts after established transport loss; defaults to 3 and is at most 100. */
+  maxReconnectAttempts?: number
   /** Per-upload idle timeout in milliseconds; defaults to 60,000. */
   idleTimeout?: number
   /** Optional HyperDHT instance passed to Hyperswarm. */
@@ -202,12 +206,22 @@ function assertSeed(seed: unknown): asserts seed is Uint8Array {
 
 function assertTopic(topic: unknown): asserts topic is Uint8Array {
   if (!b4a.isBuffer(topic) || topic.byteLength !== 32) {
-    throw configurationError(ERRORS.PROTOCOL_INVALID, 'Invalid topic')
+    throw configurationError(ERRORS.INVALID_TOPIC, 'Invalid topic')
   }
 }
 
 function assertDuration(value: unknown, name: string, maximum: number): asserts value is number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw configurationError(ERRORS.PROTOCOL_INVALID, `Invalid ${name}`)
+  }
+}
+
+function assertNonnegativeInteger(
+  value: unknown,
+  name: string,
+  maximum: number
+): asserts value is number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > maximum) {
     throw configurationError(ERRORS.PROTOCOL_INVALID, `Invalid ${name}`)
   }
 }
@@ -305,6 +319,7 @@ export class Client extends EventEmitter {
   readonly publicKey: PublicKey
   readonly topic: Topic
   readonly connectTimeout: number
+  readonly maxReconnectAttempts: number
   readonly idleTimeout: number
   readonly dht: unknown
   readonly scheduler: Scheduler
@@ -336,8 +351,10 @@ export class Client extends EventEmitter {
     assertSeed(options.seed)
     assertTopic(options.topic)
     const connectTimeout = options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
+    const maxReconnectAttempts = options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS
     const idleTimeout = options.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
     assertDuration(connectTimeout, 'connect timeout', MAX_CONNECT_TIMEOUT)
+    assertNonnegativeInteger(maxReconnectAttempts, 'max reconnect attempts', MAX_RECONNECT_ATTEMPTS)
     assertDuration(idleTimeout, 'idle timeout', MAX_IDLE_TIMEOUT)
     if (options.swarmFactory !== undefined && typeof options.swarmFactory !== 'function') {
       throw configurationError(ERRORS.PROTOCOL_INVALID, 'Invalid swarm factory')
@@ -360,6 +377,7 @@ export class Client extends EventEmitter {
       )
     }
     this.connectTimeout = connectTimeout
+    this.maxReconnectAttempts = maxReconnectAttempts
     this.idleTimeout = idleTimeout
     this.dht = options.dht
     this.scheduler = options.scheduler || { setTimeout, clearTimeout }
@@ -449,10 +467,24 @@ export class Client extends EventEmitter {
 
   private _onConnection(socket: SwarmSocket, peerInfo: SwarmPeerInfo | null = null): void {
     if (socket && typeof socket.on === 'function') socket.on('error', () => {})
+    const socketKey = socket?.remotePublicKey
     const peerKey = peerInfo?.publicKey
+    const peerMetadataMatches =
+      peerKey === undefined ||
+      (b4a.isBuffer(peerKey) &&
+        peerKey.byteLength === 32 &&
+        b4a.isBuffer(socketKey) &&
+        b4a.equals(peerKey, socketKey))
     const peerTopic =
-      b4a.isBuffer(peerKey) && peerKey.byteLength === 32 ? topicFromServerPublicKey(peerKey) : null
-    if (this.closed || peerTopic === null || !crypto.timingSafeEqual(peerTopic, this.topic)) {
+      b4a.isBuffer(socketKey) && socketKey.byteLength === 32
+        ? topicFromServerPublicKey(socketKey)
+        : null
+    if (
+      this.closed ||
+      !peerMetadataMatches ||
+      peerTopic === null ||
+      !crypto.timingSafeEqual(peerTopic, this.topic)
+    ) {
       try {
         socket.destroy(
           configurationError(ERRORS.SERVER_KEY_MISMATCH, 'Peer did not match committed topic')
@@ -460,7 +492,7 @@ export class Client extends EventEmitter {
       } catch {}
       const details = {
         status: 'rejected',
-        fingerprint: fingerprint(peerKey),
+        fingerprint: fingerprint(socketKey),
         reason: ERRORS.SERVER_KEY_MISMATCH
       }
       this.logger.warn('Rejected server with mismatched topic commitment', details)
@@ -479,9 +511,9 @@ export class Client extends EventEmitter {
     socket.once('close', () => {
       this.sockets.delete(socket)
       if (this.socket === socket) this.socket = null
-      this._emitSafe('connection-close', { fingerprint: fingerprint(peerKey) })
+      this._emitSafe('connection-close', { fingerprint: fingerprint(socketKey) })
     })
-    const details = { fingerprint: fingerprint(peerKey) }
+    const details = { fingerprint: fingerprint(socketKey) }
     this._emitSafe('authentication', { status: 'accepted', fingerprint: details.fingerprint })
     this.logger.info('Committed server connected', details)
     this._emitSafe('connection', details)
@@ -495,7 +527,7 @@ export class Client extends EventEmitter {
     const remaining = deadline - this.clock.now()
     if (remaining <= 0) {
       return Promise.reject(
-        new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'Timed out waiting for committed server')
+        new SwarmDeployError(ERRORS.CONNECT_TIMEOUT, 'Timed out waiting for committed server')
       )
     }
     return new Promise((resolve, reject) => {
@@ -513,10 +545,7 @@ export class Client extends EventEmitter {
         timer: this.scheduler.setTimeout(() => {
           finish(
             reject,
-            new SwarmDeployError(
-              ERRORS.UPLOAD_IDLE_TIMEOUT,
-              'Timed out waiting for committed server'
-            )
+            new SwarmDeployError(ERRORS.CONNECT_TIMEOUT, 'Timed out waiting for committed server')
           )
         }, remaining)
       }
@@ -597,7 +626,7 @@ export class Client extends EventEmitter {
     await this._ensureStarted()
     let deadline = this.clock.now() + this.connectTimeout
     let delay = INITIAL_RECONNECT_DELAY
-    let lastTransportError = null
+    let reconnectAttempts = 0
 
     while (!this.closed && !this.signal.aborted && this.clock.now() < deadline) {
       let socket = null
@@ -606,11 +635,18 @@ export class Client extends EventEmitter {
         return await this._startSession(socket, manifest)
       } catch (err) {
         if (!isTransportError(err)) throw err
-        lastTransportError = err
         if (socket && this.socket === socket) this.socket = null
         try {
           socket?.destroy()
         } catch {}
+        if (reconnectAttempts >= this.maxReconnectAttempts) {
+          throw new SwarmDeployError(
+            ERRORS.CONNECT_TIMEOUT,
+            'Reconnect attempt budget exhausted',
+            err
+          )
+        }
+        reconnectAttempts++
         deadline = this.clock.now() + this.connectTimeout
         const remaining = deadline - this.clock.now()
         if (remaining <= 0) break
@@ -620,10 +656,7 @@ export class Client extends EventEmitter {
     }
 
     if (this.closed || this.signal.aborted) throw abortError()
-    throw (
-      lastTransportError ||
-      new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'Reconnect window expired')
-    )
+    throw new SwarmDeployError(ERRORS.CONNECT_TIMEOUT, 'Reconnect window expired')
   }
 
   private _reportResult(result: UploadResult, final = true): UploadResult {
@@ -824,6 +857,8 @@ function transportError(): SwarmDeployError {
 export {
   DEFAULT_CONNECT_TIMEOUT,
   MAX_CONNECT_TIMEOUT,
+  DEFAULT_MAX_RECONNECT_ATTEMPTS,
+  MAX_RECONNECT_ATTEMPTS,
   DEFAULT_IDLE_TIMEOUT,
   MAX_IDLE_TIMEOUT,
   INITIAL_RECONNECT_DELAY,

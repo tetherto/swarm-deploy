@@ -118,7 +118,7 @@ console.log(JSON.stringify({
     t.is(parsed.Server, 'function')
     t.is(parsed.Client, 'function')
     t.is(parsed.ERRORS, 'object')
-    t.is(parsed.PROTOCOL_VERSION, 'number')
+    t.is(parsed.PROTOCOL_VERSION, 'undefined')
     t.is(parsed.SwarmDeployError, 'function')
     t.is(parsed.sameModule, true, 'ESM and require must resolve the same export')
   } finally {

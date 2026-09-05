@@ -76,6 +76,7 @@ export interface ClientInternals {
   _ensureStarted(): Promise<unknown>
   _delay(milliseconds: number): Promise<unknown>
   _waitForSocket(deadline: number): Promise<unknown>
+  _onConnection(socket: SwarmSocket, peerInfo?: SwarmPeerInfo | null): void
   _startSession(...args: unknown[]): Promise<unknown>
   _uploadManifest(...args: unknown[]): Promise<unknown>
 }

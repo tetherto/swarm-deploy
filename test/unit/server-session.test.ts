@@ -402,6 +402,20 @@ test('server session returns terminal statuses for unavailable or capacity-rejec
   t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
 })
 
+test('server session reports the stable active-upload limit reason', async (t) => {
+  const pair = createClientServer({
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    reserveUpload: () => ({ rejected: true, reason: ERRORS.ACTIVE_UPLOAD_LIMIT }),
+    maxFileBytes: 1024 * 1024
+  })
+  pair.messages[OFFER].send(makeUpload().offer)
+  await waitFor(() => pair.received.status.length === 1)
+
+  t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
+  t.is(pair.received.status[0].reason, ERRORS.ACTIVE_UPLOAD_LIMIT)
+})
+
 test('server session runs non-destructive retention admission before staging offer', async (t) => {
   for (const code of [ERRORS.FILE_TOO_LARGE, ERRORS.CLEANUP_FAILED]) {
     let offered = 0

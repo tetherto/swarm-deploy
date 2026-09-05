@@ -3,8 +3,11 @@
 import test from 'brittle'
 import fs from '#fs'
 import path from '#path'
-import { ERRORS, validateBasename, selectUploadPaths, buildFileManifest } from '../../dist/index.js'
+import { ERRORS } from '../../dist/index.js'
 import {
+  validateBasename,
+  selectUploadPaths,
+  buildFileManifest,
   historyName,
   isReservedHistoryName,
   validateReplaceNames,
@@ -224,6 +227,33 @@ test('selectUploadPaths selects sorted regular files and skips others', async (t
     t.ok(entry.path.startsWith(dir))
     t.ok(entry.reason === 'directory' || entry.reason === 'symlink')
   }
+})
+
+test('selectUploadPaths rejects direct history names and skips them in batches', async (t) => {
+  const dir = await createTempDir(t)
+  const reserved = path.join(dir, 'history-private.bin')
+  const accepted = path.join(dir, 'release.bin')
+  await writeDeterministicFile(reserved, 1)
+  await writeDeterministicFile(accepted, 1)
+
+  await t.exception(() => selectUploadPaths(reserved), {
+    name: 'SwarmDeployError',
+    code: ERRORS.INVALID_FILENAME
+  })
+
+  const selection = await selectUploadPaths(dir)
+  t.alike(selection.paths, [accepted])
+  t.alike(
+    selection.skipped.map((entry) => [entry.name, entry.reason]),
+    [['history-private.bin', 'reserved-history']]
+  )
+  t.alike(
+    selection.entries.map((entry) => [entry.name, entry.kind]),
+    [
+      ['history-private.bin', 'skipped'],
+      ['release.bin', 'selected']
+    ]
+  )
 })
 
 test('buildFileManifest rejects invalid chunkSize values', async (t) => {

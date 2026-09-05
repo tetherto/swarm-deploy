@@ -8,12 +8,9 @@ import path from '#path'
 import b4a from 'b4a'
 import Hyperswarm from 'hyperswarm'
 import Protomux from 'protomux'
+import { Server, parseSeed, publicKeyFromSeed, keyPairFromSeed } from '../../dist/index.js'
+import { READY } from '../../dist/protocol/constants.js'
 import {
-  Server,
-  parseSeed,
-  publicKeyFromSeed,
-  keyPairFromSeed,
-  READY,
   offer,
   status,
   bitmapPage,
@@ -22,7 +19,7 @@ import {
   chunkAck,
   finish,
   result
-} from '../../dist/index.js'
+} from '../../dist/protocol/codecs.js'
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 import { serverInternals } from '../helpers/internals.js'

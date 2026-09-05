@@ -9,6 +9,7 @@ const workflow = fs.readFileSync(
   'utf8'
 )
 const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+const reviewedAction = '146b86c4d0237c124df06ecc992ddf2c585b3405'
 
 function validate(tag) {
   return spawnSync(process.execPath, [validator], {
@@ -33,6 +34,8 @@ assert.match(workflow, /NPM_CONFIG_PROVENANCE:\s+['"]?true['"]?/)
 assert.match(workflow, /git fetch --no-tags origin main/)
 assert.match(workflow, /git merge-base --is-ancestor "\$GITHUB_SHA" origin\/main/)
 assert.doesNotMatch(workflow, /^\s*run:\s+npm publish\b/m)
+assert.doesNotMatch(workflow, /holepunchto\/actions\/publish@v1\b/)
+assert.match(workflow, new RegExp(`holepunchto/actions/publish@${reviewedAction}`))
 for (const duplicate of [
   'npm run test:node',
   'npm run test:bare',
@@ -52,7 +55,7 @@ const ordered = [
   'npm run test:types',
   'npm run validate:package',
   'npm run test:package',
-  'holepunchto/actions/publish@v1'
+  `holepunchto/actions/publish@${reviewedAction}`
 ]
 let previous = -1
 for (const marker of ordered) {

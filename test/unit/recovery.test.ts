@@ -340,6 +340,7 @@ test('recovery reports corrupt journals and continues valid journals', async (t)
   let layout!: StorageLayout
   let armed = false
   const warnings: LoggedWarning[] = []
+  const infos: LoggedWarning[] = []
   const storage = createStorage({
     afterOperation(name, filePath) {
       if (armed && name === 'sync' && filePath === layout.journals) {
@@ -365,6 +366,9 @@ test('recovery reports corrupt journals and continues valid journals', async (t)
     logger: {
       warn(message, detail) {
         warnings.push({ message, detail })
+      },
+      info(message, detail) {
+        infos.push({ message, detail })
       }
     }
   })
@@ -373,6 +377,12 @@ test('recovery reports corrupt journals and continues valid journals', async (t)
   t.is(results[0].status, 'CORRUPT')
   t.is(results[1].status, 'RESUMABLE')
   t.is(warnings.length, 1)
+  t.is(infos.length, 2)
+  const serializedLogs = JSON.stringify({ warnings, infos })
+  t.ok(serializedLogs.includes(hex(sha256(b4a.alloc(32))).slice(0, 12)))
+  t.ok(serializedLogs.includes(hex(sha256(created.upload.offer.transferId)).slice(0, 12)))
+  t.absent(serializedLogs.includes('0'.repeat(64)))
+  t.absent(serializedLogs.includes(hex(created.upload.offer.transferId)))
   t.is(await pathExists(expected.journal), false)
   t.is(await pathExists(corrupt), false)
   t.ok(

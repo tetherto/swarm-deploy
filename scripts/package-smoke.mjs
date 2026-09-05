@@ -92,8 +92,22 @@ try {
     '--no-package-lock'
   ])
 
-  const loadProbe =
-    "const api = require('@tetherto/swarm-deploy'); if (typeof api.Server !== 'function') process.exit(1)"
+  const expectedRuntimeExports = [
+    'Client',
+    'ERRORS',
+    'Server',
+    'SwarmDeployError',
+    'generateSeed',
+    'keyPairFromSeed',
+    'parseAllowlist',
+    'parsePublicKey',
+    'parseSeed',
+    'parseTopic',
+    'publicKeyFromSeed',
+    'topicFromServerPublicKey'
+  ].sort()
+  const expectedRuntimeJson = JSON.stringify(expectedRuntimeExports)
+  const loadProbe = `const api = require('@tetherto/swarm-deploy'); const actual = JSON.stringify(Object.keys(api).sort()); if (actual !== ${JSON.stringify(expectedRuntimeJson)}) throw new Error('unexpected root exports: ' + actual)`
   const importProbe =
     "import('@tetherto/swarm-deploy').then(api => { if (typeof api.Client !== 'function') process.exit(1) }, err => { console.error(err); process.exit(1) })"
   run(process.execPath, ['-e', loadProbe])

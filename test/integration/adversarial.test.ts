@@ -7,18 +7,9 @@ import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
 import { EventEmitter } from '#events'
-import {
-  ERRORS,
-  SwarmDeployError,
-  Client,
-  Server,
-  keyPairFromSeed,
-  transferId,
-  OFFER,
-  STATUS,
-  BITMAP_PAGE,
-  FINISH
-} from '../../dist/index.js'
+import { ERRORS, SwarmDeployError, Client, Server, keyPairFromSeed } from '../../dist/index.js'
+import { OFFER, STATUS, BITMAP_PAGE, FINISH } from '../../dist/protocol/constants.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
 import { ClientSession } from '../../dist/protocol/client-session.js'
 import { ServerSession } from '../../dist/protocol/server-session.js'
 import type { Offer } from '../../dist/protocol/types.js'

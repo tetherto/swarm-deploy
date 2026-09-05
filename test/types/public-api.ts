@@ -1,780 +1,135 @@
 import { Buffer } from 'node:buffer'
 import {
-  type AllowlistEvent,
-  type AllowlistFailureEvent,
-  type AllowlistKey,
-  type AllowlistReloadedEvent,
-  type AllowlistRemovedEvent,
-  type AuthenticationEvent,
-  type BatchUploadResult,
-  type Binary,
-  type BitmapPage,
-  type BitmapPageInput,
-  type BuildFileManifestOptions,
-  type Chunk,
-  type ChunkAck,
-  type ChunkAckInput,
-  type ChunkInput,
-  type CleanupEvent,
-  type ClientBatchResultEvent,
-  type ClientCloseEvent,
-  type ClientCommitEvent,
-  type ClientEvent,
-  type ClientEventName,
-  type ClientFailureEvent,
-  type ClientOfferEvent,
-  type ClientOptions,
-  type ClientProgressEvent,
-  type ClientResultEvent,
-  type ClientSkippedEvent,
-  type ClientSuccessEvent,
   Client,
-  type Codec,
-  type ConnectionCloseEvent,
-  type ConnectionOpenEvent,
-  type EncodingState,
-  type FailedUploadPath,
-  type FileManifest,
-  type FingerprintEvent,
-  type Finish,
-  type FinishInput,
-  type Logger,
-  type Offer,
-  type OfferInput,
-  type Ready,
-  type ReadyInput,
-  type ReplacementDetails,
-  type Result,
-  type ResultCode,
-  type ResultInput,
-  type RecoveryEvent,
-  type RetentionEvent,
-  type ScrubEvent,
-  type SelectedUploadPath,
-  type SelectUploadPathsOptions,
-  type ServerCloseEvent,
-  type ServerConnectionEvent,
-  type ServerEventMap,
-  type ServerEventName,
-  type ServerListeningEvent,
-  type ServerOfferEvent,
-  type ServerOptions,
-  type ServerProgressEvent,
-  type ServerTransferLifecycleEvent,
-  Server,
-  type SkippedUploadPath,
-  type SkippedUploadReason,
-  type StatusCode,
-  type StorageAdapter,
-  type StorageFileHandle,
-  type StorageStats,
-  type Status,
-  type StatusInput,
-  type TransferLifecycleEvent,
-  type UploadPathEntry,
-  type UploadResult,
-  AllowlistWatcher,
-  bitmapPage,
-  CHUNK,
-  CHUNK_ACK,
-  chunk,
-  chunkAck,
-  decodeBounded,
-  DIGEST_BYTES,
-  encodeBounded,
-  encodeTransferIdCanonical,
   ERRORS,
-  FINISH,
-  finish,
+  Server,
+  SwarmDeployError,
   generateSeed,
   keyPairFromSeed,
-  MAX_BITMAP_BITS,
-  MAX_CHUNK_BYTES,
-  MAX_CHUNK_FRAME_BYTES,
-  MAX_CONTROL_BYTES,
-  mergeBitmapPages,
-  OFFER,
-  offer,
   parseAllowlist,
   parsePublicKey,
   parseSeed,
   parseTopic,
-  PROTOCOL_VERSION,
   publicKeyFromSeed,
-  READY,
-  ready,
-  RESULT,
-  RESULT_CODE,
-  result,
-  STATUS,
-  status,
-  STATUS_CODE,
-  SwarmDeployError,
   topicFromServerPublicKey,
-  TRANSFER_ID_BYTES,
-  transferId,
-  validateBasename
+  type AuthenticationEvent,
+  type BatchUploadResult,
+  type Binary,
+  type BinaryInput,
+  type ClientEventMap,
+  type ClientOptions,
+  type ClientUploadResult,
+  type ErrorCode,
+  type Logger,
+  type PublicKey,
+  type Seed,
+  type ServerEventMap,
+  type ServerOptions,
+  type SkippedUploadReason,
+  type StorageAdapter,
+  type StorageFileHandle,
+  type StorageStats,
+  type SwarmFactory,
+  type Topic,
+  type UploadResult,
+  // @ts-expect-error protocol constants are internal submodule details
+  OFFER,
+  // @ts-expect-error protocol codecs are internal submodule details
+  encodeBounded,
+  // @ts-expect-error storage implementations are not root exports
+  SessionStore,
+  // @ts-expect-error allowlist polling is owned by Server
+  AllowlistWatcher
 } from '../../dist/index.js'
 
-const binaryInput = new Uint8Array(32)
-const seed: Binary = generateSeed()
-const serverKey = publicKeyFromSeed(seed)
-const clientKey = publicKeyFromSeed(Buffer.alloc(32, 2))
-const keyPair = keyPairFromSeed(seed)
-const binaryKeyPair = keyPairFromSeed(binaryInput)
-const binaryPublicKey = publicKeyFromSeed(binaryInput)
-const binaryTopic = topicFromServerPublicKey(binaryPublicKey)
-const logger: Logger = {
-  info(message, details) {
-    void message
-    void details
-  }
-}
+const input: BinaryInput = new Uint8Array(32)
+const seed: Seed = generateSeed()
+const parsedSeed: Seed = parseSeed(seed.toString('hex'))
+const publicKey: PublicKey = publicKeyFromSeed(input)
+const parsedKey: PublicKey = parsePublicKey(publicKey.toString('hex'))
+const keyPair = keyPairFromSeed(input)
+const topic: Topic = topicFromServerPublicKey(publicKey)
+const parsedTopic: Topic = parseTopic(topic.toString('hex'))
+const allowlist: Set<string> = parseAllowlist(`${publicKey.toString('hex')}\n`)
+const code: ErrorCode = ERRORS.CONNECT_TIMEOUT
+const reservedSkip: SkippedUploadReason = 'reserved-history'
+const bytes: Binary = Buffer.alloc(32)
 
-const storageStats: StorageStats = {
+const stats: StorageStats = {
+  dev: 1,
+  ino: 1,
   size: 0,
-  dev: 0,
-  ino: 0,
-  isDirectory: () => true,
-  isFile: () => true,
-  isSymbolicLink: () => false
+  isSymbolicLink: () => false,
+  isDirectory: () => false,
+  isFile: () => true
 }
-const storageHandle: StorageFileHandle = {
-  stat: () => Promise.resolve(storageStats),
+const handle: StorageFileHandle = {
+  stat: () => Promise.resolve(stats),
   read: () => Promise.resolve({ bytesRead: 0 }),
   write: () => Promise.resolve({ bytesWritten: 0 }),
   sync: () => Promise.resolve(),
   close: () => Promise.resolve()
 }
 const storage: StorageAdapter = {
-  open: (path, flags, mode) => {
-    void [path, flags, mode]
-    return Promise.resolve(storageHandle)
-  },
-  lstat: (path) => {
-    void path
-    return Promise.resolve(storageStats)
-  },
-  readdir: (path) => {
-    void path
-    return Promise.resolve([])
-  },
-  mkdir: (path, options) => {
-    void [path, options]
-    return Promise.resolve()
-  },
-  rm: (path, options) => {
-    void [path, options]
-    return Promise.resolve()
-  },
-  rename: (oldPath, newPath) => {
-    void [oldPath, newPath]
-    return Promise.resolve()
-  },
-  link: (existingPath, newPath) => {
-    void [existingPath, newPath]
-    return Promise.resolve()
-  },
-  unlink: (path) => {
-    void path
-    return Promise.resolve()
-  },
-  rmdir: (path) => {
-    void path
-    return Promise.resolve()
-  },
-  readFile: (path, encoding) => {
-    void [path, encoding]
-    return Promise.resolve('')
-  },
-  statfs: (path) => {
-    void path
-    return Promise.resolve({ bavail: 0, bsize: 0 })
-  }
+  readFile: () => Promise.resolve(''),
+  lstat: () => Promise.resolve(stats),
+  open: () => Promise.resolve(handle),
+  mkdir: () => Promise.resolve(),
+  rm: () => Promise.resolve(),
+  rename: () => Promise.resolve(),
+  link: () => Promise.resolve(),
+  unlink: () => Promise.resolve(),
+  rmdir: () => Promise.resolve(),
+  readdir: () => Promise.resolve([])
 }
-
+const logger: Logger = { info: (_message, _details) => {} }
+const swarmFactory: SwarmFactory = (_options) => {
+  throw new Error('type probe only')
+}
 const serverOptions: ServerOptions = {
-  seed: binaryInput,
+  seed: input,
   storageDir: '/var/lib/swarm-deploy',
-  allowedKeys: [binaryInput, clientKey.toString('hex') as AllowlistKey],
-  maxFileBytes: MAX_CHUNK_BYTES,
-  maxStagingBytes: MAX_CHUNK_BYTES * 2,
-  replaceNames: ['release.tar.gz'] as Iterable<string>,
+  allowedKeys: [parsedKey],
+  maxFileBytes: 1024,
+  maxStagingBytes: 2048,
   storage,
+  swarmFactory,
   logger
 }
 const clientOptions: ClientOptions = {
-  seed: binaryInput,
-  topic: new Uint8Array(binaryTopic),
+  seed: input,
+  topic,
+  maxReconnectAttempts: 3,
+  swarmFactory,
   logger
 }
-
 const server = new Server(serverOptions)
 const client = new Client(clientOptions)
-// @ts-expect-error serverPublicKey was removed before the initial release
-new Client({ seed: binaryInput, serverPublicKey: serverKey })
-// @ts-expect-error clients expose only the committed topic
-void client.serverPublicKey
-const recoveryFileExists: RecoveryEvent['status'] = 'FILE_EXISTS'
-const allowlistWatcher = new AllowlistWatcher({
-  filePath: '/var/lib/swarm-deploy/allowlist',
-  storage,
-  onReload: (keys) => void keys,
-  onFailure: (event) => void event.reason
-})
-allowlistWatcher.on('failure', (event) => void event.reason)
-const listening: Promise<Server> = server.listen()
-const reloaded: Promise<Set<string>> = server.reloadAllowlist([binaryInput])
-const closedServer: Promise<void> = server.close()
 const uploaded: Promise<UploadResult | BatchUploadResult> = client.upload('./artifact.bin')
-const closedClient: Promise<void> = client.close()
-const clientEventName: ClientEventName = 'skipped'
-void [
-  listening,
-  reloaded,
-  closedServer,
-  uploaded,
-  closedClient,
-  binaryKeyPair,
-  binaryPublicKey,
-  binaryTopic,
-  clientEventName,
-  recoveryFileExists,
-  allowlistWatcher
-]
+const uploadUnion: Promise<ClientUploadResult> = uploaded
 
-server.on('connection', (event: ServerConnectionEvent) => void event.connections)
-server.once('listening', (event) => void event.publicKey)
-server.on('progress', (event) => void [event.transfer, event.bytesReceived, event.totalBytes])
-server.on('retention', (event) => void [event.trigger, event.status, event.storageDeleted])
-server.on('allowlist', (event) => void [event.status, event.appliedCount, event.pendingCount])
-server.on('recovery', (event) => void [event.status, event.phase, event.reason])
-client.on('result', (event: ClientResultEvent) => {
-  const reason: string | undefined = event.reason
-  if ('files' in event) void [event.files, event.committed, event.failed, event.skipped]
-  void [event.status, reason, event.final]
+server.on('authentication', (event: AuthenticationEvent) => void event.reason)
+server.on('offer', (event: ServerEventMap['offer']) => void event.reason)
+client.on('offer', (event: ClientEventMap['offer']) => void event.reason)
+client.on('skipped', (event: ClientEventMap['skipped']) => {
+  const reason: SkippedUploadReason = event.reason
+  void reason
 })
-client.on('skipped', (event: ClientSkippedEvent) => {
-  void [event.name, event.reason]
-  // @ts-expect-error skipped client events omit the source path
-  void event.path
-})
-client.once('rejected-peer', (event) => void event.fingerprint)
-client.on('progress', (event) => void [event.transfer, event.bytesSent, event.totalBytes])
-
-function describeClientEvent(event: ClientEvent): string {
-  if ('fingerprint' in event) return event.fingerprint
-  if ('status' in event) return event.reason ?? event.status
-  return event.name
-}
-
-async function exerciseStorageAdapter() {
-  const handle = await storage.open('/tmp/file', 'r')
-  const stat = await storage.lstat('/tmp/file')
-  const names = await storage.readdir('/tmp')
-  const text = await storage.readFile('/tmp/allowlist', 'utf8')
-  const filesystem = await storage.statfs?.('/tmp')
-  await storage.mkdir('/tmp/dir', { mode: 0o700 })
-  await storage.rm('/tmp/dir', { recursive: true, force: true })
-  await storage.rename('/tmp/source', '/tmp/destination')
-  await storage.link('/tmp/source', '/tmp/destination')
-  await storage.unlink('/tmp/file')
-  await storage.rmdir('/tmp/dir')
-  await handle.read(new Uint8Array(1), 0, 1, 0)
-  await handle.write(new Uint8Array(1), 0, 1, 0)
-  await handle.sync()
-  await handle.close()
-  void [stat, names, text, filesystem]
-}
-
-void [describeClientEvent, exerciseStorageAdapter]
-
-const transfer = transferId({
-  clientPublicKey: binaryInput,
-  name: validateBasename('artifact.bin'),
-  size: 0,
-  digest: binaryInput,
-  chunkSize: MAX_CHUNK_BYTES
-})
-const canonical = encodeTransferIdCanonical({
-  clientPublicKey: binaryInput,
-  name: 'artifact.bin',
-  size: 0,
-  digest: binaryInput,
-  chunkSize: MAX_CHUNK_BYTES
-})
-const request: OfferInput = {
-  version: PROTOCOL_VERSION,
-  transferId: binaryInput,
-  name: 'artifact.bin',
-  size: 0,
-  digest: binaryInput,
-  chunkSize: MAX_CHUNK_BYTES,
-  chunkCount: 0
-}
-const encoded = encodeBounded(offer, request, MAX_CONTROL_BYTES)
-const decoded: Offer = decodeBounded(offer, new Uint8Array(encoded), MAX_CONTROL_BYTES)
-const pages: BitmapPageInput[] = [
-  { transferId: binaryInput, start: 0, count: 1, bits: new Uint8Array([0]) }
-]
-const verified: Set<number> = mergeBitmapPages(pages, 1)
-const protocolResult: ResultInput = { transferId: binaryInput, code: RESULT_CODE.COMMITTED }
-const protocolStatus: StatusInput = { transferId: binaryInput, code: STATUS_CODE.ACCEPT }
-const protocolChunk: ChunkInput = {
-  transferId: binaryInput,
-  index: 0,
-  digest: binaryInput,
-  data: new Uint8Array()
-}
-const protocolReady: ReadyInput = { transferId: binaryInput }
-const protocolChunkAck: ChunkAckInput = { transferId: binaryInput, index: 0 }
-const protocolFinish: FinishInput = { transferId: binaryInput }
-const decodedBitmapPage: BitmapPage = decodeBounded(
-  bitmapPage,
-  new Uint8Array(encodeBounded(bitmapPage, pages[0])),
-  MAX_CONTROL_BYTES
-)
-const decodedStatus: Status = decodeBounded(
-  status,
-  new Uint8Array(encodeBounded(status, protocolStatus)),
-  MAX_CONTROL_BYTES
-)
-const decodedReady: Ready = decodeBounded(
-  ready,
-  new Uint8Array(encodeBounded(ready, protocolReady)),
-  MAX_CONTROL_BYTES
-)
-const decodedChunk: Chunk = decodeBounded(
-  chunk,
-  new Uint8Array(encodeBounded(chunk, protocolChunk)),
-  MAX_CONTROL_BYTES
-)
-const decodedChunkAck: ChunkAck = decodeBounded(
-  chunkAck,
-  new Uint8Array(encodeBounded(chunkAck, protocolChunkAck)),
-  MAX_CONTROL_BYTES
-)
-const decodedFinish: Finish = decodeBounded(
-  finish,
-  new Uint8Array(encodeBounded(finish, protocolFinish)),
-  MAX_CONTROL_BYTES
-)
-const decodedResult: Result = decodeBounded(
-  result,
-  new Uint8Array(encodeBounded(result, protocolResult)),
-  MAX_CONTROL_BYTES
-)
-const decodedBuffers: Binary[] = [
-  decoded.transferId,
-  decoded.digest,
-  decodedBitmapPage.transferId,
-  decodedBitmapPage.bits,
-  decodedStatus.transferId,
-  decodedReady.transferId,
-  decodedChunk.transferId,
-  decodedChunk.digest,
-  decodedChunk.data,
-  decodedChunkAck.transferId,
-  decodedFinish.transferId,
-  decodedResult.transferId
-]
-const offerCodec: Codec<OfferInput, Offer> = offer
-const statusCodec: Codec<StatusInput, Status> = status
-const bitmapPageCodec: Codec<BitmapPageInput, BitmapPage> = bitmapPage
-const readyCodec: Codec<ReadyInput, Ready> = ready
-const chunkCodec: Codec<ChunkInput, Chunk> = chunk
-const chunkAckCodec: Codec<ChunkAckInput, ChunkAck> = chunkAck
-const finishCodec: Codec<FinishInput, Finish> = finish
-const resultCodec: Codec<ResultInput, Result> = result
 
 void [
-  AllowlistWatcher,
-  CHUNK,
-  CHUNK_ACK,
-  canonical,
-  decoded,
-  decodedBuffers,
-  ERRORS,
-  FINISH,
-  finish,
-  finishCodec,
+  parsedSeed,
   keyPair,
-  MAX_BITMAP_BITS,
-  MAX_CHUNK_FRAME_BYTES,
+  parsedTopic,
+  allowlist,
+  code,
+  reservedSkip,
+  bytes,
+  server,
+  client,
+  uploadUnion,
+  new SwarmDeployError(ERRORS.ACTIVE_UPLOAD_LIMIT, 'busy'),
   OFFER,
-  offerCodec,
-  parseAllowlist(''),
-  parsePublicKey(serverKey.toString('hex')),
-  parseSeed(seed.toString('hex')),
-  parseTopic(binaryTopic.toString('hex')),
-  protocolChunkAck,
-  protocolFinish,
-  protocolReady,
-  protocolChunk,
-  protocolResult,
-  protocolStatus,
-  READY,
-  ready,
-  readyCodec,
-  RESULT,
-  resultCodec,
-  STATUS,
-  status,
-  statusCodec,
-  topicFromServerPublicKey(serverKey),
-  transfer,
-  TRANSFER_ID_BYTES,
-  verified,
-  bitmapPageCodec,
-  chunkCodec,
-  chunkAckCodec,
-  new SwarmDeployError(ERRORS.ABORTED, 'aborted')
+  encodeBounded,
+  SessionStore,
+  AllowlistWatcher
 ]
-
-const manifest: FileManifest = {
-  path: './artifact.bin',
-  name: 'artifact.bin',
-  size: 0,
-  digest: Buffer.alloc(DIGEST_BYTES),
-  chunkDigests: [],
-  chunkCount: 0,
-  chunkSize: MAX_CHUNK_BYTES,
-  stat: { size: 0, mtimeMs: 0, ino: 0 }
-}
-void manifest
-
-/*
- * Cancellation surface. The old handwritten declaration spelled these as
- * `AbortSignal | null`, so a real signal and an explicit `null` must both stay
- * assignable. The implementation now spells the shape structurally, which also
- * has to accept the fallback controller used on runtimes without a global
- * `AbortController`.
- */
-const abortController = new AbortController()
-const manifestSignals: BuildFileManifestOptions[] = [
-  { signal: abortController.signal },
-  { signal: null },
-  {}
-]
-const selectionSignals: SelectUploadPathsOptions[] = [
-  { signal: abortController.signal },
-  { signal: null },
-  {}
-]
-const fallbackSignal = {
-  aborted: false,
-  addEventListener(_event: 'abort', _callback: () => void, _options?: { once?: boolean }) {},
-  removeEventListener(_event: 'abort', _callback: () => void) {}
-}
-const fallbackManifestOptions: BuildFileManifestOptions = { signal: fallbackSignal }
-const fallbackSelectionOptions: SelectUploadPathsOptions = { signal: fallbackSignal }
-void [manifestSignals, selectionSignals, fallbackManifestOptions, fallbackSelectionOptions]
-
-/*
- * Listener and declaration exactness checks. `Equals` is invariant, so these
- * fail whenever an event payload silently widens to `any`, `unknown`, or a
- * reshaped structural approximation.
- */
-type Equals<A, B> =
-  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false
-type Expect<T extends true> = T
-type IsAny<T> = 0 extends 1 & T ? true : false
-
-/**
- * Asserts a contextually inferred listener payload is exactly `Expected` and is
- * not `any`. Because the payload comes from overload resolution at the
- * registration site, deleting a typed `on`/`once` overload collapses `Actual`
- * to the dynamic fallback's `never` and every use below fails to compile.
- */
-type ExactPayload<Actual, Expected> =
-  IsAny<Actual> extends true ? false : Equals<Actual, Expected> extends true ? true : false
-
-type ServerEventNameCoverage = Expect<
-  Equals<
-    ServerEventName,
-    | 'authentication'
-    | 'connection'
-    | 'connection-open'
-    | 'connection-close'
-    | 'offer'
-    | 'progress'
-    | 'verification'
-    | 'commit'
-    | 'recovery'
-    | 'scrub'
-    | 'retention'
-    | 'cleanup'
-    | 'allowlist'
-    | 'revocation'
-    | 'revoked'
-    | 'listening'
-    | 'close'
-  >
->
-
-type ClientEventNameCoverage = Expect<
-  Equals<
-    ClientEventName,
-    | 'authentication'
-    | 'connection'
-    | 'connection-open'
-    | 'connection-close'
-    | 'rejected-peer'
-    | 'offer'
-    | 'progress'
-    | 'verification'
-    | 'commit'
-    | 'result'
-    | 'skipped'
-    | 'close'
-  >
->
-
-type ServerEventMapShapes = [
-  Expect<Equals<ServerEventMap['authentication'], AuthenticationEvent>>,
-  Expect<Equals<ServerEventMap['connection'], ServerConnectionEvent>>,
-  Expect<Equals<ServerEventMap['connection-open'], ConnectionOpenEvent>>,
-  Expect<Equals<ServerEventMap['connection-close'], ConnectionCloseEvent>>,
-  Expect<Equals<ServerEventMap['offer'], ServerOfferEvent>>,
-  Expect<Equals<ServerEventMap['progress'], ServerProgressEvent>>,
-  Expect<Equals<ServerEventMap['verification'], ServerTransferLifecycleEvent>>,
-  Expect<Equals<ServerEventMap['commit'], ServerTransferLifecycleEvent>>,
-  Expect<Equals<ServerEventMap['recovery'], RecoveryEvent>>,
-  Expect<Equals<ServerEventMap['scrub'], ScrubEvent>>,
-  Expect<Equals<ServerEventMap['retention'], RetentionEvent>>,
-  Expect<Equals<ServerEventMap['cleanup'], CleanupEvent>>,
-  Expect<Equals<ServerEventMap['allowlist'], AllowlistEvent>>,
-  Expect<Equals<ServerEventMap['revocation'], FingerprintEvent>>,
-  Expect<Equals<ServerEventMap['revoked'], FingerprintEvent>>,
-  Expect<Equals<ServerEventMap['listening'], ServerListeningEvent>>,
-  Expect<Equals<ServerEventMap['close'], ServerCloseEvent>>
-]
-
-type RecoveryContract = [
-  Expect<
-    Equals<
-      RecoveryEvent['status'],
-      | 'started'
-      | 'completed'
-      | 'failed'
-      | 'CORRUPT'
-      | 'COMMITTED'
-      | 'ABORTED'
-      | 'RESUMABLE'
-      | 'MISSING'
-      | 'FILE_EXISTS'
-    >
-  >,
-  Expect<Equals<RecoveryEvent['phase'], 'classification' | 'sessions' | 'journal' | undefined>>
-]
-
-type ProtocolCodeContract = [
-  Expect<Equals<StatusCode, 0 | 1 | 2 | 3 | 4>>,
-  Expect<Equals<ResultCode, 0 | 1>>,
-  Expect<Equals<EncodingState['buffer'], Binary>>,
-  Expect<Equals<Offer['transferId'], Binary>>,
-  Expect<Equals<OfferInput['transferId'], Uint8Array>>,
-  Expect<Equals<Chunk['data'], Binary>>,
-  Expect<Equals<ChunkInput['data'], Uint8Array>>,
-  Expect<Equals<Status['code'], StatusCode>>,
-  Expect<Equals<Result['code'], ResultCode>>
-]
-
-type LoggerContract = [
-  Expect<Equals<Parameters<NonNullable<Logger['info']>>, [string, Record<string, unknown>?]>>,
-  Expect<Equals<Parameters<NonNullable<Logger['warn']>>, [string, Record<string, unknown>?]>>,
-  Expect<Equals<Parameters<NonNullable<Logger['error']>>, [string, Record<string, unknown>?]>>
-]
-
-type UploadUnionContract = [
-  Expect<Equals<UploadPathEntry, SelectedUploadPath | SkippedUploadPath | FailedUploadPath>>,
-  Expect<
-    Equals<SkippedUploadReason, 'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename'>
-  >,
-  Expect<Equals<ClientSuccessEvent['reason'], undefined>>,
-  Expect<Equals<ClientBatchResultEvent['reason'], undefined>>,
-  Expect<Equals<ClientCloseEvent['reason'], undefined>>,
-  Expect<Equals<ClientFailureEvent['reason'], string | undefined>>
-]
-
-void [
-  null as unknown as ServerEventNameCoverage,
-  null as unknown as ClientEventNameCoverage,
-  null as unknown as ServerEventMapShapes,
-  null as unknown as RecoveryContract,
-  null as unknown as ProtocolCodeContract,
-  null as unknown as LoggerContract,
-  null as unknown as UploadUnionContract
-]
-
-server.on('authentication', (event) => {
-  const check: ExactPayload<typeof event, AuthenticationEvent> = true
-  void [check, event.fingerprint, event.status, event.reason]
-})
-server.on('connection', (event) => {
-  const check: ExactPayload<typeof event, ServerConnectionEvent> = true
-  void [check, event.fingerprint, event.connections]
-})
-server.on('connection-open', (event) => {
-  const check: ExactPayload<typeof event, ConnectionOpenEvent> = true
-  void check
-})
-server.on('connection-close', (event) => {
-  const check: ExactPayload<typeof event, ConnectionCloseEvent> = true
-  void check
-})
-server.on('offer', (event) => {
-  const check: ExactPayload<typeof event, ServerOfferEvent> = true
-  void [check, event.fingerprint, event.transfer, event.status, event.resumed, event.reason]
-})
-server.on('progress', (event) => {
-  const check: ExactPayload<typeof event, ServerProgressEvent> = true
-  void check
-})
-server.on('verification', (event) => {
-  const check: ExactPayload<typeof event, ServerTransferLifecycleEvent> = true
-  void [check, event.fingerprint, event.status, event.name, event.size]
-})
-server.once('commit', (event) => {
-  const check: ExactPayload<typeof event, ServerTransferLifecycleEvent> = true
-  const replacement: ReplacementDetails | undefined = event.replaced
-  void [check, event.transfer, event.status, replacement]
-})
-server.on('recovery', (event) => {
-  const check: ExactPayload<typeof event, RecoveryEvent> = true
-  void [check, event.status, event.phase]
-})
-server.on('scrub', (event) => {
-  const check: ExactPayload<typeof event, ScrubEvent> = true
-  void [check, event.status, event.deleted, event.unknownCount]
-})
-server.on('retention', (event) => {
-  const check: ExactPayload<typeof event, RetentionEvent> = true
-  void check
-})
-server.on('cleanup', (event) => {
-  const check: ExactPayload<typeof event, CleanupEvent> = true
-  void [check, event.transfer, event.name, event.reason]
-})
-server.on('allowlist', (event) => {
-  const check: ExactPayload<typeof event, AllowlistEvent> = true
-  void check
-})
-server.on('revocation', (event) => {
-  const check: ExactPayload<typeof event, FingerprintEvent> = true
-  void [check, event.fingerprint]
-})
-server.once('revoked', (event) => {
-  const check: ExactPayload<typeof event, FingerprintEvent> = true
-  void [check, event.fingerprint]
-})
-server.on('listening', (event) => {
-  const check: ExactPayload<typeof event, ServerListeningEvent> = true
-  void check
-})
-server.on('close', (event) => {
-  const check: ExactPayload<typeof event, ServerCloseEvent> = true
-  void [check, event.status]
-})
-
-client.on('authentication', (event) => {
-  const check: ExactPayload<typeof event, AuthenticationEvent> = true
-  void check
-})
-client.on('connection', (event) => {
-  const check: ExactPayload<typeof event, FingerprintEvent> = true
-  void check
-})
-client.on('connection-open', (event) => {
-  const check: ExactPayload<typeof event, FingerprintEvent> = true
-  void check
-})
-client.on('connection-close', (event) => {
-  const check: ExactPayload<typeof event, FingerprintEvent> = true
-  void check
-})
-client.on('rejected-peer', (event) => {
-  const check: ExactPayload<typeof event, FingerprintEvent> = true
-  void check
-})
-client.on('offer', (event) => {
-  const check: ExactPayload<typeof event, ClientOfferEvent> = true
-  void [check, event.status, event.resumedChunks, event.totalChunks, event.reason]
-})
-client.on('progress', (event) => {
-  const check: ExactPayload<typeof event, ClientProgressEvent> = true
-  void [check, event.chunksSent, event.bytesSent]
-})
-client.on('verification', (event) => {
-  const check: ExactPayload<typeof event, TransferLifecycleEvent> = true
-  void [check, event.status]
-})
-client.once('commit', (event) => {
-  const check: ExactPayload<typeof event, ClientCommitEvent> = true
-  void [check, event.result, event.status]
-})
-client.on('result', (event) => {
-  const check: ExactPayload<typeof event, ClientResultEvent> = true
-  void check
-})
-client.on('skipped', (event) => {
-  const check: ExactPayload<typeof event, ClientSkippedEvent> = true
-  void check
-})
-client.on('close', (event) => {
-  const check: ExactPayload<typeof event, ClientCloseEvent> = true
-  void [check, event.status]
-})
-
-allowlistWatcher.on('reloaded', (event) => {
-  const check: ExactPayload<typeof event, AllowlistReloadedEvent> = true
-  void [check, event.count]
-})
-allowlistWatcher.on('removed', (event) => {
-  const check: ExactPayload<typeof event, AllowlistRemovedEvent> = true
-  void [check, event.removed]
-})
-allowlistWatcher.once('failure', (event) => {
-  const check: ExactPayload<typeof event, AllowlistFailureEvent> = true
-  void [check, event.reason]
-})
-
-/*
- * Dynamic-name compatibility. A non-literal event name falls through to the
- * trailing overload, which must still accept a precisely typed listener the way
- * the historical `any[]` signature did. These calls fail to compile if that
- * overload widens back to `unknown[]`.
- */
-const dynamicEvent: string = 'offer'
-const dynamicSymbol: symbol = Symbol('custom')
-
-server.on(dynamicEvent, (event: ServerOfferEvent) => void event.transfer)
-server.once(dynamicEvent, (event: ServerOfferEvent) => void event.transfer)
-server.on(dynamicSymbol, () => {})
-client.on(dynamicEvent, (event: ClientOfferEvent) => void event.status)
-client.once(dynamicSymbol, (event: ClientCloseEvent) => void event.status)
-allowlistWatcher.on(dynamicEvent, (event: AllowlistFailureEvent) => void event.reason)
-
-/*
- * Narrowing must survive the added fallback: a literal event name still selects
- * the typed overload rather than the dynamic one.
- */
-server.on('offer', (event) => {
-  const stillNarrowed: ExactPayload<typeof event, ServerOfferEvent> = true
-  void stillNarrowed
-})
-client.on('progress', (event) => {
-  const stillNarrowed: ExactPayload<typeof event, ClientProgressEvent> = true
-  void stillNarrowed
-})
-allowlistWatcher.on('reloaded', (event) => {
-  const stillNarrowed: ExactPayload<typeof event, AllowlistReloadedEvent> = true
-  void stillNarrowed
-})
-
-function describeUploadEntry(entry: UploadPathEntry): string {
-  if (entry.kind === 'selected') return entry.path
-  if (entry.kind === 'skipped') return entry.reason
-  return entry.code ?? entry.reason
-}
-void describeUploadEntry

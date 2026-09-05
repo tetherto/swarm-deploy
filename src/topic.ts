@@ -14,7 +14,7 @@ export function topicFromServerPublicKey(serverPublicKey: PublicKeyInput): Topic
 
 export function parseTopic(value: string): Topic {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) {
-    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Expected canonical 32-byte topic')
+    throw new SwarmDeployError(ERRORS.INVALID_TOPIC, 'Expected canonical 32-byte topic')
   }
   return b4a.from(value, 'hex')
 }

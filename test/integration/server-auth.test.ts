@@ -9,14 +9,9 @@ import fs from '#fs'
 import path from '#path'
 import Hyperswarm, { type HyperswarmSocket } from 'hyperswarm'
 import Protomux from 'protomux'
+import { ERRORS, Server, keyPairFromSeed } from '../../dist/index.js'
+import { OFFER, CHUNK, FINISH, STATUS_CODE } from '../../dist/protocol/constants.js'
 import {
-  Server,
-  keyPairFromSeed,
-  transferId,
-  OFFER,
-  CHUNK,
-  FINISH,
-  STATUS_CODE,
   offer,
   status,
   bitmapPage,
@@ -25,7 +20,8 @@ import {
   chunkAck,
   finish,
   result
-} from '../../dist/index.js'
+} from '../../dist/protocol/codecs.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
 import type { ServerOptions } from '../../dist/server.js'
 import type { Offer, Result, Status, TransferMessage } from '../../dist/protocol/types.js'
 import type { ChunkAck } from '../../dist/protocol/types.js'
@@ -287,6 +283,8 @@ test('Server wires mutable names into staging and current-only retention pins', 
   const internal = serverInternals(server)
 
   t.alike(internal.sessionStore.replaceNames, new Set(['release.tar.gz']))
+  t.is(internal.sessionStore.resumeTtl, server.resumeTtl)
+  t.is(typeof internal.sessionStore.isSessionActive, 'function')
   t.is(internal.retentionManager.isPinned({ name: 'release.tar.gz' } as CommitRecord), true)
   t.is(
     internal.retentionManager.isPinned({
@@ -391,6 +389,47 @@ test('Server firewalls unknown keys before protocol and allows authenticated upl
     await fs.promises.readFile(path.join(internal.layout.root, upload.name)),
     b4a.from('authenticated upload')
   )
+})
+
+test('Server rejects missing or mismatched authenticated socket identities', async (t) => {
+  const allowedKey = keyPairFromSeed(ALLOWED_SEED).publicKey
+  const otherKey = keyPairFromSeed(UNKNOWN_SEED).publicKey
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: await createTempDir(t),
+    allowedKeys: [allowedKey],
+    maxFileBytes: 1024 * 1024,
+    maxStagingBytes: 1024 * 1024,
+    swarmFactory: () => createStubSwarm([])
+  })
+  t.teardown(() => server.close())
+  await server.listen()
+  const destroyed: Array<{ code?: string }> = []
+
+  serverInternals(server)._onConnection(
+    {
+      remotePublicKey: allowedKey,
+      destroy(error) {
+        destroyed.push(error as { code?: string })
+      }
+    },
+    { publicKey: otherKey }
+  )
+  serverInternals(server)._onConnection(
+    {
+      destroy(error) {
+        destroyed.push(error as { code?: string })
+      }
+    },
+    { publicKey: allowedKey }
+  )
+
+  t.alike(
+    destroyed.map((error) => error.code),
+    [ERRORS.AUTH_REJECTED, ERRORS.AUTH_REJECTED]
+  )
+  t.is(serverInternals(server)._connections.size, 0)
+  t.is(serverInternals(server)._sessions.size, 0)
 })
 
 test('Server revocation closes sockets and deletes authenticated resumable sessions', async (t) => {

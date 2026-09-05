@@ -6,9 +6,11 @@ import b4a from 'b4a'
 import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
+import { EventEmitter } from '#events'
 import Hyperswarm from 'hyperswarm'
 import {
   Client,
+  ERRORS,
   Server,
   keyPairFromSeed,
   parseTopic,
@@ -115,7 +117,10 @@ test('parseTopic accepts only canonical lowercase 64-hex topics', (t) => {
     `${canonical}0`,
     `${canonical.slice(0, 63)}g`
   ]) {
-    t.exception(() => parseTopic(invalid), { name: 'SwarmDeployError' })
+    t.exception(() => parseTopic(invalid), {
+      name: 'SwarmDeployError',
+      code: ERRORS.INVALID_TOPIC
+    })
   }
 })
 
@@ -140,10 +145,45 @@ test('Client validates identity commitment and bounded timeouts before networkin
     },
     { ...options, connectTimeout: 0 },
     { ...options, connectTimeout: 30_001 },
+    { ...options, maxReconnectAttempts: -1 },
+    { ...options, maxReconnectAttempts: 101 },
     { ...options, idleTimeout: 0 }
   ]) {
     t.exception(() => new Client(invalid), { name: 'SwarmDeployError' })
   }
+})
+
+test('Client authenticates the socket key and rejects mismatched peer metadata', (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const rogueKey = keyPairFromSeed(ROGUE_SEED).publicKey
+  const client = new Client({
+    seed: CLIENT_A_SEED,
+    topic: topicFromServerPublicKey(serverKey)
+  })
+  t.teardown(() => client.close())
+  const rejected: Array<{ code?: string }> = []
+  const socket = new EventEmitter() as EventEmitter & {
+    remotePublicKey?: Buffer
+    destroyed?: boolean
+    destroy(error?: unknown): void
+  }
+  socket.remotePublicKey = serverKey
+  socket.destroy = (error) => {
+    socket.destroyed = true
+    rejected.push(error as { code?: string })
+  }
+
+  clientInternals(client)._onConnection(socket, { publicKey: rogueKey })
+
+  t.is(socket.destroyed, true)
+  t.is(rejected[0].code, ERRORS.SERVER_KEY_MISMATCH)
+  t.is(clientInternals(client).sockets.size, 0)
+
+  const missing = new EventEmitter() as typeof socket
+  missing.destroy = socket.destroy
+  clientInternals(client)._onConnection(missing, { publicKey: serverKey })
+  t.is(rejected[1].code, ERRORS.SERVER_KEY_MISMATCH)
+  t.is(clientInternals(client).sockets.size, 0)
 })
 
 test('Client close aborts pending discovery promptly', async (t) => {

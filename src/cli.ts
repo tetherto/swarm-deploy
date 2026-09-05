@@ -474,6 +474,7 @@ function isConfigFailure(err: unknown): boolean {
   return (
     err.code === ERRORS.INVALID_SEED ||
     err.code === ERRORS.INVALID_PUBLIC_KEY ||
+    err.code === ERRORS.INVALID_TOPIC ||
     err.code === ERRORS.PROTOCOL_INVALID ||
     err.code === ERRORS.SERVER_KEY_MISMATCH
   )

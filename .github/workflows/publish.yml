@@ -44,4 +44,4 @@ jobs:
       - run: npm run test:types
       - run: npm run validate:package
       - run: npm run test:package
-      - uses: holepunchto/actions/publish@v1
+      - uses: holepunchto/actions/publish@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1

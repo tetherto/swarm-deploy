@@ -49,7 +49,9 @@ swarm-deploy --help
 PR/main CI is the full test authority. The tag workflow verifies the exact
 stable tag and package version, confirms the tagged commit is on `main`, builds
 the untracked `dist/`, and validates the package before delegating to
-`holepunchto/actions/publish@v1`. That action publishes with
+`holepunchto/actions/publish` at
+`146b86c4d0237c124df06ecc992ddf2c585b3405`. That composite action currently
+references `create-release@v1` internally and publishes with
 `npm publish --ignore-scripts` and creates the GitHub release, so the workflow
 must build `dist/` before invoking it.
 

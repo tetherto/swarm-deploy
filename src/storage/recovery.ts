@@ -172,7 +172,7 @@ async function prepareStorageRecovery({
         const result = await commitStore.retireCorruptAttempt(id)
         retired++
         report(logger, 'warn', 'Retired corrupt commit attempt before session recovery', {
-          transferId: id
+          transfer: activeTransfer
         })
         emit(onEvent, {
           type: 'recovery',
@@ -276,7 +276,7 @@ async function recoverStorage({
       }
       result = { status: 'CORRUPT', reason: err.message }
       report(logger, 'warn', 'Skipping corrupt commit journal', {
-        transferId: id,
+        transfer: transferFingerprint(id),
         reason: err.message
       })
       if (retired.removedStaging) {
@@ -289,7 +289,10 @@ async function recoverStorage({
       }
     }
     results.push(result)
-    report(logger, 'info', 'Recovered commit journal', { transferId: id, status: result.status })
+    report(logger, 'info', 'Recovered commit journal', {
+      transfer: transferFingerprint(id),
+      status: result.status
+    })
     emit(onEvent, {
       type: 'recovery',
       status: result.status,

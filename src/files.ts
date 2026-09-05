@@ -175,11 +175,15 @@ function classifyEntry(entryPath: string, stat: fs.Stats): ClassifiedEntry {
   } catch {
     return { kind: 'skipped', reason: 'invalid-filename' }
   }
+  if (isReservedHistoryName(name)) {
+    return { kind: 'skipped', reason: 'reserved-history' }
+  }
 
   return { kind: 'selected', name }
 }
 
-export type SkippedUploadReason = 'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename'
+export type SkippedUploadReason =
+  'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename' | 'reserved-history'
 
 export interface SelectedUploadPath {
   kind: 'selected'
@@ -224,12 +228,15 @@ export async function selectUploadPaths(
   }
 
   if (rootStat.isFile()) {
-    validateBasename(path.basename(inputPath))
+    const name = validateBasename(path.basename(inputPath))
+    if (isReservedHistoryName(name)) {
+      throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
+    }
     return {
       paths: [inputPath],
       skipped: [],
       failed: [],
-      entries: [{ kind: 'selected', name: path.basename(inputPath), path: inputPath }]
+      entries: [{ kind: 'selected', name, path: inputPath }]
     }
   }
 

@@ -16,8 +16,10 @@ Three different 32-byte values have different jobs:
 - **Topic:** a nonsecret 32-byte commitment to the server identity: `SHA-256("swarm-deploy/topic/v1\0" || serverPublicKey)`.
 
 Clients join the configured topic, then verify that the authenticated HyperDHT
-Noise peer key derives that exact topic before sending protocol or upload
-metadata. An arbitrary peer announcing the topic receives no application data.
+Noise socket key derives that exact topic before sending protocol or upload
+metadata. If Hyperswarm also supplies peer metadata, its public key must be
+valid and equal the socket key. An arbitrary peer announcing the topic receives
+no application data.
 Keep the server seed stable: rotating it changes the server key and topic, so
 every client configuration must be updated.
 
@@ -124,7 +126,12 @@ swarm-deploy upload \
   ./dist/artifact-linux-x64.tar.gz
 ```
 
-A directory uploads its immediate regular-file children once, in lexical order. Subdirectories and symlinks are skipped; unreadable entries are reported as failures while later files continue.
+A directory uploads its immediate regular-file children once, in lexical order.
+Subdirectories, symlinks, unsafe names, and regular files beginning with the
+reserved `history-` prefix are skipped; the stable reason for the latter is
+`reserved-history`. Unreadable entries are reported as failures while later
+files continue. A direct file beginning with `history-` is rejected with
+`INVALID_FILENAME`.
 
 Accepted basenames match:
 
@@ -145,6 +152,18 @@ retention. Historical versions and ordinary create-only artifacts remain
 eligible for normal retention. An unmanaged path is never replaced.
 
 Files use fixed 1 MiB SHA-256 chunks. Verified chunks are hidden under `.swarm-deploy/` and resume after reconnect. A final file becomes visible only after exact size and whole-file SHA-256 verification plus an atomic no-replace commit.
+
+Before admitting a new offer against `maxStagingBytes`, the server reclaims
+TTL-expired inactive resumable sessions and re-evaluates capacity. A session
+attached to an active upload is never reclaimed; if it occupies the remaining
+capacity, the new offer receives `STAGING_LIMIT`.
+
+The client waits up to `connectTimeout` for initial discovery and starts a fresh
+window after each established transport loss. Repeated establish/close flapping
+is bounded by `maxReconnectAttempts` (default 3, maximum 100). Initial discovery
+timeouts, reconnect-window expiry, and budget exhaustion report
+`CONNECT_TIMEOUT`; `UPLOAD_IDLE_TIMEOUT` is reserved for active upload,
+response-drain, or transport inactivity.
 
 If a basename itself is exactly 64 lowercase hexadecimal characters, pass a path containing a directory component such as `./<name>` so the CLI cannot mistake it for an accidentally pasted seed.
 
@@ -186,7 +205,8 @@ await server.listen()
 
 const client = new Client({
   seed: parseSeed(process.env.SWARM_DEPLOY_CLIENT_SEED),
-  topic: parseTopic(process.env.SWARM_DEPLOY_TOPIC)
+  topic: parseTopic(process.env.SWARM_DEPLOY_TOPIC),
+  maxReconnectAttempts: 3
 })
 
 const result = await client.upload('./dist/artifact-linux-x64.tar.gz')
@@ -202,7 +222,14 @@ CommonJS uses the same API:
 const { Client, Server, parseTopic } = require('@tetherto/swarm-deploy')
 ```
 
-Its root entrypoint also exports identity/topic helpers, file-selection/manifest helpers, bounded protocol codecs/constants, `AllowlistWatcher`, `SwarmDeployError`, and `ERRORS`. See the generated `dist/index.d.ts` for the complete API.
+The supported root runtime exports are exactly `Client`, `Server`, `ERRORS`,
+`SwarmDeployError`, `generateSeed`, `keyPairFromSeed`, `parseAllowlist`,
+`parsePublicKey`, `parseSeed`, `parseTopic`, `publicKeyFromSeed`, and
+`topicFromServerPublicKey`. The root also exports the types needed for
+Client/Server options, results, events, swarm injection, logging, binary
+identities, and storage injection. Protocol codecs/constants, transfer-ID
+machinery, file-manifest helpers, and storage implementations are internal
+submodule details, not supported root API.
 
 ## Events and logging
 
@@ -238,6 +265,8 @@ The CLI writes human-readable messages followed by JSON details to stderr. Use
 the typed API events when diagnostics must be ingested as structured records.
 Treat `reason` as a stable error code where the event type documents one; do
 not parse exception messages or use fingerprints as credentials.
+Offer-capacity rejection uses `ACTIVE_UPLOAD_LIMIT`; topic parsing uses
+`INVALID_TOPIC`; discovery/reconnect exhaustion uses `CONNECT_TIMEOUT`.
 
 ## CLI exit codes
 
@@ -303,7 +332,10 @@ be exactly `vX.Y.Z`, equal the version in `package.json`, and point to a commit
 on `main`. Full Node, Bare, property, CLI, and quality tests run exclusively in
 PR/main CI. The tag workflow builds an untracked `dist/`, validates and smokes
 the package, then delegates npm publication and GitHub release creation to
-`holepunchto/actions/publish@v1`. The action publishes with
+the reviewed immutable Holepunch actions revision
+`146b86c4d0237c124df06ecc992ddf2c585b3405`. The composite publish action
+currently references `create-release@v1` internally; this repository pins the
+reviewed composite action without vendoring it. The action publishes with
 `npm publish --ignore-scripts`, so the workflow creates `dist/` first.
 
 Before the first release, configure npm trusted publishing for

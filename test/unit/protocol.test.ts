@@ -3,8 +3,8 @@
 
 import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
+import { ERRORS, keyPairFromSeed, publicKeyFromSeed, type Fixed32 } from '../../dist/index.js'
 import {
-  ERRORS,
   OFFER,
   STATUS,
   BITMAP_PAGE,
@@ -18,6 +18,10 @@ import {
   MAX_CHUNK_BYTES,
   MAX_CHUNK_FRAME_BYTES,
   MAX_BITMAP_BITS,
+  type ResultCode,
+  type StatusCode
+} from '../../dist/protocol/constants.js'
+import {
   encodeBounded,
   decodeBounded,
   offer,
@@ -28,24 +32,20 @@ import {
   chunkAck,
   finish,
   result,
-  transferId,
-  encodeTransferIdCanonical,
-  mergeBitmapPages,
-  keyPairFromSeed,
-  publicKeyFromSeed,
-  type BitmapPageInput,
-  type ChunkAckInput,
-  type ChunkInput,
-  type Codec,
-  type FinishInput,
-  type Fixed32,
-  type OfferInput,
-  type ReadyInput,
-  type ResultCode,
-  type ResultInput,
-  type StatusCode,
-  type StatusInput
-} from '../../dist/index.js'
+  mergeBitmapPages
+} from '../../dist/protocol/codecs.js'
+import { transferId, encodeTransferIdCanonical } from '../../dist/protocol/transfer-id.js'
+import type {
+  BitmapPageInput,
+  ChunkAckInput,
+  ChunkInput,
+  Codec,
+  FinishInput,
+  OfferInput,
+  ReadyInput,
+  ResultInput,
+  StatusInput
+} from '../../dist/protocol/types.js'
 import { CHUNK_SIZE, digestBuffer } from '../helpers/files.js'
 
 const KEY = publicKeyFromSeed(b4a.alloc(32, 7))

@@ -351,9 +351,15 @@ test('startup classifies a corrupt journal before removing its orphan staging', 
   await created.sessionStore.close()
 
   const events: unknown[] = []
+  const logs: unknown[] = []
   await prepareStorageRecovery({
     layout,
     commitStore,
+    logger: {
+      warn(message, details) {
+        logs.push({ message, details })
+      }
+    },
     onEvent(event) {
       events.push(event)
     }
@@ -390,6 +396,9 @@ test('startup classifies a corrupt journal before removing its orphan staging', 
       reason: 'corrupt-journal'
     }
   ])
+  const serializedLogs = JSON.stringify(logs)
+  t.ok(serializedLogs.includes(orphanFingerprint))
+  t.absent(serializedLogs.includes(orphanId))
   await reopened.close()
 })
 

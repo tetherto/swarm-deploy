@@ -20,6 +20,8 @@ export type {
   SwarmDiscovery,
   SwarmFactory,
   SwarmFactoryOptions,
+  SwarmPeerInfo,
+  SwarmSocket,
   Topic,
   TransferEvent,
   TransferId,
@@ -33,85 +35,8 @@ export {
   publicKeyFromSeed
 } from './identity.js'
 export { parseTopic, topicFromServerPublicKey } from './topic.js'
-export {
-  validateBasename,
-  selectUploadPaths,
-  buildFileManifest,
-  type BuildFileManifestOptions,
-  type FailedUploadPath,
-  type FileManifest,
-  type FileSnapshot,
-  type SelectedUploadPath,
-  type SelectUploadPathsOptions,
-  type SkippedUploadPath,
-  type SkippedUploadReason,
-  type UploadPathEntry,
-  type UploadPathSelection
-} from './files.js'
-export {
-  OFFER,
-  STATUS,
-  BITMAP_PAGE,
-  READY,
-  CHUNK,
-  CHUNK_ACK,
-  FINISH,
-  RESULT,
-  STATUS_CODE,
-  RESULT_CODE,
-  PROTOCOL_VERSION,
-  DIGEST_BYTES,
-  TRANSFER_ID_BYTES,
-  MAX_CONTROL_BYTES,
-  MAX_CHUNK_BYTES,
-  MAX_CHUNK_FRAME_BYTES,
-  MAX_BITMAP_BITS,
-  type ResultCode,
-  type StatusCode
-} from './protocol/constants.js'
-export {
-  encodeBounded,
-  decodeBounded,
-  offer,
-  status,
-  bitmapPage,
-  ready,
-  chunk,
-  chunkAck,
-  finish,
-  result,
-  mergeBitmapPages
-} from './protocol/codecs.js'
-export { transferId, encodeTransferIdCanonical } from './protocol/transfer-id.js'
-export type {
-  BitmapPage,
-  BitmapPageInput,
-  Chunk,
-  ChunkAck,
-  ChunkAckInput,
-  ChunkInput,
-  Codec,
-  EncodingState,
-  Finish,
-  FinishInput,
-  Offer,
-  OfferInput,
-  Ready,
-  ReadyInput,
-  Result,
-  ResultInput,
-  Status,
-  StatusInput,
-  TransferIdInput
-} from './protocol/types.js'
-export {
-  parseAllowlist,
-  AllowlistWatcher,
-  type AllowlistFailureEvent,
-  type AllowlistReloadedEvent,
-  type AllowlistRemovedEvent,
-  type AllowlistWatcherOptions
-} from './allowlist.js'
+export { parseAllowlist } from './allowlist.js'
+export type { SkippedUploadReason } from './files.js'
 export {
   Server,
   type AllowlistEvent,
@@ -150,6 +75,7 @@ export {
   type ClientResultEvent,
   type ClientSkippedEvent,
   type ClientSuccessEvent,
+  type ClientUploadResult,
   type SkippedUploadEntry,
   type UploadResult,
   type UploadStatus

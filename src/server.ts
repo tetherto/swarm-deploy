@@ -599,7 +599,7 @@ export class Server extends EventEmitter {
       return { rejected: true, reason: 'FILE_BUSY' }
     }
     if (this._activeUploads.size >= this.maxActiveUploads) {
-      return { rejected: true, reason: 'ACTIVE_UPLOAD_LIMIT' }
+      return { rejected: true, reason: ERRORS.ACTIVE_UPLOAD_LIMIT }
     }
     const reservation = { id, name }
     this._activeUploads.set(id, reservation)
@@ -704,7 +704,15 @@ export class Server extends EventEmitter {
 
   private _onConnection(socket: SwarmSocket, peerInfo: SwarmPeerInfo | null = null): void {
     if (socket && typeof socket.on === 'function') socket.on('error', () => {})
-    const ownerKey = socket?.remotePublicKey || peerInfo?.publicKey
+    const socketKey = socket?.remotePublicKey
+    const peerKey = peerInfo?.publicKey
+    const ownerKey =
+      b4a.isBuffer(socketKey) &&
+      socketKey.byteLength === 32 &&
+      (peerKey === undefined ||
+        (b4a.isBuffer(peerKey) && peerKey.byteLength === 32 && b4a.equals(socketKey, peerKey)))
+        ? socketKey
+        : null
     if (this.closed || !this._isAllowed(ownerKey)) {
       this._emitSafe('authentication', {
         status: 'rejected',
@@ -903,6 +911,8 @@ export class Server extends EventEmitter {
         layout: this.layout,
         maxStagingBytes: this.maxStagingBytes,
         minFreeBytes: this.minFreeBytes,
+        resumeTtl: this.resumeTtl,
+        isSessionActive: (session) => this._isSessionActive(session),
         storage: this.storage,
         replaceNames: this.replaceNames,
         onEvent: (event: { type: string } & Record<string, unknown>) => {

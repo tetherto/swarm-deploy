@@ -39,6 +39,7 @@ import {
   result
 } from '../../dist/protocol/codecs.js'
 import { transferId } from '../../dist/protocol/transfer-id.js'
+import { ERRORS } from '../../dist/errors.js'
 import type {
   Chunk,
   Digest,
@@ -442,6 +443,28 @@ test('client session resolves committed and already committed results', async (t
     code: STATUS_CODE.ALREADY_COMMITTED
   })
   t.is((await alreadyUpload).status, 'ALREADY_COMMITTED')
+})
+
+test('client session preserves the stable active-upload limit reason', async (t) => {
+  const manifest = createManifest(1)
+  const pair = createPair({ manifest })
+  const events: Array<Record<string, unknown>> = []
+  pair.session.onEvent = (event) => events.push(event)
+  const { uploading } = await openAndOffer(pair, manifest)
+  pair.serverMessages[STATUS].send({
+    transferId: pair.received.offer[0].transferId,
+    code: STATUS_CODE.REJECTED,
+    reason: ERRORS.ACTIVE_UPLOAD_LIMIT
+  })
+
+  await t.exception(() => uploading, {
+    name: 'SwarmDeployError',
+    code: ERRORS.ACTIVE_UPLOAD_LIMIT
+  })
+  t.is(
+    events.find((event) => event.type === 'offer' && event.status === 'rejected')?.reason,
+    ERRORS.ACTIVE_UPLOAD_LIMIT
+  )
 })
 
 test('client session turns terminal statuses, local checksums, timeouts, and bad frames into typed errors', async (t) => {

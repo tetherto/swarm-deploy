@@ -6,14 +6,9 @@ import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
 import Hyperswarm from 'hyperswarm'
-import {
-  Client,
-  Server,
-  buildFileManifest,
-  keyPairFromSeed,
-  transferId,
-  ERRORS
-} from '../../dist/index.js'
+import { Client, Server, keyPairFromSeed, ERRORS } from '../../dist/index.js'
+import { buildFileManifest } from '../../dist/files.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 import { serverInternals } from '../helpers/internals.js'

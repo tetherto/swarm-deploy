@@ -76,6 +76,8 @@ interface CreateStoreOptions {
   checkpointChunks?: number
   storage?: TestStorage
   replaceNames?: Iterable<string>
+  resumeTtl?: number
+  isSessionActive?: (session: { id: string }) => boolean
 }
 
 interface CreatedStore {
@@ -188,7 +190,9 @@ async function createStore(t: Assert, options: CreateStoreOptions = {}): Promise
     clock,
     checkpointChunks: options.checkpointChunks ?? 16,
     storage: options.storage,
-    replaceNames: options.replaceNames
+    replaceNames: options.replaceNames,
+    resumeTtl: options.resumeTtl,
+    isSessionActive: options.isSessionActive
   })
   await store.init()
   t.teardown(() => store.close())
@@ -736,6 +740,49 @@ test('offer rejects capacity, final destinations, and conflicting session names'
     name: 'SwarmDeployError',
     code: ERRORS.FILE_EXISTS
   })
+})
+
+test('offer reclaims expired inactive staging before enforcing capacity', async (t) => {
+  const active = new Set<string>()
+  const { layout, clock, store } = await createStore(t, {
+    maxStagingBytes: 11,
+    resumeTtl: 1_000,
+    isSessionActive: (session) => active.has(session.id)
+  })
+  const stale = makeUpload(OWNER, { name: 'stale.bin' })
+  const incoming = makeUpload(OTHER_OWNER, { name: 'incoming.bin' })
+  await store.offer(OWNER, stale.offer)
+  clock.advance(1_001)
+
+  const accepted = await store.offer(OTHER_OWNER, incoming.offer)
+
+  t.is(accepted.state, 'receiving')
+  t.is(store.sessions.has(transferHex(stale.offer)), false)
+  t.is(store.sessions.has(transferHex(incoming.offer)), true)
+  t.is(await pathExists(stagingPath(layout, stale.offer)), false)
+  t.is(store.reservedBytes, incoming.offer.size)
+})
+
+test('offer preserves expired active staging and returns STAGING_LIMIT', async (t) => {
+  const active = new Set<string>()
+  const { layout, clock, store } = await createStore(t, {
+    maxStagingBytes: 11,
+    resumeTtl: 1_000,
+    isSessionActive: (session) => active.has(session.id)
+  })
+  const receiving = makeUpload(OWNER, { name: 'active.bin' })
+  const incoming = makeUpload(OTHER_OWNER, { name: 'incoming.bin' })
+  await store.offer(OWNER, receiving.offer)
+  active.add(transferHex(receiving.offer))
+  clock.advance(1_001)
+
+  await t.exception(() => store.offer(OTHER_OWNER, incoming.offer), {
+    name: 'SwarmDeployError',
+    code: ERRORS.STAGING_LIMIT
+  })
+  t.is(store.sessions.has(transferHex(receiving.offer)), true)
+  t.is(await pathExists(stagingPath(layout, receiving.offer)), true)
+  t.is(store.reservedBytes, receiving.offer.size)
 })
 
 test('offer rejects noncanonical IDs and chunk counts', async (t) => {
