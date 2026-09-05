@@ -160,7 +160,8 @@ test('buildFileManifest hashes boundary sizes with logical chunks', async (t) =>
 
 test('buildFileManifest assembles logical chunks independent of stream size', async (t) => {
   const dir = await createTempDir(t)
-  const size = CHUNK_SIZE + 1
+  const chunkSize = 128
+  const size = chunkSize + 1
   const filePath = path.join(dir, 'stream-chunks.bin')
   await writeDeterministicFile(filePath, size)
 
@@ -172,8 +173,8 @@ test('buildFileManifest assembles logical chunks independent of stream size', as
     patchable.createReadStream = original
   })
 
-  const manifest = await buildFileManifest(filePath)
-  const expected = expectedManifest(size)
+  const manifest = await buildFileManifest(filePath, { chunkSize })
+  const expected = expectedManifest(size, chunkSize)
   t.alike(manifest.digest, expected.digest)
   t.is(manifest.chunkCount, expected.chunkCount)
   t.alike(manifest.chunkDigests, expected.chunkDigests)

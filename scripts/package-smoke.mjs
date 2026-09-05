@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const root = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)))
+const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 const consumer = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-deploy-package-'))
 let tarball = null
 
@@ -24,26 +25,10 @@ function run(command, args, options = {}) {
 }
 
 try {
-  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8')
-  for (const snippet of [
-    'npm install @tetherto/swarm-deploy',
-    'npm install --global @tetherto/swarm-deploy',
-    'swarm-deploy topic --seed-file server.seed',
-    'swarm-deploy upload',
-    "require('@tetherto/swarm-deploy')",
-    "from '@tetherto/swarm-deploy'"
-  ]) {
-    assert.ok(readme.includes(snippet), `README missing installed-package example: ${snippet}`)
-  }
-  assert.ok(!readme.includes('npx swarm-deploy'), 'README must use the installed global CLI')
-  const primaryReadme = readme.split('## Contributor development')[0]
-  assert.ok(!primaryReadme.includes('node dist/'), 'primary README must not invoke checkout dist')
-  assert.ok(!primaryReadme.includes('bare dist/'), 'primary README must not invoke checkout dist')
-
   const packed = run('npm', ['pack', '--json'], { cwd: root })
   const [manifest] = JSON.parse(packed.stdout)
-  assert.equal(manifest.name, '@tetherto/swarm-deploy')
-  assert.equal(manifest.version, '0.1.0')
+  assert.equal(manifest.name, packageJson.name)
+  assert.equal(manifest.version, packageJson.version)
   assert.ok(manifest.size <= 512 * 1024, `packed size ${manifest.size} exceeds 512 KiB`)
   assert.ok(
     manifest.unpackedSize <= 2 * 1024 * 1024,

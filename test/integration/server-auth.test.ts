@@ -25,7 +25,6 @@ import { transferId } from '../../dist/protocol/transfer-id.js'
 import type { ServerOptions } from '../../dist/server.js'
 import type { Offer, Result, Status, TransferMessage } from '../../dist/protocol/types.js'
 import type { ChunkAck } from '../../dist/protocol/types.js'
-import type { CommitRecord } from '../../dist/storage/commit-journal.js'
 import type { SwarmDiscovery, Topic } from '../../dist/types.js'
 import type { Testnet } from 'hyperdht/testnet'
 import { createTempDir } from '../helpers/files.js'
@@ -114,10 +113,12 @@ function deferred(): Deferred {
   return { promise, resolve }
 }
 
-function uploadFor(ownerKey: Uint8Array): Offer {
-  const data = b4a.from('authenticated upload')
+function uploadFor(
+  ownerKey: Uint8Array,
+  name = 'artifact.bin',
+  data = b4a.from('authenticated upload')
+): Offer {
   const digest = sha256(data)
-  const name = 'artifact.bin'
   const size = data.byteLength
   const chunkSize = 1024 * 1024
   return {
@@ -268,31 +269,51 @@ test('Server validates and copies exact replacement names', (t) => {
   }
 })
 
-test('Server wires mutable names into staging and current-only retention pins', async (t) => {
+test('Server retention preserves mutable current while evicting its history', async (t) => {
+  const root = await createTempDir(t)
+  const ownerKey = keyPairFromSeed(ALLOWED_SEED).publicKey
   const server = new Server({
     seed: SERVER_SEED,
-    storageDir: await createTempDir(t),
-    allowedKeys: [keyPairFromSeed(ALLOWED_SEED).publicKey],
+    storageDir: root,
+    allowedKeys: [ownerKey],
     maxFileBytes: 1024 * 1024,
     maxStagingBytes: 1024 * 1024,
+    maxStorageBytes: 27,
     replaceNames: ['release.tar.gz'],
     swarmFactory: () => createStubSwarm([])
   })
   t.teardown(() => server.close())
   await server.listen()
   const internal = serverInternals(server)
+  const publish = async (data: Buffer, replacing = false) => {
+    const value = uploadFor(ownerKey, 'release.tar.gz', data)
+    await internal.sessionStore.offer(ownerKey, value)
+    await internal.sessionStore.writeChunk(value.transferId, {
+      transferId: value.transferId,
+      index: 0,
+      digest: sha256(data),
+      data
+    })
+    await internal.sessionStore.finish(value.transferId)
+    const session = internal.sessionStore.sessions.get(b4a.toString(value.transferId, 'hex'))!
+    const record = await internal.commitStore.commit(session, {
+      ...(replacing ? { replaceNames: new Set(['release.tar.gz']) } : {})
+    })
+    await internal.sessionStore.retireCommitted(value.transferId)
+    return record
+  }
 
-  t.alike(internal.sessionStore.replaceNames, new Set(['release.tar.gz']))
-  t.is(internal.sessionStore.resumeTtl, server.resumeTtl)
-  t.is(typeof internal.sessionStore.isSessionActive, 'function')
-  t.is(internal.retentionManager.isPinned({ name: 'release.tar.gz' } as CommitRecord), true)
-  t.is(
-    internal.retentionManager.isPinned({
-      name: `history-${'1'.repeat(64)}`
-    } as CommitRecord),
-    false
-  )
-  t.is(internal.retentionManager.isPinned({ name: 'release.tar.gz.sig' } as CommitRecord), false)
+  const previous = await publish(b4a.from('first release'))
+  const current = await publish(b4a.from('second release'), true)
+  const historyPath = path.join(root, `history-${previous.transferId}`)
+  t.ok(fs.existsSync(historyPath), 'replacement created managed history')
+
+  const result = await internal.retentionManager.run({ incomingBytes: 1 })
+
+  t.is(result.storageDeleted, 1)
+  t.is(fs.existsSync(historyPath), false)
+  t.alike(await fs.promises.readFile(path.join(root, 'release.tar.gz')), b4a.from('second release'))
+  t.alike(await internal.commitStore.list(), [current])
 })
 
 test('Server releases transfer and name reservations after startup failure', async (t) => {

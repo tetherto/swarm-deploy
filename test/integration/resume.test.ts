@@ -5,8 +5,23 @@ import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
+import { EventEmitter } from '#events'
+import Protomux from 'protomux'
+import { Duplex } from 'streamx'
 import { Client, Server, keyPairFromSeed, topicFromServerPublicKey } from '../../dist/index.js'
 import { SwarmDeployError, ERRORS } from '../../dist/errors.js'
+import { UPLOAD_PROTOCOL } from '../../dist/protocol/client-session.js'
+import {
+  offer,
+  status,
+  bitmapPage,
+  ready,
+  chunk,
+  chunkAck,
+  finish,
+  result
+} from '../../dist/protocol/codecs.js'
+import type { Scheduler, Swarm, SwarmSocket } from '../../dist/types.js'
 import { createTempDir, writeDeterministicFile, CHUNK_SIZE } from '../helpers/files.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 import { clientInternals, destroyServerConnections, serverInternals } from '../helpers/internals.js'
@@ -14,14 +29,104 @@ import { clientInternals, destroyServerConnections, serverInternals } from '../h
 const SERVER_SEED = b4a.alloc(32, 31)
 const CLIENT_SEED = b4a.alloc(32, 32)
 
-/** A transport-loss failure carries the flag the reconnect window keys on. */
-interface TransportError extends SwarmDeployError {
-  transport?: boolean
-}
-
 interface Harness {
   client: Client
   server: Server
+}
+
+interface ScriptedSwarm extends Swarm {
+  connect(): void
+  emit(event: string, ...args: unknown[]): boolean
+}
+
+interface ImmediateTimer {
+  native: ReturnType<typeof setTimeout>
+  cancelled: boolean
+}
+
+function createDuplexPair(): { client: SwarmSocket; server: Duplex } {
+  let left!: Duplex
+  let right!: Duplex
+  left = new Duplex({
+    write(data, callback) {
+      right.push(data)
+      callback(null)
+    }
+  })
+  right = new Duplex({
+    write(data, callback) {
+      left.push(data)
+      callback(null)
+    }
+  })
+  left.on('error', () => {})
+  right.on('error', () => {})
+  left.once('close', () => {
+    if (!right.destroyed) right.destroy()
+  })
+  right.once('close', () => {
+    if (!left.destroyed) left.destroy()
+  })
+  return { client: left as unknown as SwarmSocket, server: right }
+}
+
+function createFlappingSwarm(serverKey: Buffer, onOffer: () => void): ScriptedSwarm {
+  const swarm = new EventEmitter() as unknown as ScriptedSwarm
+  swarm.connect = () => {
+    const { client, server } = createDuplexPair()
+    client.remotePublicKey = serverKey
+    const mux = Protomux.from(server)
+    mux.pair({ protocol: UPLOAD_PROTOCOL }, (id) => {
+      const channel = mux.createChannel({ protocol: UPLOAD_PROTOCOL, id })
+      channel.addMessage({
+        encoding: offer,
+        onmessage() {
+          onOffer()
+          server.destroy()
+        }
+      })
+      channel.addMessage({ encoding: status })
+      channel.addMessage({ encoding: bitmapPage })
+      channel.addMessage({ encoding: ready })
+      channel.addMessage({ encoding: chunk })
+      channel.addMessage({ encoding: chunkAck })
+      channel.addMessage({ encoding: finish })
+      channel.addMessage({ encoding: result })
+      channel.open()
+    })
+    swarm.emit('connection', client, { publicKey: serverKey })
+  }
+  swarm.join = () => ({
+    flushed: () => {
+      swarm.connect()
+      return Promise.resolve()
+    }
+  })
+  swarm.destroy = () => {}
+  return swarm
+}
+
+function createImmediateScheduler(
+  now: { value: number },
+  onReconnect: (() => void) | null
+): Scheduler {
+  return {
+    setTimeout(callback, delay) {
+      const timer = { native: null as unknown as ReturnType<typeof setTimeout>, cancelled: false }
+      timer.native = setTimeout(() => {
+        if (timer.cancelled) return
+        if (delay === 30_000) now.value += delay
+        if (delay <= 1_000) onReconnect?.()
+        callback()
+      }, 0)
+      return timer
+    },
+    clearTimeout(handle) {
+      const timer = handle as ImmediateTimer
+      timer.cancelled = true
+      clearTimeout(timer.native)
+    }
+  }
 }
 
 async function setup(t: Assert): Promise<Harness> {
@@ -98,35 +203,30 @@ test('Client resolves a lost final result through ALREADY_COMMITTED', async (t) 
 })
 
 test('Client starts a fresh reconnect window after an active transport loss', async (t) => {
-  let now = 0
+  const now = { value: 0 }
+  let attempts = 0
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const swarm = createFlappingSwarm(serverKey, () => {
+    attempts++
+    now.value = 60_000
+  })
   const client = new Client({
     seed: CLIENT_SEED,
-    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
-    clock: { now: () => now }
+    topic: topicFromServerPublicKey(serverKey),
+    clock: { now: () => now.value },
+    scheduler: createImmediateScheduler(now, null),
+    swarmFactory: () => swarm
   })
-  const deadlines: number[] = []
-  const socket = {}
-  const internal = clientInternals(client)
-  internal._ensureStarted = () => Promise.resolve(client)
-  internal._delay = () => Promise.resolve(true)
-  internal._waitForSocket = (deadline) => {
-    deadlines.push(deadline)
-    if (deadlines.length === 1) return Promise.resolve(socket)
-    now = deadline
-    return Promise.reject(new SwarmDeployError(ERRORS.CONNECT_TIMEOUT, 'unavailable'))
-  }
-  internal._startSession = () => {
-    now = 60_000
-    const error: TransportError = new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'lost')
-    error.transport = true
-    return Promise.reject(error)
-  }
+  t.teardown(() => client.close())
+  const source = path.join(await createTempDir(t), 'fresh-window.bin')
+  await fs.promises.writeFile(source, b4a.from('fresh reconnect deadline'))
 
-  await t.exception(() => internal._uploadManifest({}), {
+  await t.exception(() => client.upload(source), {
     name: 'SwarmDeployError',
     code: ERRORS.CONNECT_TIMEOUT
   })
-  t.alike(deadlines, [30_000, 90_000])
+  t.is(attempts, 1)
+  t.is(now.value, 90_000)
 })
 
 test('Client reports CONNECT_TIMEOUT when the initial server is missing', async (t) => {
@@ -150,24 +250,26 @@ test('Client reports CONNECT_TIMEOUT when the initial server is missing', async 
 })
 
 test('Client bounds repeated transport flapping with a reconnect budget', async (t) => {
+  const now = { value: 0 }
+  let attempts = 0
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  let swarm!: ScriptedSwarm
+  swarm = createFlappingSwarm(serverKey, () => {
+    attempts++
+  })
   const client = new Client({
     seed: CLIENT_SEED,
-    topic: topicFromServerPublicKey(keyPairFromSeed(SERVER_SEED).publicKey),
-    maxReconnectAttempts: 2
+    topic: topicFromServerPublicKey(serverKey),
+    maxReconnectAttempts: 2,
+    clock: { now: () => now.value },
+    scheduler: createImmediateScheduler(now, () => swarm.connect()),
+    swarmFactory: () => swarm
   })
-  const internal = clientInternals(client)
-  let attempts = 0
-  internal._ensureStarted = () => Promise.resolve(client)
-  internal._waitForSocket = () => Promise.resolve({})
-  internal._delay = () => Promise.resolve(true)
-  internal._startSession = () => {
-    attempts++
-    const error: TransportError = new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'flapped')
-    error.transport = true
-    return Promise.reject(error)
-  }
+  t.teardown(() => client.close())
+  const source = path.join(await createTempDir(t), 'flapping.bin')
+  await fs.promises.writeFile(source, b4a.from('bounded flapping'))
 
-  await t.exception(() => internal._uploadManifest({}), {
+  await t.exception(() => client.upload(source), {
     name: 'SwarmDeployError',
     code: ERRORS.CONNECT_TIMEOUT
   })

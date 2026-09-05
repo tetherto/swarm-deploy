@@ -277,9 +277,13 @@ test('retention keeps managed commits when no limits are configured', async (t) 
 test('retention expires commits using their server commit time', async (t) => {
   const stores = await createStores(t, { retention: { maxAge: 1_000 } })
   const artifact = await commit(t, stores, 'old.bin', b4a.from('old'))
-  stores.clock.advance(1_000)
+  stores.clock.advance(999)
 
-  await stores.manager.run()
+  t.is((await stores.manager.run()).ageDeleted, 0)
+  t.is(await pathExists(artifact.finalPath), true)
+  stores.clock.advance(1)
+
+  t.is((await stores.manager.run()).ageDeleted, 1)
 
   t.is(await pathExists(artifact.finalPath), false)
   t.alike(await stores.commitStore.list(), [])
@@ -288,9 +292,14 @@ test('retention expires commits using their server commit time', async (t) => {
 test('retention evicts oldest filename first to reserve incoming capacity', async (t) => {
   const stores = await createStores(t, { retention: { maxStorageBytes: 6 } })
   const alpha = await commit(t, stores, 'alpha.bin', b4a.from('aaa'))
+  stores.clock.advance(1)
   const bravo = await commit(t, stores, 'bravo.bin', b4a.from('bbb'))
 
-  await stores.manager.run({ incomingBytes: 3 })
+  t.is((await stores.manager.run()).storageDeleted, 0)
+  t.is(await pathExists(alpha.finalPath), true)
+  t.is(await pathExists(bravo.finalPath), true)
+
+  t.is((await stores.manager.run({ incomingBytes: 1 })).storageDeleted, 1)
 
   t.is(await pathExists(alpha.finalPath), false)
   t.is(await pathExists(bravo.finalPath), true)
@@ -588,6 +597,15 @@ test('retention expires only disconnected sessions past the default TTL', async 
   await stores.manager.expireSessions()
   t.is(stores.sessionStore.sessions.has(hex(inactive.offer.transferId)), false)
   t.is(stores.sessionStore.sessions.has(activeId), true)
+  t.is(
+    await pathExists(path.join(stores.layout.staging, `${activeId}.part`)),
+    true,
+    'active upload staging survives past TTL'
+  )
+
+  activeId = null
+  t.is(await stores.manager.expireSessions(), 1)
+  t.is(stores.sessionStore.sessions.has(hex(active.offer.transferId)), false)
 })
 
 test('retention validates numeric limits and durations', async (t) => {

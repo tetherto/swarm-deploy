@@ -7,13 +7,21 @@ import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
 import { EventEmitter } from '#events'
+import { Duplex } from 'streamx'
 import { ERRORS, SwarmDeployError, Client, Server, keyPairFromSeed } from '../../dist/index.js'
 import { OFFER, STATUS, BITMAP_PAGE, FINISH } from '../../dist/protocol/constants.js'
 import { transferId } from '../../dist/protocol/transfer-id.js'
 import { ClientSession } from '../../dist/protocol/client-session.js'
 import { ServerSession } from '../../dist/protocol/server-session.js'
 import type { Offer } from '../../dist/protocol/types.js'
-import type { SwarmDiscovery } from '../../dist/types.js'
+import type {
+  Scheduler,
+  SwarmDiscovery,
+  SwarmFactory,
+  SwarmFactoryOptions,
+  SwarmSocket,
+  Topic
+} from '../../dist/types.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { SessionStore } from '../../dist/storage/session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
@@ -23,7 +31,7 @@ import { createTempDir } from '../helpers/files.js'
 import { createStorage, type TestStorage } from '../helpers/storage.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 import { settledError } from '../helpers/cancellation.js'
-import { clientInternals, destroyServerConnections, serverInternals } from '../helpers/internals.js'
+import { destroyServerConnections, serverInternals } from '../helpers/internals.js'
 
 const OWNER = b4a.alloc(32, 0x41)
 const OTHER_OWNER = b4a.alloc(32, 0x42)
@@ -53,6 +61,10 @@ interface Deferred {
   resolve: () => void
 }
 
+interface DeterministicTimer {
+  cancelled: boolean
+}
+
 interface HarnessChunk {
   transferId: Buffer
   index: number
@@ -76,6 +88,19 @@ interface UploadOptions {
 interface StubSwarm extends EventEmitter {
   join(): SwarmDiscovery
   destroy(): Promise<void>
+}
+
+interface MemorySwarm extends EventEmitter {
+  options: SwarmFactoryOptions
+  sockets: Set<SwarmSocket>
+  destroyed: boolean
+  join(topic: Topic, roles: { server: boolean; client: boolean }): SwarmDiscovery
+  destroy(): void
+}
+
+interface MemoryNetwork {
+  factory: SwarmFactory
+  destroy(): void
 }
 
 interface CreateStoreOptions {
@@ -180,6 +205,24 @@ function deferred(): Deferred {
   return { promise, resolve }
 }
 
+function createReconnectScheduler(entered: Deferred, release: Deferred): Scheduler {
+  return {
+    setTimeout(callback, delay) {
+      const timer: DeterministicTimer = { cancelled: false }
+      if (delay <= 1_000) {
+        entered.resolve()
+        release.promise.then(() => {
+          if (!timer.cancelled) callback()
+        })
+      }
+      return timer
+    },
+    clearTimeout(timer) {
+      ;(timer as DeterministicTimer).cancelled = true
+    }
+  }
+}
+
 function diagnosticTimeout<T>(promise: Promise<T>, label: string, timeout = 2_000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   return Promise.race([
@@ -246,6 +289,82 @@ function createStubSwarm(): StubSwarm {
   swarm.join = () => ({ flushed: () => Promise.resolve() })
   swarm.destroy = () => Promise.resolve()
   return swarm
+}
+
+function createMemoryNetwork(): MemoryNetwork {
+  let server: MemorySwarm | null = null
+  const clients = new Set<MemorySwarm>()
+
+  const connect = (client: MemorySwarm): void => {
+    if (!server || server.destroyed || client.destroyed) return
+    let clientSocket!: Duplex
+    let serverSocket!: Duplex
+    clientSocket = new Duplex({
+      write(data, callback) {
+        serverSocket.push(data)
+        callback(null)
+      }
+    })
+    serverSocket = new Duplex({
+      write(data, callback) {
+        clientSocket.push(data)
+        callback(null)
+      }
+    })
+    clientSocket.on('error', () => {})
+    serverSocket.on('error', () => {})
+    ;(clientSocket as unknown as SwarmSocket).remotePublicKey = server.options.keyPair.publicKey
+    ;(serverSocket as unknown as SwarmSocket).remotePublicKey = client.options.keyPair.publicKey
+    client.sockets.add(clientSocket as unknown as SwarmSocket)
+    server.sockets.add(serverSocket as unknown as SwarmSocket)
+    let reconnectScheduled = false
+    const closed = (): void => {
+      client.sockets.delete(clientSocket as unknown as SwarmSocket)
+      server?.sockets.delete(serverSocket as unknown as SwarmSocket)
+      if (!clientSocket.destroyed) clientSocket.destroy()
+      if (!serverSocket.destroyed) serverSocket.destroy()
+      if (reconnectScheduled || client.destroyed) return
+      reconnectScheduled = true
+      Promise.resolve().then(() => connect(client))
+    }
+    clientSocket.once('close', closed)
+    serverSocket.once('close', closed)
+    server.emit('connection', serverSocket, { publicKey: client.options.keyPair.publicKey })
+    client.emit('connection', clientSocket, { publicKey: server.options.keyPair.publicKey })
+  }
+
+  const factory: SwarmFactory = (options) => {
+    const swarm = new EventEmitter() as MemorySwarm
+    swarm.options = options
+    swarm.sockets = new Set()
+    swarm.destroyed = false
+    swarm.join = (_topic: Topic, roles) => {
+      if (roles.server) server = swarm
+      if (roles.client) {
+        clients.add(swarm)
+        Promise.resolve().then(() => connect(swarm))
+      }
+      return { flushed: () => Promise.resolve() }
+    }
+    swarm.destroy = () => {
+      swarm.destroyed = true
+      clients.delete(swarm)
+      if (server === swarm) server = null
+      for (const socket of [...swarm.sockets]) socket.destroy()
+      swarm.sockets.clear()
+    }
+    return swarm
+  }
+
+  return {
+    factory,
+    destroy() {
+      for (const client of clients) client.destroy()
+      server?.destroy()
+      clients.clear()
+      server = null
+    }
+  }
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -469,7 +588,8 @@ test('same-ID offers are idempotent while same-name races admit one transfer', a
 })
 
 test('disconnect boundaries resume without exposing partial uploads', async (t) => {
-  const testnet = await createLocalTestnet(t)
+  const network = createMemoryNetwork()
+  t.teardown(() => network.destroy())
   const clientSeed = b4a.alloc(32, 0x45)
   const ownerKey = keyPairFromSeed(clientSeed).publicKey
   const server = new Server({
@@ -479,7 +599,7 @@ test('disconnect boundaries resume without exposing partial uploads', async (t) 
     maxFileBytes: CHUNK_SIZE,
     maxStagingBytes: 16 * CHUNK_SIZE,
     minFreeBytes: 0,
-    dht: testnet.createNode()
+    swarmFactory: network.factory
   })
   t.teardown(() => server.close())
   await server.listen()
@@ -661,23 +781,22 @@ test('disconnect boundaries resume without exposing partial uploads', async (t) 
   ]
 
   for (const entry of cases) {
+    const retryEntered = deferred()
+    const releaseRetry = deferred()
     const client = new Client({
       seed: clientSeed,
       topic: server.topic,
       connectTimeout: 5_000,
       idleTimeout: 5_000,
-      dht: testnet.createNode()
+      scheduler: createReconnectScheduler(retryEntered, releaseRetry),
+      swarmFactory: network.factory
     })
-    const internalClient = clientInternals(client)
     const source = path.join(await createTempDir(t), `${entry.name}.bin`)
     const data = b4a.from(`disconnect at ${entry.name}`)
     await fs.promises.writeFile(source, data)
     const finalPath = path.join(internal.layout.root, path.basename(source))
     const triggered = deferred()
-    const retryEntered = deferred()
-    const releaseRetry = deferred()
     const releaseBoundary = deferred()
-    const originalDelay = internalClient._delay
     let fired = false
     const control = entry.install(() => {
       if (fired) return
@@ -685,11 +804,6 @@ test('disconnect boundaries resume without exposing partial uploads', async (t) 
       triggered.resolve()
     }, releaseBoundary)
     const hooks = boundaryHooks(control)
-    internalClient._delay = async (...args) => {
-      retryEntered.resolve()
-      await releaseRetry.promise
-      return originalDelay.apply(internalClient, args)
-    }
     const uploading = client.upload(source)
     try {
       await diagnosticTimeout(
@@ -713,7 +827,6 @@ test('disconnect boundaries resume without exposing partial uploads', async (t) 
     } finally {
       releaseBoundary.resolve()
       releaseRetry.resolve()
-      internalClient._delay = originalDelay
       clientSendHook = null
       clientPumpHook = null
       serverSendHook = null

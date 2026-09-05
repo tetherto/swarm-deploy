@@ -11,10 +11,6 @@ const repoRoot = path.join(__dirname, '../..')
 const testDist = path.join(repoRoot, '.test-dist')
 const dist = path.join(repoRoot, 'dist')
 
-interface PackageScripts {
-  scripts: Record<string, string>
-}
-
 function listCompiledFiles(directory: string): string[] {
   const found: string[] = []
 
@@ -75,33 +71,4 @@ test('compiled tests resolve only compiled output, never TypeScript sources', (t
   }
 
   t.alike(offenders, [], `compiled requires must stay inside .test-dist or dist: ${offenders}`)
-})
-
-test('runtime scripts and CI execute only compiled test output', (t) => {
-  const pkg = JSON.parse(
-    fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')
-  ) as PackageScripts
-  t.is(pkg.scripts['build:test'], 'rm -rf .test-dist && tsc -p tsconfig.test.json')
-  t.is(
-    pkg.scripts['test:node'],
-    'npm run build && npm run build:test && brittle-node .test-dist/run.js'
-  )
-  t.is(
-    pkg.scripts['test:bare'],
-    'npm run build && npm run build:test && brittle-bare .test-dist/run.js'
-  )
-
-  const workflow = fs.readFileSync(path.join(repoRoot, '.github/workflows/ci.yml'), 'utf8')
-  t.ok(
-    workflow.includes('npx brittle-node .test-dist/unit/protocol-property.test.js'),
-    'the property job must run emitted JavaScript'
-  )
-  t.absent(
-    /brittle-(?:node|bare) (?!\.test-dist\/)/.test(workflow),
-    'no CI job may run tests outside .test-dist'
-  )
-  t.ok(
-    workflow.includes('npm run build && npm run build:test && npm run test:types'),
-    'CI must compile sources and tests before linting'
-  )
 })

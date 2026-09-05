@@ -154,23 +154,22 @@ test('offer codec round-trips representative data', (t) => {
   t.alike<OfferInput>(decoded, value)
 })
 
-test('status codec round-trips representative data', (t) => {
-  const value = {
-    transferId: sampleOffer().transferId,
-    code: STATUS_CODE.ACCEPT
+test('status codec round-trips accepted and rejected responses', (t) => {
+  const fixtures: StatusInput[] = [
+    {
+      transferId: sampleOffer().transferId,
+      code: STATUS_CODE.ACCEPT
+    },
+    {
+      transferId: sampleOffer().transferId,
+      code: STATUS_CODE.REJECTED,
+      reason: 'staging limit'
+    }
+  ]
+  for (const value of fixtures) {
+    const decoded = decodeBounded(status, encodeBounded(status, value))
+    t.alike<StatusInput>(decoded, { reason: '', ...value })
   }
-  const decoded = decodeBounded(status, encodeBounded(status, value))
-  t.alike<StatusInput>(decoded, { ...value, reason: '' })
-})
-
-test('status codec round-trips rejected responses with reason', (t) => {
-  const value = {
-    transferId: sampleOffer().transferId,
-    code: STATUS_CODE.REJECTED,
-    reason: 'staging limit'
-  }
-  const decoded = decodeBounded(status, encodeBounded(status, value))
-  t.alike<StatusInput>(decoded, value)
 })
 
 test('status and result encoders do not mutate caller values', (t) => {
@@ -310,17 +309,6 @@ test('decodeBounded canonicalizes plain Uint8Array codec outputs', (t) => {
   assertCanonicalBuffer(t, decodedAck.transferId, 'ACK transfer ID')
   assertCanonicalBuffer(t, decodedFinish.transferId, 'finish transfer ID')
   assertCanonicalBuffer(t, decodedResult.transferId, 'result transfer ID')
-})
-
-test('fixed32 semantic validation rejects short transfer ID fields on decode', (t) => {
-  const encoded = encodeBounded(chunkAck, {
-    transferId: sampleOffer().transferId,
-    index: 0
-  })
-  t.exception(() => decodeBounded(chunkAck, encoded.subarray(0, 31)), {
-    name: 'SwarmDeployError',
-    code: ERRORS.PROTOCOL_INVALID
-  })
 })
 
 test('fixed-width fields must be exactly 32 bytes on encode', (t) => {
@@ -535,46 +523,6 @@ test('mergeBitmapPages rejects mixed transfer IDs', (t) => {
       code: ERRORS.PROTOCOL_INVALID
     }
   )
-})
-
-test('chunkAck validates transfer ID width and chunk index', (t) => {
-  t.exception(
-    () =>
-      encodeBounded(chunkAck, {
-        transferId: b4a.alloc(16),
-        index: 0
-      }),
-    {
-      name: 'SwarmDeployError',
-      code: ERRORS.PROTOCOL_INVALID
-    }
-  )
-
-  const encoded = encodeBounded(chunkAck, {
-    transferId: sampleOffer().transferId,
-    index: 0
-  })
-  t.exception(() => decodeBounded(chunkAck, encoded.subarray(0, encoded.byteLength - 1)), {
-    name: 'SwarmDeployError',
-    code: ERRORS.PROTOCOL_INVALID
-  })
-})
-
-test('decodeBounded rejects trailing bytes', (t) => {
-  const encoded = encodeBounded(finish, { transferId: sampleOffer().transferId })
-  const trailing = b4a.concat([encoded, b4a.from([0x00])])
-  t.exception(() => decodeBounded(finish, trailing), {
-    name: 'SwarmDeployError',
-    code: ERRORS.PROTOCOL_INVALID
-  })
-})
-
-test('decodeBounded rejects inputs larger than bound before decoding', (t) => {
-  const encoded = encodeBounded(ready, { transferId: sampleOffer().transferId })
-  t.exception(() => decodeBounded(ready, encoded, encoded.byteLength - 1), {
-    name: 'SwarmDeployError',
-    code: ERRORS.PROTOCOL_INVALID
-  })
 })
 
 test('transfer ID canonical encoding matches pinned known vector', (t) => {

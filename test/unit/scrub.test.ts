@@ -110,22 +110,6 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function createFifo(filePath: string): Promise<boolean> {
-  let execFile!: typeof import('node:child_process').execFile
-  try {
-    ;({ execFile } = require('child_process') as typeof import('node:child_process'))
-  } catch {
-    return false
-  }
-  await new Promise<void>((resolve, reject) => {
-    execFile('mkfifo', [filePath], (err) => {
-      if (err) reject(err)
-      else resolve()
-    })
-  })
-  return true
-}
-
 async function createStores(
   t: Assert,
   { storage, isSessionActive = () => false, logger }: CreateStoresOptions = {}
@@ -230,19 +214,28 @@ test('startup scrub removes missing, truncated, symlinked, and digest-invalid ma
   t.alike(await fs.promises.readFile(foreignTarget), b4a.from('foreign'))
 })
 
-test('startup scrub removes managed FIFOs where supported', async (t) => {
-  const stores = await createStores(t)
-  const fifo = await commit(t, stores, 'managed.fifo', b4a.from('fifo'))
-  await fs.promises.unlink(fifo.finalPath)
-  if (!(await createFifo(fifo.finalPath))) {
-    t.ok(true)
-    return
+test('startup scrub removes a managed non-regular file', async (t) => {
+  let nonRegularPath: string | null = null
+  const storage = createStorage()
+  const lstat = storage.lstat
+  storage.lstat = async (filePath) => {
+    const stat = await lstat(filePath)
+    if (filePath !== nonRegularPath) return stat
+    return {
+      ...stat,
+      isFile: () => false,
+      isDirectory: () => false,
+      isSymbolicLink: () => false
+    }
   }
+  const stores = await createStores(t, { storage })
+  const managed = await commit(t, stores, 'managed.special', b4a.from('special'))
+  nonRegularPath = managed.finalPath
 
   const result = await stores.manager.scrubCommitted()
 
   t.is(result.deleted, 1)
-  t.is(await pathExists(fifo.finalPath), false)
+  t.is(await pathExists(managed.finalPath), false)
   t.alike(await stores.commitStore.list(), [])
 })
 

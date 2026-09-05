@@ -155,6 +155,7 @@ export interface ClientSessionOptions {
   idleTimeout?: number
   scheduler?: SessionScheduler
   readChunk?: ((manifest: FileManifest, index: number) => Uint8Array | Promise<Uint8Array>) | null
+  openSource?: (filePath: string, flags: string | number) => Promise<fs.promises.FileHandle>
   destroy?: ((error: unknown) => void) | null
   signal?: AbortSignalLike | null
   onEvent?: (payload: Record<string, unknown>) => void
@@ -171,6 +172,7 @@ export class ClientSession {
   idleTimeout: number
   scheduler: SessionScheduler
   readChunk: ((manifest: FileManifest, index: number) => Uint8Array | Promise<Uint8Array>) | null
+  openSource: (filePath: string, flags: string | number) => Promise<fs.promises.FileHandle>
   signal: AbortSignalLike | null
   onEvent: (payload: Record<string, unknown>) => void
   removeAbort: () => void
@@ -200,6 +202,7 @@ export class ClientSession {
     idleTimeout = DEFAULT_IDLE_TIMEOUT,
     scheduler = { setTimeout, clearTimeout },
     readChunk = null,
+    openSource = (filePath, flags) => fs.promises.open(filePath, flags),
     destroy = null,
     signal = null,
     onEvent = () => {}
@@ -224,6 +227,7 @@ export class ClientSession {
     if (readChunk !== null && typeof readChunk !== 'function') {
       throw protocolError('Invalid chunk reader')
     }
+    if (typeof openSource !== 'function') throw protocolError('Invalid source opener')
     if (destroy !== null && typeof destroy !== 'function') {
       throw protocolError('Invalid connection destroyer')
     }
@@ -234,6 +238,7 @@ export class ClientSession {
     this.idleTimeout = idleTimeout
     this.scheduler = scheduler
     this.readChunk = readChunk
+    this.openSource = openSource
     this.signal = signal
     this.onEvent = onEvent
     this.removeAbort = () => {}
@@ -463,7 +468,7 @@ export class ClientSession {
       const manifest = this._sourceManifest()
       const before = await fs.promises.lstat(manifest.path)
       assertStableStat(manifest.stat, before)
-      handle = await fs.promises.open(manifest.path, safeFileOpenFlags('read'))
+      handle = await this.openSource(manifest.path, safeFileOpenFlags('read'))
       assertStableStat(manifest.stat, await handle.stat())
       this.file = handle
     } catch (err) {

@@ -154,6 +154,7 @@ async function createVerifiedSession(t: Assert, storage?: TestStorage): Promise<
     checkpointChunks: 1,
     storage
   })
+  t.teardown(() => sessionStore.close())
   await sessionStore.init()
   await sessionStore.offer(OWNER, upload.offer)
   await sessionStore.writeChunk(upload.offer.transferId, asChunk(upload.chunk))

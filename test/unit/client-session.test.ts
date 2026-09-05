@@ -1,7 +1,7 @@
 /// <reference path="../types/brittle.d.ts" />
 /// <reference path="../types/third-party.d.ts" />
 
-import test from 'brittle'
+import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
 import crypto from '#crypto'
 import fs from '#fs'
@@ -83,6 +83,7 @@ interface CreatePairOptions {
   manifest?: HarnessManifest
   scheduler?: SessionScheduler | null
   readChunk?: ((manifest: FileManifest, index: number) => Promise<Uint8Array>) | null
+  openSource?: NonNullable<ConstructorParameters<typeof ClientSession>[0]['openSource']>
   useFileReader?: boolean
 }
 
@@ -154,12 +155,16 @@ function createManifest(count = 3): HarnessManifest {
   }
 }
 
-function createPair({
-  manifest = createManifest(),
-  scheduler = null,
-  readChunk = null,
-  useFileReader = false
-}: CreatePairOptions = {}): ProtocolPair {
+function createPair(
+  t: Assert,
+  {
+    manifest = createManifest(),
+    scheduler = null,
+    readChunk = null,
+    openSource,
+    useFileReader = false
+  }: CreatePairOptions = {}
+): ProtocolPair {
   const { left, right } = createDuplexPair()
   const clientMux = Protomux.from(left)
   const serverMux = Protomux.from(right)
@@ -200,7 +205,13 @@ function createPair({
     channel: channel as unknown as ProtocolChannel,
     clientPublicKey: CLIENT_KEY,
     readChunk: useFileReader ? null : readChunk || ((_manifest, index) => manifest.chunks![index]),
+    ...(openSource ? { openSource } : {}),
     ...(scheduler ? { scheduler } : {})
+  })
+  t.teardown(async () => {
+    await session.close().catch(() => {})
+    left.destroy()
+    right.destroy()
   })
 
   return {
@@ -245,7 +256,7 @@ async function openAndOffer(
 
 test('client session sends OFFER only after its channel fully opens', async (t) => {
   const manifest = createManifest(0)
-  const pair = createPair({ manifest })
+  const pair = createPair(t, { manifest })
   const uploading = pair.session.upload(asManifest(manifest))
 
   await new Promise((resolve) => setTimeout(resolve, 5))
@@ -278,7 +289,7 @@ test('client session sends OFFER only after its channel fully opens', async (t) 
 
 test('client session uploads only indexes absent from verified bitmap pages', async (t) => {
   const manifest = createManifest(3)
-  const pair = createPair({ manifest })
+  const pair = createPair(t, { manifest })
   const { uploading } = await openAndOffer(pair, manifest)
   const id = pair.received.offer[0].transferId
 
@@ -298,7 +309,7 @@ test('client session uploads only indexes absent from verified bitmap pages', as
 
 test('client session limits unacknowledged chunks and defers FINISH', async (t) => {
   const manifest = createManifest(MAX_IN_FLIGHT + 1)
-  const pair = createPair({ manifest })
+  const pair = createPair(t, { manifest })
   const { uploading } = await openAndOffer(pair, manifest)
   const id = pair.received.offer[0].transferId
 
@@ -325,7 +336,7 @@ test('client session limits unacknowledged chunks and defers FINISH', async (t) 
 
 test('client session pauses chunk production until Protomux drains', async (t) => {
   const manifest = createManifest(2)
-  const pair = createPair({ manifest })
+  const pair = createPair(t, { manifest })
   const { uploading } = await openAndOffer(pair, manifest)
   const id = pair.received.offer[0].transferId
   const send = pair.session.messages[CHUNK].send
@@ -355,14 +366,14 @@ test('client session pauses chunk production until Protomux drains', async (t) =
 
 test('client session fails closed on invalid server transfer IDs and states', async (t) => {
   const manifest = createManifest(1)
-  const pair = createPair({ manifest })
+  const pair = createPair(t, { manifest })
   const { uploading } = await openAndOffer(pair, manifest)
   const id = pair.received.offer[0].transferId
 
   pair.serverMessages[READY].send({ transferId: id })
   await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
 
-  const second = createPair({ manifest })
+  const second = createPair(t, { manifest })
   const { uploading: retry } = await openAndOffer(second, manifest)
   second.serverMessages[STATUS].send({ transferId: b4a.alloc(32), code: STATUS_CODE.ACCEPT })
   await t.exception(() => retry, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
@@ -371,7 +382,7 @@ test('client session fails closed on invalid server transfer IDs and states', as
 test('client session fails closed on every forbidden server message direction', async (t) => {
   const manifest = createManifest(1)
   for (const type of [OFFER, CHUNK, FINISH]) {
-    const pair = createPair({ manifest })
+    const pair = createPair(t, { manifest })
     const { uploading } = await openAndOffer(pair, manifest)
     const id = pair.received.offer[0].transferId
     if (type === OFFER) pair.serverMessages[type].send(pair.received.offer[0])
@@ -389,45 +400,35 @@ test('client session fails closed on every forbidden server message direction', 
   }
 })
 
-test('client session rejects duplicate acknowledgements', async (t) => {
-  const manifest = createManifest(1)
-  const pair = createPair({ manifest })
-  const { uploading } = await openAndOffer(pair, manifest)
-  const id = pair.received.offer[0].transferId
+test('client session rejects invalid acknowledgements', async (t) => {
+  for (const invalid of ['duplicate', 'mismatched-transfer', 'out-of-range'] as const) {
+    const manifest = createManifest(1)
+    const pair = createPair(t, { manifest })
+    const { uploading } = await openAndOffer(pair, manifest)
+    const id = pair.received.offer[0].transferId
 
-  pair.accept()
-  await waitFor(() => pair.received.chunk.length === 1)
-  pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 0 })
-  pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 0 })
-  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
-})
-
-test('client session rejects acknowledgements with a mismatched transfer ID', async (t) => {
-  const manifest = createManifest(1)
-  const pair = createPair({ manifest })
-  const { uploading } = await openAndOffer(pair, manifest)
-
-  pair.accept()
-  await waitFor(() => pair.received.chunk.length === 1)
-  pair.serverMessages[CHUNK_ACK].send({ transferId: b4a.alloc(32), index: 0 })
-  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
-})
-
-test('client session rejects acknowledgements with an out-of-range index', async (t) => {
-  const manifest = createManifest(1)
-  const pair = createPair({ manifest })
-  const { uploading } = await openAndOffer(pair, manifest)
-  const id = pair.received.offer[0].transferId
-
-  pair.accept()
-  await waitFor(() => pair.received.chunk.length === 1)
-  pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 1 })
-  await t.exception(() => uploading, { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' })
+    pair.accept()
+    await waitFor(() => pair.received.chunk.length === 1)
+    if (invalid === 'duplicate') {
+      pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 0 })
+      pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 0 })
+    } else {
+      pair.serverMessages[CHUNK_ACK].send({
+        transferId: invalid === 'mismatched-transfer' ? b4a.alloc(32) : id,
+        index: invalid === 'out-of-range' ? 1 : 0
+      })
+    }
+    await t.exception(
+      () => uploading,
+      { name: 'SwarmDeployError', code: 'PROTOCOL_INVALID' },
+      invalid
+    )
+  }
 })
 
 test('client session resolves committed and already committed results', async (t) => {
   const manifest = createManifest(0)
-  const committed = createPair({ manifest })
+  const committed = createPair(t, { manifest })
   const { uploading: committedUpload } = await openAndOffer(committed, manifest)
   const id = committed.received.offer[0].transferId
   committed.accept()
@@ -435,7 +436,7 @@ test('client session resolves committed and already committed results', async (t
   committed.serverMessages[RESULT].send({ transferId: id, code: 0 })
   t.is((await committedUpload).status, 'COMMITTED')
 
-  const already = createPair({ manifest })
+  const already = createPair(t, { manifest })
   const { uploading: alreadyUpload } = await openAndOffer(already, manifest)
   const alreadyId = already.received.offer[0].transferId
   already.serverMessages[STATUS].send({
@@ -447,7 +448,7 @@ test('client session resolves committed and already committed results', async (t
 
 test('client session preserves the stable active-upload limit reason', async (t) => {
   const manifest = createManifest(1)
-  const pair = createPair({ manifest })
+  const pair = createPair(t, { manifest })
   const events: Array<Record<string, unknown>> = []
   pair.session.onEvent = (event) => events.push(event)
   const { uploading } = await openAndOffer(pair, manifest)
@@ -469,7 +470,7 @@ test('client session preserves the stable active-upload limit reason', async (t)
 
 test('client session turns terminal statuses, local checksums, timeouts, and bad frames into typed errors', async (t) => {
   const manifest = createManifest(1)
-  const unavailable = createPair({ manifest })
+  const unavailable = createPair(t, { manifest })
   const { uploading: unavailableUpload } = await openAndOffer(unavailable, manifest)
   unavailable.serverMessages[STATUS].send({
     transferId: unavailable.received.offer[0].transferId,
@@ -477,7 +478,7 @@ test('client session turns terminal statuses, local checksums, timeouts, and bad
   })
   await t.exception(() => unavailableUpload, { name: 'SwarmDeployError', code: 'FILE_EXISTS' })
 
-  const checksum = createPair({
+  const checksum = createPair(t, {
     manifest,
     readChunk: () => Promise.resolve(b4a.alloc(manifest.chunkSize, 99))
   })
@@ -496,7 +497,7 @@ test('client session turns terminal statuses, local checksums, timeouts, and bad
       timers.delete(timer as FakeTimer)
     }
   }
-  const timedOut = createPair({ manifest, scheduler })
+  const timedOut = createPair(t, { manifest, scheduler })
   const { uploading: timeoutUpload } = await openAndOffer(timedOut, manifest)
   for (const timer of timers) timer.callback()
   await t.exception(() => timeoutUpload, { name: 'SwarmDeployError', code: 'UPLOAD_IDLE_TIMEOUT' })
@@ -520,7 +521,7 @@ test('client session reports a source removed after pre-hash as FILE_BUSY', asyn
   const source = path.join(await createTempDir(t), 'removed.bin')
   await fs.promises.writeFile(source, b4a.from('remove after pre-hash'))
   const manifest = await buildFileManifest(source)
-  const pair = createPair({ manifest, useFileReader: true })
+  const pair = createPair(t, { manifest, useFileReader: true })
   const { uploading } = await openAndOffer(pair, manifest)
   await fs.promises.rm(source)
 
@@ -529,20 +530,32 @@ test('client session reports a source removed after pre-hash as FILE_BUSY', asyn
 })
 
 test('client session closes its channel when source descriptor cleanup fails', async (t) => {
-  const manifest = createManifest(0)
-  const pair = createPair({ manifest })
+  const source = path.join(await createTempDir(t), 'close-failure.bin')
+  await fs.promises.writeFile(source, b4a.from('close me'))
+  const manifest = await buildFileManifest(source)
+  let opened: Awaited<ReturnType<typeof fs.promises.open>> | null = null
+  const pair = createPair(t, {
+    manifest,
+    useFileReader: true,
+    async openSource(filePath, flags) {
+      const handle = await fs.promises.open(filePath, flags)
+      const close = handle.close.bind(handle)
+      handle.close = async () => {
+        await close()
+        throw new Error('injected close failure')
+      }
+      opened = handle
+      return handle
+    }
+  })
   const { uploading } = await openAndOffer(pair, manifest)
   const id = pair.received.offer[0].transferId
 
   pair.accept()
-  await waitFor(() => pair.received.finish.length === 1)
-  pair.session.file = {
-    close() {
-      throw new Error('injected close failure')
-    }
-  } as unknown as NonNullable<ClientSession['file']>
-  pair.serverMessages[RESULT].send({ transferId: id, code: 0 })
+  await waitFor(() => pair.received.chunk.length === 1)
+  pair.serverMessages[CHUNK_ACK].send({ transferId: id, index: 0 })
 
-  await t.exception(() => uploading)
+  await t.exception(() => uploading, { message: 'injected close failure' })
+  await t.exception(() => opened!.stat(), { code: 'EBADF' })
   t.ok(pair.channel.closed)
 })

@@ -1,7 +1,7 @@
 /// <reference path="../types/brittle.d.ts" />
 /// <reference path="../types/third-party.d.ts" />
 
-import test from 'brittle'
+import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
 import crypto from '#crypto'
 import Protomux, { type ProtomuxChannel } from 'protomux'
@@ -117,6 +117,7 @@ interface ClientServerPair {
   channel: ProtomuxChannel
   messages: HarnessMessage[]
   received: ReceivedMessages
+  destroyed: SwarmDeployError[]
   readonly serverSession: ServerSession | null
 }
 
@@ -193,6 +194,7 @@ function makeUpload({
 }
 
 function createClientServer(
+  t: Assert,
   sessionOptions: Omit<ServerSessionOptions, 'channel' | 'ownerKey' | 'destroy'>
 ): ClientServerPair {
   const { left, right } = createDuplexPair()
@@ -206,13 +208,17 @@ function createClientServer(
     result: []
   }
   let serverSession: ServerSession | null = null
+  const destroyed: SwarmDeployError[] = []
 
   serverMux.pair({ protocol: UPLOAD_PROTOCOL }, (id) => {
     const serverChannel = serverMux.createChannel({ protocol: UPLOAD_PROTOCOL, id })
     serverSession = new ServerSession({
       channel: serverChannel as unknown as ProtocolChannel,
       ownerKey: OWNER,
-      destroy: () => right.destroy(),
+      destroy: (error) => {
+        destroyed.push(error as SwarmDeployError)
+        right.destroy()
+      },
       ...sessionOptions
     })
   })
@@ -235,6 +241,11 @@ function createClientServer(
     channel.addMessage({ encoding: result, onmessage: (value) => received.result.push(value) })
   ]
   channel.open()
+  t.teardown(async () => {
+    await serverSession?.close().catch(() => {})
+    left.destroy()
+    right.destroy()
+  })
 
   return {
     left,
@@ -242,6 +253,7 @@ function createClientServer(
     channel,
     messages,
     received,
+    destroyed,
     get serverSession() {
       return serverSession
     }
@@ -322,7 +334,7 @@ test('server session writes sequential chunks before acknowledging and retires c
     }
   })
   const committed: CommitCall[] = []
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore({
       commit(session, options) {
@@ -357,7 +369,19 @@ test('server session writes sequential chunks before acknowledging and retires c
 
 test('server session rejects chunks before READY by destroying the connection', async (t) => {
   const sessionStore = createSessionStore()
-  const pair = createClientServer({
+  let offers = 0
+  let writes = 0
+  const offer = sessionStore.offer
+  const writeChunk = sessionStore.writeChunk
+  sessionStore.offer = (...args) => {
+    offers++
+    return offer(...args)
+  }
+  sessionStore.writeChunk = (...args) => {
+    writes++
+    return writeChunk(...args)
+  }
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore(),
     maxFileBytes: 1024 * 1024
@@ -367,6 +391,11 @@ test('server session rejects chunks before READY by destroying the connection', 
   pair.messages[CHUNK].send(upload.chunk)
   await waitFor(() => pair.right.destroyed)
 
+  t.is(pair.destroyed.length, 1)
+  t.is(pair.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  t.is(pair.destroyed[0].message, 'Chunk received before ready')
+  t.is(offers, 0)
+  t.is(writes, 0)
   t.is(sessionStore.sessions.size, 0)
 })
 
@@ -378,7 +407,7 @@ test('server session returns terminal statuses for unavailable or capacity-rejec
   ]
 
   for (const [inspectStatus, expected] of cases) {
-    const pair = createClientServer({
+    const pair = createClientServer(t, {
       sessionStore: createSessionStore(),
       commitStore: createCommitStore({
         inspect: () => Promise.resolve({ status: inspectStatus } as InspectResult)
@@ -391,7 +420,7 @@ test('server session returns terminal statuses for unavailable or capacity-rejec
     t.is(pair.received.status[0].code, expected)
   }
 
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore: createSessionStore(),
     commitStore: createCommitStore(),
     maxFileBytes: 1
@@ -403,7 +432,7 @@ test('server session returns terminal statuses for unavailable or capacity-rejec
 })
 
 test('server session reports the stable active-upload limit reason', async (t) => {
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore: createSessionStore(),
     commitStore: createCommitStore(),
     reserveUpload: () => ({ rejected: true, reason: ERRORS.ACTIVE_UPLOAD_LIMIT }),
@@ -425,7 +454,7 @@ test('server session runs non-destructive retention admission before staging off
       offered++
       return originalOffer(...args)
     }
-    const pair = createClientServer({
+    const pair = createClientServer(t, {
       sessionStore,
       commitStore: createCommitStore(),
       retentionManager: {
@@ -448,8 +477,15 @@ test('server session runs non-destructive retention admission before staging off
 })
 
 test('server session fails closed when an OFFER transfer ID is noncanonical', async (t) => {
-  const pair = createClientServer({
-    sessionStore: createSessionStore(),
+  const sessionStore = createSessionStore()
+  let offers = 0
+  const offer = sessionStore.offer
+  sessionStore.offer = (...args) => {
+    offers++
+    return offer(...args)
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
     commitStore: createCommitStore(),
     maxFileBytes: 1024 * 1024
   })
@@ -458,13 +494,24 @@ test('server session fails closed when an OFFER transfer ID is noncanonical', as
   pair.messages[OFFER].send({ ...upload.offer, transferId: b4a.alloc(32) })
   await waitFor(() => pair.right.destroyed)
 
+  t.is(pair.destroyed.length, 1)
+  t.is(pair.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  t.is(pair.destroyed[0].message, 'Noncanonical transfer ID')
+  t.is(offers, 0)
+  t.is(sessionStore.sessions.size, 0)
   t.absent(pair.serverSession?.transferId)
 })
 
 test('server session limits queued chunks before storage work', async (t) => {
   const writing = deferred()
-  const sessionStore = createSessionStore({ writeChunk: () => writing.promise })
-  const pair = createClientServer({
+  let writes = 0
+  const sessionStore = createSessionStore({
+    writeChunk: () => {
+      writes++
+      return writing.promise
+    }
+  })
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore(),
     maxFileBytes: 1024 * 1024
@@ -476,13 +523,19 @@ test('server session limits queued chunks before storage work', async (t) => {
   for (let index = 0; index < 5; index++) pair.messages[CHUNK].send(upload.chunk)
   await waitFor(() => pair.right.destroyed)
   writing.resolve()
+  await pair.serverSession!.settle().catch(() => {})
 
+  t.ok(pair.serverSession)
+  t.is(pair.destroyed.length, 1)
+  t.is(pair.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  t.is(pair.destroyed[0].message, 'Too many queued chunks')
+  t.is(writes, 0)
   t.is(sessionStore.sessions.size, 1)
 })
 
 test('server session closes an idle connection after the default timeout', async (t) => {
   const scheduler = createTimeoutScheduler()
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore: createSessionStore(),
     commitStore: createCommitStore(),
     maxFileBytes: 1024 * 1024,
@@ -508,7 +561,7 @@ test('server session revocation prevents queued chunk writes', async (t) => {
       await release.promise
     }
   })
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore(),
     maxFileBytes: 1024 * 1024,
@@ -549,7 +602,7 @@ test('server session revocation prevents queued finish commit', async (t) => {
     session.state = 'verified'
     return Promise.resolve()
   }
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore({
       commit: () => {
@@ -582,7 +635,7 @@ test('server session settlement retains cleanup errors raised after revocation',
     sessionStore.sessions.get(b4a.toString(transferId, 'hex'))!.state = 'verified'
     return Promise.resolve()
   }
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore({
       commit: () => {
@@ -609,7 +662,7 @@ test('server session admits a replaceable managed offer and commits it', async (
   const committed: CommitCall[] = []
   const events: Array<Record<string, unknown>> = []
   const sessionStore = createSessionStore()
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore({
       inspect(...args) {
@@ -667,7 +720,7 @@ test('server session rejects existing empty uploads before staging', async (t) =
     offers++
     return originalOffer(...args)
   }
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore({
       inspect: () => Promise.resolve({ status: 'FILE_EXISTS' })
@@ -705,8 +758,8 @@ test('server session holds one destination lease and releases it on close', asyn
     reserveUpload,
     releaseUpload
   }
-  const first = createClientServer(options)
-  const second = createClientServer(options)
+  const first = createClientServer(t, options)
+  const second = createClientServer(t, options)
   const upload = makeUpload({ name: 'release.tar.gz' })
 
   first.messages[OFFER].send(upload.offer)
@@ -716,7 +769,7 @@ test('server session holds one destination lease and releases it on close', asyn
   t.is(second.received.status[0].code, STATUS_CODE.FILE_BUSY)
 
   await first.serverSession!.close()
-  const third = createClientServer(options)
+  const third = createClientServer(t, options)
   third.messages[OFFER].send(upload.offer)
   await waitFor(() => third.received.ready.length === 1)
   t.is(active.size, 1)
@@ -733,7 +786,7 @@ test('server session activates a reservation only after staging offer succeeds',
     t.is(active, false, 'incoming reservation is not yet an active resumable session')
     return originalOffer(...args)
   }
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore(),
     maxFileBytes: 1024 * 1024,
@@ -758,7 +811,7 @@ test('server session rejects reserved history offers without staging', async (t)
     offered = true
     return createSessionStore().offer(...args)
   }
-  const pair = createClientServer({
+  const pair = createClientServer(t, {
     sessionStore,
     commitStore: createCommitStore({
       inspect: () => {

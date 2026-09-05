@@ -128,12 +128,22 @@ export function createStorage({
     ): Promise<TestStorageFileHandle> {
       await beforeOperation('open', filePath, flags, mode)
       const handle = await promises.open(filePath, flags, mode)
-      await afterOperation('open', filePath, flags, mode)
+      try {
+        await afterOperation('open', filePath, flags, mode)
+      } catch (err) {
+        await handle.close().catch(() => {})
+        throw err
+      }
 
       return {
         fd: handle.fd,
         close: async (): Promise<void> => {
-          await beforeOperation('close', filePath)
+          try {
+            await beforeOperation('close', filePath)
+          } catch (err) {
+            await handle.close().catch(() => {})
+            throw err
+          }
           const result = await handle.close()
           await afterOperation('close', filePath)
           return result

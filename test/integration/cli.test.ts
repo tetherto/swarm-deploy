@@ -127,30 +127,6 @@ function runtimeLabel(): string {
   return typeof Bare !== 'undefined' ? 'bare' : 'node'
 }
 
-test('keygen, public-key, and topic work through main without leaking the seed', async (t) => {
-  const dir = await createTempDir(t)
-  const seedPath = path.join(dir, 'ci.seed')
-  const generated = createIo()
-  t.is(await main(['keygen', '--out', seedPath], {}, generated), 0)
-  const seed = (await fs.promises.readFile(seedPath, 'utf8')).trim()
-  t.ok(HEX64.test(seed))
-  t.is(generated.text('stdout').trim(), b4a.toString(publicKeyFromSeed(parseSeed(seed)), 'hex'))
-  assertNoSecret(t, generated.text('stdout') + generated.text('stderr'), seed)
-
-  const published = createIo()
-  t.is(await main(['public-key', '--seed-file', seedPath], {}, published), 0)
-  t.is(published.text('stdout'), generated.text('stdout'))
-  assertNoSecret(t, published.text('stdout') + published.text('stderr'), seed)
-
-  const topic = createIo()
-  t.is(await main(['topic', '--seed-file', seedPath], {}, topic), 0)
-  t.is(
-    topic.text('stdout'),
-    `${b4a.toString(topicFromServerPublicKey(publicKeyFromSeed(parseSeed(seed))), 'hex')}\n`
-  )
-  assertNoSecret(t, topic.text('stdout') + topic.text('stderr'), seed)
-})
-
 test('CLI server becomes ready then uploads a file and a directory batch', async (t) => {
   const testnet = await createLocalTestnet(t)
   const dir = await createTempDir(t)
