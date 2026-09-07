@@ -1,11 +1,6 @@
-# swarm-deploy
+# Swarm deploy
 
 Secure, resumable artifact uploads from CI clients to one receiving server over Hyperswarm.
-
-Swarm Deploy supports Node.js 22 and 24, plus the current stable Bare runtime,
-on Linux and macOS. Older Node.js lines and Windows are not supported. It
-receives and stores files only; it never executes, unpacks, installs, or serves
-them.
 
 ## Security model
 
@@ -25,12 +20,14 @@ every client configuration must be updated.
 
 Knowing the topic does not expose stored files. Swarm Deploy is receive-only:
 the server does not provide a download protocol, execute content, or serve a
-website. Publish stored files through a separately configured web server or
+website.
+
+Publish stored files through a separately configured web server or
 artifact service when needed.
 
 HyperDHT Noise authenticates both transport keys and encrypts the connection. SHA-256 verifies transferred bytes; it does not prove that an authorized client uploaded safe software.
 
-The server OS account and dedicated storage root are trusted against concurrent local tampering. Existing or detected symlink and directory-identity changes fail closed, but native `openat` hardening against a malicious local writer is outside version 1.
+The server OS account and dedicated storage root are trusted against concurrent local tampering.
 
 ## Install
 
@@ -216,21 +213,6 @@ await client.close()
 await server.close()
 ```
 
-CommonJS uses the same API:
-
-```js
-const { Client, Server, parseTopic } = require('@tetherto/swarm-deploy')
-```
-
-The supported root runtime exports are exactly `Client`, `Server`, `ERRORS`,
-`SwarmDeployError`, `generateSeed`, `keyPairFromSeed`, `parseAllowlist`,
-`parsePublicKey`, `parseSeed`, `parseTopic`, `publicKeyFromSeed`, and
-`topicFromServerPublicKey`. The root also exports the types needed for
-Client/Server options, results, events, swarm injection, logging, binary
-identities, and storage injection. Protocol codecs/constants, transfer-ID
-machinery, file-manifest helpers, and storage implementations are internal
-submodule details, not supported root API.
-
 ## Events and logging
 
 `Server` and `Client` are event emitters. Event payloads use 12-character SHA-256 fingerprints for peer and transfer correlation; they never contain seeds or full public keys. Exceptions thrown by event listeners or logger methods are contained and cannot change upload, cleanup, or lifecycle correctness.
@@ -324,24 +306,3 @@ bare dist/bin/swarm-deploy.js --help
 
 See [the Swarm Deploy specification](docs/spec/swarm-deploy.md) for the
 complete protocol, replacement, package, and threat-model requirements.
-
-## Publish
-
-Publishing is tag-driven through `.github/workflows/publish.yml`. The tag must
-be exactly `vX.Y.Z`, equal the version in `package.json`, and point to a commit
-on `main`. Full Node, Bare, property, CLI, and quality tests run exclusively in
-PR/main CI. The tag workflow builds an untracked `dist/`, validates and smokes
-the package, then delegates npm publication and GitHub release creation to
-the reviewed immutable Holepunch actions revision
-`146b86c4d0237c124df06ecc992ddf2c585b3405`. The composite publish action
-currently references `create-release@v1` internally; this repository pins the
-reviewed composite action without vendoring it. The action publishes with
-`npm publish --ignore-scripts`, so the workflow creates `dist/` first.
-
-Before the first release, configure npm trusted publishing for
-`@tetherto/swarm-deploy` with GitHub Actions as the provider, this repository
-owner/name, workflow filename `publish.yml`, and GitHub environment `npm`.
-Protect that environment as appropriate. The workflow needs no npm token:
-GitHub grants the configured OIDC identity through `id-token: write`. Local
-builds, tests, and this migration task do not publish anything. See
-[RELEASING.md](RELEASING.md) for the complete preflight and rollback runbook.
