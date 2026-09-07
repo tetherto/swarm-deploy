@@ -1083,7 +1083,7 @@ test('wrong-role env alone is a missing seed source', async (t) => {
   assertNoSecret(t, upload.text('stdout') + upload.text('stderr'), wrongClient)
 })
 
-test('failed keygen unlinks only its own exclusive inode', async (t) => {
+test('failed keygen cleanup never unlinks a replacement destination', async (t) => {
   const dir = await createTempDir(t)
   const out = path.join(dir, 'race.seed')
   const replacement = '99'.repeat(32)
@@ -1099,7 +1099,13 @@ test('failed keygen unlinks only its own exclusive inode', async (t) => {
     mode?: unknown
   ): Promise<KeygenDescriptor> {
     const handle = await originalOpen.call(this, filePath, flags, mode)
-    if (filePath !== out) return handle
+    if (
+      path.dirname(filePath) !== dir ||
+      !path.basename(filePath).startsWith('.race.seed.') ||
+      !filePath.endsWith('.tmp')
+    ) {
+      return handle
+    }
     return {
       fd: handle.fd,
       chmod: (...args: unknown[]) => handle.chmod(...args),
@@ -1108,7 +1114,6 @@ test('failed keygen unlinks only its own exclusive inode', async (t) => {
       sync: (...args: unknown[]) => handle.sync(...args),
       close: async () => {
         await handle.close()
-        await originalUnlink(out)
         await fs.promises.writeFile(out, `${replacement}\n`, { flag: 'wx', mode: 0o600 })
       }
     }

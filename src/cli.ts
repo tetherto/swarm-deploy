@@ -35,7 +35,6 @@ type CliIo = {
   connectTimeout?: number
   idleTimeout?: number
 }
-type FileIdentity = Pick<fs.Stats, 'dev' | 'ino'>
 
 const COMMANDS = new Set(['keygen', 'public-key', 'topic', 'server', 'upload'])
 const HELP_ARGS = new Set(['--help', '-h'])
@@ -243,38 +242,25 @@ async function readSeedFile(filePath: string): Promise<Buffer> {
   return parseSeedText(text, 'seed file')
 }
 
-function sameFileIdentity(
-  left: FileIdentity | null | undefined,
-  right: FileIdentity | null | undefined
-): boolean {
-  return (
-    !!left &&
-    !!right &&
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    (typeof left.dev === 'number' || typeof left.dev === 'bigint') &&
-    (typeof left.ino === 'number' || typeof left.ino === 'bigint')
-  )
-}
-
-async function unlinkOwnedSeedFile(
-  filePath: string,
-  identity: FileIdentity | null | undefined
-): Promise<void> {
-  if (!identity) return
+async function removeSeedTemporary(filePath: string): Promise<void> {
   try {
-    const current = await fs.promises.lstat(filePath)
-    if (current.isSymbolicLink() || !current.isFile()) return
-    if (!sameFileIdentity(current, identity)) return
     await fs.promises.unlink(filePath)
-    try {
-      await syncDirectory(path.dirname(filePath))
-    } catch {}
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return
+    throw configError('Unable to remove temporary seed file')
+  }
+  try {
+    await syncDirectory(path.dirname(filePath))
   } catch {}
 }
 
 async function writeSeedFile(filePath: string, seedHex: string): Promise<void> {
   if (typeof filePath !== 'string' || filePath.length === 0) throw usageError('Missing --out')
+  const directory = path.dirname(filePath)
+  const temporary = path.join(
+    directory,
+    `.${path.basename(filePath)}.${b4a.toString(generateSeed(), 'hex')}.tmp`
+  )
   try {
     await fs.promises.lstat(filePath)
     throw configError('Refusing to overwrite existing seed file')
@@ -282,32 +268,36 @@ async function writeSeedFile(filePath: string, seedHex: string): Promise<void> {
     if (err instanceof CliError) throw err
     if (errorCode(err) !== 'ENOENT') throw configError('Unable to create seed file')
   }
-  let handle = null
-  let identity = null
+  let handle: FileHandle | null = null
   try {
-    handle = await fs.promises.open(filePath, createSeedFlags(), 0o600)
+    handle = await fs.promises.open(temporary, createSeedFlags(), 0o600)
   } catch (err) {
-    if (errorCode(err) === 'EEXIST') throw configError('Refusing to overwrite existing seed file')
     throw configError('Unable to create seed file')
   }
   try {
     const opened = await handle.stat()
     if (!opened.isFile()) throw configError('Unable to create seed file')
-    identity = { dev: opened.dev, ino: opened.ino }
     if (typeof handle.chmod === 'function') await handle.chmod(0o600)
     await writeAll(handle, b4a.from(`${seedHex}\n`))
     await handle.sync()
   } catch (err) {
     await handle.close().catch(() => {})
     handle = null
-    await unlinkOwnedSeedFile(filePath, identity)
+    await removeSeedTemporary(temporary)
     if (err instanceof CliError) throw err
     throw configError('Unable to write seed file')
   }
   await handle.close()
+  handle = null
   try {
-    await syncDirectory(path.dirname(filePath))
-  } catch {}
+    await fs.promises.link(temporary, filePath)
+    await syncDirectory(directory)
+  } catch (err) {
+    await removeSeedTemporary(temporary)
+    if (errorCode(err) === 'EEXIST') throw configError('Refusing to overwrite existing seed file')
+    throw configError('Unable to create seed file')
+  }
+  await removeSeedTemporary(temporary)
 }
 
 function isCanonicalHexToken(value: unknown): boolean {
