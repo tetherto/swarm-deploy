@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+*.seed
+/.superpowers/
+/docs/superpowers/
+/dist/
+/.test-dist/
+*.tsbuildinfo
+**/*.js.map
+**/*.d.ts.map
+/.swarm-deploy/

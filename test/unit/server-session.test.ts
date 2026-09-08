@@ -1,0 +1,831 @@
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
+
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import crypto from '#crypto'
+import Protomux, { type ProtomuxChannel } from 'protomux'
+import { Duplex } from 'streamx'
+import { SwarmDeployError, ERRORS } from '../../dist/errors.js'
+import {
+  ServerSession,
+  UPLOAD_PROTOCOL,
+  type CommitStore,
+  type RetentionManager,
+  type ServerSessionOptions,
+  type ServerSessionStore
+} from '../../dist/protocol/server-session.js'
+import {
+  OFFER,
+  CHUNK,
+  FINISH,
+  STATUS_CODE,
+  type StatusCode
+} from '../../dist/protocol/constants.js'
+import {
+  offer,
+  status,
+  bitmapPage,
+  ready,
+  chunk,
+  chunkAck,
+  finish,
+  result
+} from '../../dist/protocol/codecs.js'
+import { transferId } from '../../dist/protocol/transfer-id.js'
+import type {
+  BitmapPage,
+  Chunk,
+  ChunkAck,
+  Digest,
+  Offer,
+  ProtocolChannel,
+  Ready,
+  Result,
+  SessionScheduler,
+  Status
+} from '../../dist/protocol/types.js'
+
+const OWNER = b4a.alloc(32, 7)
+
+type InspectResult = Awaited<ReturnType<CommitStore['inspect']>>
+type InspectStatus = InspectResult['status']
+type VerifiedSession =
+  ServerSessionStore['sessions'] extends Map<string, infer Session> ? Session : never
+
+/** A Protomux message as the harness drives it: any encoded payload. */
+interface HarnessMessage {
+  send(value: unknown): boolean
+}
+
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+  reject: (reason: unknown) => void
+}
+
+interface HarnessUpload {
+  offer: Offer
+  chunk: Chunk
+}
+
+interface ReceivedMessages {
+  status: Status[]
+  bitmapPage: BitmapPage[]
+  ready: Ready[]
+  chunkAck: ChunkAck[]
+  result: Result[]
+}
+
+/** The session store fake also carries the `inspect` seam the server reads. */
+interface FakeSessionStore extends ServerSessionStore {
+  inspect: unknown
+}
+
+interface CreateSessionStoreOptions {
+  writeChunk?: (transferId: Uint8Array, chunk: Chunk) => Promise<void>
+  inspect?: unknown
+}
+
+interface CreateCommitStoreOptions {
+  inspect?: CommitStore['inspect']
+  commit?: CommitStore['commit']
+}
+
+/** Retention stand-in: these tests only assert the instance is forwarded. */
+interface RetentionMarker {
+  marker: string
+}
+
+interface CommitCall {
+  session: VerifiedSession
+  options: Parameters<CommitStore['commit']>[1]
+}
+
+interface FakeTimer {
+  callback: () => void
+  timeout: number
+}
+
+interface TimeoutScheduler extends SessionScheduler {
+  timers: Map<FakeTimer, FakeTimer>
+}
+
+interface ClientServerPair {
+  left: Duplex
+  right: Duplex
+  channel: ProtomuxChannel
+  messages: HarnessMessage[]
+  received: ReceivedMessages
+  destroyed: SwarmDeployError[]
+  readonly serverSession: ServerSession | null
+}
+
+function sha256(bytes: Uint8Array): Digest {
+  return crypto.createHash('sha256').update(bytes).digest()
+}
+
+function deferred(): Deferred {
+  let resolve!: () => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<void>((done, fail) => {
+    resolve = () => done()
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
+function waitFor(predicate: () => boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let attempts = 0
+    const check = (): void => {
+      if (predicate()) return resolve()
+      if (++attempts === 100) return reject(new Error('Timed out waiting for protocol progress'))
+      setTimeout(check, 1)
+    }
+    check()
+  })
+}
+
+function createDuplexPair(): { left: Duplex; right: Duplex } {
+  let left!: Duplex
+  let right!: Duplex
+  left = new Duplex({
+    write(data, callback) {
+      right.push(data)
+      callback(null)
+    }
+  })
+  right = new Duplex({
+    write(data, callback) {
+      left.push(data)
+      callback(null)
+    }
+  })
+  left.on('error', () => {})
+  right.on('error', () => {})
+  return { left, right }
+}
+
+function makeUpload({
+  name = 'artifact.bin',
+  data = b4a.from('payload')
+}: { name?: string; data?: Buffer } = {}): HarnessUpload {
+  const digest = sha256(data)
+  const upload = {
+    version: 1,
+    name,
+    size: data.byteLength,
+    digest,
+    chunkSize: 1024 * 1024,
+    chunkCount: data.byteLength === 0 ? 0 : 1
+  }
+  const id = transferId({
+    clientPublicKey: OWNER,
+    name,
+    size: upload.size,
+    digest,
+    chunkSize: upload.chunkSize
+  })
+  return {
+    offer: { ...upload, transferId: id },
+    chunk: { transferId: id, index: 0, digest, data }
+  }
+}
+
+function createClientServer(
+  t: Assert,
+  sessionOptions: Omit<ServerSessionOptions, 'channel' | 'ownerKey' | 'destroy'>
+): ClientServerPair {
+  const { left, right } = createDuplexPair()
+  const clientMux = Protomux.from(left)
+  const serverMux = Protomux.from(right)
+  const received: ReceivedMessages = {
+    status: [],
+    bitmapPage: [],
+    ready: [],
+    chunkAck: [],
+    result: []
+  }
+  let serverSession: ServerSession | null = null
+  const destroyed: SwarmDeployError[] = []
+
+  serverMux.pair({ protocol: UPLOAD_PROTOCOL }, (id) => {
+    const serverChannel = serverMux.createChannel({ protocol: UPLOAD_PROTOCOL, id })
+    serverSession = new ServerSession({
+      channel: serverChannel as unknown as ProtocolChannel,
+      ownerKey: OWNER,
+      destroy: (error) => {
+        destroyed.push(error as SwarmDeployError)
+        right.destroy()
+      },
+      ...sessionOptions
+    })
+  })
+
+  const channel = clientMux.createChannel({ protocol: UPLOAD_PROTOCOL, id: b4a.from('transfer') })
+  const messages: HarnessMessage[] = [
+    channel.addMessage({ encoding: offer }),
+    channel.addMessage({ encoding: status, onmessage: (value) => received.status.push(value) }),
+    channel.addMessage({
+      encoding: bitmapPage,
+      onmessage: (value) => received.bitmapPage.push(value)
+    }),
+    channel.addMessage({ encoding: ready, onmessage: (value) => received.ready.push(value) }),
+    channel.addMessage({ encoding: chunk }),
+    channel.addMessage({
+      encoding: chunkAck,
+      onmessage: (value) => received.chunkAck.push(value)
+    }),
+    channel.addMessage({ encoding: finish }),
+    channel.addMessage({ encoding: result, onmessage: (value) => received.result.push(value) })
+  ]
+  channel.open()
+  t.teardown(async () => {
+    await serverSession?.close().catch(() => {})
+    left.destroy()
+    right.destroy()
+  })
+
+  return {
+    left,
+    right,
+    channel,
+    messages,
+    received,
+    destroyed,
+    get serverSession() {
+      return serverSession
+    }
+  }
+}
+
+function createSessionStore({
+  writeChunk = () => Promise.resolve(),
+  inspect = null
+}: CreateSessionStoreOptions = {}): FakeSessionStore {
+  const sessions = new Map<string, VerifiedSession>()
+  return {
+    sessions,
+    offer(ownerKey, value) {
+      const session = {
+        id: b4a.toString(value.transferId, 'hex'),
+        transferId: value.transferId,
+        ownerKey,
+        name: value.name,
+        size: value.size,
+        digest: value.digest,
+        chunkSize: value.chunkSize,
+        chunkCount: value.chunkCount,
+        state: 'receiving'
+      }
+      sessions.set(session.id, session)
+      return Promise.resolve({
+        verified: new Set<number>(),
+        state: 'receiving',
+        resumed: false
+      })
+    },
+    async writeChunk(transferId, value) {
+      await writeChunk(transferId, value)
+      return { verified: new Set([value.index]), resumed: false }
+    },
+    finish(transferId) {
+      const session = sessions.get(b4a.toString(transferId, 'hex'))!
+      session.state = 'verified'
+      return Promise.resolve({ state: 'verified' })
+    },
+    retireCommitted(transferId) {
+      return Promise.resolve(sessions.delete(b4a.toString(transferId, 'hex')))
+    },
+    inspect
+  }
+}
+
+function createCommitStore({
+  inspect = () => Promise.resolve({ status: 'AVAILABLE' }),
+  commit = () => Promise.resolve()
+}: CreateCommitStoreOptions = {}): CommitStore {
+  return { inspect, commit }
+}
+
+function createTimeoutScheduler(): TimeoutScheduler {
+  const timers = new Map<FakeTimer, FakeTimer>()
+  return {
+    timers,
+    setTimeout(callback, timeout) {
+      const timer = { callback, timeout }
+      timers.set(timer, timer)
+      return timer
+    },
+    clearTimeout(timer) {
+      timers.delete(timer as FakeTimer)
+    }
+  }
+}
+
+test('server session writes sequential chunks before acknowledging and retires committed sessions', async (t) => {
+  const wrote = deferred()
+  const releaseWrite = deferred()
+  const sessionStore = createSessionStore({
+    writeChunk: async () => {
+      wrote.resolve()
+      await releaseWrite.promise
+    }
+  })
+  const committed: CommitCall[] = []
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore({
+      commit(session, options) {
+        committed.push({ session, options })
+        return Promise.resolve({ name: session.name })
+      }
+    }),
+    retentionManager: { marker: 'retention' } as unknown as RetentionManager,
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  t.is(pair.received.status[0].code, STATUS_CODE.ACCEPT)
+  t.is(pair.received.bitmapPage.length, 1)
+
+  pair.messages[CHUNK].send(upload.chunk)
+  await wrote.promise
+  t.is(pair.received.chunkAck.length, 0)
+  releaseWrite.resolve()
+  await waitFor(() => pair.received.chunkAck.length === 1)
+  t.alike(pair.received.chunkAck[0], { transferId: upload.offer.transferId, index: 0 })
+
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+  await waitFor(() => pair.received.result.length === 1)
+  t.is(pair.received.result[0].code, 0)
+  t.is(committed.length, 1)
+  t.is((committed[0].options.retentionManager as unknown as RetentionMarker).marker, 'retention')
+  t.is(sessionStore.sessions.size, 0)
+})
+
+test('server session rejects chunks before READY by destroying the connection', async (t) => {
+  const sessionStore = createSessionStore()
+  let offers = 0
+  let writes = 0
+  const offer = sessionStore.offer
+  const writeChunk = sessionStore.writeChunk
+  sessionStore.offer = (...args) => {
+    offers++
+    return offer(...args)
+  }
+  sessionStore.writeChunk = (...args) => {
+    writes++
+    return writeChunk(...args)
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+
+  pair.messages[CHUNK].send(upload.chunk)
+  await waitFor(() => pair.right.destroyed)
+
+  t.is(pair.destroyed.length, 1)
+  t.is(pair.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  t.is(pair.destroyed[0].message, 'Chunk received before ready')
+  t.is(offers, 0)
+  t.is(writes, 0)
+  t.is(sessionStore.sessions.size, 0)
+})
+
+test('server session returns terminal statuses for unavailable or capacity-rejected offers', async (t) => {
+  const cases: Array<[InspectStatus, StatusCode]> = [
+    ['ALREADY_COMMITTED', STATUS_CODE.ALREADY_COMMITTED],
+    ['FILE_EXISTS', STATUS_CODE.FILE_EXISTS],
+    ['FILE_BUSY', STATUS_CODE.FILE_BUSY]
+  ]
+
+  for (const [inspectStatus, expected] of cases) {
+    const pair = createClientServer(t, {
+      sessionStore: createSessionStore(),
+      commitStore: createCommitStore({
+        inspect: () => Promise.resolve({ status: inspectStatus } as InspectResult)
+      }),
+      maxFileBytes: 1024 * 1024
+    })
+    const upload = makeUpload({ name: `${inspectStatus}.bin` })
+    pair.messages[OFFER].send(upload.offer)
+    await waitFor(() => pair.received.status.length === 1)
+    t.is(pair.received.status[0].code, expected)
+  }
+
+  const pair = createClientServer(t, {
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    maxFileBytes: 1
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.status.length === 1)
+  t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
+})
+
+test('server session reports the stable active-upload limit reason', async (t) => {
+  const pair = createClientServer(t, {
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    reserveUpload: () => ({ rejected: true, reason: ERRORS.ACTIVE_UPLOAD_LIMIT }),
+    maxFileBytes: 1024 * 1024
+  })
+  pair.messages[OFFER].send(makeUpload().offer)
+  await waitFor(() => pair.received.status.length === 1)
+
+  t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
+  t.is(pair.received.status[0].reason, ERRORS.ACTIVE_UPLOAD_LIMIT)
+})
+
+test('server session runs non-destructive retention admission before staging offer', async (t) => {
+  for (const code of [ERRORS.FILE_TOO_LARGE, ERRORS.CLEANUP_FAILED]) {
+    let offered = 0
+    const sessionStore = createSessionStore()
+    const originalOffer = sessionStore.offer
+    sessionStore.offer = (...args) => {
+      offered++
+      return originalOffer(...args)
+    }
+    const pair = createClientServer(t, {
+      sessionStore,
+      commitStore: createCommitStore(),
+      retentionManager: {
+        admit() {
+          throw new SwarmDeployError(code, 'Rejected before receiving bytes')
+        }
+      } as unknown as RetentionManager,
+      maxFileBytes: 1024 * 1024
+    })
+    const upload = makeUpload({ name: `${code}.bin` })
+
+    pair.messages[OFFER].send(upload.offer)
+    await waitFor(() => pair.received.status.length === 1)
+
+    t.is(pair.received.status[0].code, STATUS_CODE.REJECTED, code)
+    t.is(pair.received.status[0].reason, code, code)
+    t.is(offered, 0, `${code} allocated no staging session`)
+    t.is(pair.received.chunkAck.length, 0, `${code} received zero bytes`)
+  }
+})
+
+test('server session fails closed when an OFFER transfer ID is noncanonical', async (t) => {
+  const sessionStore = createSessionStore()
+  let offers = 0
+  const offer = sessionStore.offer
+  sessionStore.offer = (...args) => {
+    offers++
+    return offer(...args)
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+
+  pair.messages[OFFER].send({ ...upload.offer, transferId: b4a.alloc(32) })
+  await waitFor(() => pair.right.destroyed)
+
+  t.is(pair.destroyed.length, 1)
+  t.is(pair.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  t.is(pair.destroyed[0].message, 'Noncanonical transfer ID')
+  t.is(offers, 0)
+  t.is(sessionStore.sessions.size, 0)
+  t.absent(pair.serverSession?.transferId)
+})
+
+test('server session limits queued chunks before storage work', async (t) => {
+  const writing = deferred()
+  let writes = 0
+  const sessionStore = createSessionStore({
+    writeChunk: () => {
+      writes++
+      return writing.promise
+    }
+  })
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+
+  for (let index = 0; index < 5; index++) pair.messages[CHUNK].send(upload.chunk)
+  await waitFor(() => pair.right.destroyed)
+  writing.resolve()
+  await pair.serverSession!.settle().catch(() => {})
+
+  t.ok(pair.serverSession)
+  t.is(pair.destroyed.length, 1)
+  t.is(pair.destroyed[0].code, ERRORS.PROTOCOL_INVALID)
+  t.is(pair.destroyed[0].message, 'Too many queued chunks')
+  t.is(writes, 0)
+  t.is(sessionStore.sessions.size, 1)
+})
+
+test('server session closes an idle connection after the default timeout', async (t) => {
+  const scheduler = createTimeoutScheduler()
+  const pair = createClientServer(t, {
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024,
+    scheduler
+  })
+  await waitFor(() => pair.serverSession !== null)
+
+  const [timer] = scheduler.timers.values()
+  t.is(timer.timeout, 60_000)
+  timer.callback()
+  await waitFor(() => pair.right.destroyed)
+})
+
+test('server session revocation prevents queued chunk writes', async (t) => {
+  const started = deferred()
+  const release = deferred()
+  let writes = 0
+  let reservationsReleased = 0
+  const sessionStore = createSessionStore({
+    writeChunk: async () => {
+      writes++
+      started.resolve()
+      await release.promise
+    }
+  })
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024,
+    reserveUpload: () => ({ reserved: true }),
+    releaseUpload: () => {
+      reservationsReleased++
+    }
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  pair.messages[CHUNK].send(upload.chunk)
+  await started.promise
+  pair.messages[CHUNK].send(upload.chunk)
+
+  pair.serverSession!.revoke()
+  release.resolve()
+  await pair.serverSession!.settle()
+
+  t.is(writes, 1)
+  t.is(reservationsReleased, 1)
+})
+
+test('server session revocation prevents queued finish commit', async (t) => {
+  const started = deferred()
+  const release = deferred()
+  let finished = 0
+  let committed = 0
+  const sessionStore = createSessionStore({
+    writeChunk: async () => {
+      started.resolve()
+      await release.promise
+    }
+  })
+  sessionStore.finish = (transferId) => {
+    finished++
+    const session = sessionStore.sessions.get(b4a.toString(transferId, 'hex'))!
+    session.state = 'verified'
+    return Promise.resolve()
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore({
+      commit: () => {
+        committed++
+        return Promise.resolve()
+      }
+    }),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  pair.messages[CHUNK].send(upload.chunk)
+  await started.promise
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+
+  pair.serverSession!.revoke()
+  release.resolve()
+  await pair.serverSession!.settle()
+
+  t.is(finished, 0)
+  t.is(committed, 0)
+})
+
+test('server session settlement retains cleanup errors raised after revocation', async (t) => {
+  const started = deferred()
+  const commit = deferred()
+  const sessionStore = createSessionStore()
+  sessionStore.finish = (transferId) => {
+    sessionStore.sessions.get(b4a.toString(transferId, 'hex'))!.state = 'verified'
+    return Promise.resolve()
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore({
+      commit: () => {
+        started.resolve()
+        return commit.promise
+      }
+    }),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload()
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+  await started.promise
+
+  pair.serverSession!.revoke()
+  commit.reject(new AggregateError([new Error('rollback failed')], 'cleanup failed'))
+
+  await t.exception(() => pair.serverSession!.settle(), { name: 'AggregateError' })
+})
+
+test('server session admits a replaceable managed offer and commits it', async (t) => {
+  const inspections: Array<Parameters<CommitStore['inspect']>> = []
+  const committed: CommitCall[] = []
+  const events: Array<Record<string, unknown>> = []
+  const sessionStore = createSessionStore()
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore({
+      inspect(...args) {
+        inspections.push(args)
+        return Promise.resolve({ status: 'REPLACEABLE' } as InspectResult)
+      },
+      commit(session, options) {
+        committed.push({ session, options })
+        return Promise.resolve({
+          name: session.name,
+          replaces: {
+            name: session.name,
+            transferId: '1'.repeat(64),
+            historyName: `history-${'1'.repeat(64)}`
+          }
+        })
+      }
+    }),
+    replaceNames: ['release.tar.gz'],
+    onEvent: (event) => events.push(event),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload({ name: 'release.tar.gz' })
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.ready.length === 1)
+  t.is(pair.received.status[0].code, STATUS_CODE.ACCEPT)
+  t.is(inspections.length, 1)
+  t.is(inspections[0][0], 'release.tar.gz')
+  t.alike(inspections[0][2]?.replaceNames, new Set(['release.tar.gz']))
+
+  pair.messages[CHUNK].send(upload.chunk)
+  await waitFor(() => pair.received.chunkAck.length === 1)
+  pair.messages[FINISH].send({ transferId: upload.offer.transferId })
+  await waitFor(() => pair.received.result.length === 1)
+
+  t.is(pair.received.result[0].code, 0)
+  t.is(committed.length, 1)
+  t.alike(committed[0].options.replaceNames, new Set(['release.tar.gz']))
+  t.is(sessionStore.sessions.size, 0)
+  const succeeded = events.find((event) => event.type === 'commit' && event.status === 'succeeded')
+  t.alike(succeeded?.replaced, {
+    name: 'release.tar.gz',
+    transferId: '1'.repeat(64),
+    historyName: `history-${'1'.repeat(64)}`
+  })
+})
+
+test('server session rejects existing empty uploads before staging', async (t) => {
+  let offers = 0
+  let reservationsReleased = 0
+  const sessionStore = createSessionStore()
+  const originalOffer = sessionStore.offer
+  sessionStore.offer = (...args) => {
+    offers++
+    return originalOffer(...args)
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore({
+      inspect: () => Promise.resolve({ status: 'FILE_EXISTS' })
+    }),
+    reserveUpload: () => ({ reserved: true }),
+    releaseUpload: () => {
+      reservationsReleased++
+    },
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload({ name: 'immutable.bin', data: b4a.alloc(0) })
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.status.length === 1)
+
+  t.is(pair.received.status[0].code, STATUS_CODE.FILE_EXISTS)
+  t.is(offers, 0)
+  t.is(reservationsReleased, 1)
+})
+
+test('server session holds one destination lease and releases it on close', async (t) => {
+  const active = new Set<string>()
+  const reserveUpload: NonNullable<ServerSessionOptions['reserveUpload']> = (_id, name) => {
+    if (active.has(name)) return { rejected: true, reason: 'FILE_BUSY' }
+    active.add(name)
+    return { name }
+  }
+  const releaseUpload: NonNullable<ServerSessionOptions['releaseUpload']> = (reservation) => {
+    active.delete((reservation as { name: string }).name)
+  }
+  const options = {
+    sessionStore: createSessionStore(),
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024,
+    reserveUpload,
+    releaseUpload
+  }
+  const first = createClientServer(t, options)
+  const second = createClientServer(t, options)
+  const upload = makeUpload({ name: 'release.tar.gz' })
+
+  first.messages[OFFER].send(upload.offer)
+  await waitFor(() => first.received.ready.length === 1)
+  second.messages[OFFER].send(upload.offer)
+  await waitFor(() => second.received.status.length === 1)
+  t.is(second.received.status[0].code, STATUS_CODE.FILE_BUSY)
+
+  await first.serverSession!.close()
+  const third = createClientServer(t, options)
+  third.messages[OFFER].send(upload.offer)
+  await waitFor(() => third.received.ready.length === 1)
+  t.is(active.size, 1)
+  await third.serverSession!.close()
+  t.is(active.size, 0)
+})
+
+test('server session activates a reservation only after staging offer succeeds', async (t) => {
+  let active = false
+  const reservation = { id: 'reserved', name: 'artifact.bin' }
+  const sessionStore = createSessionStore()
+  const originalOffer = sessionStore.offer
+  sessionStore.offer = (...args) => {
+    t.is(active, false, 'incoming reservation is not yet an active resumable session')
+    return originalOffer(...args)
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore(),
+    maxFileBytes: 1024 * 1024,
+    reserveUpload: () => reservation,
+    activateUpload: (candidate) => {
+      t.is(candidate, reservation)
+      active = true
+    }
+  })
+
+  pair.messages[OFFER].send(makeUpload().offer)
+  await waitFor(() => pair.received.ready.length === 1)
+
+  t.is(active, true)
+  await pair.serverSession!.close()
+})
+
+test('server session rejects reserved history offers without staging', async (t) => {
+  let offered = false
+  const sessionStore = createSessionStore()
+  sessionStore.offer = (...args) => {
+    offered = true
+    return createSessionStore().offer(...args)
+  }
+  const pair = createClientServer(t, {
+    sessionStore,
+    commitStore: createCommitStore({
+      inspect: () => {
+        throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
+      }
+    }),
+    maxFileBytes: 1024 * 1024
+  })
+  const upload = makeUpload({ name: 'history-client.bin' })
+
+  pair.messages[OFFER].send(upload.offer)
+  await waitFor(() => pair.received.status.length === 1)
+
+  t.is(pair.received.status[0].code, STATUS_CODE.REJECTED)
+  t.is(pair.received.status[0].reason, ERRORS.INVALID_FILENAME)
+  t.is(offered, false)
+})
