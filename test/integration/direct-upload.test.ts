@@ -77,6 +77,69 @@ test('direct server-key upload commits only after an explicit final result', asy
   ])
 })
 
+test('terminal delivery failure never contradicts durable lifecycle events', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 111)
+  const clientSeed = b4a.alloc(32, 112)
+  const storage = await createTempDir(t)
+  const input = path.join(await createTempDir(t), 'delivery.txt')
+  await fs.promises.writeFile(input, 'durably committed before terminal delivery fails')
+  const serverNode = testnet.createNode()
+  const dht = {
+    get destroyed() {
+      return serverNode.destroyed
+    },
+    createServer(
+      options: Parameters<typeof serverNode.createServer>[0],
+      handler: Parameters<typeof serverNode.createServer>[1]
+    ) {
+      return serverNode.createServer(options, (socket) => {
+        const stream = socket as unknown as { write(bytes: Buffer): boolean }
+        const write = stream.write.bind(stream)
+        stream.write = (bytes) =>
+          b4a.toString(bytes).includes('"COMMITTED"') ? false : write(bytes)
+        handler(socket)
+      })
+    },
+    connect: serverNode.connect.bind(serverNode),
+    on: serverNode.on.bind(serverNode),
+    destroy: serverNode.destroy.bind(serverNode)
+  }
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    idleTimeout: 20,
+    dht
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    idleTimeout: 1_000,
+    dht: testnet.createNode()
+  })
+  const phases: string[] = []
+  server.on('verification', (event) => phases.push(`verification:${event.status}`))
+  server.on('commit', (event) => phases.push(`commit:${event.status}`))
+  server.on('failure', () => phases.push('failure'))
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  await t.exception(client.upload(input))
+  t.is(
+    await fs.promises.readFile(path.join(storage, 'delivery.txt'), 'utf8'),
+    'durably committed before terminal delivery fails'
+  )
+  t.alike(phases, ['verification:started', 'verification:succeeded', 'commit:succeeded', 'failure'])
+})
+
 test('directory uploads use separate direct connections in lexical order', async (t) => {
   const testnet = await createLocalTestnet(t)
   const serverSeed = b4a.alloc(32, 93)

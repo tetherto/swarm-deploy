@@ -351,7 +351,9 @@ export class Server extends EventEmitter {
     let sentAdmission = false
     let event: ReturnType<Server['transfer']> | null = null
     let verificationStarted = false
+    let verificationSucceeded = false
     let commitStarted = false
+    let commitSucceeded = false
     try {
       const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
       assertMetadataTransferId(owner, metadata)
@@ -439,17 +441,19 @@ export class Server extends EventEmitter {
           await this.sessions.readVerified(b4a.from(metadata.transferId, 'hex')),
           { retentionManager: this.retention, signal: this.signal, replaceNames: this.replaceNames }
         )
-        await this.sessions.retireCommitted(b4a.from(metadata.transferId, 'hex'))
         this.emitSafe('verification', {
           ...event,
           fingerprint: fingerprint(owner),
           status: 'succeeded'
         })
+        verificationSucceeded = true
         this.emitSafe('commit', {
           ...event,
           fingerprint: fingerprint(owner),
           status: 'succeeded'
         })
+        commitSucceeded = true
+        await this.sessions.retireCommitted(b4a.from(metadata.transferId, 'hex'))
         await writeFinal(
           socket,
           { v: 1, status: 'COMMITTED' },
@@ -505,17 +509,19 @@ export class Server extends EventEmitter {
         signal: this.signal,
         replaceNames: this.replaceNames
       })
-      await this.sessions.retireCommitted(verified.transferId)
       this.emitSafe('verification', {
         ...event,
         fingerprint: fingerprint(owner),
         status: 'succeeded'
       })
+      verificationSucceeded = true
       this.emitSafe('commit', {
         ...event,
         fingerprint: fingerprint(owner),
         status: 'succeeded'
       })
+      commitSucceeded = true
+      await this.sessions.retireCommitted(verified.transferId)
       await writeFinal(
         socket,
         { v: 1, status: 'COMMITTED' },
@@ -528,7 +534,7 @@ export class Server extends EventEmitter {
         reason
       })
       this.emitSafe('failure', { fingerprint: owner ? fingerprint(owner) : 'invalid', reason })
-      if (event && verificationStarted) {
+      if (event && verificationStarted && !verificationSucceeded) {
         this.emitSafe('verification', {
           ...event,
           fingerprint: fingerprint(owner),
@@ -536,7 +542,7 @@ export class Server extends EventEmitter {
           reason
         })
       }
-      if (event && commitStarted) {
+      if (event && commitStarted && !commitSucceeded) {
         this.emitSafe('commit', {
           ...event,
           fingerprint: fingerprint(owner),
@@ -551,7 +557,7 @@ export class Server extends EventEmitter {
             { v: 1, status: 'REJECTED', code: reason },
             { timeout: this.idleTimeout }
           )
-        } else {
+        } else if (!commitSucceeded) {
           await writeFinal(
             socket,
             { v: 1, status: 'FAILED', code: reason },
