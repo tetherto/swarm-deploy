@@ -91,6 +91,10 @@ export interface ClientResultEvent {
   name?: string
   status: UploadStatus | ErrorCode | 'COMMITTED' | 'FAILED'
   final: boolean
+  files?: number
+  committed?: number
+  failed?: number
+  skipped?: number
 }
 export interface ClientEventMap {
   connection: FingerprintEvent
@@ -203,7 +207,11 @@ export class Client extends EventEmitter {
     } catch {}
   }
 
-  private async uploadManifest(manifest: TarManifest, reset = false): Promise<UploadResult> {
+  private async uploadManifest(
+    manifest: TarManifest,
+    reset = false,
+    emitFinal = true
+  ): Promise<UploadResult> {
     throwIfAborted(this.signal)
     const socket = await this.direct.connect(this.serverPublicKey, {
       signal: this.signal,
@@ -225,13 +233,16 @@ export class Client extends EventEmitter {
       const admission = await reader.control(decodeDirectAdmission, this.signal, this.idleTimeout)
       if (admission.status === 'ALREADY_COMMITTED') {
         this.emitSafe('offer', { name: manifest.name, status: 'already-committed' })
-        return this.result(manifest, 'ALREADY_COMMITTED')
+        return this.result(manifest, 'ALREADY_COMMITTED', emitFinal)
       }
       if (admission.status === 'REJECTED') throw fail(admission.code, 'Server rejected upload')
       if (admission.status === 'VERIFIED') {
         const final = await reader.control(decodeDirectFinal, this.signal, this.idleTimeout)
         if (final.status !== 'COMMITTED') throw fail(final.code, 'Server failed verified upload')
-        return this.result(manifest, 'COMMITTED')
+        this.emitSafe('verification', { name: manifest.name, status: 'started' })
+        this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
+        this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
+        return this.result(manifest, 'COMMITTED', emitFinal)
       }
       const offset = admission.offset
       const expected =
@@ -254,7 +265,7 @@ export class Client extends EventEmitter {
         this.emitSafe('offer', { name: manifest.name, status: 'reset', offset: 0 })
         reader.closeReader()
         socket.destroy()
-        return this.uploadManifest(manifest, true)
+        return this.uploadManifest(manifest, true, emitFinal)
       }
       if (regenerated.bytesSent !== manifest.tarSize - offset) {
         throw fail(ERRORS.PROTOCOL_INVALID, 'Incomplete deterministic TAR transfer')
@@ -272,7 +283,7 @@ export class Client extends EventEmitter {
       }
       this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
       this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
-      return this.result(manifest, 'COMMITTED')
+      return this.result(manifest, 'COMMITTED', emitFinal)
     } finally {
       reader.closeReader()
       try {
@@ -281,7 +292,7 @@ export class Client extends EventEmitter {
     }
   }
 
-  private result(manifest: TarManifest, status: UploadStatus): UploadResult {
+  private result(manifest: TarManifest, status: UploadStatus, final: boolean): UploadResult {
     const result = {
       status,
       name: manifest.name,
@@ -290,7 +301,7 @@ export class Client extends EventEmitter {
       transferId: b4a.from(manifest.transferId)
     }
     this.logger.info('Direct upload completed', { name: result.name, status: result.status })
-    this.emitSafe('result', { name: result.name, status, final: true })
+    this.emitSafe('result', { name: result.name, status, final })
     return result
   }
   private async perform(inputPath: string): Promise<ClientUploadResult> {
@@ -317,7 +328,9 @@ export class Client extends EventEmitter {
       try {
         results.push(
           await this.uploadManifest(
-            await buildTarManifest(entry.path, this.publicKey, { signal: this.signal })
+            await buildTarManifest(entry.path, this.publicKey, { signal: this.signal }),
+            false,
+            false
           )
         )
       } catch (error) {
@@ -334,12 +347,29 @@ export class Client extends EventEmitter {
       results,
       skipped: selection.skipped
     }
-    this.emitSafe('result', { status: result.status, final: true })
+    const committed = results.filter(
+      (entry) => entry.status === 'COMMITTED' || entry.status === 'ALREADY_COMMITTED'
+    ).length
+    this.emitSafe('result', {
+      status: result.status,
+      final: true,
+      files: results.length,
+      committed,
+      failed: results.length - committed,
+      skipped: selection.skipped.length
+    })
     return result
   }
   upload(inputPath: string): Promise<ClientUploadResult> {
     if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Client is closed'))
-    const operation = this.queue.then(() => this.perform(inputPath))
+    const operation = this.queue
+      .then(() => this.perform(inputPath))
+      .catch((error: unknown) => {
+        const reason = codeOf(error)
+        this.emitSafe('failure', { fingerprint: fingerprint(this.serverPublicKey), reason })
+        this.emitSafe('result', { status: reason, final: true })
+        throw error
+      })
     this.queue = operation.then(
       () => undefined,
       () => undefined

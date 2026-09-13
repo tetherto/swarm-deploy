@@ -31,6 +31,7 @@ import {
   type MetadataRecord
 } from '../../dist/tar-protocol/controls.js'
 import { TarProtocolLifecycle, writeProtocolBytes } from '../../dist/tar-protocol/lifecycle.js'
+import { DirectWireReader } from '../../dist/tar-protocol/direct-wire.js'
 import {
   validateAndExtractTar,
   type TarExtractionStaging
@@ -38,6 +39,26 @@ import {
 import { createTempDir } from '../helpers/files.js'
 
 const CLIENT_KEY = b4a.alloc(32, 23)
+
+function readableSocket() {
+  const listeners = new Map<string, Set<(value?: Buffer) => void>>()
+  return {
+    on(event: string, listener: (value?: Buffer) => void) {
+      if (!listeners.has(event)) listeners.set(event, new Set())
+      listeners.get(event)?.add(listener)
+      return this
+    },
+    removeListener(event: string, listener: (value?: Buffer) => void) {
+      listeners.get(event)?.delete(listener)
+      return this
+    },
+    pause() {},
+    resume() {},
+    emit(event: string, value?: Buffer) {
+      for (const listener of listeners.get(event) || []) listener(value)
+    }
+  }
+}
 
 function sha256(bytes: Uint8Array): Buffer {
   return crypto.createHash('sha256').update(bytes).digest()
@@ -433,6 +454,18 @@ test('protocol lifecycle requires explicit final success', (t) => {
   reset.admission({ v: 1, status: 'ACCEPT', offset: 0 })
   reset.beginTar()
   t.is(reset.state, 'TAR')
+})
+
+test('direct wire rejects buffered bytes after exact TAR without waiting for EOF', async (t) => {
+  const socket = readableSocket()
+  const reader = new DirectWireReader(socket as never)
+  socket.emit('data', b4a.from('ab'))
+  await reader.tar(1, async () => {}, null, 100)
+  await t.exception(reader.requireEnd(null, 100), {
+    code: ERRORS.PROTOCOL_INVALID,
+    message: 'Trailing bytes after exact TAR payload'
+  })
+  reader.closeReader()
 })
 
 test('protocol byte writer honors backpressure', async (t) => {

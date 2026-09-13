@@ -352,7 +352,6 @@ export class Server extends EventEmitter {
     try {
       const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
       assertMetadataTransferId(owner, metadata)
-      current.transfer = metadata.transferId
       const event = this.transfer(metadata)
       if (
         metadata.fileSize > this.maxFileBytes ||
@@ -401,7 +400,24 @@ export class Server extends EventEmitter {
       if (inspected.status === 'FILE_EXISTS') {
         throw fail(ERRORS.FILE_EXISTS, 'Destination already exists')
       }
+      if (this.activeUploads.size >= this.maxActiveUploads) {
+        await writeAdmission(
+          socket,
+          { v: 1, status: 'REJECTED', code: ERRORS.ACTIVE_UPLOAD_LIMIT },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
+        sentAdmission = true
+        this.emitSafe('offer', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'rejected',
+          reason: ERRORS.ACTIVE_UPLOAD_LIMIT
+        })
+        return
+      }
+      this.activeUploads.add(socket)
       const admission = await this.sessions.admit(owner, metadata)
+      current.transfer = metadata.transferId
       if (admission.status === 'VERIFIED') {
         await writeAdmission(
           socket,
@@ -409,7 +425,12 @@ export class Server extends EventEmitter {
           { signal: this.signal, timeout: this.idleTimeout }
         )
         sentAdmission = true
-        const record = await this.commits.commit(
+        this.emitSafe('verification', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'started'
+        })
+        await this.commits.commit(
           await this.sessions.readVerified(b4a.from(metadata.transferId, 'hex')),
           { retentionManager: this.retention, signal: this.signal, replaceNames: this.replaceNames }
         )
@@ -422,12 +443,10 @@ export class Server extends EventEmitter {
         this.emitSafe('commit', {
           ...event,
           fingerprint: fingerprint(owner),
-          status: 'succeeded',
-          reason: record.transferId
+          status: 'succeeded'
         })
         return
       }
-      this.activeUploads.add(socket)
       await writeAdmission(
         socket,
         admission.status === 'ACCEPT'
@@ -469,7 +488,7 @@ export class Server extends EventEmitter {
         status: 'started'
       })
       const verified = await this.sessions.verify(owner, metadata)
-      const record = await this.commits.commit(verified, {
+      await this.commits.commit(verified, {
         retentionManager: this.retention,
         signal: this.signal,
         replaceNames: this.replaceNames
@@ -488,8 +507,7 @@ export class Server extends EventEmitter {
       this.emitSafe('commit', {
         ...event,
         fingerprint: fingerprint(owner),
-        status: 'succeeded',
-        reason: record.transferId
+        status: 'succeeded'
       })
     } catch (error) {
       const reason = codeOf(error)
@@ -546,7 +564,8 @@ export class Server extends EventEmitter {
       await prepareStorageRecovery({
         layout: this.layout,
         commitStore: this.commits,
-        logger: this.logger
+        logger: this.logger,
+        onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
       await this.sessions.init()
       const recovered = await recoverStorage({
@@ -554,7 +573,8 @@ export class Server extends EventEmitter {
         sessionStore: this.sessions,
         commitStore: this.commits,
         logger: this.logger,
-        isAuthorized: (owner) => this.allowed(owner)
+        isAuthorized: (owner) => this.allowed(owner),
+        onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
       this.emitSafe('recovery', {
         status: 'completed',
@@ -575,9 +595,10 @@ export class Server extends EventEmitter {
           [...this.active.values()].some(
             (active) => active.transfer === (session as unknown as { id: string }).id
           ),
-        hasActiveUploads: () => this.active.size > 0,
+        hasActiveUploads: () => this.activeUploads.size > 0,
         isPinned: (record) => this.replaceNames.has(record.name),
-        logger: this.logger
+        logger: this.logger,
+        onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
       await this.retention.start()
       throwIfAborted(this.signal)

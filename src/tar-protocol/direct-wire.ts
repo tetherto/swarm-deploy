@@ -155,9 +155,12 @@ export class DirectWireReader {
   }
   /** The sender's write-half close is the deterministic no-trailing boundary. */
   async requireEnd(signal: AbortSignalLike | null | undefined, timeout: number): Promise<void> {
-    while (!this.ended && !this.failure) await this.wait(signal, timeout)
-    if (this.failure) throw this.failure
     if (this.available !== 0) throw invalid('Trailing bytes after exact TAR payload')
+    while (!this.ended && !this.failure) {
+      await this.wait(signal, timeout)
+      if (this.available !== 0) throw invalid('Trailing bytes after exact TAR payload')
+    }
+    if (this.failure) throw this.failure
   }
   closeReader(): void {
     for (const event of ['data', 'end', 'close', 'error'] as const) {
@@ -171,6 +174,7 @@ export class DirectWireReader {
               : this.error
       this.socket.removeListener(event, listener as never)
     }
+    this.socket.resume?.()
   }
 }
 
