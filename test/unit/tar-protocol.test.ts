@@ -3,7 +3,6 @@
 
 import test from 'brittle'
 import b4a from 'b4a'
-import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
 import { pack, type Header } from 'tar-stream'
@@ -36,6 +35,7 @@ import {
   validateAndExtractTar,
   type TarExtractionStaging
 } from '../../dist/tar-protocol/extract.js'
+import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createTempDir } from '../helpers/files.js'
 
 const CLIENT_KEY = b4a.alloc(32, 23)
@@ -61,7 +61,7 @@ function readableSocket() {
 }
 
 function sha256(bytes: Uint8Array): Buffer {
-  return crypto.createHash('sha256').update(bytes).digest()
+  return sodiumSha256(bytes)
 }
 
 async function collectTar(manifest: TarManifest, offset = 0): Promise<Buffer> {

@@ -1,7 +1,7 @@
 import path from '#path'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { historyName, isReservedHistoryName, validateBasename } from '../files.js'
-import { assertSafeUint } from '../protocol/validation.js'
+import { assertSafeUint } from '../validation.js'
 import { MetadataFormatError, readJson } from './atomic-file.js'
 import { assertSafeFile } from './layout.js'
 import type { StorageAdapter, StorageLayout, StorageStat } from './types.js'

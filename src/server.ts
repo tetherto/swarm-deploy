@@ -1,5 +1,4 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
 import events from '#events'
 import fs from '#fs'
 import { createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
@@ -28,6 +27,7 @@ import {
   writeAdmission,
   writeFinal
 } from './tar-protocol/direct-wire.js'
+import { sodiumSha256 } from './tar-protocol/hash.js'
 import { assertMetadataTransferId } from './tar-protocol/manifest.js'
 import type {
   AuthenticationEvent,
@@ -166,9 +166,7 @@ function key(value: unknown, label: string): Buffer {
   return b4a.from(value)
 }
 function fingerprint(value: Uint8Array): string {
-  return b4a
-    .toString(crypto.createHash('sha256').update(value).digest(), 'hex')
-    .slice(0, FINGERPRINT_LENGTH)
+  return b4a.toString(sodiumSha256(value), 'hex').slice(0, FINGERPRINT_LENGTH)
 }
 function safeLogger(logger: Logger | null | undefined): SafeLogger {
   const call = (method: keyof Logger, message: string, details?: Record<string, unknown>): void => {

@@ -1,7 +1,7 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
+import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import {
   historyName,
@@ -9,9 +9,9 @@ import {
   validateBasename,
   validateReplaceNames
 } from '../files.js'
-import { transferId } from '../protocol/transfer-id.js'
-import { assertFixed32, assertSafeUint } from '../protocol/validation.js'
+import { digestMatches, SodiumSha256, sodiumSha256 } from '../tar-protocol/hash.js'
 import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
+import { assertFixed32, assertSafeUint } from '../validation.js'
 import {
   assertSafeDirectory,
   assertSafeFile,
@@ -58,10 +58,8 @@ interface CommitSession {
   size: number
   digest: Uint8Array
   /** Direct-TAR sessions carry these immutable archive fields. */
-  tarSize?: number
-  tarDigest?: Uint8Array
-  /** Temporary pre-TAR wire compatibility only. */
-  chunkSize?: number
+  tarSize: number
+  tarDigest: Uint8Array
   state: string
 }
 
@@ -129,7 +127,7 @@ function existsError(message: string): SwarmDeployError {
 }
 
 function assertNotAborted(signal: AbortSignalLike | null): void {
-  if (signal?.aborted) throw new SwarmDeployError(ERRORS.REVOKED, 'Upload access was revoked')
+  if (signal?.aborted) throw new SwarmDeployError(ERRORS.ABORTED, 'Upload was aborted')
 }
 
 function toHex(bytes: Uint8Array): string {
@@ -151,11 +149,13 @@ function isMissing(error: unknown): boolean {
 }
 
 function attemptId(): string {
-  return toHex(crypto.randomBytes(32))
+  const bytes = b4a.allocUnsafe(32)
+  sodium.randombytes_buf(bytes)
+  return toHex(bytes)
 }
 
 function fingerprint(ownerKey: Uint8Array): string {
-  return toHex(crypto.createHash('sha256').update(ownerKey).digest())
+  return toHex(sodiumSha256(ownerKey))
 }
 
 function replacementsEqual(
@@ -205,32 +205,18 @@ function assertSession(session: unknown): asserts session is CommitSession {
   assertFixed32(candidate.digest, 'session digest')
   if (candidate.id !== toHex(candidate.transferId)) throw storageError('Session ID mismatch')
 
-  if ('tarSize' in candidate || 'tarDigest' in candidate) {
-    assertSafeUint(candidate.tarSize, 'session TAR size')
-    assertFixed32(candidate.tarDigest, 'session TAR digest')
-    assertMetadataTransferId(candidate.ownerKey as Uint8Array, {
-      v: 1,
-      name: candidate.name as string,
-      fileSize: candidate.size as number,
-      fileSha256: toHex(candidate.digest as Uint8Array),
-      tarSize: candidate.tarSize as number,
-      tarSha256: toHex(candidate.tarDigest as Uint8Array),
-      transferId: candidate.id,
-      reset: false
-    })
-    return
-  }
-  // Compatibility bridge for the old server protocol; its persistence is not
-  // consulted by direct-TAR session admission.
-  assertSafeUint(candidate.chunkSize, 'session chunk size')
-  const expectedId = transferId({
-    clientPublicKey: candidate.ownerKey,
-    name: candidate.name,
-    size: candidate.size,
-    digest: candidate.digest,
-    chunkSize: candidate.chunkSize
+  assertSafeUint(candidate.tarSize, 'session TAR size')
+  assertFixed32(candidate.tarDigest, 'session TAR digest')
+  assertMetadataTransferId(candidate.ownerKey as Uint8Array, {
+    v: 1,
+    name: candidate.name as string,
+    fileSize: candidate.size as number,
+    fileSha256: toHex(candidate.digest as Uint8Array),
+    tarSize: candidate.tarSize as number,
+    tarSha256: toHex(candidate.tarDigest as Uint8Array),
+    transferId: candidate.id,
+    reset: false
   })
-  if (!b4a.equals(expectedId, candidate.transferId)) throw storageError('Noncanonical session ID')
 }
 
 async function readExactly(
@@ -282,7 +268,7 @@ function digestExactFile(
       const before = await handle.stat()
       if (!before.isFile() || before.size !== size) return null
 
-      const hash = crypto.createHash('sha256')
+      const hash = new SodiumSha256()
       let position = 0
       while (position < size) {
         const bytes = b4a.alloc(Math.min(64 * 1024, size - position))
@@ -707,16 +693,16 @@ class CommitStore {
     record: CommitRecord,
     expectedIdentity: FileIdentity,
     attemptId: string,
-    revoked: unknown
+    aborted: unknown
   ): Promise<never> {
     try {
       await this._markAttemptAborting(record.transferId, attemptId)
       await this._removeAbortedPublication(record, expectedIdentity)
       await this._discardJournal(record.transferId, attemptId)
     } catch (cleanupError) {
-      throw new AggregateError([revoked, cleanupError], 'Unable to clean up revoked commit')
+      throw new AggregateError([aborted, cleanupError], 'Unable to clean up aborted commit')
     }
-    throw revoked
+    throw aborted
   }
 
   async _removeOwnedFile(
@@ -738,7 +724,7 @@ class CommitStore {
     const stat = await this._safeFileOrAbsent(filePath, directory)
     if (!stat) return false
     const result = await digestExactFile(filePath, record.size, this.storage, syncFirst)
-    return result !== null && b4a.equals(result.digest, b4a.from(record.sha256, 'hex'))
+    return result !== null && digestMatches(result.digest, b4a.from(record.sha256, 'hex'))
   }
 
   _recordFromSession(session: CommitSession): CommitRecord {
@@ -828,7 +814,7 @@ class CommitStore {
     if (matches.length > 1) throw storageError('Duplicate managed commit filename')
     const record = matches[0]
     const digested = await digestExactFile(finalPath, record.size, this.storage)
-    if (!digested || !b4a.equals(digested.digest, b4a.from(record.sha256, 'hex'))) return null
+    if (!digested || !digestMatches(digested.digest, b4a.from(record.sha256, 'hex'))) return null
     return { record, identity: digested.identity }
   }
 
@@ -916,9 +902,9 @@ class CommitStore {
     transferId: Uint8Array,
     sessionStore: SessionStore | null
   ): Promise<false | { status: 'COMMITTED' | 'ABORTED'; record: CommitRecord }> {
-    assertFixed32(transferId, 'revoked transfer ID')
+    assertFixed32(transferId, 'aborted transfer ID')
     if (!sessionStore || typeof sessionStore.readVerified !== 'function') {
-      throw storageError('Invalid session store for revoked attempt retry')
+      throw storageError('Invalid session store for aborted attempt retry')
     }
     const id = toHex(transferId)
     const pending = await this._readJournal(id).catch((err: unknown) => {
@@ -968,7 +954,7 @@ class CommitStore {
         !identitiesEqual(fileIdentity(staging), journal.sourceStagingIdentity) ||
         !(await this._matchesRecord(stagingPath, this.layout.staging, journal.record))
       ) {
-        throw storageError('Staging file changed before revoked attempt retry')
+        throw storageError('Staging file changed before aborted attempt retry')
       }
       if (journal.state === 'committing') {
         const marked = await this._markAttemptAborting(id, journal.attemptId)
@@ -1039,7 +1025,7 @@ class CommitStore {
     const stagingDigest = await digestExactFile(stagingPath, record.size, this.storage, true)
     if (
       stagingDigest === null ||
-      !b4a.equals(stagingDigest.digest, b4a.from(record.sha256, 'hex'))
+      !digestMatches(stagingDigest.digest, b4a.from(record.sha256, 'hex'))
     ) {
       throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Staging file checksum mismatch')
     }
@@ -1088,7 +1074,7 @@ class CommitStore {
         this._reportCleanupPending(record, err)
         return record
       }
-      if (errorCode(err) === ERRORS.REVOKED) {
+      if (errorCode(err) === ERRORS.ABORTED) {
         return this._abortAttempt(record, stagingDigest.identity, journalAttemptId, err)
       }
       if (!linked && errorCode(err) !== 'EEXIST') {
@@ -1155,7 +1141,7 @@ class CommitStore {
     if (!state.present) return { name, identity: null }
     if (!state.stat) throw existsError('History destination already exists')
     const digested = await digestExactFile(this._finalPath(name), existing.size, this.storage)
-    if (!digested || !b4a.equals(digested.digest, b4a.from(existing.sha256, 'hex'))) {
+    if (!digested || !digestMatches(digested.digest, b4a.from(existing.sha256, 'hex'))) {
       throw existsError('History destination already exists')
     }
     return { name, identity: digested.identity }
@@ -1278,16 +1264,16 @@ class CommitStore {
         this._reportCleanupPending(newRecord, err)
         return newRecord
       }
-      const revoked = errorCode(err) === ERRORS.REVOKED
+      const aborted = errorCode(err) === ERRORS.ABORTED
       try {
-        if (revoked) await this._markAttemptAborting(newRecord.transferId, attempt)
+        if (aborted) await this._markAttemptAborting(newRecord.transferId, attempt)
         await this._rollbackReplacement(journal)
         await this._discardJournal(newRecord.transferId, attempt)
       } catch (cleanupError) {
         throw new AggregateError(
           [err, cleanupError],
-          revoked
-            ? 'Unable to clean up revoked replacement'
+          aborted
+            ? 'Unable to clean up aborted replacement'
             : 'Unable to roll back failed replacement'
         )
       }
@@ -1551,7 +1537,7 @@ class CommitStore {
 
     if (journal.state === 'aborting') {
       if (!sessionStore || typeof sessionStore.readVerified !== 'function') {
-        throw storageError('Session store cannot validate revoked commit journal')
+        throw storageError('Session store cannot validate aborted commit journal')
       }
       const session = await sessionStore.readVerified(b4a.from(id, 'hex'))
       if (

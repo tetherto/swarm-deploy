@@ -3,7 +3,6 @@
 
 import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
-import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS } from '../../dist/errors.js'
@@ -19,6 +18,7 @@ import {
   regenerateTarSuffix,
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
+import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createClock } from '../helpers/clock.js'
 import { createTempDir } from '../helpers/files.js'
 import { createStorage } from '../helpers/storage.js'
@@ -73,10 +73,7 @@ test('TAR admission reconstructs a durable offset and rehashes its prefix on res
   t.is(admission.status, 'RESUME')
   if (admission.status !== 'RESUME') throw new Error('Expected resumable TAR admission')
   t.is(admission.offset, 777)
-  t.alike(
-    admission.prefixSha256,
-    crypto.createHash('sha256').update(archive.subarray(0, 777)).digest()
-  )
+  t.alike(admission.prefixSha256, sodiumSha256(archive.subarray(0, 777)))
   t.is(restarted.reservedBytes, metadata.tarSize + metadata.fileSize)
 })
 
@@ -173,10 +170,7 @@ test('failed append rolls staging back before a shorter retry and restart', asyn
   t.is(admission.status, 'RESUME')
   if (admission.status !== 'RESUME') throw new Error('Expected shorter durable retry')
   t.is(admission.offset, 512)
-  t.alike(
-    admission.prefixSha256,
-    crypto.createHash('sha256').update(archive.subarray(0, 512)).digest()
-  )
+  t.alike(admission.prefixSha256, sodiumSha256(archive.subarray(0, 512)))
 })
 
 test('rollback failure quarantines a TAR session until restart repairs it', async (t) => {

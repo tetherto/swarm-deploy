@@ -1,10 +1,10 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { assertSafeDirectory, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
-import { assertSafeUint } from '../protocol/validation.js'
+import { digestMatches, SodiumSha256 } from '../tar-protocol/hash.js'
+import { assertSafeUint } from '../validation.js'
 import { withRootLease } from './root-coordinator.js'
 import type { CommitRecord } from './commit-journal.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
@@ -192,7 +192,7 @@ function inspectManagedFinal(
     if (initial.size !== record.size) return 'WRONG_SIZE'
     if (!hash) return 'VALID'
 
-    const digest = crypto.createHash('sha256')
+    const digest = new SodiumSha256()
     let handle = null
     try {
       handle = await openSafeRegularFile(finalPath, 'read', storage)
@@ -212,7 +212,7 @@ function inspectManagedFinal(
         !after.isFile() ||
         after.size !== record.size ||
         !identityMatches(before, after) ||
-        !b4a.equals(digest.digest(), b4a.from(record.sha256, 'hex'))
+        !digestMatches(digest.digest(), b4a.from(record.sha256, 'hex'))
       ) {
         return 'DIGEST_INVALID'
       }

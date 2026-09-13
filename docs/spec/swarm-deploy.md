@@ -204,11 +204,10 @@ malicious TAR rejection, create/replace/history v2 crash points, recovery,
 retention, cancellation, events, CLI behavior, and package import/type smoke.
 
 Legacy discovery/topic, Protomux, chunk bitmap, chunk scheduling, reconnect,
-and revocation-reload tests are deleted or rewritten rather than retained as
-current behavior. `hyperswarm`, `protomux`, `compact-encoding`, and
-`bare-crypto` stay installed only while still imported by the pre-refactor
-implementation; later implementation tasks remove each dependency after its
-last import and replacement tests are green.
+and revocation-reload tests are deleted rather than retained as current
+behavior. The package has no application dependency on `hyperswarm`,
+`protomux`, `compact-encoding`, or `bare-crypto`; transitive HyperDHT
+dependencies remain an implementation detail of HyperDHT itself.
 
 Production and tests remain strict TypeScript targeting ES2022 with Node16
 module behavior. Generated `dist/`, `.test-dist/`, coverage, task reports, and

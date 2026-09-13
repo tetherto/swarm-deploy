@@ -6,7 +6,11 @@ import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
 import { Client, Server, keyPairFromSeed } from '../../dist/index.js'
-import { buildTarManifest, metadataFromManifest } from '../../dist/tar-protocol/manifest.js'
+import {
+  buildTarManifest,
+  metadataFromManifest,
+  regenerateTarSuffix
+} from '../../dist/tar-protocol/manifest.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
@@ -226,4 +230,61 @@ test('a divergent durable TAR prefix is reset once before direct commit', async 
   t.alike(offers, ['resumed', 'reset'])
   t.is(connections, 2)
   t.is(await fs.promises.readFile(path.join(storage, 'reset.txt'), 'utf8'), 'resume reset payload')
+})
+
+test('a matching durable TAR prefix resumes on one direct connection', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 97)
+  const clientSeed = b4a.alloc(32, 98)
+  const storage = await createTempDir(t)
+  const input = path.join(await createTempDir(t), 'resume.txt')
+  await fs.promises.writeFile(input, 'matching direct TAR resume payload')
+  const clientKey = keyPairFromSeed(clientSeed)
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: storage,
+    allowedKeys: [clientKey.publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  const offers: string[] = []
+  let connections = 0
+  server.on('offer', (event) => offers.push(event.status))
+  server.on('connection', () => {
+    connections++
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  const manifest = await buildTarManifest(input, clientKey.publicKey)
+  const chunks: Buffer[] = []
+  await regenerateTarSuffix(manifest, 0, (chunk) => {
+    chunks.push(b4a.from(chunk))
+  })
+  const archive = b4a.concat(chunks)
+  const metadata = metadataFromManifest(manifest)
+  const sessions = (server as unknown as { sessions: SessionStore }).sessions
+  if (!sessions) throw new Error('Server session store unavailable')
+  await sessions.admit(clientKey.publicKey, metadata)
+  await sessions.append(clientKey.publicKey, metadata, 0, archive.subarray(0, 512))
+
+  const result = await client.upload(input)
+  t.is(result.status, 'COMMITTED')
+  t.alike(offers, ['resumed'])
+  t.is(connections, 1)
+  t.is(
+    await fs.promises.readFile(path.join(storage, 'resume.txt'), 'utf8'),
+    'matching direct TAR resume payload'
+  )
 })

@@ -1,5 +1,4 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
 import events from '#events'
 import fs from '#fs'
 import { createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
@@ -26,6 +25,7 @@ import {
   regenerateTarSuffix,
   type TarManifest
 } from './tar-protocol/manifest.js'
+import { sodiumSha256 } from './tar-protocol/hash.js'
 import type {
   Digest,
   FingerprintEvent,
@@ -137,9 +137,7 @@ function codeOf(error: unknown): ErrorCode {
     : ERRORS.PROTOCOL_INVALID
 }
 function fingerprint(value: Uint8Array): string {
-  return b4a
-    .toString(crypto.createHash('sha256').update(value).digest(), 'hex')
-    .slice(0, FINGERPRINT_LENGTH)
+  return b4a.toString(sodiumSha256(value), 'hex').slice(0, FINGERPRINT_LENGTH)
 }
 function logger(log: Logger | null | undefined): Required<Logger> {
   const call = (method: keyof Logger, message: string, details?: Record<string, unknown>): void => {

@@ -15,7 +15,7 @@ import { readCommitJournal } from './commit-journal.js'
 import { assertSafeFile, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout } from './types.js'
 import type { Clock } from '../types.js'
-import { assertSafeUint } from '../protocol/validation.js'
+import { assertSafeUint } from '../validation.js'
 
 const VERSION = 2
 const RECEIVING = 'receiving'
@@ -96,12 +96,12 @@ function key(value: Uint8Array, name: string): void {
 
 function sameMetadata(session: TarSession, metadata: MetadataRecord, owner: Uint8Array): boolean {
   return (
-    b4a.equals(session.ownerKey, owner) &&
+    sodium.sodium_memcmp(session.ownerKey, owner) &&
     session.name === metadata.name &&
     session.size === metadata.fileSize &&
     session.tarSize === metadata.tarSize &&
-    b4a.equals(session.digest, b4a.from(metadata.fileSha256, 'hex')) &&
-    b4a.equals(session.tarDigest, b4a.from(metadata.tarSha256, 'hex'))
+    sodium.sodium_memcmp(session.digest, b4a.from(metadata.fileSha256, 'hex')) &&
+    sodium.sodium_memcmp(session.tarDigest, b4a.from(metadata.tarSha256, 'hex'))
   )
 }
 
@@ -140,7 +140,7 @@ async function syncDirectory(directory: string, storage: StorageAdapter): Promis
   }
 }
 
-/** Durable direct-TAR sessions, independent from the legacy chunk store. */
+/** Durable direct-TAR session authority. */
 export class TarSessionStore {
   readonly layout: StorageLayout
   readonly maxStagingBytes: number
@@ -723,7 +723,7 @@ export class TarSessionStore {
       key(owner, 'owner key')
       let removed = 0
       for (const session of [...this.sessions.values()]) {
-        if (!b4a.equals(session.ownerKey, owner)) continue
+        if (!sodium.sodium_memcmp(session.ownerKey, owner)) continue
         await this.removeSession(session)
         removed++
       }

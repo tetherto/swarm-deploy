@@ -1,9 +1,9 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
 import fs from '#fs'
 import os from '#os'
 import path from '#path'
 import process from '#process'
+import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import type {
   StorageAdapter,
@@ -120,7 +120,9 @@ export function protectedDirectories(layout: StorageLayout): string[] {
 }
 
 function randomToken(): string {
-  return b4a.toString(crypto.randomBytes(32), 'hex')
+  const bytes = b4a.allocUnsafe(32)
+  sodium.randombytes_buf(bytes)
+  return b4a.toString(bytes, 'hex')
 }
 
 function currentPid(): number {

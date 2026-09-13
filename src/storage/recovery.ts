@@ -1,7 +1,7 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
 import fs from '#fs'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { sodiumSha256 } from '../tar-protocol/hash.js'
 import { assertSafeDirectory, withSafeDirectoryIdentity } from './layout.js'
 import { CorruptJournalError } from './commit-store.js'
 import { RetentionManager } from './retention.js'
@@ -23,6 +23,8 @@ interface SessionStore {
     name: string
     size: number
     digest: Uint8Array
+    tarSize: number
+    tarDigest: Uint8Array
     state: string
   }>
   expire(ttl: number, shouldExpire: (session: { state: string }) => boolean): Promise<number>
@@ -89,9 +91,7 @@ function isJournalName(name: string): boolean {
 }
 
 function transferFingerprint(id: string): string {
-  return b4a
-    .toString(crypto.createHash('sha256').update(b4a.from(id, 'hex')).digest(), 'hex')
-    .slice(0, 12)
+  return b4a.toString(sodiumSha256(b4a.from(id, 'hex')), 'hex').slice(0, 12)
 }
 
 function report(
