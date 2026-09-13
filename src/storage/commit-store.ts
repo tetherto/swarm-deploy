@@ -11,6 +11,7 @@ import {
 } from '../files.js'
 import { transferId } from '../protocol/transfer-id.js'
 import { assertFixed32, assertSafeUint } from '../protocol/validation.js'
+import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
 import {
   assertSafeDirectory,
   assertSafeFile,
@@ -56,7 +57,11 @@ interface CommitSession {
   name: string
   size: number
   digest: Uint8Array
-  chunkSize: number
+  /** Direct-TAR sessions carry these immutable archive fields. */
+  tarSize?: number
+  tarDigest?: Uint8Array
+  /** Temporary pre-TAR wire compatibility only. */
+  chunkSize?: number
   state: string
 }
 
@@ -198,9 +203,26 @@ function assertSession(session: unknown): asserts session is CommitSession {
   validateBasename(candidate.name)
   assertSafeUint(candidate.size, 'session size')
   assertFixed32(candidate.digest, 'session digest')
-  assertSafeUint(candidate.chunkSize, 'session chunk size')
   if (candidate.id !== toHex(candidate.transferId)) throw storageError('Session ID mismatch')
 
+  if ('tarSize' in candidate || 'tarDigest' in candidate) {
+    assertSafeUint(candidate.tarSize, 'session TAR size')
+    assertFixed32(candidate.tarDigest, 'session TAR digest')
+    assertMetadataTransferId(candidate.ownerKey as Uint8Array, {
+      v: 1,
+      name: candidate.name as string,
+      fileSize: candidate.size as number,
+      fileSha256: toHex(candidate.digest as Uint8Array),
+      tarSize: candidate.tarSize as number,
+      tarSha256: toHex(candidate.tarDigest as Uint8Array),
+      transferId: candidate.id,
+      reset: false
+    })
+    return
+  }
+  // Compatibility bridge for the old server protocol; its persistence is not
+  // consulted by direct-TAR session admission.
+  assertSafeUint(candidate.chunkSize, 'session chunk size')
   const expectedId = transferId({
     clientPublicKey: candidate.ownerKey,
     name: candidate.name,
@@ -309,6 +331,10 @@ class CommitStore {
 
   _stagingPath(id: string): string {
     return path.join(this.layout.staging, `${id}.part`)
+  }
+
+  _tarStagingPath(id: string): string {
+    return path.join(this.layout.staging, `${id}.tar.part`)
   }
 
   _sessionPath(id: string): string {
@@ -881,6 +907,7 @@ class CommitStore {
     if (leftovers.staging) {
       await this._removeFile(this._stagingPath(id), this.layout.staging)
     }
+    await this._removeFile(this._tarStagingPath(id), this.layout.staging)
     await this._discardJournal(id, journal.attemptId)
     return { status: 'COMMITTED', record: journal.record }
   }
@@ -1051,6 +1078,7 @@ class CommitStore {
       await this._removeFile(this._sessionPath(record.transferId), this.layout.sessions)
       assertNotAborted(signal)
       await this._removeFile(stagingPath, this.layout.staging)
+      await this._removeFile(this._tarStagingPath(record.transferId), this.layout.staging)
       assertNotAborted(signal)
       await this._discardJournal(record.transferId, journalAttemptId)
       if (retentionManager) await retentionManager._afterCommitUnlocked()
@@ -1241,6 +1269,7 @@ class CommitStore {
 
       await this._removeFile(this._sessionPath(newRecord.transferId), this.layout.sessions)
       await this._removeFile(stagingPath, this.layout.staging)
+      await this._removeFile(this._tarStagingPath(newRecord.transferId), this.layout.staging)
       await this._discardJournal(newRecord.transferId, attempt)
       if (retentionManager) await retentionManager._afterCommitUnlocked()
       return newRecord
@@ -1515,6 +1544,7 @@ class CommitStore {
     ) {
       await this._removeFile(this._sessionPath(id), this.layout.sessions)
       await this._removeFile(this._stagingPath(id), this.layout.staging)
+      await this._removeFile(this._tarStagingPath(id), this.layout.staging)
       await this._discardJournal(id, journalAttemptId)
       return { status: 'COMMITTED', record }
     }
@@ -1581,6 +1611,7 @@ class CommitStore {
       }
       await this._removeFile(this._sessionPath(id), this.layout.sessions)
       await this._removeFile(this._stagingPath(id), this.layout.staging)
+      await this._removeFile(this._tarStagingPath(id), this.layout.staging)
       await this._discardJournal(id, journalAttemptId)
       return { status: 'COMMITTED', record }
     }

@@ -3,7 +3,7 @@ import type { Server } from '../../dist/server.js'
 import type { AllowlistWatcher } from '../../dist/allowlist.js'
 import type { CommitStore } from '../../dist/storage/commit-store.js'
 import type { RetentionManager } from '../../dist/storage/retention.js'
-import type { SessionStore } from '../../dist/storage/session-store.js'
+import type { LegacySessionStore as SessionStore } from '../../dist/storage/legacy-session-store.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import type { SwarmPeerInfo, SwarmSocket } from '../../dist/types.js'
 

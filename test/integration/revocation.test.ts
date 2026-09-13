@@ -15,7 +15,7 @@ import type { Codec, Offer, ProtocolChannel } from '../../dist/protocol/types.js
 import type { SwarmDiscovery } from '../../dist/types.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { readJson } from '../../dist/storage/atomic-file.js'
-import { SessionStore } from '../../dist/storage/session-store.js'
+import { LegacySessionStore as SessionStore } from '../../dist/storage/legacy-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import type { StorageAdapter, StorageLayout } from '../../dist/storage/types.js'
 import { createTempDir } from '../helpers/files.js'

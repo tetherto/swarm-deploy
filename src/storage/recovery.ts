@@ -23,7 +23,6 @@ interface SessionStore {
     name: string
     size: number
     digest: Uint8Array
-    chunkSize: number
     state: string
   }>
   expire(ttl: number, shouldExpire: (session: { state: string }) => boolean): Promise<number>

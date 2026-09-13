@@ -1,6 +1,5 @@
-import DHT from 'hyperdht'
 import b4a from 'b4a'
-import crypto from '#crypto'
+import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from './errors.js'
 import type { Binary, BinaryInput, KeyPair, PublicKey, Seed, SeedInput } from './types.js'
 
@@ -27,7 +26,9 @@ export function parsePublicKey(value: string): PublicKey {
 }
 
 export function generateSeed(): Seed {
-  return b4a.from(crypto.randomBytes(32))
+  const seed = b4a.allocUnsafe(32)
+  sodium.randombytes_buf(seed)
+  return seed
 }
 
 function assertValidSeed(seed: SeedInput): asserts seed is Seed {
@@ -38,7 +39,10 @@ function assertValidSeed(seed: SeedInput): asserts seed is Seed {
 
 export function keyPairFromSeed(seed: SeedInput): KeyPair {
   assertValidSeed(seed)
-  return DHT.keyPair(seed)
+  const publicKey = b4a.alloc(32)
+  const secretKey = b4a.alloc(64)
+  sodium.crypto_sign_seed_keypair(publicKey, secretKey, seed)
+  return { publicKey, secretKey }
 }
 
 export function publicKeyFromSeed(seed: SeedInput): PublicKey {

@@ -23,7 +23,7 @@ import type {
   Topic
 } from '../../dist/types.js'
 import { initLayout } from '../../dist/storage/layout.js'
-import { SessionStore } from '../../dist/storage/session-store.js'
+import { LegacySessionStore as SessionStore } from '../../dist/storage/legacy-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import { recoverStorage } from '../../dist/storage/recovery.js'
 import type { StorageLayout } from '../../dist/storage/types.js'

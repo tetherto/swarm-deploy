@@ -12,7 +12,7 @@ import type { Chunk, Digest, Offer } from '../../dist/protocol/types.js'
 import { historyName } from '../../dist/files.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { readJson } from '../../dist/storage/atomic-file.js'
-import { SessionStore } from '../../dist/storage/session-store.js'
+import { LegacySessionStore as SessionStore } from '../../dist/storage/legacy-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import {
   assertCommitRecord,

@@ -8,7 +8,7 @@ import path from '#path'
 import createTestnet from 'hyperdht/testnet'
 import { Client, Server, keyPairFromSeed } from '../../dist/index.js'
 import { ClientSession } from '../../dist/protocol/client-session.js'
-import { SessionStore } from '../../dist/storage/session-store.js'
+import { LegacySessionStore as SessionStore } from '../../dist/storage/legacy-session-store.js'
 import { RetentionManager } from '../../dist/storage/retention.js'
 import { createTempDir } from '../helpers/files.js'
 import {

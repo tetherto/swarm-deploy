@@ -20,18 +20,19 @@ and disclosure may use a private GitHub Security Advisory.
 ## Operator precautions
 
 - Generate independent server and client seeds, store them as owner-readable
-  secrets, and never pass or log them as command-line arguments. If a seed may
-  be exposed, rotate it, remove the corresponding public key from the
-  allowlist, and purge the compromised secret from logs and caches.
+  secrets, and never pass or log them as command-line arguments. A client pins
+  the server's full public key; the server's immutable startup allowlist names
+  permitted client public keys. If a seed may be exposed, rotate it, restart
+  with a revised allowlist, and purge the compromised secret from logs and caches.
 - Run under a dedicated non-root account with a dedicated storage root.
   Swarm Deploy protects against detected symlink and directory-identity
   changes, but it does not defend against a malicious process with the same OS
   permissions.
-- Protect the allowlist as security-sensitive configuration. Review
-  authentication/revocation diagnostics after every change.
+- Protect the startup allowlist as security-sensitive configuration. It is not
+  watched or reloaded: use a controlled server restart to change access.
 - Do not manipulate `.swarm-deploy/` or copy an active storage root. Stop the
   server cleanly before backup or restore, preserve the whole root, and let the
   same or newer package version complete recovery before serving traffic.
-- Fingerprints, topics, digests, and public keys are not seeds, but full public
-  keys still identify deployment principals. Share only what operations
-  require.
+- Fingerprints and digests are not seeds, but full public keys still identify
+  deployment principals. Share only the server public key with uploaders and
+  only client public keys with server operators.

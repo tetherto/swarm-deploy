@@ -5,17 +5,11 @@ import path from '#path'
 import process from '#process'
 import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS } from './errors.js'
-import { parseSeed, generateSeed, publicKeyFromSeed } from './identity.js'
-import { parseTopic, topicFromServerPublicKey } from './topic.js'
-import { parseAllowlist } from './allowlist.js'
+import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './identity.js'
 import { validateReplaceNames } from './files.js'
-import { Server, type ServerLogger, type ServerOptions, type ServerSwarmFactory } from './server.js'
-import {
-  Client,
-  type ClientOptions,
-  type ClientSwarmFactory,
-  type ClientUploadResult
-} from './client.js'
+import { Server, type ServerLogger, type ServerOptions } from './server.js'
+import { Client, type ClientOptions, type ClientUploadResult } from './client.js'
+import type { DirectDhtNode } from './direct-dht.js'
 
 type Env = Record<string, string | undefined>
 type Output = { write(value: string): unknown }
@@ -30,17 +24,15 @@ type CliIo = {
   process?: SignalProcess
   Server?: new (options: ServerOptions) => Server
   Client?: new (options: ClientOptions) => Client
-  dht?: unknown
-  swarmFactory?: ServerSwarmFactory & ClientSwarmFactory
+  dht?: DirectDhtNode
   connectTimeout?: number
   idleTimeout?: number
 }
 
-const COMMANDS = new Set(['keygen', 'public-key', 'topic', 'server', 'upload'])
+const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload'])
 const HELP_ARGS = new Set(['--help', '-h'])
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MAX_SEED_FILE_BYTES = 65
-const MAX_ALLOWLIST_BYTES = 1024 * 1024
 const SERVER_SEED_ENV = 'SWARM_DEPLOY_SERVER_SEED'
 const CLIENT_SEED_ENV = 'SWARM_DEPLOY_CLIENT_SEED'
 
@@ -48,9 +40,8 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key --seed-file <seed-file>',
-  '  swarm-deploy topic --seed-file <server-seed-file>',
-  '  swarm-deploy server --seed-file <seed-file> --storage <dir> --allowlist <file> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
-  '  swarm-deploy upload --seed-file <seed-file> --topic <64-lower-hex> <file-or-directory>',
+  '  swarm-deploy server --seed-file <seed-file> --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
+  '  swarm-deploy upload --seed-file <seed-file> --server-key <64-lower-hex> <file-or-directory>',
   '',
   'Use --seed-file. A command-specific environment variable is also accepted.'
 ].join('\n')
@@ -317,7 +308,8 @@ function rejectRawSeed() {
 function parseOptions(
   args: string[],
   allowed: ReadonlySet<string>,
-  repeatable: ReadonlySet<string> = new Set()
+  repeatable: ReadonlySet<string> = new Set(),
+  keyValues: ReadonlySet<string> = new Set()
 ): {
   options: Record<string, string | undefined>
   repeatedOptions: Record<string, string[] | undefined>
@@ -334,7 +326,9 @@ function parseOptions(
   const positionals: string[] = []
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
-    if (isRawSeedOption(arg) || isCanonicalHexToken(arg)) rejectRawSeed()
+    if (isRawSeedOption(arg) || (isCanonicalHexToken(arg) && !keyValues.has(args[i - 1]))) {
+      rejectRawSeed()
+    }
     if (arg.startsWith('-')) {
       if (arg.includes('=') || !allowed.has(arg)) throw usageError('Unknown option')
       if (
@@ -351,6 +345,7 @@ function parseOptions(
         }
         throw usageError('Missing option value')
       }
+      if (isCanonicalHexToken(value) && !keyValues.has(arg)) rejectRawSeed()
       if (repeatable.has(arg)) {
         const values = repeatedOptions[arg] || []
         values.push(value)
@@ -518,31 +513,24 @@ async function runPublicKey(args: string[]): Promise<string> {
   return b4a.toString(publicKeyFromSeed(seed), 'hex')
 }
 
-async function runTopic(args: string[]): Promise<string> {
-  const { options, positionals } = parseOptions(args, new Set(['--seed-file']))
-  requirePositionals(positionals, 0, 'topic does not accept positional arguments')
-  const seed = await readSeedFile(requireOption(options, '--seed-file'))
-  return b4a.toString(topicFromServerPublicKey(publicKeyFromSeed(seed)), 'hex')
-}
-
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, repeatedOptions, positionals } = parseOptions(
     args,
     new Set([
       '--seed-file',
       '--storage',
-      '--allowlist',
+      '--allow-key',
       '--max-file-bytes',
       '--max-staging-bytes',
       '--max-storage-bytes',
       '--max-age-days',
       '--replace-name'
     ]),
-    new Set(['--replace-name'])
+    new Set(['--replace-name', '--allow-key']),
+    new Set(['--allow-key'])
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
-  const allowlistPath = requireOption(options, '--allowlist')
   const maxFileBytes = parsePositiveSafeInteger(
     requireOption(options, '--max-file-bytes'),
     'max-file-bytes'
@@ -569,16 +557,20 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     envName: SERVER_SEED_ENV,
     role: 'server'
   })
-  const allowlistText = await readBoundedRegularFile(
-    allowlistPath,
-    MAX_ALLOWLIST_BYTES,
-    'allowlist'
-  )
-  let allowedKeys: Set<string>
+  const allowedKeyValues = repeatedOptions['--allow-key'] || []
+  if (allowedKeyValues.length === 0) throw usageError('Missing --allow-key')
+  const allowedKeys = new Set<Buffer>()
   try {
-    allowedKeys = parseAllowlist(allowlistText)
+    for (const value of allowedKeyValues) {
+      const parsed = parsePublicKey(value)
+      const encoded = b4a.toString(parsed, 'hex')
+      if ([...allowedKeys].some((candidate) => b4a.toString(candidate, 'hex') === encoded)) {
+        throw new Error('duplicate')
+      }
+      allowedKeys.add(parsed)
+    }
   } catch {
-    throw configError('Invalid allowlist')
+    throw usageError('Invalid --allow-key')
   }
 
   const ServerImpl = io.Server || Server
@@ -588,14 +580,12 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       seed,
       storageDir,
       allowedKeys,
-      allowlistPath,
       maxFileBytes,
       maxStagingBytes,
       maxStorageBytes,
       maxAge,
       replaceNames,
       dht: io.dht,
-      swarmFactory: io.swarmFactory,
       logger: createLogger(io)
     })
   } catch (err) {
@@ -622,7 +612,6 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     }
     if (!runError) {
       writeLine(io.stdout, b4a.toString(server.publicKey, 'hex'))
-      writeLine(io.stdout, b4a.toString(server.topic, 'hex'))
       writeLine(io.stdout, 'ready')
       await stopped
     }
@@ -655,7 +644,12 @@ function printUploadResult(result: ClientUploadResult, io: CliIo): number {
 }
 
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, positionals } = parseOptions(args, new Set(['--seed-file', '--topic']))
+  const { options, positionals } = parseOptions(
+    args,
+    new Set(['--seed-file', '--server-key']),
+    new Set(),
+    new Set(['--server-key'])
+  )
   const [inputPath] = requirePositionals(positionals, 1, 'upload requires a file or directory')
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
@@ -663,11 +657,11 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
     envName: CLIENT_SEED_ENV,
     role: 'client'
   })
-  let topic: Buffer
+  let serverPublicKey: Buffer
   try {
-    topic = parseTopic(requireOption(options, '--topic'))
+    serverPublicKey = parsePublicKey(requireOption(options, '--server-key'))
   } catch {
-    throw usageError('Invalid --topic')
+    throw usageError('Invalid --server-key')
   }
 
   const ClientImpl = io.Client || Client
@@ -675,11 +669,10 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   try {
     client = new ClientImpl({
       seed,
-      topic,
+      serverPublicKey,
       dht: io.dht,
       connectTimeout: io.connectTimeout,
       idleTimeout: io.idleTimeout,
-      swarmFactory: io.swarmFactory,
       logger: createLogger(io)
     })
   } catch (err) {
@@ -731,10 +724,6 @@ async function dispatch(argv: string[], env: Env, io: CliIo): Promise<number> {
   }
   if (command === 'public-key') {
     writeLine(io.stdout, await runPublicKey(args))
-    return 0
-  }
-  if (command === 'topic') {
-    writeLine(io.stdout, await runTopic(args))
     return 0
   }
   if (command === 'server') return runServer(args, env, io)

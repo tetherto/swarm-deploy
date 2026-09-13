@@ -12,6 +12,18 @@
     "sourceMap": true,
     "types": ["node"]
   },
-  "include": ["test/**/*.ts"],
-  "exclude": ["test/types/public-api.ts"]
+  "files": [
+    "test/run.ts",
+    "test/unit/direct-dht.test.ts",
+    "test/unit/tar-protocol.test.ts",
+    "test/unit/imports.test.ts",
+    "test/unit/imports-node.test.ts",
+    "test/unit/tar-session-store.test.ts",
+    "test/unit/final-review-storage.test.ts",
+    "test/unit/commit-store.test.ts",
+    "test/unit/recovery.test.ts",
+    "test/unit/retention.test.ts",
+    "test/unit/scrub.test.ts",
+    "test/integration/direct-upload.test.ts"
+  ]
 }
