@@ -436,17 +436,19 @@ export class Server extends EventEmitter {
           status: 'started'
         })
         verificationStarted = true
-        commitStarted = true
-        await this.commits.commit(
-          await this.sessions.readVerified(b4a.from(metadata.transferId, 'hex')),
-          { retentionManager: this.retention, signal: this.signal, replaceNames: this.replaceNames }
-        )
+        const verified = await this.sessions.readVerified(b4a.from(metadata.transferId, 'hex'))
         this.emitSafe('verification', {
           ...event,
           fingerprint: fingerprint(owner),
           status: 'succeeded'
         })
         verificationSucceeded = true
+        commitStarted = true
+        await this.commits.commit(verified, {
+          retentionManager: this.retention,
+          signal: this.signal,
+          replaceNames: this.replaceNames
+        })
         this.emitSafe('commit', {
           ...event,
           fingerprint: fingerprint(owner),
@@ -503,18 +505,18 @@ export class Server extends EventEmitter {
       })
       verificationStarted = true
       const verified = await this.sessions.verify(owner, metadata)
-      commitStarted = true
-      await this.commits.commit(verified, {
-        retentionManager: this.retention,
-        signal: this.signal,
-        replaceNames: this.replaceNames
-      })
       this.emitSafe('verification', {
         ...event,
         fingerprint: fingerprint(owner),
         status: 'succeeded'
       })
       verificationSucceeded = true
+      commitStarted = true
+      await this.commits.commit(verified, {
+        retentionManager: this.retention,
+        signal: this.signal,
+        replaceNames: this.replaceNames
+      })
       this.emitSafe('commit', {
         ...event,
         fingerprint: fingerprint(owner),
