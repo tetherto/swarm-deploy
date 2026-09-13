@@ -349,10 +349,13 @@ export class Server extends EventEmitter {
     })
     const reader = new DirectWireReader(socket)
     let sentAdmission = false
+    let event: ReturnType<Server['transfer']> | null = null
+    let verificationStarted = false
+    let commitStarted = false
     try {
       const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
       assertMetadataTransferId(owner, metadata)
-      const event = this.transfer(metadata)
+      event = this.transfer(metadata)
       if (
         metadata.fileSize > this.maxFileBytes ||
         this.activeUploads.size >= this.maxActiveUploads
@@ -430,21 +433,28 @@ export class Server extends EventEmitter {
           fingerprint: fingerprint(owner),
           status: 'started'
         })
+        verificationStarted = true
+        commitStarted = true
         await this.commits.commit(
           await this.sessions.readVerified(b4a.from(metadata.transferId, 'hex')),
           { retentionManager: this.retention, signal: this.signal, replaceNames: this.replaceNames }
         )
         await this.sessions.retireCommitted(b4a.from(metadata.transferId, 'hex'))
-        await writeFinal(
-          socket,
-          { v: 1, status: 'COMMITTED' },
-          { signal: this.signal, timeout: this.idleTimeout }
-        )
+        this.emitSafe('verification', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'succeeded'
+        })
         this.emitSafe('commit', {
           ...event,
           fingerprint: fingerprint(owner),
           status: 'succeeded'
         })
+        await writeFinal(
+          socket,
+          { v: 1, status: 'COMMITTED' },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
         return
       }
       await writeAdmission(
@@ -487,18 +497,15 @@ export class Server extends EventEmitter {
         fingerprint: fingerprint(owner),
         status: 'started'
       })
+      verificationStarted = true
       const verified = await this.sessions.verify(owner, metadata)
+      commitStarted = true
       await this.commits.commit(verified, {
         retentionManager: this.retention,
         signal: this.signal,
         replaceNames: this.replaceNames
       })
       await this.sessions.retireCommitted(verified.transferId)
-      await writeFinal(
-        socket,
-        { v: 1, status: 'COMMITTED' },
-        { signal: this.signal, timeout: this.idleTimeout }
-      )
       this.emitSafe('verification', {
         ...event,
         fingerprint: fingerprint(owner),
@@ -509,6 +516,11 @@ export class Server extends EventEmitter {
         fingerprint: fingerprint(owner),
         status: 'succeeded'
       })
+      await writeFinal(
+        socket,
+        { v: 1, status: 'COMMITTED' },
+        { signal: this.signal, timeout: this.idleTimeout }
+      )
     } catch (error) {
       const reason = codeOf(error)
       this.logger.warn('Direct upload failed', {
@@ -516,6 +528,22 @@ export class Server extends EventEmitter {
         reason
       })
       this.emitSafe('failure', { fingerprint: owner ? fingerprint(owner) : 'invalid', reason })
+      if (event && verificationStarted) {
+        this.emitSafe('verification', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'failed',
+          reason
+        })
+      }
+      if (event && commitStarted) {
+        this.emitSafe('commit', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'failed',
+          reason
+        })
+      }
       try {
         if (!sentAdmission) {
           await writeAdmission(

@@ -226,6 +226,7 @@ export class Client extends EventEmitter {
       })
     )
     const reader = new DirectWireReader(socket)
+    let verificationStarted = false
     try {
       const metadata = metadataFromManifest(manifest, reset)
       await writeMetadata(socket, metadata, { signal: this.signal, timeout: this.idleTimeout })
@@ -237,9 +238,10 @@ export class Client extends EventEmitter {
       }
       if (admission.status === 'REJECTED') throw fail(admission.code, 'Server rejected upload')
       if (admission.status === 'VERIFIED') {
+        this.emitSafe('verification', { name: manifest.name, status: 'started' })
+        verificationStarted = true
         const final = await reader.control(decodeDirectFinal, this.signal, this.idleTimeout)
         if (final.status !== 'COMMITTED') throw fail(final.code, 'Server failed verified upload')
-        this.emitSafe('verification', { name: manifest.name, status: 'started' })
         this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
         this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
         return this.result(manifest, 'COMMITTED', emitFinal)
@@ -276,6 +278,7 @@ export class Client extends EventEmitter {
         totalBytes: manifest.tarSize - offset
       })
       this.emitSafe('verification', { name: manifest.name, status: 'started' })
+      verificationStarted = true
       endWrite(socket)
       const final = await reader.control(decodeDirectFinal, this.signal, this.idleTimeout)
       if (final.status !== 'COMMITTED') {
@@ -284,6 +287,13 @@ export class Client extends EventEmitter {
       this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
       this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
       return this.result(manifest, 'COMMITTED', emitFinal)
+    } catch (error) {
+      const reason = codeOf(error)
+      if (verificationStarted) {
+        this.emitSafe('verification', { name: manifest.name, status: 'failed', reason })
+        this.emitSafe('commit', { name: manifest.name, status: 'failed', reason })
+      }
+      throw error
     } finally {
       reader.closeReader()
       try {

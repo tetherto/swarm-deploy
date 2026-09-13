@@ -32,6 +32,7 @@ test('public Client and Server use direct server-key configuration', (t) => {
     seed: CLIENT_A_SEED,
     serverPublicKey: server.publicKey
   } as unknown as ConstructorParameters<typeof Client>[0])
+  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
 
   t.alike(client.serverPublicKey, server.publicKey)
   t.absent('topic' in client)

@@ -33,6 +33,23 @@ test('direct server-key upload commits only after an explicit final result', asy
     connectTimeout: 5_000,
     dht: testnet.createNode()
   })
+  const serverEvents: string[] = []
+  const clientEvents: string[] = []
+  server.on('offer', () => serverEvents.push('offer'))
+  server.on('progress', () => {
+    if (serverEvents.at(-1) !== 'progress') serverEvents.push('progress')
+  })
+  server.on('verification', (event) => serverEvents.push(`verification:${event.status}`))
+  server.on('commit', (event) => serverEvents.push(`commit:${event.status}`))
+  client.on('offer', () => clientEvents.push('offer'))
+  client.on('progress', () => {
+    if (clientEvents.at(-1) !== 'progress') clientEvents.push('progress')
+  })
+  client.on('verification', (event) => clientEvents.push(`verification:${event.status}`))
+  client.on('commit', (event) => clientEvents.push(`commit:${event.status}`))
+  client.on('result', (event) => {
+    if (event.final) clientEvents.push('result')
+  })
   t.teardown(async () => {
     await client.close()
     await server.close()
@@ -42,6 +59,22 @@ test('direct server-key upload commits only after an explicit final result', asy
   const result = await client.upload(input)
   t.is(result.status, 'COMMITTED')
   t.is(await fs.promises.readFile(path.join(storage, 'artifact.txt'), 'utf8'), 'direct TAR payload')
+  t.alike(serverEvents, [
+    'offer',
+    'progress',
+    'verification:started',
+    'verification:succeeded',
+    'commit:succeeded'
+  ])
+  t.alike(clientEvents, [
+    'offer',
+    'offer',
+    'progress',
+    'verification:started',
+    'verification:succeeded',
+    'commit:succeeded',
+    'result'
+  ])
 })
 
 test('directory uploads use separate direct connections in lexical order', async (t) => {
