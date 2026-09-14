@@ -310,7 +310,7 @@ export class TarSessionStore {
     )
   }
 
-  private async hashPrefix(session: TarSession): Promise<Buffer> {
+  private hashPrefix(session: TarSession): Promise<Buffer> {
     return withSafeDirectoryIdentity(this.layout.staging, this.storage, async () => {
       const handle = await openSafeRegularFile(session.tarPath, 'read', this.storage)
       try {
@@ -338,7 +338,7 @@ export class TarSessionStore {
     })
   }
 
-  private async ensureTarLength(session: TarSession): Promise<boolean> {
+  private ensureTarLength(session: TarSession): Promise<boolean> {
     return withSafeDirectoryIdentity(this.layout.staging, this.storage, async () => {
       const handle = await openSafeRegularFile(session.tarPath, 'write', this.storage)
       try {
@@ -621,7 +621,7 @@ export class TarSessionStore {
     await this.writeSession(session)
   }
 
-  async verify(ownerKey: Uint8Array, input: MetadataRecord): Promise<TarSession> {
+  verify(ownerKey: Uint8Array, input: MetadataRecord): Promise<TarSession> {
     return this.run(async () => {
       this.assertReady()
       key(ownerKey, 'owner key')
@@ -765,7 +765,7 @@ export class TarSessionStore {
   }
 
   expire(ttl: number, predicate: (session: TarSession) => boolean = () => true): Promise<number> {
-    return this.run(async () => {
+    return this.run(() => {
       this.assertReady()
       return this.expireUnlocked(ttl, predicate)
     })
@@ -776,8 +776,9 @@ export class TarSessionStore {
   }
 
   close(): Promise<void> {
-    return this.run(async () => {
+    return this.run(() => {
       this.closed = true
+      return Promise.resolve()
     })
   }
 }

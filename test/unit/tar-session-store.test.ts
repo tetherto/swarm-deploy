@@ -436,7 +436,7 @@ test('admission free-space checks include prior TAR peak reservations', async (t
   const peak = metadata.tarSize + metadata.fileSize
   const storage = {
     ...createStorage(),
-    statfs: async () => ({ bavail: peak * 2 + 99, bsize: 1 })
+    statfs: () => Promise.resolve({ bavail: peak * 2 + 99, bsize: 1 })
   }
   const store = new SessionStore({
     layout,

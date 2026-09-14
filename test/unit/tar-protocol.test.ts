@@ -460,7 +460,7 @@ test('direct wire rejects buffered bytes after exact TAR without waiting for EOF
   const socket = readableSocket()
   const reader = new DirectWireReader(socket as never)
   socket.emit('data', b4a.from('ab'))
-  await reader.tar(1, async () => {}, null, 100)
+  await reader.tar(1, () => Promise.resolve(), null, 100)
   await t.exception(reader.requireEnd(null, 100), {
     code: ERRORS.PROTOCOL_INVALID,
     message: 'Trailing bytes after exact TAR payload'
