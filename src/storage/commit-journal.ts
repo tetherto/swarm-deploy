@@ -1,4 +1,6 @@
+import b4a from 'b4a'
 import path from '#path'
+import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { historyName, isReservedHistoryName, validateBasename } from '../files.js'
 import { assertSafeUint } from '../validation.js'
@@ -11,6 +13,14 @@ const REPLACEMENT_COMMIT_VERSION = 2
 const JOURNAL_VERSION = 1
 const REPLACEMENT_JOURNAL_VERSION = 2
 const MAX_COMMIT_METADATA_BYTES = 16 * 1024
+
+function sameTransferId(left: string, right: string): boolean {
+  return (
+    isHex(left) &&
+    isHex(right) &&
+    sodium.sodium_memcmp(b4a.from(left, 'hex'), b4a.from(right, 'hex'))
+  )
+}
 
 /** Ordered v2 transaction boundaries; each one is durable before the next. */
 export const REPLACEMENT_PHASES = [
@@ -215,7 +225,7 @@ function parseReplacementJournal(id: string, journal: Record<string, unknown>): 
     journal.intent !== 'replace' ||
     (journal.state !== 'committing' && journal.state !== 'aborting') ||
     !isReplacementPhase(journal.phase) ||
-    journal.transferId !== id ||
+    !sameTransferId(journal.transferId as string, id) ||
     !isHex(journal.attemptId) ||
     typeof journal.name !== 'string' ||
     journal.publicationName !== `${journal.attemptId}.part`
@@ -231,12 +241,14 @@ function parseReplacementJournal(id: string, journal: Record<string, unknown>): 
   }
   const record = parseRecord(journal.record)
   const oldRecord = parseRecord(journal.oldRecord)
-  if (record.transferId !== id) throw new CorruptJournalError('Commit journal ID mismatch')
+  if (!sameTransferId(record.transferId, id)) {
+    throw new CorruptJournalError('Commit journal ID mismatch')
+  }
   if (record.name !== name) throw new CorruptJournalError('Replacement journal name mismatch')
   if (journal.historyName !== historyName(oldRecord.transferId)) {
     throw new CorruptJournalError('Invalid replacement history name')
   }
-  if (oldRecord.transferId === record.transferId) {
+  if (sameTransferId(oldRecord.transferId, record.transferId)) {
     throw new CorruptJournalError('Replacement journal replaces its own transfer')
   }
   if (
@@ -319,14 +331,16 @@ export async function readCommitJournal(
     if (
       journal.version !== JOURNAL_VERSION ||
       (journal.state !== 'committing' && journal.state !== 'aborting') ||
-      journal.transferId !== id ||
+      !sameTransferId(journal.transferId as string, id) ||
       !isHex(journal.attemptId)
     ) {
       throw new CorruptJournalError('Invalid commit journal')
     }
     const sourceStagingIdentity = parseIdentity(journal.sourceStagingIdentity)
     const record = parseRecord(journal.record)
-    if (record.transferId !== id) throw new CorruptJournalError('Commit journal ID mismatch')
+    if (!sameTransferId(record.transferId, id)) {
+      throw new CorruptJournalError('Commit journal ID mismatch')
+    }
     return {
       version: JOURNAL_VERSION,
       record,

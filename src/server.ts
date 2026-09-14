@@ -1,6 +1,7 @@
 import b4a from 'b4a'
 import events from '#events'
 import fs from '#fs'
+import sodium from 'sodium-native'
 import { createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
 import {
   DirectDhtServer,
@@ -202,7 +203,7 @@ export class Server extends EventEmitter {
   readonly minFreeBytes: number
   readonly maxAge: number | undefined
   readonly maxStorageBytes: number | undefined
-  private readonly allowedKeySnapshot: ReadonlySet<string>
+  private readonly allowedKeySnapshot: readonly Buffer[]
   readonly logger: SafeLogger
   readonly dht: DirectDhtNode | undefined
   readonly dhtFactory: DirectDhtFactory | undefined
@@ -272,7 +273,7 @@ export class Server extends EventEmitter {
     }
     this.maxAge = options.maxAge
     this.maxStorageBytes = options.maxStorageBytes
-    const allow = new Set<string>()
+    const allow: Buffer[] = []
     if (
       !options.allowedKeys ||
       typeof (options.allowedKeys as Iterable<unknown>)[Symbol.iterator] !== 'function'
@@ -280,11 +281,13 @@ export class Server extends EventEmitter {
       throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid allowed keys')
     }
     for (const candidate of options.allowedKeys) {
-      const encoded = b4a.toString(key(candidate, 'allowed key'), 'hex')
-      if (allow.has(encoded)) throw fail(ERRORS.PROTOCOL_INVALID, 'Duplicate allowed key')
-      allow.add(encoded)
+      const candidateKey = key(candidate, 'allowed key')
+      if (allow.some((allowed) => sodium.sodium_memcmp(allowed, candidateKey))) {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'Duplicate allowed key')
+      }
+      allow.push(candidateKey)
     }
-    this.allowedKeySnapshot = allow
+    this.allowedKeySnapshot = allow.map((candidate) => b4a.from(candidate))
     this.dht = options.dht
     this.dhtFactory = options.dhtFactory
     this.storage = options.storage || fs.promises
@@ -304,7 +307,7 @@ export class Server extends EventEmitter {
       !!owner &&
       b4a.isBuffer(owner) &&
       owner.byteLength === 32 &&
-      this.allowedKeySnapshot.has(b4a.toString(owner, 'hex'))
+      this.allowedKeySnapshot.some((allowed) => sodium.sodium_memcmp(owner, allowed))
     )
   }
   private transfer(metadata: { transferId: string; name: string; fileSize: number }) {
@@ -638,9 +641,7 @@ export class Server extends EventEmitter {
       throwIfAborted(this.signal)
       this.transport = new DirectDhtServer({
         keyPair: this.keyPair,
-        allowedClientPublicKeys: [...this.allowedKeySnapshot].map((value) =>
-          b4a.from(value, 'hex')
-        ),
+        allowedClientPublicKeys: this.allowedKeySnapshot.map((value) => b4a.from(value)),
         dht: this.dht,
         dhtFactory: this.dhtFactory,
         onConnection: (socket) => {

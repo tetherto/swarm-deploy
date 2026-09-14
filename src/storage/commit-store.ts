@@ -133,6 +133,13 @@ function assertNotAborted(signal: AbortSignalLike | null): void {
 function toHex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
 }
+function sameHex32(left: string, right: string): boolean {
+  return (
+    /^[0-9a-f]{64}$/.test(left) &&
+    /^[0-9a-f]{64}$/.test(right) &&
+    sodium.sodium_memcmp(b4a.from(left, 'hex'), b4a.from(right, 'hex'))
+  )
+}
 
 function isCommitRecordName(name: unknown): name is string {
   return typeof name === 'string' && /^[0-9a-f]{64}\.json$/.test(name)
@@ -165,7 +172,7 @@ function replacementsEqual(
   if (left === undefined || right === undefined) return left === right
   return (
     left.name === right.name &&
-    left.transferId === right.transferId &&
+    sameHex32(left.transferId, right.transferId) &&
     left.historyName === right.historyName
   )
 }
@@ -175,16 +182,16 @@ function recordsEqual(left: CommitRecord, right: CommitRecord): boolean {
     left.version === right.version &&
     left.name === right.name &&
     left.size === right.size &&
-    left.sha256 === right.sha256 &&
+    sameHex32(left.sha256, right.sha256) &&
     left.committedAt === right.committedAt &&
     left.uploaderFingerprint === right.uploaderFingerprint &&
-    left.transferId === right.transferId &&
+    sameHex32(left.transferId, right.transferId) &&
     replacementsEqual(left.replaces, right.replaces)
   )
 }
 
 function sameContent(left: CommitRecord, right: CommitRecord): boolean {
-  return left.size === right.size && left.sha256 === right.sha256
+  return left.size === right.size && sameHex32(left.sha256, right.sha256)
 }
 
 /** The record the old sidecar becomes once its inode is only reachable as history. */
@@ -203,7 +210,9 @@ function assertSession(session: unknown): asserts session is CommitSession {
   validateBasename(candidate.name)
   assertSafeUint(candidate.size, 'session size')
   assertFixed32(candidate.digest, 'session digest')
-  if (candidate.id !== toHex(candidate.transferId)) throw storageError('Session ID mismatch')
+  if (!sameHex32(candidate.id, toHex(candidate.transferId))) {
+    throw storageError('Session ID mismatch')
+  }
 
   assertSafeUint(candidate.tarSize, 'session TAR size')
   assertFixed32(candidate.tarDigest, 'session TAR digest')
@@ -786,8 +795,8 @@ class CommitStore {
       record &&
       record.name === name &&
       record.size === offer.size &&
-      record.sha256 === toHex(offer.digest) &&
-      record.transferId === id &&
+      sameHex32(record.sha256, toHex(offer.digest)) &&
+      sameHex32(record.transferId, id) &&
       (await this._matchesRecord(finalPath, this.layout.root, record))
     ) {
       return { status: 'ALREADY_COMMITTED', record }
@@ -798,7 +807,10 @@ class CommitStore {
     if (!current || !identitiesEqual(current.identity, fileIdentity(final))) {
       return { status: 'FILE_EXISTS' }
     }
-    if (current.record.size === offer.size && current.record.sha256 === toHex(offer.digest)) {
+    if (
+      current.record.size === offer.size &&
+      sameHex32(current.record.sha256, toHex(offer.digest))
+    ) {
       return { status: 'ALREADY_COMMITTED', record: current.record }
     }
     return { status: 'REPLACEABLE', record: current.record }

@@ -6,6 +6,7 @@ import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
 import { main } from '../../dist/cli.js'
+import { parseAllowlist } from '../../dist/allowlist.js'
 import { keyPairFromSeed } from '../../dist/identity.js'
 import type { ClientOptions, ServerOptions } from '../../dist/index.js'
 import { createTempDir } from '../helpers/files.js'
@@ -27,6 +28,17 @@ function output() {
   }
 }
 
+test('allowlist parsing rejects duplicate canonical keys', (t) => {
+  const key = b4a.toString(CLIENT_KEY, 'hex')
+  let failure: unknown = null
+  try {
+    parseAllowlist(`${key}\n${key}\n`)
+  } catch (error) {
+    failure = error
+  }
+  t.is((failure as Error | null)?.message, 'Duplicate allowlist key')
+})
+
 test('CLI passes --server-key only to the direct client', async (t) => {
   const root = await createTempDir(t)
   const seedPath = path.join(root, 'client.seed')
@@ -39,16 +51,18 @@ test('CLI passes --server-key only to the direct client', async (t) => {
     constructor(value: ClientOptions) {
       options = value
     }
-    async upload() {
-      return {
+    upload() {
+      return Promise.resolve({
         status: 'COMMITTED' as const,
         name: 'artifact.txt',
         size: 19,
         digest: b4a.alloc(32),
         transferId: b4a.alloc(32)
-      }
+      })
     }
-    async close() {}
+    close() {
+      return Promise.resolve()
+    }
   }
   const stdout = output()
   const stderr = output()
@@ -92,11 +106,13 @@ test('CLI snapshots repeatable --allow-key values for the direct server', async 
     constructor(value: ServerOptions) {
       options = value
     }
-    async listen() {
+    listen() {
       queueMicrotask(() => stop?.())
-      return this
+      return Promise.resolve(this)
     }
-    async close() {}
+    close() {
+      return Promise.resolve()
+    }
   }
   const stdout = output()
   const stderr = output()
