@@ -19,6 +19,7 @@
     "test/unit/retention.test.ts",
     "test/unit/tar-protocol.test.ts",
     "test/unit/tar-session-store.test.ts",
+    "test/unit/commit-recovery.test.ts",
     "test/integration/direct-upload.test.ts"
   ]
 }

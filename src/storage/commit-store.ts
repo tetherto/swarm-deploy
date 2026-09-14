@@ -1485,6 +1485,7 @@ class CommitStore {
       }
       await this._removeFile(stagingPath, this.layout.staging)
     }
+    await this._removeFile(this._tarStagingPath(id), this.layout.staging)
   }
 
   /** Proves the verified session and staging an aborted attempt must retain. */
