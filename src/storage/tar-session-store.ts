@@ -10,7 +10,7 @@ import {
 } from '../tar-protocol/controls.js'
 import { validateAndExtractTar } from '../tar-protocol/extract.js'
 import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
-import { atomicWriteRenamed, readJson, writeAtomic } from './atomic-file.js'
+import { atomicWriteRenamed, MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
 import { readCommitJournal } from './commit-journal.js'
 import { assertSafeFile, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout } from './types.js'
@@ -151,6 +151,7 @@ export class TarSessionStore {
   readonly storage: StorageAdapter
   readonly sessions = new Map<string, TarSession>()
   reservedBytes = 0
+  purgedSessions = 0
   initialized = false
   closed = false
   private pending: Promise<unknown> = Promise.resolve()
@@ -199,6 +200,10 @@ export class TarSessionStore {
 
   private filePath(id: string): string {
     return path.join(this.layout.staging, `${id}.part`)
+  }
+
+  private journalPath(id: string): string {
+    return path.join(this.layout.journals, `${id}.json`)
   }
 
   private reserve(session: TarSession): number {
@@ -310,6 +315,12 @@ export class TarSessionStore {
     )
   }
 
+  private async purgeCorruptSession(id: string): Promise<void> {
+    await this.remove(this.tarPath(id), this.layout.staging)
+    await this.remove(this.sessionPath(id), this.layout.sessions)
+    this.purgedSessions++
+  }
+
   private hashPrefix(session: TarSession): Promise<Buffer> {
     return withSafeDirectoryIdentity(this.layout.staging, this.storage, async () => {
       const handle = await openSafeRegularFile(session.tarPath, 'read', this.storage)
@@ -387,15 +398,32 @@ export class TarSessionStore {
       for (const name of names.sort()) {
         if (!/^[0-9a-f]{64}\.json$/.test(name)) throw problem('Invalid session metadata path')
         const id = name.slice(0, -5)
-        const record = await readJson(this.sessionPath(id), this.storage, 16 * 1024)
-        if (record.version === 1) {
-          await this.remove(this.sessionPath(id), this.layout.sessions)
-          const oldStaging = this.filePath(id)
-          const journal = await readCommitJournal(id, this.layout, this.storage)
-          if (!journal) await this.remove(oldStaging, this.layout.staging)
+        let record: Record<string, unknown>
+        try {
+          record = await readJson(this.sessionPath(id), this.storage, 16 * 1024)
+        } catch (error) {
+          if (!(error instanceof MetadataFormatError)) throw error
+          await this.purgeCorruptSession(id)
           continue
         }
-        const session = this.fromDisk(id, record)
+        if (record.version === 1) {
+          await this.remove(this.sessionPath(id), this.layout.sessions)
+          await this.remove(this.tarPath(id), this.layout.staging)
+          await this.remove(this.filePath(id), this.layout.staging)
+          await this.remove(this.journalPath(id), this.layout.journals)
+          this.purgedSessions++
+          continue
+        }
+        let session: TarSession
+        try {
+          session = this.fromDisk(id, record)
+        } catch (error) {
+          if (!(error instanceof SwarmDeployError) || error.code !== ERRORS.PROTOCOL_INVALID) {
+            throw error
+          }
+          await this.purgeCorruptSession(id)
+          continue
+        }
         if (session.state === DELETING) {
           await this.remove(session.tarPath, this.layout.staging)
           await this.remove(this.filePath(id), this.layout.staging)
@@ -714,34 +742,6 @@ export class TarSessionStore {
       if (!session) return false
       await this.removeSession(session)
       return true
-    })
-  }
-
-  deleteByOwner(owner: Uint8Array): Promise<number> {
-    return this.run(async () => {
-      this.assertReady()
-      key(owner, 'owner key')
-      let removed = 0
-      for (const session of [...this.sessions.values()]) {
-        if (!sodium.sodium_memcmp(session.ownerKey, owner)) continue
-        await this.removeSession(session)
-        removed++
-      }
-      return removed
-    })
-  }
-
-  deleteUnauthorized(predicate: (ownerKey: Uint8Array) => boolean): Promise<number> {
-    return this.run(async () => {
-      this.assertReady()
-      if (typeof predicate !== 'function') throw problem('Invalid session authorization predicate')
-      let removed = 0
-      for (const session of [...this.sessions.values()]) {
-        if (predicate(session.ownerKey)) continue
-        await this.removeSession(session)
-        removed++
-      }
-      return removed
     })
   }
 

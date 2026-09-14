@@ -83,6 +83,8 @@ test('CLI passes --server-key only to the direct client', async (t) => {
         seedPath,
         '--server-key',
         b4a.toString(SERVER_KEY, 'hex'),
+        '--idle-timeout',
+        '4321',
         artifact
       ],
       {},
@@ -98,6 +100,7 @@ test('CLI passes --server-key only to the direct client', async (t) => {
   )
   const clientOptions = options as unknown as ClientOptions
   t.alike(clientOptions.serverPublicKey, SERVER_KEY)
+  t.is(clientOptions.idleTimeout, 4321)
   t.absent('topic' in clientOptions)
   t.is(stdout.text(), 'artifact.txt COMMITTED\n')
   t.is(stderr.text(), '')

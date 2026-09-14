@@ -98,6 +98,10 @@ function transferFingerprint(id: string): string {
   return b4a.toString(sodiumSha256(b4a.from(id, 'hex')), 'hex').slice(0, 12)
 }
 
+function pathFingerprint(name: string): string {
+  return b4a.toString(sodiumSha256(b4a.from(name)), 'hex').slice(0, 12)
+}
+
 function report(
   logger: Logger | null,
   level: keyof Logger,
@@ -243,7 +247,9 @@ async function recoverStorage({
   const results: RecoveryResult[] = []
   for (const name of names.sort()) {
     if (!isJournalName(name)) {
-      report(logger, 'warn', 'Ignoring unknown journal path', { name })
+      report(logger, 'warn', 'Ignoring unknown journal path', {
+        fingerprint: pathFingerprint(name)
+      })
       continue
     }
     const id = name.slice(0, -'.json'.length)

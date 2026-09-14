@@ -19,7 +19,8 @@ SERVER_KEY=$(swarm-deploy public-key --seed-file server.seed)
 CLIENT_KEY=$(swarm-deploy public-key --seed-file client.seed)
 swarm-deploy server --seed-file server.seed --storage /srv/artifacts \
   --allow-key "$CLIENT_KEY" --max-file-bytes 1073741824 --max-staging-bytes 2147483648
-swarm-deploy upload --seed-file client.seed --server-key "$SERVER_KEY" ./artifact.tgz
+swarm-deploy upload --seed-file client.seed --server-key "$SERVER_KEY" \
+  --idle-timeout 60000 ./artifact.tgz
 ```
 
 The server prints its full public key and then `ready`. Its `--allow-key`
@@ -57,6 +58,9 @@ await server.close()
 
 Events and logs use short SHA-256 fingerprints only. They never expose seeds,
 secret keys, full remote public keys, TAR contents, or resumable session data.
+The server `listening` event reports its local key fingerprint in the
+`fingerprint` field; the CLI separately prints the full server public key for
+client configuration.
 
 ## Safety
 

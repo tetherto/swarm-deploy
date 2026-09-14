@@ -41,7 +41,7 @@ const USAGE = [
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key --seed-file <seed-file>',
   '  swarm-deploy server --seed-file <seed-file> --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
-  '  swarm-deploy upload --seed-file <seed-file> --server-key <64-lower-hex> <file-or-directory>',
+  '  swarm-deploy upload --seed-file <seed-file> --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <file-or-directory>',
   '',
   'Use --seed-file. A command-specific environment variable is also accepted.'
 ].join('\n')
@@ -645,7 +645,7 @@ function printUploadResult(result: ClientUploadResult, io: CliIo): number {
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, positionals } = parseOptions(
     args,
-    new Set(['--seed-file', '--server-key']),
+    new Set(['--seed-file', '--server-key', '--idle-timeout']),
     new Set(),
     new Set(['--server-key'])
   )
@@ -662,6 +662,10 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   } catch {
     throw usageError('Invalid --server-key')
   }
+  const idleTimeout =
+    options['--idle-timeout'] === undefined
+      ? io.idleTimeout
+      : parsePositiveSafeInteger(options['--idle-timeout'], 'idle-timeout')
 
   const ClientImpl = io.Client || Client
   let client: Client
@@ -671,7 +675,7 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
       serverPublicKey,
       dht: io.dht,
       connectTimeout: io.connectTimeout,
-      idleTimeout: io.idleTimeout,
+      idleTimeout,
       logger: createLogger(io)
     })
   } catch (err) {

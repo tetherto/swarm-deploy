@@ -252,11 +252,18 @@ export class Client extends EventEmitter {
         status: admission.status === 'RESUME' ? 'resumed' : 'accepted',
         offset
       })
+      let progress = offset
       const regenerated = await regenerateTarSuffix(
         manifest,
         offset,
         async (chunk) => {
           await writeTar(socket, chunk, { signal: this.signal, timeout: this.idleTimeout })
+          progress += chunk.byteLength
+          this.emitSafe('progress', {
+            name: manifest.name,
+            bytesSent: progress,
+            totalBytes: manifest.tarSize
+          })
         },
         { signal: this.signal, expectedPrefixSha256: expected }
       )
@@ -270,11 +277,14 @@ export class Client extends EventEmitter {
       if (regenerated.bytesSent !== manifest.tarSize - offset) {
         throw fail(ERRORS.PROTOCOL_INVALID, 'Incomplete deterministic TAR transfer')
       }
-      this.emitSafe('progress', {
-        name: manifest.name,
-        bytesSent: regenerated.bytesSent,
-        totalBytes: manifest.tarSize - offset
-      })
+      if (progress !== manifest.tarSize) {
+        progress = manifest.tarSize
+        this.emitSafe('progress', {
+          name: manifest.name,
+          bytesSent: progress,
+          totalBytes: manifest.tarSize
+        })
+      }
       this.emitSafe('verification', { name: manifest.name, status: 'started' })
       verificationStarted = true
       endWrite(socket)

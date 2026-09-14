@@ -8,6 +8,7 @@ import path from '#path'
 import { Client, Server, keyPairFromSeed } from '../../dist/index.js'
 import {
   buildTarManifest,
+  deterministicTarSize,
   metadataFromManifest,
   regenerateTarSuffix
 } from '../../dist/tar-protocol/manifest.js'
@@ -39,6 +40,7 @@ test('direct server-key upload commits only after an explicit final result', asy
   })
   const serverEvents: string[] = []
   const clientEvents: string[] = []
+  const clientProgress: Array<{ bytesSent: number; totalBytes: number }> = []
   server.on('offer', () => serverEvents.push('offer'))
   server.on('progress', () => {
     if (serverEvents.at(-1) !== 'progress') serverEvents.push('progress')
@@ -49,6 +51,7 @@ test('direct server-key upload commits only after an explicit final result', asy
   client.on('progress', () => {
     if (clientEvents.at(-1) !== 'progress') clientEvents.push('progress')
   })
+  client.on('progress', (event) => clientProgress.push(event))
   client.on('verification', (event) => clientEvents.push(`verification:${event.status}`))
   client.on('commit', (event) => clientEvents.push(`commit:${event.status}`))
   client.on('result', (event) => {
@@ -62,6 +65,7 @@ test('direct server-key upload commits only after an explicit final result', asy
   await server.listen()
   const result = await client.upload(input)
   t.is(result.status, 'COMMITTED')
+  if (!('size' in result)) throw new Error('Expected single upload result')
   t.is(await fs.promises.readFile(path.join(storage, 'artifact.txt'), 'utf8'), 'direct TAR payload')
   t.alike(serverEvents, [
     'offer',
@@ -79,6 +83,58 @@ test('direct server-key upload commits only after an explicit final result', asy
     'commit:succeeded',
     'result'
   ])
+  t.ok(clientProgress.length >= 2)
+  t.ok(clientProgress[0].bytesSent < clientProgress.at(-1)!.bytesSent)
+  t.is(clientProgress.at(-1)!.bytesSent, deterministicTarSize(result.size))
+  t.ok(clientProgress.every((event) => event.totalBytes === deterministicTarSize(result.size)))
+})
+
+test('identical direct upload short-circuits before TAR transfer without history mutation', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 113)
+  const clientSeed = b4a.alloc(32, 114)
+  const storage = await createTempDir(t)
+  const input = path.join(await createTempDir(t), 'identical.txt')
+  await fs.promises.writeFile(input, 'same artifact twice')
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    replaceNames: ['identical.txt'],
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  let connections = 0
+  let clientProgress = 0
+  let serverProgress = 0
+  server.on('connection', () => connections++)
+  client.on('progress', () => clientProgress++)
+  server.on('progress', () => serverProgress++)
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  t.is((await client.upload(input)).status, 'COMMITTED')
+  const before = (await fs.promises.readdir(storage)).sort()
+  clientProgress = 0
+  serverProgress = 0
+
+  t.is((await client.upload(input)).status, 'ALREADY_COMMITTED')
+  t.is(connections, 2)
+  t.is(clientProgress, 0)
+  t.is(serverProgress, 0)
+  t.alike((await fs.promises.readdir(storage)).sort(), before)
+  t.absent(before.some((name) => name.startsWith('history-')))
 })
 
 test('terminal delivery failure never contradicts durable lifecycle events', async (t) => {
@@ -256,8 +312,10 @@ test('a matching durable TAR prefix resumes on one direct connection', async (t)
     dht: testnet.createNode()
   })
   const offers: string[] = []
+  const progress: Array<{ bytesSent: number; totalBytes: number }> = []
   let connections = 0
   server.on('offer', (event) => offers.push(event.status))
+  client.on('progress', (event) => progress.push(event))
   server.on('connection', () => {
     connections++
   })
@@ -283,6 +341,13 @@ test('a matching durable TAR prefix resumes on one direct connection', async (t)
   t.is(result.status, 'COMMITTED')
   t.alike(offers, ['resumed'])
   t.is(connections, 1)
+  t.ok(progress.length >= 2)
+  t.ok(progress.every((event) => event.totalBytes === manifest.tarSize))
+  t.ok(
+    progress.every((event, index) => index === 0 || event.bytesSent > progress[index - 1].bytesSent)
+  )
+  t.ok(progress[0].bytesSent > 512)
+  t.is(progress.at(-1)!.bytesSent, manifest.tarSize)
   t.is(
     await fs.promises.readFile(path.join(storage, 'resume.txt'), 'utf8'),
     'matching direct TAR resume payload'

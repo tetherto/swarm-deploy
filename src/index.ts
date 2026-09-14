@@ -4,12 +4,10 @@ export type {
   BinaryInput,
   Digest,
   FingerprintEvent,
-  Fixed32,
   KeyPair,
   Logger,
   PublicKey,
   PublicKeyInput,
-  ReplacementDetails,
   Seed,
   SeedInput,
   ServerScheduler

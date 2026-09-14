@@ -25,10 +25,15 @@ import {
   regenerateTarSuffix,
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
+import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
+import type { CommitStore } from '../../dist/storage/commit-store.js'
 import { createTempDir } from '../helpers/files.js'
 import { waitFor } from '../helpers/testnet.js'
 
 const EventEmitter = events.EventEmitter
+const sodium = require('sodium-native') as {
+  sodium_memcmp(left: Uint8Array, right: Uint8Array): boolean
+}
 const SERVER_SEED = b4a.alloc(32, 0xb1)
 const CLIENT_SEED = b4a.alloc(32, 0xb2)
 const CLIENT_KEY = keyPairFromSeed(CLIENT_SEED).publicKey
@@ -238,6 +243,25 @@ test('Server rejects excess authenticated sockets and releases connection capaci
   t.alike(opened, [1, 1])
 })
 
+test('Server authorization compares every allowlist entry before accepting', async (t) => {
+  const original = sodium.sodium_memcmp
+  let comparisons = 0
+  sodium.sodium_memcmp = (left, right) => {
+    comparisons++
+    return original(left, right)
+  }
+  try {
+    const { node } = await createServer(t, {
+      allowedKeys: [CLIENT_KEY, b4a.alloc(32, 0xc1), b4a.alloc(32, 0xc2)]
+    })
+    comparisons = 0
+    node.accept(new FakeSocket(CLIENT_KEY))
+    t.is(comparisons, 9)
+  } finally {
+    sodium.sodium_memcmp = original
+  }
+})
+
 test('Server reserves active upload capacity atomically and releases failure and success paths', async (t) => {
   const { server, node } = await createServer(t, {
     maxConnections: 4,
@@ -399,4 +423,80 @@ test('Server close aborts pending reads, clears timers, and waits for listener c
   t.is(socket.listenerCount('end'), 0)
   t.is(intervals.size, 0)
   t.is(node.handleClosed, true)
+})
+
+test('Server close waits for blocked commit work before releasing its storage lock', async (t) => {
+  const storageDir = await createTempDir(t)
+  const { server, node } = await createServer(t, {
+    storageDir,
+    idleTimeout: 10_000
+  })
+  const input = await manifest(t, 'blocked-commit.txt', 'must not publish after close')
+  const commits = (server as unknown as { commits: CommitStore }).commits
+  const originalCommit = commits.commit.bind(commits)
+  let releaseCommit: () => void = () => {}
+  let commitStarted = false
+  const gate = new Promise<void>((resolve) => {
+    releaseCommit = resolve
+  })
+  commits.commit = async (...args: Parameters<CommitStore['commit']>) => {
+    commitStarted = true
+    await gate
+    return originalCommit(...args)
+  }
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(metadataFrame(input.manifest))
+  await waitFor(() => statuses(socket).includes('ACCEPT'))
+  socket.feed(input.tar)
+  socket.finishInput()
+  await waitFor(() => commitStarted)
+
+  let closed = false
+  const closing = server.close().then(() => {
+    closed = true
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.is(closed, false, 'close remains pending while commit owns receive work')
+
+  releaseCommit()
+  await promptly(closing, 'blocked commit shutdown')
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'blocked-commit.txt')), {
+    code: 'ENOENT'
+  })
+
+  const releaseLock = await acquireStorageLock(initLayout(storageDir))
+  await releaseLock()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'blocked-commit.txt')), {
+    code: 'ENOENT'
+  })
+})
+
+test('Server recovery reports the number of purged corrupt TAR sessions', async (t) => {
+  const storageDir = await createTempDir(t)
+  const layout = initLayout(storageDir)
+  await fs.promises.writeFile(path.join(layout.sessions, `${'cd'.repeat(32)}.json`), '{bad')
+  await fs.promises.writeFile(
+    path.join(layout.staging, `${'cd'.repeat(32)}.tar.part`),
+    'discardable'
+  )
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    dht: new FakeServerNode()
+  })
+  t.teardown(() => server.close())
+  const completed: number[] = []
+  server.on('recovery', (event) => {
+    if (event.status === 'completed') completed.push(event.purgedSessions ?? -1)
+  })
+
+  await server.listen()
+  t.alike(completed, [1])
 })

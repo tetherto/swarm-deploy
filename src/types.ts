@@ -21,8 +21,6 @@ export type PublicKeyInput = BinaryInput
 export type Digest = Binary
 /** A SHA-256-derived transfer identifier. */
 export type TransferId = Binary
-/** A fixed-width 32-byte value accepted by protocol transfer-ID helpers. */
-export type Fixed32 = BinaryInput
 
 export interface KeyPair {
   publicKey: PublicKey
@@ -69,14 +67,4 @@ export interface TransferEvent {
 export interface TransferLifecycleEvent extends TransferEvent {
   status: 'started' | 'succeeded' | 'failed'
   reason?: string
-}
-
-/** Metadata describing the managed artifact a successful replacement superseded. */
-export interface ReplacementDetails {
-  /** The configured mutable name the new artifact now occupies. */
-  name: string
-  /** The superseded transfer ID, in canonical lowercase hexadecimal. */
-  transferId: string
-  /** The generated top-level sibling that now holds the superseded artifact. */
-  historyName: string
 }

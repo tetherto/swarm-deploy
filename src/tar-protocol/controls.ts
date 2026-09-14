@@ -1,5 +1,6 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError, type ErrorCode } from '../errors.js'
+import { deterministicTarSize } from './ustar.js'
 
 export const CONTROL_VERSION = 1
 export const MAX_CONTROL_RECORD_BYTES = 4 * 1024
@@ -34,8 +35,6 @@ export type AdmissionRecord =
 export type FinalRecord =
   | { v: typeof CONTROL_VERSION; status: 'COMMITTED' }
   | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode }
-
-type RecordDecoder<T> = (bytes: Uint8Array) => T
 
 function invalid(message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
@@ -79,13 +78,6 @@ function assertName(value: unknown): asserts value is string {
   }
 }
 
-function expectedTarSize(fileSize: number): number {
-  const padding = (512 - (fileSize % 512)) % 512
-  const size = 512 + fileSize + padding + 1024
-  if (!Number.isSafeInteger(size)) throw invalid('Invalid TAR size')
-  return size
-}
-
 function assertStableCode(value: unknown): asserts value is ErrorCode {
   if (typeof value !== 'string' || !STABLE_CODES.has(value)) throw invalid('Invalid error code')
 }
@@ -127,7 +119,7 @@ function validateMetadata(value: unknown): MetadataRecord {
   assertSafeUint(value.fileSize, 'file size')
   assertHex32(value.fileSha256, 'file digest')
   assertSafeUint(value.tarSize, 'TAR size')
-  if (value.tarSize !== expectedTarSize(value.fileSize)) throw invalid('Noncanonical TAR size')
+  if (value.tarSize !== deterministicTarSize(value.fileSize)) throw invalid('Noncanonical TAR size')
   assertHex32(value.tarSha256, 'TAR digest')
   assertHex32(value.transferId, 'transfer ID')
   if (typeof value.reset !== 'boolean') throw invalid('Invalid reset flag')
@@ -204,38 +196,4 @@ export function encodeControlFrame(record: Uint8Array): Buffer {
   frame[3] = record.byteLength & 0xff
   frame.set(record, 4)
   return frame
-}
-
-export class ControlFrameDecoder<T> {
-  private buffered = b4a.alloc(0)
-  private readonly decode: RecordDecoder<T>
-
-  constructor(decode: RecordDecoder<T>) {
-    if (typeof decode !== 'function') throw invalid('Invalid control decoder')
-    this.decode = decode
-  }
-
-  push(chunk: Uint8Array): T[] {
-    if (!b4a.isBuffer(chunk)) throw invalid('Invalid control frame bytes')
-    if (chunk.byteLength > 0) this.buffered = b4a.concat([this.buffered, chunk])
-    const records: T[] = []
-    while (this.buffered.byteLength >= 4) {
-      const length =
-        this.buffered[0] * 0x1000000 +
-        this.buffered[1] * 0x10000 +
-        this.buffered[2] * 0x100 +
-        this.buffered[3]
-      if (length <= 0 || length > MAX_CONTROL_RECORD_BYTES) {
-        throw invalid('Invalid control frame length')
-      }
-      if (this.buffered.byteLength < 4 + length) break
-      records.push(this.decode(this.buffered.subarray(4, 4 + length)))
-      this.buffered = this.buffered.subarray(4 + length)
-    }
-    return records
-  }
-
-  finish(): void {
-    if (this.buffered.byteLength !== 0) throw invalid('Truncated control frame')
-  }
 }

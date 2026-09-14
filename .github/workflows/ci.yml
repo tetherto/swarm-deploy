@@ -20,6 +20,7 @@ jobs:
       - run: npm ci
       - run: npm run build && npm run build:test && npm run test:types
       - run: npm run lint
+      - run: npm run test:property
       - run: npm run test:release-tag
       - uses: holepunchto/actions/setup-bare@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
       - run: bare --version

@@ -476,32 +476,6 @@ class RetentionManager {
     }
   }
 
-  admit(incomingBytes: number): Promise<boolean> {
-    return withRootLease(this.layout.root, () => this._admitUnlocked(incomingBytes))
-  }
-
-  async _admitUnlocked(incomingBytes: number): Promise<boolean> {
-    assertSafeUint(incomingBytes, 'incomingBytes')
-    if (this.maxStorageBytes === undefined) return true
-    if (incomingBytes > this.maxStorageBytes) {
-      throw new SwarmDeployError(
-        ERRORS.FILE_TOO_LARGE,
-        'Incoming artifact exceeds committed storage limit'
-      )
-    }
-    let records
-    try {
-      records = await this.commitStore.list()
-    } catch (err) {
-      throw cleanupError('Unable to inspect committed storage capacity', err)
-    }
-    const total = this._totalSize(records)
-    if (this.cleanupFailure && total > this.maxStorageBytes - incomingBytes) {
-      throw cleanupError('Committed storage cleanup is unhealthy', this.cleanupFailure)
-    }
-    return true
-  }
-
   async _run({ incomingBytes = 0 }: RetentionRunOptions = {}): Promise<{
     expiredSessions: number
     scrubbed: number

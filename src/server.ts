@@ -79,7 +79,7 @@ export interface ServerConnectionEvent extends FingerprintEvent {
   connections: number
 }
 export interface ServerListeningEvent {
-  publicKey: string
+  fingerprint: string
 }
 export interface ServerOfferEvent extends TransferEvent, FingerprintEvent {
   status: 'accepted' | 'resumed' | 'reset' | 'rejected' | 'already-committed'
@@ -217,6 +217,7 @@ export class Server extends EventEmitter {
   private readonly abort = createAbortController()
   private readonly active = new Map<DirectDhtSocket, Active>()
   private readonly activeUploads = new Set<DirectDhtSocket>()
+  private readonly receives = new Set<Promise<void>>()
   private layout: StorageLayout | null = null
   private sessions: SessionStore | null = null
   private commits: CommitStore | null = null
@@ -303,12 +304,12 @@ export class Server extends EventEmitter {
     } catch {}
   }
   private allowed(owner: Uint8Array | null): owner is Buffer {
-    return (
-      !!owner &&
-      b4a.isBuffer(owner) &&
-      owner.byteLength === 32 &&
-      this.allowedKeySnapshot.some((allowed) => sodium.sodium_memcmp(owner, allowed))
-    )
+    if (!owner || !b4a.isBuffer(owner) || owner.byteLength !== 32) return false
+    let accepted = false
+    for (const allowed of this.allowedKeySnapshot) {
+      accepted = sodium.sodium_memcmp(owner, allowed) || accepted
+    }
+    return accepted
   }
   private transfer(metadata: { transferId: string; name: string; fileSize: number }) {
     return {
@@ -616,7 +617,11 @@ export class Server extends EventEmitter {
       this.emitSafe('recovery', {
         status: 'completed',
         journals: recovered.length,
-        purgedSessions: 0
+        purgedSessions: this.sessions.purgedSessions
+      })
+      this.logger.info('Storage recovery completed', {
+        journals: recovered.length,
+        purgedSessions: this.sessions.purgedSessions
       })
       this.retention = new RetentionManager({
         layout: this.layout,
@@ -645,12 +650,17 @@ export class Server extends EventEmitter {
         dht: this.dht,
         dhtFactory: this.dhtFactory,
         onConnection: (socket) => {
-          this.receive(socket).catch(() => {})
+          const receive = this.receive(socket)
+          this.receives.add(receive)
+          const settled = (): void => {
+            this.receives.delete(receive)
+          }
+          receive.then(settled, settled)
         }
       })
       await this.transport.listen()
       this.listening = true
-      this.emitSafe('listening', { publicKey: fingerprint(this.publicKey) })
+      this.emitSafe('listening', { fingerprint: fingerprint(this.publicKey) })
       this.logger.info('Direct DHT server listening', { fingerprint: fingerprint(this.publicKey) })
       return this
     } catch (error) {
@@ -668,9 +678,10 @@ export class Server extends EventEmitter {
         socket.destroy()
       } catch {}
     }
-    this.active.clear()
     await this.transport?.close().catch(() => {})
     this.transport = null
+    await Promise.allSettled([...this.receives])
+    this.active.clear()
     await this.retention?.stop().catch(() => {})
     this.retention = null
     await this.sessions?.close().catch(() => {})

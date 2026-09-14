@@ -14,8 +14,9 @@ import {
   type MetadataRecord
 } from './controls.js'
 import { digestMatches, SodiumSha256 } from './hash.js'
+import { assertUstarFileSize, deterministicTarSize } from './ustar.js'
 
-export const TAR_BLOCK_BYTES = 512
+export { deterministicTarSize, TAR_BLOCK_BYTES } from './ustar.js'
 export const TAR_MODE = 0o644
 export const TAR_UID = 0
 export const TAR_GID = 0
@@ -23,8 +24,6 @@ export const TAR_MTIME_MS = 0
 export const TAR_UNAME = ''
 export const TAR_GNAME = ''
 export const TAR_TRANSFER_DOMAIN = 'swarm-deploy/direct-tar/v1'
-const TAR_END_BYTES = 2 * TAR_BLOCK_BYTES
-const MAX_USTAR_SIZE = 0o77777777777
 const READ_BYTES = 64 * 1024
 
 export interface TarSourceIdentity {
@@ -62,14 +61,7 @@ function invalid(message: string, cause: unknown = null): SwarmDeployError {
 }
 
 function assertSafeSize(size: unknown): asserts size is number {
-  if (
-    typeof size !== 'number' ||
-    !Number.isSafeInteger(size) ||
-    size < 0 ||
-    size > MAX_USTAR_SIZE
-  ) {
-    throw invalid('Invalid deterministic TAR file size')
-  }
+  assertUstarFileSize(size)
 }
 
 function assertClientKey(key: Uint8Array): void {
@@ -273,14 +265,6 @@ export function computeTarTransferId(
   transferField(hash, 'gname', TAR_GNAME)
   transferField(hash, 'pax', 'none')
   return hash.digest()
-}
-
-export function deterministicTarSize(fileSize: number): number {
-  assertSafeSize(fileSize)
-  const padding = (TAR_BLOCK_BYTES - (fileSize % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES
-  const total = TAR_BLOCK_BYTES + fileSize + padding + TAR_END_BYTES
-  if (!Number.isSafeInteger(total)) throw invalid('Invalid deterministic TAR size')
-  return total
 }
 
 export async function buildTarManifest(

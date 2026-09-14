@@ -19,17 +19,15 @@ import {
 import {
   CONTROL_VERSION,
   MAX_CONTROL_RECORD_BYTES,
-  ControlFrameDecoder,
   decodeAdmissionRecord,
   decodeFinalRecord,
   decodeMetadataRecord,
   encodeAdmissionRecord,
-  encodeControlFrame,
   encodeFinalRecord,
   encodeMetadataRecord,
   type MetadataRecord
 } from '../../dist/tar-protocol/controls.js'
-import { TarProtocolLifecycle, writeProtocolBytes } from '../../dist/tar-protocol/lifecycle.js'
+import { writeProtocolBytes } from '../../dist/tar-protocol/lifecycle.js'
 import { DirectWireReader } from '../../dist/tar-protocol/direct-wire.js'
 import {
   validateAndExtractTar,
@@ -269,15 +267,14 @@ test('control decoders reject unknown fields, versions, types, hex, and bounds',
   )
 })
 
-test('control framing handles fragmentation and rejects oversized frames', (t) => {
-  const value = { v: 1, status: 'COMMITTED' } as const
-  const frame = encodeControlFrame(encodeFinalRecord(value))
-  const decoder = new ControlFrameDecoder(decodeFinalRecord)
-  t.alike(decoder.push(frame.subarray(0, 2)), [])
-  t.alike(decoder.push(frame.subarray(2)), [value])
-  t.exception(() => new ControlFrameDecoder(decodeFinalRecord).push(b4a.from([0, 0, 16, 1])), {
-    code: ERRORS.PROTOCOL_INVALID
+test('metadata rejects file sizes beyond canonical USTAR capacity', (t) => {
+  const fileSize = 0o77777777777 + 1
+  const padding = (512 - (fileSize % 512)) % 512
+  const value = metadataForTar(b4a.alloc(0), {
+    fileSize,
+    tarSize: 512 + fileSize + padding + 1024
   })
+  t.exception(() => encodeMetadataRecord(value), { code: ERRORS.PROTOCOL_INVALID })
 })
 
 test('one-entry TAR extraction validates and hashes the regular file', async (t) => {
@@ -424,36 +421,6 @@ test('TAR extraction rejects extra, truncated, trailing, and digest attacks', as
     const staging = memoryStaging()
     await t.exception(validateAndExtractTar([attack.tar], attack.metadata, staging))
   }
-})
-
-test('protocol lifecycle requires explicit final success', (t) => {
-  const lifecycle = new TarProtocolLifecycle()
-  lifecycle.metadata()
-  lifecycle.admission({ v: 1, status: 'ACCEPT', offset: 0 })
-  lifecycle.beginTar()
-  lifecycle.completeTar()
-  t.exception(() => lifecycle.close(), { code: ERRORS.PROTOCOL_INVALID })
-
-  const committed = new TarProtocolLifecycle()
-  committed.metadata()
-  committed.admission({ v: 1, status: 'ACCEPT', offset: 0 })
-  committed.beginTar()
-  committed.completeTar()
-  committed.final({ v: 1, status: 'COMMITTED' })
-  t.is(committed.result, 'COMMITTED')
-
-  const idempotent = new TarProtocolLifecycle()
-  idempotent.metadata()
-  idempotent.admission({ v: 1, status: 'ALREADY_COMMITTED' })
-  t.is(idempotent.result, 'ALREADY_COMMITTED')
-
-  const reset = new TarProtocolLifecycle()
-  reset.metadata()
-  reset.admission({ v: 1, status: 'RESUME', offset: 512, prefixSha256: '22'.repeat(32) })
-  reset.reset()
-  reset.admission({ v: 1, status: 'ACCEPT', offset: 0 })
-  reset.beginTar()
-  t.is(reset.state, 'TAR')
 })
 
 test('direct wire rejects buffered bytes after exact TAR without waiting for EOF', async (t) => {

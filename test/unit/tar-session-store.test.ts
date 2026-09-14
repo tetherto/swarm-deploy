@@ -77,6 +77,126 @@ test('TAR admission reconstructs a durable offset and rehashes its prefix on res
   t.is(restarted.reservedBytes, metadata.tarSize + metadata.fileSize)
 })
 
+test('restart purges malformed TAR session metadata and its discardable TAR staging', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const initial = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await initial.init()
+  await initial.close()
+
+  const id = 'ab'.repeat(32)
+  const metadataPath = path.join(layout.sessions, `${id}.json`)
+  const tarPath = path.join(layout.staging, `${id}.tar.part`)
+  await fs.promises.writeFile(metadataPath, '{malformed')
+  await fs.promises.writeFile(tarPath, 'discardable')
+
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+
+  t.is(restarted.purgedSessions, 1)
+  await t.exception(() => fs.promises.lstat(metadataPath), { code: 'ENOENT' })
+  await t.exception(() => fs.promises.lstat(tarPath), { code: 'ENOENT' })
+})
+
+test('corrupt session recovery preserves journal-owned extracted staging', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const id = 'ef'.repeat(32)
+  const initial = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await initial.init()
+  await initial.close()
+
+  const extractedPath = path.join(layout.staging, `${id}.part`)
+  const contents = b4a.from('journal-owned')
+  await fs.promises.writeFile(extractedPath, contents)
+  const stat = await fs.promises.stat(extractedPath)
+  await fs.promises.writeFile(path.join(layout.sessions, `${id}.json`), '{bad')
+  await fs.promises.writeFile(path.join(layout.staging, `${id}.tar.part`), 'discardable')
+  await fs.promises.writeFile(
+    path.join(layout.journals, `${id}.json`),
+    JSON.stringify({
+      version: 1,
+      state: 'committing',
+      transferId: id,
+      attemptId: '12'.repeat(32),
+      sourceStagingIdentity: { dev: String(stat.dev), ino: String(stat.ino) },
+      record: {
+        version: 1,
+        name: 'journal-owned.bin',
+        size: contents.byteLength,
+        sha256: b4a.toString(sodiumSha256(contents), 'hex'),
+        committedAt: 0,
+        uploaderFingerprint: '34'.repeat(32),
+        transferId: id
+      }
+    })
+  )
+
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  t.alike(await fs.promises.readFile(extractedPath), contents)
+  await t.exception(() => fs.promises.lstat(path.join(layout.staging, `${id}.tar.part`)), {
+    code: 'ENOENT'
+  })
+})
+
+test('restart purges corrupt canonical metadata and reconstructs valid reservations', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const peak = metadata.tarSize + metadata.fileSize
+  const validName = 'remaining.bin'
+  const valid = {
+    ...metadata,
+    name: validName,
+    transferId: b4a.toString(
+      computeTarTransferId(OTHER_OWNER, {
+        name: validName,
+        fileSize: metadata.fileSize,
+        fileSha256: b4a.from(metadata.fileSha256, 'hex'),
+        tarSize: metadata.tarSize,
+        tarSha256: b4a.from(metadata.tarSha256, 'hex')
+      }),
+      'hex'
+    )
+  }
+  const first = new SessionStore({ layout, maxStagingBytes: peak * 2 })
+  await first.init()
+  await first.admit(OWNER, metadata)
+  await first.admit(OTHER_OWNER, valid)
+  await first.close()
+
+  const corruptPath = path.join(layout.sessions, `${metadata.transferId}.json`)
+  const corrupt = JSON.parse(await fs.promises.readFile(corruptPath, 'utf8')) as {
+    partialTar: { path: string }
+  }
+  corrupt.partialTar.path = 'not-canonical.tar.part'
+  await fs.promises.writeFile(corruptPath, JSON.stringify(corrupt))
+
+  const restarted = new SessionStore({ layout, maxStagingBytes: peak * 2 })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+
+  t.is(restarted.purgedSessions, 1)
+  t.is(restarted.reservedBytes, peak)
+  t.is((await restarted.admit(OTHER_OWNER, valid)).status, 'ACCEPT')
+  await t.exception(() => fs.promises.lstat(corruptPath), { code: 'ENOENT' })
+  await t.exception(
+    () => fs.promises.lstat(path.join(layout.staging, `${metadata.transferId}.tar.part`)),
+    { code: 'ENOENT' }
+  )
+})
+
 test('TAR admission rejects owner mismatch and reset durably truncates the admitted archive', async (t) => {
   const { layout, metadata, archive } = await fixture(t)
   const store = new SessionStore({ layout, maxStagingBytes: metadata.tarSize + metadata.fileSize })
@@ -464,7 +584,7 @@ test('admission free-space checks include prior TAR peak reservations', async (t
   await t.exception(() => store.admit(OTHER_OWNER, second), { code: ERRORS.DISK_RESERVE })
 })
 
-test('empty TAR appends and closed cleanup APIs are rejected without TTL progress', async (t) => {
+test('empty TAR appends and closed session reads are rejected without TTL progress', async (t) => {
   const { layout, metadata } = await fixture(t)
   const clock = createClock()
   const store = new SessionStore({
@@ -483,11 +603,9 @@ test('empty TAR appends and closed cleanup APIs are rejected without TTL progres
   await t.exception(() => store.readVerified(b4a.from(metadata.transferId, 'hex')), {
     code: ERRORS.PROTOCOL_INVALID
   })
-  await t.exception(() => store.deleteByOwner(OWNER), { code: ERRORS.PROTOCOL_INVALID })
-  await t.exception(() => store.deleteUnauthorized(() => true), { code: ERRORS.PROTOCOL_INVALID })
 })
 
-test('restart purges legacy staging only when its journal is absent', async (t) => {
+test('restart purges legacy sessions and retires associated journals', async (t) => {
   const { layout, metadata } = await fixture(t)
   const first = new SessionStore({ layout, maxStagingBytes: metadata.tarSize + metadata.fileSize })
   await first.init()
@@ -513,12 +631,18 @@ test('restart purges legacy staging only when its journal is absent', async (t) 
     path.join(layout.journals, `${metadata.transferId}.json`),
     '{not json'
   )
-  const blocked = new SessionStore({
+  const restarted = new SessionStore({
     layout,
     maxStagingBytes: metadata.tarSize + metadata.fileSize
   })
-  await t.exception(() => blocked.init())
-  t.alike(await fs.promises.readFile(legacyStaging), b4a.from('journal-owned?'))
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  t.is(restarted.purgedSessions, 1)
+  await t.exception(() => fs.promises.lstat(legacyStaging), { code: 'ENOENT' })
+  await t.exception(
+    () => fs.promises.lstat(path.join(layout.journals, `${metadata.transferId}.json`)),
+    { code: 'ENOENT' }
+  )
 })
 
 test('corrupt journal retirement removes its file staging but preserves TAR evidence', async (t) => {
