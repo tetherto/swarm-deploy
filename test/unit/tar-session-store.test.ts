@@ -9,7 +9,7 @@ import { ERRORS } from '../../dist/errors.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { SessionStore } from '../../dist/storage/session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
-import { recoverStorage } from '../../dist/storage/recovery.js'
+import { prepareStorageRecovery, recoverStorage } from '../../dist/storage/recovery.js'
 import { historyName } from '../../dist/files.js'
 import {
   buildTarManifest,
@@ -519,6 +519,26 @@ test('restart purges legacy staging only when its journal is absent', async (t) 
   })
   await t.exception(() => blocked.init())
   t.alike(await fs.promises.readFile(legacyStaging), b4a.from('journal-owned?'))
+})
+
+test('corrupt journal retirement removes its file staging but preserves TAR evidence', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const store = new SessionStore({ layout, maxStagingBytes: metadata.tarSize + metadata.fileSize })
+  await store.init()
+  t.teardown(() => store.close())
+  await fs.promises.writeFile(path.join(layout.journals, `${metadata.transferId}.json`), '{corrupt')
+  await fs.promises.writeFile(path.join(layout.staging, `${metadata.transferId}.part`), 'file')
+  const tarPath = path.join(layout.staging, `${metadata.transferId}.tar.part`)
+  await fs.promises.writeFile(tarPath, 'tar')
+
+  t.is(await prepareStorageRecovery({ layout, commitStore: new CommitStore({ layout }) }), 1)
+  await t.exception(
+    () => fs.promises.lstat(path.join(layout.staging, `${metadata.transferId}.part`)),
+    {
+      code: 'ENOENT'
+    }
+  )
+  t.alike(await fs.promises.readFile(tarPath), b4a.from('tar'))
 })
 
 test('deleting TAR sessions finish cleanup durably on restart', async (t) => {
