@@ -47,8 +47,12 @@ interface CommitStore {
     options: { isAuthorized: ((ownerKey: Uint8Array) => boolean) | null }
   ): Promise<RecoveryResult>
   list(): Promise<CommitRecord[]>
+  scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }>
   delete(record: CommitRecord): Promise<boolean>
-  purge(record: CommitRecord): Promise<false | { purged: true; preservedPath: boolean }>
+  purge(
+    record: CommitRecord,
+    options?: { preservePath?: boolean }
+  ): Promise<false | { purged: true; preservedPath: boolean }>
 }
 
 type RecoveryEvent =

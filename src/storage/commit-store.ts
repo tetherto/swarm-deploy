@@ -19,7 +19,7 @@ import {
   protectedDirectories,
   withSafeDirectoryIdentity
 } from './layout.js'
-import { readJson, writeAtomic } from './atomic-file.js'
+import { MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
 import {
   CorruptJournalError,
   JOURNAL_VERSION,
@@ -1658,15 +1658,42 @@ class CommitStore {
     return records
   }
 
-  /**
-   * A replacement makes the old sidecar the history record after its new
-   * current sidecar is durable, so one name can briefly carry two records.
-   * Only a journal-owned duplicate is tolerated, reported at the history name
-   * that recovery will persist; anything else fails closed.
-   */
-  async list(): Promise<CommitRecord[]> {
+  async scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }> {
     await this._assertLayout()
-    const records = await this._scanRecords()
+    const names = await withSafeDirectoryIdentity(this.layout.commits, this.storage, () =>
+      this.storage.readdir(this.layout.commits)
+    )
+    const records: CommitRecord[] = []
+    let deleted = 0
+    for (const filename of names.filter(isCommitRecordName).sort()) {
+      const id = filename.slice(0, -'.json'.length)
+      const recordPath = this._recordPath(id)
+      let record: CommitRecord | null = null
+      let invalid = false
+      try {
+        const parsed = await readJson(recordPath, this.storage, MAX_COMMIT_METADATA_BYTES)
+        try {
+          record = assertRecord(parsed)
+          invalid = record.transferId !== id
+        } catch {
+          invalid = true
+        }
+      } catch (err) {
+        if (!(err instanceof MetadataFormatError)) throw err
+        invalid = true
+      }
+      if (invalid) {
+        await this._removeFile(recordPath, this.layout.commits)
+        deleted++
+        continue
+      }
+      if (!record) throw storageError('Commit record disappeared during scrub')
+      records.push(record)
+    }
+    return { records: await this._resolveRecords(records), deleted }
+  }
+
+  async _resolveRecords(records: CommitRecord[]): Promise<CommitRecord[]> {
     const counts = new Map<string, number>()
     for (const record of records) counts.set(record.name, (counts.get(record.name) ?? 0) + 1)
 
@@ -1693,6 +1720,17 @@ class CommitStore {
       seen.add(record.name)
     }
     return resolved
+  }
+
+  /**
+   * A replacement makes the old sidecar the history record after its new
+   * current sidecar is durable, so one name can briefly carry two records.
+   * Only a journal-owned duplicate is tolerated, reported at the history name
+   * that recovery will persist; anything else fails closed.
+   */
+  async list(): Promise<CommitRecord[]> {
+    await this._assertLayout()
+    return this._resolveRecords(await this._scanRecords())
   }
 
   /**
@@ -1730,12 +1768,29 @@ class CommitStore {
     return true
   }
 
-  async purge(record: CommitRecord): Promise<false | { purged: true; preservedPath: boolean }> {
+  async purge(
+    record: CommitRecord,
+    { preservePath = false }: { preservePath?: boolean } = {}
+  ): Promise<false | { purged: true; preservedPath: boolean }> {
     await this._assertLayout()
     assertRecord(record)
     if (!(await this._storedRecordFor(record))) return false
 
-    const final = await this._removeManagedFinalOrAbsent(record)
+    let final
+    if (preservePath) {
+      let preservedPath = false
+      await withSafeDirectoryIdentity(this.layout.root, this.storage, async () => {
+        try {
+          await this.storage.lstat(this._finalPath(record.name))
+          preservedPath = true
+        } catch (err) {
+          if (!isMissing(err)) throw err
+        }
+      })
+      final = { removed: false, preservedPath }
+    } else {
+      final = await this._removeManagedFinalOrAbsent(record)
+    }
     await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
     return { purged: true, preservedPath: final.preservedPath }
   }

@@ -25,8 +25,12 @@ interface SessionStore {
 interface CommitStore {
   storage?: StorageAdapter
   list(): Promise<CommitRecord[]>
+  scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }>
   delete(record: CommitRecord): Promise<boolean>
-  purge(record: CommitRecord): Promise<false | { purged: true; preservedPath: boolean }>
+  purge(
+    record: CommitRecord,
+    options?: { preservePath?: boolean }
+  ): Promise<false | { purged: true; preservedPath: boolean }>
 }
 
 interface Logger {
@@ -208,13 +212,19 @@ function inspectManagedFinal(
         position += bytes.byteLength
       }
       const after = await handle.stat()
-      if (
-        !after.isFile() ||
-        after.size !== record.size ||
-        !identityMatches(before, after) ||
-        !digestMatches(digest.digest(), b4a.from(record.sha256, 'hex'))
-      ) {
-        return 'DIGEST_INVALID'
+      if (!after.isFile() || after.size !== record.size || !identityMatches(before, after)) {
+        return 'CHANGED'
+      }
+      if (!digestMatches(digest.digest(), b4a.from(record.sha256, 'hex'))) return 'DIGEST_INVALID'
+      let visible
+      try {
+        visible = await storage.lstat(finalPath)
+      } catch (err) {
+        if (isMissing(err)) return 'CHANGED'
+        throw err
+      }
+      if (!visible.isFile() || visible.size !== record.size || !identityMatches(initial, visible)) {
+        return 'CHANGED'
       }
       return 'VALID'
     } finally {
@@ -270,6 +280,7 @@ class RetentionManager {
     if (
       !commitStore ||
       typeof commitStore.list !== 'function' ||
+      typeof commitStore.scrubRecords !== 'function' ||
       typeof commitStore.delete !== 'function' ||
       typeof commitStore.purge !== 'function'
     ) {
@@ -352,7 +363,13 @@ class RetentionManager {
     for (const directory of [this.layout.root, this.layout.internal, this.layout.commits]) {
       await assertSafeDirectory(directory, this.storage)
     }
-    const records = await this.commitStore.list()
+    let scanned
+    try {
+      scanned = await this.commitStore.scrubRecords()
+    } catch (err) {
+      throw cleanupError('Unable to scrub managed commit metadata', err)
+    }
+    const records = scanned.records
     const knownNames = new Set(records.map((record) => record.name))
     const rootNames = await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
       this.storage.readdir(this.layout.root)
@@ -365,7 +382,7 @@ class RetentionManager {
     }
 
     const valid = []
-    let deleted = 0
+    let deleted = scanned.deleted
     for (const record of records) {
       const status = await inspectManagedFinal(record, {
         layout: this.layout,
@@ -378,7 +395,7 @@ class RetentionManager {
       }
       let purged
       try {
-        purged = await this.commitStore.purge(record)
+        purged = await this.commitStore.purge(record, { preservePath: status === 'CHANGED' })
         if (!purged) {
           throw storageError('Managed commit record disappeared during scrub')
         }
