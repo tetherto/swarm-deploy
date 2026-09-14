@@ -12,7 +12,8 @@ children of one directory. Directory children are processed in lexical order;
 each child is an independent upload on a fresh connection. Directories,
 symlinks, nested entries, and unsafe names are rejected or skipped before
 connecting. Names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`;
-`.swarm-deploy` and the server-managed `history-` namespace are reserved.
+names are limited to 100 UTF-8 bytes, and the server-managed `history-`
+namespace is reserved.
 
 The refactor has no peer discovery, topic, Hyperswarm, Protomux channel, chunk
 protocol, chunk hash, bitmap, or multi-file connection.

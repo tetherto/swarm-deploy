@@ -19,12 +19,7 @@ export interface SelectUploadPathsOptions {
 }
 
 export function validateBasename(name: string): string {
-  if (
-    typeof name !== 'string' ||
-    !SAFE_NAME.test(name) ||
-    name === '.swarm-deploy' ||
-    b4a.from(name).byteLength > 100
-  ) {
+  if (typeof name !== 'string' || !SAFE_NAME.test(name) || b4a.from(name).byteLength > 100) {
     throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Invalid filename')
   }
   return name

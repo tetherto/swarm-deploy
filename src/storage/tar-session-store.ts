@@ -321,6 +321,18 @@ export class TarSessionStore {
     this.purgedSessions++
   }
 
+  /** Removes only a regular crash residue and syncs its parent before reporting it purged. */
+  private async purgeSafeResidue(filePath: string, directory: string): Promise<void> {
+    await withSafeDirectoryIdentity(directory, this.storage, async () => {
+      await assertSafeFile(filePath, this.storage)
+      await this.storage.unlink(filePath)
+    })
+    await withSafeDirectoryIdentity(directory, this.storage, () =>
+      syncDirectory(directory, this.storage)
+    )
+    this.purgedSessions++
+  }
+
   private hashPrefix(session: TarSession): Promise<Buffer> {
     return withSafeDirectoryIdentity(this.layout.staging, this.storage, async () => {
       const handle = await openSafeRegularFile(session.tarPath, 'read', this.storage)
@@ -396,7 +408,13 @@ export class TarSessionStore {
       }
       const names = await this.storage.readdir(this.layout.sessions)
       for (const name of names.sort()) {
-        if (!/^[0-9a-f]{64}\.json$/.test(name)) throw problem('Invalid session metadata path')
+        if (!/^[0-9a-f]{64}\.json$/.test(name)) {
+          if (/^\.[0-9a-f]{64}\.json\.[0-9a-f]{32,64}\.tmp$/.test(name)) {
+            await this.purgeSafeResidue(path.join(this.layout.sessions, name), this.layout.sessions)
+            continue
+          }
+          throw problem('Invalid session metadata path')
+        }
         const id = name.slice(0, -5)
         let record: Record<string, unknown>
         try {
@@ -459,10 +477,10 @@ export class TarSessionStore {
         if (staged) {
           const journal = await readCommitJournal(staged[1], this.layout, this.storage)
           if (journal) continue
-          await this.remove(path.join(this.layout.staging, name), this.layout.staging)
+          await this.purgeSafeResidue(path.join(this.layout.staging, name), this.layout.staging)
           continue
         }
-        throw problem('Unknown staging path')
+        await this.purgeSafeResidue(path.join(this.layout.staging, name), this.layout.staging)
       }
       this.initialized = true
     })

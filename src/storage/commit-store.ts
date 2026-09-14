@@ -690,7 +690,7 @@ class CommitStore {
   _reportCleanupPending(record: CommitRecord, err: unknown): void {
     try {
       this.logger?.warn?.('Committed artifact cleanup remains pending', {
-        transferId: record.transferId,
+        fingerprint: record.uploaderFingerprint,
         name: record.name,
         code: errorCode(err),
         reason: err instanceof Error ? err.message : String(err)
@@ -842,26 +842,6 @@ class CommitStore {
     }
   }
 
-  async _inspectJournalPublication(
-    journal: CommitJournal
-  ): Promise<{ final: StorageStat | null; sidecar: CommitRecord | null; committed: boolean }> {
-    const { record, sourceStagingIdentity } = journal
-    const finalPath = this._finalPath(record.name)
-    const final = await this._safeFileOrAbsent(finalPath, this.layout.root)
-    const sidecar = await this._readRecordOrAbsent(this._recordPath(record.transferId))
-    if (
-      final &&
-      (!identitiesEqual(fileIdentity(final), sourceStagingIdentity) ||
-        !(await this._matchesRecord(finalPath, this.layout.root, record)))
-    ) {
-      throw storageError('Final publication does not match commit journal')
-    }
-    if (sidecar && !recordsEqual(sidecar, record)) {
-      throw storageError('Commit sidecar does not match journal')
-    }
-    return { final, sidecar, committed: !!final && !!sidecar }
-  }
-
   async _validateAttemptLeftovers(
     id: string,
     journal: CommitJournal,
@@ -891,23 +871,6 @@ class CommitStore {
       throw storageError('Staging file does not match commit journal')
     }
     return { sessionFile, staging }
-  }
-
-  async _cleanupCommittedAttempt(
-    id: string,
-    journal: CommitJournal,
-    sessionStore: SessionStore
-  ): Promise<{ status: 'COMMITTED'; record: CommitRecord }> {
-    const leftovers = await this._validateAttemptLeftovers(id, journal, sessionStore)
-    if (leftovers.sessionFile) {
-      await this._removeFile(this._sessionPath(id), this.layout.sessions)
-    }
-    if (leftovers.staging) {
-      await this._removeFile(this._stagingPath(id), this.layout.staging)
-    }
-    await this._removeFile(this._tarStagingPath(id), this.layout.staging)
-    await this._discardJournal(id, journal.attemptId)
-    return { status: 'COMMITTED', record: journal.record }
   }
 
   commit(

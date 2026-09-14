@@ -70,7 +70,7 @@ function assertClientKey(key: Uint8Array): void {
 
 function canonicalName(filePath: string): string {
   const name = validateBasename(path.basename(filePath))
-  if (isReservedHistoryName(name) || name === '.swarm-deploy' || b4a.from(name).byteLength > 100) {
+  if (isReservedHistoryName(name)) {
     throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Filename cannot be encoded as USTAR')
   }
   return name

@@ -70,7 +70,6 @@ function assertName(value: unknown): asserts value is string {
   if (
     typeof value !== 'string' ||
     !SAFE_NAME.test(value) ||
-    value === '.swarm-deploy' ||
     value.startsWith(HISTORY_PREFIX) ||
     b4a.from(value).byteLength > 100
   ) {

@@ -104,6 +104,92 @@ test('restart purges malformed TAR session metadata and its discardable TAR stag
   await t.exception(() => fs.promises.lstat(tarPath), { code: 'ENOENT' })
 })
 
+test('restart purges durable atomic session metadata residue', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const initial = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await initial.init()
+  await initial.close()
+
+  const residue = path.join(layout.sessions, `.${'ab'.repeat(32)}.json.${'cd'.repeat(32)}.tmp`)
+  await fs.promises.writeFile(residue, 'incomplete atomic metadata')
+  const events: string[] = []
+  const storage = createStorage({
+    afterOperation(name, target) {
+      if (name === 'unlink' || name === 'sync') events.push(`${name}:${target}`)
+    }
+  })
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize,
+    storage
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+
+  t.is(restarted.purgedSessions, 1)
+  await t.exception(() => fs.promises.lstat(residue), { code: 'ENOENT' })
+  const unlinked = events.indexOf(`unlink:${residue}`)
+  t.ok(unlinked >= 0)
+  t.ok(events.slice(unlinked + 1).includes(`sync:${layout.sessions}`))
+})
+
+test('restart purges unowned regular staging residue', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const initial = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await initial.init()
+  await initial.close()
+
+  const residue = path.join(layout.staging, 'interrupted-extract.tmp')
+  await fs.promises.writeFile(residue, 'incomplete staging')
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+
+  t.is(restarted.purgedSessions, 1)
+  await t.exception(() => fs.promises.lstat(residue), { code: 'ENOENT' })
+})
+
+test('restart fails closed for unknown symlink and non-regular staging entries', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const initial = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await initial.init()
+  await initial.close()
+
+  const target = path.join(layout.root, 'outside-target')
+  const symlink = path.join(layout.staging, 'unknown-link')
+  await fs.promises.writeFile(target, 'must not be followed')
+  await fs.promises.symlink(target, symlink)
+  const withLink = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await t.exception(() => withLink.init(), { code: ERRORS.PROTOCOL_INVALID })
+  t.ok((await fs.promises.lstat(symlink)).isSymbolicLink())
+  t.alike(await fs.promises.readFile(target), b4a.from('must not be followed'))
+
+  await fs.promises.unlink(symlink)
+  const directory = path.join(layout.staging, 'unknown-directory')
+  await fs.promises.mkdir(directory)
+  const withDirectory = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await t.exception(() => withDirectory.init(), { code: ERRORS.PROTOCOL_INVALID })
+  t.ok((await fs.promises.lstat(directory)).isDirectory())
+})
+
 test('corrupt session recovery preserves journal-owned extracted staging', async (t) => {
   const { layout, metadata } = await fixture(t)
   const id = 'ef'.repeat(32)
@@ -419,6 +505,46 @@ test('direct TAR verified staging commits and cleans both staging files', async 
     { code: 'ENOENT' }
   )
   t.is(record.transferId, metadata.transferId)
+})
+
+test('post-commit cleanup warning identifies the uploader fingerprint', async (t) => {
+  const { layout, metadata, archive } = await fixture(t)
+  let failCleanup = true
+  const warnings: Array<{ message: string; details: Record<string, unknown> }> = []
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (failCleanup && name === 'unlink' && target.endsWith('.part')) {
+        failCleanup = false
+        throw new Error('interrupted staging cleanup')
+      }
+    }
+  })
+  const sessions = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize,
+    storage
+  })
+  await sessions.init()
+  t.teardown(() => sessions.close())
+  await sessions.admit(OWNER, metadata)
+  await sessions.append(OWNER, metadata, 0, archive)
+  const record = await new CommitStore({
+    layout,
+    storage,
+    logger: { warn: (message, details) => warnings.push({ message, details }) }
+  }).commit(await sessions.verify(OWNER, metadata))
+
+  t.alike(warnings, [
+    {
+      message: 'Committed artifact cleanup remains pending',
+      details: {
+        fingerprint: record.uploaderFingerprint,
+        name: record.name,
+        code: null,
+        reason: 'interrupted staging cleanup'
+      }
+    }
+  ])
 })
 
 test('direct TAR commits replace mutable files and retain history', async (t) => {
