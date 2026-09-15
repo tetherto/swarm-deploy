@@ -76,12 +76,9 @@ export class DirectWireReader {
     this.wake = null
     wake?.()
   }
-  private async wait(signal: AbortSignalLike | null | undefined, timeout: number): Promise<void> {
-    if (this.available > 0) return
-    if (this.failure) throw this.failure
-    if (this.ended) throw invalid('Truncated direct protocol phase')
-    if (signal?.aborted) throw abortError()
-    await new Promise<void>((resolve, reject) => {
+  /** Resolves on the next socket event: data, end, close, or error. */
+  private awaitEvent(signal: AbortSignalLike | null | undefined, timeout: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       let remove = () => {}
       const timer = setTimeout(
         () =>
@@ -101,6 +98,22 @@ export class DirectWireReader {
       this.wake = () => finish(this.failure)
       this.socket.resume?.()
     })
+  }
+
+  /**
+   * Returns only once at least one byte is buffered.
+   *
+   * The terminal checks are re-evaluated after every wake, not just on entry: a
+   * peer that half-closes mid-phase wakes this with no data, and resolving
+   * there would hand the caller an empty `chunks` array to dereference.
+   */
+  private async wait(signal: AbortSignalLike | null | undefined, timeout: number): Promise<void> {
+    while (this.available === 0) {
+      if (this.failure) throw this.failure
+      if (this.ended) throw invalid('Truncated direct protocol phase')
+      if (signal?.aborted) throw abortError()
+      await this.awaitEvent(signal, timeout)
+    }
   }
   async exact(
     bytes: number,
@@ -157,7 +170,10 @@ export class DirectWireReader {
   async requireEnd(signal: AbortSignalLike | null | undefined, timeout: number): Promise<void> {
     if (this.available !== 0) throw invalid('Trailing bytes after exact TAR payload')
     while (!this.ended && !this.failure) {
-      await this.wait(signal, timeout)
+      if (signal?.aborted) throw abortError()
+      // Waits on the raw event here: reaching end-of-stream is the success
+      // condition for this phase, not a truncation.
+      await this.awaitEvent(signal, timeout)
       if (this.available !== 0) throw invalid('Trailing bytes after exact TAR payload')
     }
     if (this.failure) throw this.failure

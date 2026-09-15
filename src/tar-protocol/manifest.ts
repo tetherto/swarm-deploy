@@ -14,15 +14,27 @@ import {
   type MetadataRecord
 } from './controls.js'
 import { digestMatches, SodiumSha256 } from './hash.js'
-import { assertUstarFileSize, deterministicTarSize } from './ustar.js'
+import {
+  assertUstarFileSize,
+  deterministicTarSize,
+  TAR_GID,
+  TAR_GNAME,
+  TAR_MODE,
+  TAR_MTIME_MS,
+  TAR_UID,
+  TAR_UNAME
+} from './ustar.js'
 
-export { deterministicTarSize, TAR_BLOCK_BYTES } from './ustar.js'
-export const TAR_MODE = 0o644
-export const TAR_UID = 0
-export const TAR_GID = 0
-export const TAR_MTIME_MS = 0
-export const TAR_UNAME = ''
-export const TAR_GNAME = ''
+export {
+  deterministicTarSize,
+  TAR_BLOCK_BYTES,
+  TAR_GID,
+  TAR_GNAME,
+  TAR_MODE,
+  TAR_MTIME_MS,
+  TAR_UID,
+  TAR_UNAME
+} from './ustar.js'
 export const TAR_TRANSFER_DOMAIN = 'swarm-deploy/direct-tar/v1'
 const READ_BYTES = 64 * 1024
 

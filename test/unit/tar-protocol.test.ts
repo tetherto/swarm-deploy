@@ -33,6 +33,15 @@ import {
   validateAndExtractTar,
   type TarExtractionStaging
 } from '../../dist/tar-protocol/extract.js'
+import {
+  canonicalUstarHeader,
+  TAR_GID,
+  TAR_GNAME,
+  TAR_MODE,
+  TAR_MTIME_MS,
+  TAR_UID,
+  TAR_UNAME
+} from '../../dist/tar-protocol/ustar.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createTempDir } from '../helpers/files.js'
 
@@ -573,4 +582,63 @@ test('manifest metadata conversion is exact and reset-aware', async (t) => {
   t.exception(() => assertMetadataTransferId(b4a.alloc(32, 24), metadata), {
     code: ERRORS.PROTOCOL_INVALID
   })
+})
+
+test('canonical USTAR header matches the tar-stream packer byte for byte', async (t) => {
+  // The send path frames with tar-stream while the receive path byte-compares
+  // against canonicalUstarHeader. A one-byte divergence rejects every upload,
+  // so the equivalence is pinned here rather than left to inspection.
+  const cases: Array<{ name: string; size: number }> = [
+    { name: 'a', size: 0 },
+    { name: 'artifact.bin', size: 7 },
+    { name: 'x'.repeat(99), size: 511 },
+    { name: 'x'.repeat(100), size: 512 },
+    { name: 'file-name_1.2.3', size: 8193 },
+    { name: 'z', size: 1024 * 1024 }
+  ]
+  for (const { name, size } of cases) {
+    const packed = (
+      await archive(
+        {
+          name,
+          type: 'file',
+          size,
+          mode: TAR_MODE,
+          uid: TAR_UID,
+          gid: TAR_GID,
+          mtime: new Date(TAR_MTIME_MS),
+          uname: TAR_UNAME,
+          gname: TAR_GNAME,
+          linkname: '',
+          devmajor: 0,
+          devminor: 0,
+          pax: null
+        },
+        b4a.alloc(size)
+      )
+    ).subarray(0, 512)
+    t.alike(canonicalUstarHeader(name, size), packed, `${name.length}ch/${size}B header matches`)
+  }
+})
+
+test('a truncated protocol phase reports a typed error, not a crash', async (t) => {
+  // A peer that half-closes mid-phase wakes the reader with nothing buffered.
+  // Resolving there would hand the caller an empty queue to dereference.
+  for (const prefix of [b4a.from([0, 0]), null]) {
+    const socket = readableSocket()
+    const reader = new DirectWireReader(socket as never)
+    const pending = reader.exact(4, null, 1000)
+    if (prefix) socket.emit('data', prefix)
+    socket.emit('end')
+    await t.exception(pending, { code: ERRORS.PROTOCOL_INVALID })
+  }
+})
+
+test('reaching end of stream still satisfies requireEnd', async (t) => {
+  const socket = readableSocket()
+  const reader = new DirectWireReader(socket as never)
+  const pending = reader.requireEnd(null, 1000)
+  socket.emit('end')
+  await pending
+  t.pass('clean half-close is the success condition for the final phase')
 })

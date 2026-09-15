@@ -1,18 +1,9 @@
 import b4a from 'b4a'
-import { extract, type Header } from 'tar-stream'
 import { throwIfAborted, type AbortSignalLike } from '../abort.js'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { decodeMetadataRecord, encodeMetadataRecord, type MetadataRecord } from './controls.js'
 import { digestMatches, SodiumSha256 } from './hash.js'
-import {
-  TAR_BLOCK_BYTES,
-  TAR_GID,
-  TAR_GNAME,
-  TAR_MODE,
-  TAR_MTIME_MS,
-  TAR_UID,
-  TAR_UNAME
-} from './manifest.js'
+import { canonicalUstarHeader, TAR_BLOCK_BYTES } from './ustar.js'
 
 export interface TarExtractionStaging {
   writeTar(chunk: Uint8Array): void | Promise<void>
@@ -32,69 +23,55 @@ export interface TarExtractionResult {
   tarSha256: Buffer
 }
 
+const EMPTY = b4a.alloc(0)
+
 function invalid(message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
 }
 
-function octal(value: number, digits: number): Buffer {
-  const encoded = value.toString(8)
-  if (encoded.length > digits) throw invalid('Canonical TAR field overflow')
-  return b4a.from(`${'0'.repeat(digits - encoded.length)}${encoded} `)
-}
-
-function setBytes(target: Buffer, offset: number, value: Uint8Array): void {
-  target.set(value, offset)
-}
-
-function canonicalHeader(metadata: MetadataRecord): Buffer {
-  const header = b4a.alloc(TAR_BLOCK_BYTES)
-  setBytes(header, 0, b4a.from(metadata.name))
-  setBytes(header, 100, octal(TAR_MODE, 6))
-  setBytes(header, 108, octal(TAR_UID, 6))
-  setBytes(header, 116, octal(TAR_GID, 6))
-  setBytes(header, 124, octal(metadata.fileSize, 11))
-  setBytes(header, 136, octal(TAR_MTIME_MS / 1000, 11))
-  header[156] = 48
-  setBytes(header, 257, b4a.from([0x75, 0x73, 0x74, 0x61, 0x72, 0]))
-  setBytes(header, 263, b4a.from('00'))
-  if (TAR_UNAME) setBytes(header, 265, b4a.from(TAR_UNAME))
-  if (TAR_GNAME) setBytes(header, 297, b4a.from(TAR_GNAME))
-  setBytes(header, 329, octal(0, 6))
-  setBytes(header, 337, octal(0, 6))
-
-  let checksum = 8 * 32
-  for (let index = 0; index < 148; index++) checksum += header[index]
-  for (let index = 156; index < TAR_BLOCK_BYTES; index++) checksum += header[index]
-  setBytes(header, 148, octal(checksum, 6))
-  return header
-}
-
-class CanonicalTarValidator {
+/**
+ * Validates a deterministic single-entry TAR stream and yields its payload.
+ *
+ * Because every byte outside the payload is fixed by the offered metadata, the
+ * whole stream can be checked by comparison: the header must equal the one
+ * canonical block, and everything after the payload must be zero. A stream that
+ * survives that is, by construction, one entry whose bytes are exactly
+ * `tar[512 .. 512 + fileSize)`, so no TAR parser is needed to extract it.
+ */
+class CanonicalTarReader {
   private readonly metadata: MetadataRecord
   private readonly header: Buffer
   private position = 0
 
   constructor(metadata: MetadataRecord) {
     this.metadata = metadata
-    this.header = canonicalHeader(metadata)
+    this.header = canonicalUstarHeader(metadata.name, metadata.fileSize)
   }
 
-  write(chunk: Uint8Array): void {
-    if (this.position > this.metadata.tarSize - chunk.byteLength) {
+  /** Checks `chunk` in place and returns the slice of it that is file payload. */
+  write(chunk: Uint8Array): Uint8Array {
+    const base = this.position
+    if (base > this.metadata.tarSize - chunk.byteLength) {
       throw invalid('Trailing TAR payload')
     }
+    const contentEnd = TAR_BLOCK_BYTES + this.metadata.fileSize
     for (let index = 0; index < chunk.byteLength; index++) {
-      const absolute = this.position + index
+      const absolute = base + index
       if (absolute < TAR_BLOCK_BYTES) {
         if (chunk[index] !== this.header[absolute]) throw invalid('Noncanonical TAR header')
         continue
       }
-      const contentEnd = TAR_BLOCK_BYTES + this.metadata.fileSize
       if (absolute >= contentEnd && chunk[index] !== 0) {
         throw invalid('Nonzero TAR padding or terminator')
       }
     }
-    this.position += chunk.byteLength
+    this.position = base + chunk.byteLength
+
+    // Payload occupies absolute offsets [512, 512 + fileSize); clip the chunk
+    // to that window and translate back to chunk-relative indices.
+    const start = Math.max(base, TAR_BLOCK_BYTES)
+    const end = Math.min(this.position, contentEnd)
+    return end <= start ? EMPTY : chunk.subarray(start - base, end - base)
   }
 
   finish(): void {
@@ -115,32 +92,6 @@ function assertStaging(staging: TarExtractionStaging): void {
   }
 }
 
-function assertHeader(header: Header, metadata: MetadataRecord): void {
-  if (
-    header.name !== metadata.name ||
-    header.type !== 'file' ||
-    header.size !== metadata.fileSize ||
-    header.mode !== TAR_MODE ||
-    header.uid !== TAR_UID ||
-    header.gid !== TAR_GID ||
-    header.mtime.getTime() !== TAR_MTIME_MS ||
-    header.uname !== TAR_UNAME ||
-    header.gname !== TAR_GNAME ||
-    (header.linkname !== null && header.linkname !== '') ||
-    header.devmajor !== 0 ||
-    header.devminor !== 0 ||
-    header.pax !== null
-  ) {
-    throw invalid('Unexpected TAR entry')
-  }
-}
-
-function waitForDrain(stream: {
-  once(event: 'drain', listener: () => void): unknown
-}): Promise<void> {
-  return new Promise((resolve) => stream.once('drain', resolve))
-}
-
 export async function validateAndExtractTar(
   source: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
   offeredMetadata: MetadataRecord,
@@ -151,58 +102,26 @@ export async function validateAndExtractTar(
   const metadata = decodeMetadataRecord(encodeMetadataRecord(offeredMetadata))
   const expectedFileDigest = b4a.from(metadata.fileSha256, 'hex')
   const expectedTarDigest = b4a.from(metadata.tarSha256, 'hex')
-  const structure = new CanonicalTarValidator(metadata)
+  const reader = new CanonicalTarReader(metadata)
   const fileHash = new SodiumSha256()
   const tarHash = new SodiumSha256()
-  const unpack = extract()
-  let entries = 0
   let extractedBytes = 0
-  let extractionFailure: unknown = null
-  let extractionTask: Promise<void> = Promise.resolve()
-
-  const finished = new Promise<void>((resolve, reject) => {
-    unpack.once('finish', resolve)
-    unpack.once('error', reject)
-  })
-
-  unpack.on('entry', (header, stream, next) => {
-    entries++
-    extractionTask = (async () => {
-      assertHeader(header, metadata)
-      for await (const value of stream) {
-        throwIfAborted(signal)
-        if (!b4a.isBuffer(value)) throw invalid('Invalid TAR entry bytes')
-        extractedBytes += value.byteLength
-        if (extractedBytes > metadata.fileSize) throw invalid('Oversized TAR entry')
-        fileHash.update(value)
-        await staging.writeFile(value)
-      }
-    })()
-    extractionTask.then(
-      () => next(),
-      (error) => {
-        extractionFailure = error
-        next(error instanceof Error ? error : invalid('TAR extraction failed', error))
-      }
-    )
-  })
 
   try {
     throwIfAborted(signal)
     for await (const value of source) {
       throwIfAborted(signal)
       if (!b4a.isBuffer(value)) throw invalid('Invalid TAR source bytes')
-      structure.write(value)
+      const payload = reader.write(value)
       tarHash.update(value)
       await staging.writeTar(value)
-      if (!unpack.write(value)) await waitForDrain(unpack)
+      if (payload.byteLength > 0) {
+        extractedBytes += payload.byteLength
+        fileHash.update(payload)
+        await staging.writeFile(payload)
+      }
     }
-    structure.finish()
-    unpack.end(b4a.alloc(0))
-    await finished
-    await extractionTask
-    if (extractionFailure) throw extractionFailure
-    if (entries !== 1) throw invalid('TAR must contain exactly one entry')
+    reader.finish()
     if (extractedBytes !== metadata.fileSize) throw invalid('Extracted file size mismatch')
 
     const fileSha256 = fileHash.digest()
@@ -221,8 +140,6 @@ export async function validateAndExtractTar(
       tarSha256
     }
   } catch (error) {
-    unpack.destroy(error instanceof Error ? error : invalid('TAR extraction failed', error))
-    await finished.catch(() => {})
     await Promise.resolve(staging.abort(error)).catch(() => {})
     if (error instanceof SwarmDeployError) throw error
     throw invalid('TAR extraction failed', error)
