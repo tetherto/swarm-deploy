@@ -14,6 +14,7 @@ import {
 } from '../../dist/tar-protocol/manifest.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
 import { createTempDir } from '../helpers/files.js'
+import { createStorage } from '../helpers/storage.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 
 test('direct server-key upload commits only after an explicit final result', async (t) => {
@@ -351,5 +352,58 @@ test('a matching durable TAR prefix resumes on one direct connection', async (t)
   t.is(
     await fs.promises.readFile(path.join(storage, 'resume.txt'), 'utf8'),
     'matching direct TAR resume payload'
+  )
+})
+
+test('a committed upload still reports success when session cleanup fails', async (t) => {
+  // Retiring the session happens after the artifact is durably published.
+  // Failing there must not turn a completed commit into a client-visible
+  // failure; the residue is purged on the next start instead.
+  const testnet = await createLocalTestnet(t)
+  const storageDir = await createTempDir(t)
+  const input = path.join(await createTempDir(t), 'artifact.txt')
+  await fs.promises.writeFile(input, 'cleanup failure payload')
+
+  let blockRetire = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (blockRetire && name === 'unlink' && target.endsWith('.tar.part')) {
+        throw Object.assign(new Error('EIO: simulated cleanup failure'), { code: 'EIO' })
+      }
+    }
+  })
+
+  const serverSeed = b4a.alloc(32, 71)
+  const clientSeed = b4a.alloc(32, 72)
+  const server = new Server({
+    seed: serverSeed,
+    storageDir,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 8192,
+    minFreeBytes: 0,
+    dht: testnet.createNode(),
+    storage
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  blockRetire = true
+  const result = await client.upload(input)
+
+  t.is(result.status, 'COMMITTED', 'the client is told the truth about its commit')
+  t.is(
+    await fs.promises.readFile(path.join(storageDir, 'artifact.txt'), 'utf8'),
+    'cleanup failure payload',
+    'the artifact is published'
   )
 })

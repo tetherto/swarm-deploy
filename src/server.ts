@@ -457,7 +457,7 @@ export class Server extends EventEmitter {
           status: 'succeeded'
         })
         commitSucceeded = true
-        await this.sessions.retireCommitted(b4a.from(metadata.transferId, 'hex'))
+        await this.retireQuietly(b4a.from(metadata.transferId, 'hex'), owner)
         await writeFinal(
           socket,
           { v: 1, status: 'COMMITTED' },
@@ -525,7 +525,7 @@ export class Server extends EventEmitter {
         status: 'succeeded'
       })
       commitSucceeded = true
-      await this.sessions.retireCommitted(verified.transferId)
+      await this.retireQuietly(verified.transferId, owner)
       await writeFinal(
         socket,
         { v: 1, status: 'COMMITTED' },
@@ -575,6 +575,25 @@ export class Server extends EventEmitter {
     } finally {
       this.activeUploads.delete(socket)
       reader.closeReader()
+    }
+  }
+
+  /**
+   * Retires a committed session without letting cleanup undo a durable commit.
+   *
+   * The artifact is already published at this point, so a failure to unlink the
+   * session leaves recoverable residue that `init()` purges on the next start.
+   * Propagating it here would abort before the terminal record and tell the
+   * client its upload failed after it had in fact succeeded.
+   */
+  private async retireQuietly(transferId: Uint8Array, owner: Uint8Array | null): Promise<void> {
+    try {
+      await this.sessions!.retireCommitted(transferId)
+    } catch (error) {
+      this.logger.warn('Committed session cleanup failed', {
+        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        reason: codeOf(error)
+      })
     }
   }
 
