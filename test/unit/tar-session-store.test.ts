@@ -852,3 +852,105 @@ test('TAR sessions reserve peak staging across restart and expire only while ina
   t.is(store.reservedBytes, 0)
   await store.close()
 })
+
+test('a session whose staging cannot be unlinked never strands its reservation', async (t) => {
+  // Reservation accounting must stay equal to the sum over live sessions. A
+  // failed unlink previously skipped the decrement, so the capacity stayed
+  // spent and the name stayed permanently busy.
+  const { layout, metadata, archive } = await fixture(t)
+  const reservation = metadata.tarSize + metadata.fileSize
+  let blockUnlink = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (blockUnlink && name === 'unlink' && target.endsWith('.tar.part')) {
+        throw Object.assign(new Error('EIO: simulated unlink failure'), { code: 'EIO' })
+      }
+    }
+  })
+  const store = new SessionStore({ layout, maxStagingBytes: reservation * 4, storage })
+  await store.init()
+  t.teardown(() => store.close())
+
+  await store.admit(OWNER, metadata)
+  await store.append(OWNER, metadata, 0, archive.subarray(0, 600))
+  t.is(store.reservedBytes, reservation, 'reservation is held while the session lives')
+
+  blockUnlink = true
+  await t.exception(store.delete(b4a.from(metadata.transferId, 'hex')))
+  blockUnlink = false
+
+  t.is(store.reservedBytes, 0, 'reservation is released even though the unlink failed')
+  t.is(store.sessions.size, 0, 'session is dropped from the in-memory authority')
+})
+
+test('an unremovable expired session does not deny later admissions', async (t) => {
+  // admit() sweeps expired sessions on every offer, so one session that cannot
+  // be cleaned up must not take the whole upload path down with it.
+  const clock = createClock()
+  const { layout, metadata, archive } = await fixture(t)
+  const reservation = metadata.tarSize + metadata.fileSize
+  let blockUnlink = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (blockUnlink && name === 'unlink' && target.endsWith('.tar.part')) {
+        throw Object.assign(new Error('EIO: simulated unlink failure'), { code: 'EIO' })
+      }
+    }
+  })
+  const store = new SessionStore({
+    layout,
+    maxStagingBytes: reservation * 4,
+    resumeTtl: 1000,
+    clock,
+    storage
+  })
+  await store.init()
+  t.teardown(() => store.close())
+
+  await store.admit(OWNER, metadata)
+  await store.append(OWNER, metadata, 0, archive.subarray(0, 600))
+
+  blockUnlink = true
+  clock.advance(5000)
+
+  // The expired session is swept during this admission; its failure is counted
+  // rather than propagated, so the offer itself still succeeds.
+  const second = await fixture(t, 'a different payload entirely')
+  const admission = await store.admit(OWNER, second.metadata)
+  t.is(admission.status, 'ACCEPT', 'a later offer is still admitted')
+  t.is(store.strandedSessions, 1, 'the failure is observable')
+  t.absent(store.sessions.has(metadata.transferId), 'the stranded session is not retained')
+  t.is(
+    store.reservedBytes,
+    second.metadata.tarSize + second.metadata.fileSize,
+    'only the live session holds a reservation'
+  )
+})
+
+test('a non-regular staging path fails with a typed error, not a null dereference', async (t) => {
+  // assertSafeFile reports an unsafe path with a null cause. The ENOENT
+  // tolerance check used to read `.code` straight off that cause, turning a
+  // recoverable protocol error into an unhandled TypeError.
+  const { layout, metadata } = await fixture(t)
+  const store = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize
+  })
+  await store.init()
+  t.teardown(() => store.close())
+  await store.admit(OWNER, metadata)
+
+  const tarPath = path.join(layout.staging, `${metadata.transferId}.tar.part`)
+  await fs.promises.unlink(tarPath)
+  await fs.promises.mkdir(tarPath)
+
+  let failure: unknown = null
+  try {
+    await store.delete(b4a.from(metadata.transferId, 'hex'))
+  } catch (error: unknown) {
+    failure = error
+  }
+  t.ok(failure, 'the unsafe path is rejected')
+  t.absent(failure instanceof TypeError, 'the guard does not dereference a null cause')
+  t.is((failure as { code?: string }).code, ERRORS.PROTOCOL_INVALID, 'the error stays typed')
+})

@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { isMissing } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
 import sodium from 'sodium-native'
@@ -152,6 +153,8 @@ export class TarSessionStore {
   readonly sessions = new Map<string, TarSession>()
   reservedBytes = 0
   purgedSessions = 0
+  /** Sessions dropped from memory whose staging files could not be unlinked. */
+  strandedSessions = 0
   initialized = false
   closed = false
   private pending: Promise<unknown> = Promise.resolve()
@@ -298,14 +301,10 @@ export class TarSessionStore {
       try {
         await assertSafeFile(filePath, this.storage)
       } catch (error: unknown) {
-        if (
-          typeof error === 'object' &&
-          error !== null &&
-          'cause' in error &&
-          (error.cause as { code?: string }).code === 'ENOENT'
-        ) {
-          return
-        }
+        // `assertSafeFile` also throws for a path that exists but is not a
+        // regular file, and those errors carry a null cause; `isMissing`
+        // absorbs that rather than dereferencing it.
+        if (isMissing(error)) return
         throw error
       }
       await this.storage.unlink(filePath)
@@ -741,15 +740,26 @@ export class TarSessionStore {
     })
   }
 
+  /**
+   * Drops a session from the in-memory authority exactly once.
+   *
+   * `reservedBytes` must always equal the sum of `reserve()` over `sessions`,
+   * so the bookkeeping runs in a `finally`: a failed unlink would otherwise
+   * strand the reservation for the lifetime of the process, and leave the name
+   * permanently colliding in `admit()`. Any file that survives the failure is a
+   * crash residue, which `init()` purges on the next start.
+   */
   private async removeSession(session: TarSession): Promise<void> {
     session.state = DELETING
     session.updatedAt = this.clock.now()
-    await this.writeSession(session)
-    await this.remove(session.tarPath, this.layout.staging)
-    await this.remove(this.filePath(session.id), this.layout.staging)
-    await this.remove(this.sessionPath(session.id), this.layout.sessions)
-    this.sessions.delete(session.id)
-    this.reservedBytes -= this.reserve(session)
+    try {
+      await this.writeSession(session)
+      await this.remove(session.tarPath, this.layout.staging)
+      await this.remove(this.filePath(session.id), this.layout.staging)
+      await this.remove(this.sessionPath(session.id), this.layout.sessions)
+    } finally {
+      if (this.sessions.delete(session.id)) this.reservedBytes -= this.reserve(session)
+    }
   }
 
   delete(transferId: Uint8Array): Promise<boolean> {
@@ -763,11 +773,20 @@ export class TarSessionStore {
     })
   }
 
+  /**
+   * Sweeps expired sessions without letting one failure abort the rest.
+   *
+   * `admit()` runs this opportunistically on every offer, so a single session
+   * whose files cannot be unlinked must not deny service to every later
+   * upload. Failures are counted in `strandedSessions` and reported to the
+   * explicit `expire()` caller, which asked for the sweep and can act on it.
+   */
   private async expireUnlocked(
     ttl: number,
     predicate: (session: TarSession) => boolean = () => true
-  ): Promise<number> {
+  ): Promise<{ removed: number; failure: unknown }> {
     let removed = 0
+    let failure: unknown = null
     for (const session of [...this.sessions.values()]) {
       if (
         this.clock.now() - session.updatedAt <= ttl ||
@@ -776,16 +795,23 @@ export class TarSessionStore {
       ) {
         continue
       }
-      await this.removeSession(session)
-      removed++
+      try {
+        await this.removeSession(session)
+        removed++
+      } catch (error) {
+        this.strandedSessions++
+        if (failure === null) failure = error
+      }
     }
-    return removed
+    return { removed, failure }
   }
 
   expire(ttl: number, predicate: (session: TarSession) => boolean = () => true): Promise<number> {
-    return this.run(() => {
+    return this.run(async () => {
       this.assertReady()
-      return this.expireUnlocked(ttl, predicate)
+      const { removed, failure } = await this.expireUnlocked(ttl, predicate)
+      if (failure !== null) throw failure
+      return removed
     })
   }
 
