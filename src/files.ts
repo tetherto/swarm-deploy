@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { errorCode } from './error-code.js'
 import fs from '#fs'
 import path from '#path'
 import { throwIfAborted } from './abort.js'
@@ -70,11 +71,6 @@ export function validateReplaceNames(values?: Iterable<string>): Set<string> {
 type SelectedEntry = { kind: 'selected'; name: string }
 type SkippedEntry = { kind: 'skipped'; reason: SkippedUploadReason }
 type ClassifiedEntry = SelectedEntry | SkippedEntry
-
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
-}
 
 function classifyEntry(entryPath: string, stat: fs.Stats): ClassifiedEntry {
   if (stat.isSymbolicLink()) {

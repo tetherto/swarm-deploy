@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { errorCode, isMissing } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS, SwarmDeployError } from '../errors.js'
@@ -101,11 +102,6 @@ interface RetentionManagerOptions {
   onEvent?: ((event: RetentionEvent) => void) | null
 }
 
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -116,16 +112,6 @@ function storageError(message: string, cause: unknown | null = null): SwarmDeplo
 
 function cleanupError(message: string, cause: unknown | null = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.CLEANUP_FAILED, message, cause)
-}
-
-function isMissing(error: unknown): boolean {
-  if (errorCode(error) === 'ENOENT') return true
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'cause' in error &&
-    errorCode(error.cause) === 'ENOENT'
-  )
 }
 
 function assertPositiveSafeUint(value: unknown, name: string): asserts value is number {

@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { errorCode } from '../error-code.js'
 import fs from '#fs'
 import os from '#os'
 import path from '#path'
@@ -19,11 +20,6 @@ interface LockOwner {
   pid: number
   startedAt: number
   token: string
-}
-
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
 }
 
 function storageError(message: string, cause: unknown | null = null): SwarmDeployError {

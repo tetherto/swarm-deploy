@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { errorCode } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
 import sodium from 'sodium-native'
@@ -49,11 +50,6 @@ function randomSuffix(): string {
   const bytes = b4a.allocUnsafe(16)
   sodium.randombytes_buf(bytes)
   return b4a.toString(bytes, 'hex')
-}
-
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
 }
 
 async function assertRegularOrAbsent(filePath: string, storage: StorageAdapter): Promise<void> {

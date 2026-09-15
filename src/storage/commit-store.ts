@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { errorCode, isMissing } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
 import sodium from 'sodium-native'
@@ -109,11 +110,6 @@ type ReplacementPlan =
   | { mode: 'idempotent'; record: CommitRecord }
   | { mode: 'replace'; oldRecord: CommitRecord; finalIdentity: FileIdentity }
 
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
-}
-
 function storageError(message: string, cause: unknown | null = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
 }
@@ -143,16 +139,6 @@ function sameHex32(left: string, right: string): boolean {
 
 function isCommitRecordName(name: unknown): name is string {
   return typeof name === 'string' && /^[0-9a-f]{64}\.json$/.test(name)
-}
-
-function isMissing(error: unknown): boolean {
-  if (errorCode(error) === 'ENOENT') return true
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'cause' in error &&
-    errorCode(error.cause) === 'ENOENT'
-  )
 }
 
 function attemptId(): string {

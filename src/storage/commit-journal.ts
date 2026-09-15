@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { isMissing } from '../error-code.js'
 import path from '#path'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
@@ -56,21 +57,6 @@ function storageError(message: string, cause: unknown | null = null): SwarmDeplo
 
 export function isHex(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
-}
-
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
-}
-
-function isMissing(error: unknown): boolean {
-  if (errorCode(error) === 'ENOENT') return true
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'cause' in error &&
-    errorCode(error.cause) === 'ENOENT'
-  )
 }
 
 function identityValue(value: unknown): string {

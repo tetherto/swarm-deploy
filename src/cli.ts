@@ -1,4 +1,5 @@
 import b4a from 'b4a'
+import { errorCode } from './error-code.js'
 import fs from '#fs'
 import os from '#os'
 import path from '#path'
@@ -70,11 +71,6 @@ function basenameOf(value: unknown): string {
   } catch {
     return String(value)
   }
-}
-
-function errorCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined
-  return typeof error.code === 'string' ? error.code : undefined
 }
 
 function isRuntime(value: unknown): boolean {
