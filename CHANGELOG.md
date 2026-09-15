@@ -16,3 +16,11 @@ All notable changes to this package are documented here.
 - Require an explicit terminal result; EOF and close are not success.
 - Keep recovery logs on 12-character transfer fingerprints and narrow the supported root API to Client/Server usage.
 - Pin the release publish action to the reviewed immutable Holepunch actions revision.
+- Release a session's staging reservation even when its files cannot be unlinked, so a failed cleanup no longer exhausts staging capacity or leaves the name permanently busy.
+- Keep expired-session sweeps from aborting on the first failure, so one unremovable session no longer rejects every later upload; the count is exposed as `strandedSessions`.
+- Report a peer that half-closes mid-phase as a typed `PROTOCOL_INVALID` truncation instead of an untyped runtime error.
+- Report an unsafe staging path as a typed error instead of dereferencing a null error cause.
+- Validate received archives against the canonical framing directly and take the payload by offset, removing the redundant second parse and its unreachable entry checks.
+- Consolidate the canonical USTAR constants, header, and size math into one module, with a test pinning the header against the packer.
+- Keep a failed post-commit session cleanup from reporting a durably committed upload as a failure.
+- Share one null-safe error-code helper instead of seven private copies.

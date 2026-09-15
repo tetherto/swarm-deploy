@@ -72,8 +72,9 @@ One connection carries exactly one file and follows this sequence:
    offset. If it does not match, the client requests `RESET`; the server
    truncates and synchronizes the staged TAR, then replies `ACCEPT` at zero.
 6. The server acknowledges transport completion, validates the exact TAR
-   length and TAR SHA-256, extracts and validates the one permitted entry, and
-   commits it using the storage protocol below.
+   length and TAR SHA-256, checks the stream against the one permitted
+   canonical framing and takes its payload by offset, and commits it using the
+   storage protocol below.
 7. The server sends one explicit terminal result (`COMMITTED`,
    `ALREADY_COMMITTED`, or a stable error) before either peer closes.
 
@@ -97,13 +98,23 @@ USTAR subset with:
 - canonical octal fields, checksum, zero padding, and two 512-byte end blocks.
 
 The implementation rejects any archive whose byte length differs from the
-deterministic length derived from the file size. Extraction accepts exactly
-one regular entry with the offered name and size, rejects trailing entries or
-non-canonical headers, and computes the extracted file SHA-256 while writing.
-The extracted size and digest must equal the metadata before commit.
+deterministic length derived from the file size.
 
-`tar-stream` supplies streaming packing and extraction, but these canonical
-rules, byte counts, and validation are Swarm Deploy protocol requirements.
+Because every byte outside the payload is fixed by the offered metadata,
+extraction is a comparison rather than a parse. The receiver derives the one
+canonical 512-byte header from `(name, size)`, requires the stream to match it
+exactly, requires every byte after the payload to be zero, and requires the
+total length to equal the deterministic length. A stream that satisfies those
+checks is by construction a single regular entry whose contents are exactly
+`tar[512 .. 512 + size)`, so the payload is taken by offset. Any deviation —
+a second entry, a non-canonical or non-file header, PAX or GNU extensions,
+trailing bytes, or truncation — fails one of those checks. The extracted size
+and digest must equal the metadata before commit.
+
+`tar-stream` supplies streaming packing on the send path. The receive path
+depends on no TAR parser; these canonical rules, byte counts, and validation
+are Swarm Deploy protocol requirements. The two must agree byte for byte, and
+a test pins the canonical header against the packer's output.
 
 ### Resume state
 
