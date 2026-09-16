@@ -55,6 +55,33 @@ async function fixture(
   }
 }
 
+async function additionalFixture(
+  layout: ReturnType<typeof initLayout>,
+  owner: Buffer,
+  name: string,
+  content: string
+): Promise<{
+  metadata: ReturnType<typeof metadataFromManifest>
+  archive: Buffer
+}> {
+  const sourceDirectory = path.join(layout.root, `source-${name}`)
+  await fs.promises.mkdir(sourceDirectory)
+  const source = path.join(sourceDirectory, name)
+  await fs.promises.writeFile(source, content)
+  const manifest = await buildTarManifest(source, owner)
+  return { metadata: metadataFromManifest(manifest), archive: await tar(manifest) }
+}
+
+function promptly<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<T>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 250)
+    })
+  ]).finally(() => clearTimeout(timer))
+}
+
 test('TAR admission reconstructs a durable offset and rehashes its prefix on restart', async (t) => {
   const { layout, metadata, archive } = await fixture(t)
   const first = new SessionStore({ layout, maxStagingBytes: metadata.tarSize + metadata.fileSize })
@@ -476,6 +503,181 @@ test('complete TAR extraction creates journal-ready verified file staging', asyn
     b4a.from('TAR offset storage payload')
   )
   t.is((await store.readVerified(b4a.from(metadata.transferId, 'hex'))).tarSize, metadata.tarSize)
+})
+
+test('verification does not block unrelated sessions and rejects same-session mutation', async (t) => {
+  const first = await fixture(t, 'verification A payload')
+  const second = await additionalFixture(
+    first.layout,
+    OTHER_OWNER,
+    'verification-b.bin',
+    'verification B payload'
+  )
+  let verificationStarted: () => void = () => {}
+  let releaseVerification: () => void = () => {}
+  const started = new Promise<void>((resolve) => {
+    verificationStarted = resolve
+  })
+  const gate = new Promise<void>((resolve) => {
+    releaseVerification = resolve
+  })
+  let blocked = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (!blocked && name === 'read' && target.endsWith(`${first.metadata.transferId}.tar.part`)) {
+        blocked = true
+        verificationStarted()
+        return gate
+      }
+    }
+  })
+  const store = new SessionStore({
+    layout: first.layout,
+    maxStagingBytes:
+      first.metadata.tarSize +
+      first.metadata.fileSize +
+      second.metadata.tarSize +
+      second.metadata.fileSize,
+    storage
+  })
+  await store.init()
+  await store.admit(OWNER, first.metadata)
+  await store.append(OWNER, first.metadata, 0, first.archive)
+
+  const verification = store.verify(OWNER, first.metadata)
+  await started
+  try {
+    t.alike(await promptly(store.admit(OTHER_OWNER, second.metadata), 'session B admission'), {
+      status: 'ACCEPT',
+      offset: 0
+    })
+    t.is(
+      await promptly(
+        store.append(OTHER_OWNER, second.metadata, 0, second.archive.subarray(0, 512)),
+        'session B append'
+      ),
+      512
+    )
+    await t.exception(
+      promptly(store.admit(OWNER, { ...first.metadata, reset: true }), 'session A reset rejection'),
+      { code: ERRORS.FILE_BUSY }
+    )
+    await t.exception(
+      promptly(
+        store.append(OWNER, first.metadata, first.metadata.tarSize, b4a.alloc(1)),
+        'session A append rejection'
+      ),
+      { code: ERRORS.FILE_BUSY }
+    )
+    await t.exception(
+      promptly(
+        store.delete(b4a.from(first.metadata.transferId, 'hex')),
+        'session A delete rejection'
+      ),
+      { code: ERRORS.FILE_BUSY }
+    )
+    t.is(
+      await promptly(
+        store.expire(0, (session) => session.id === first.metadata.transferId),
+        'verification-safe expiry'
+      ),
+      0
+    )
+
+    let closed = false
+    const closing = store.close().then(() => {
+      closed = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    t.is(closed, false, 'close waits for in-flight verification')
+    releaseVerification()
+    t.is((await verification).state, 'verified')
+    await promptly(closing, 'session store close')
+  } finally {
+    releaseVerification()
+    await Promise.allSettled([verification])
+    await store.close()
+  }
+})
+
+test('failed verification clears extracted staging and permits a clean retry', async (t) => {
+  const { layout, metadata, archive } = await fixture(t)
+  const store = new SessionStore({ layout, maxStagingBytes: metadata.tarSize + metadata.fileSize })
+  await store.init()
+  t.teardown(() => store.close())
+  const corrupt = b4a.from(archive)
+  corrupt[512] ^= 0xff
+  await store.admit(OWNER, metadata)
+  await store.append(OWNER, metadata, 0, corrupt)
+
+  await t.exception(store.verify(OWNER, metadata), { code: ERRORS.CHECKSUM_MISMATCH })
+  await t.exception(
+    () => fs.promises.lstat(path.join(layout.staging, `${metadata.transferId}.part`)),
+    { code: 'ENOENT' }
+  )
+  const reset = await store.admit(OWNER, { ...metadata, reset: true })
+  t.alike(reset, { status: 'ACCEPT', offset: 0 })
+  await store.append(OWNER, metadata, 0, archive)
+  t.is((await store.verify(OWNER, metadata)).state, 'verified')
+})
+
+test('verification cleanup failure durably quarantines residue until restart', async (t) => {
+  const { layout, metadata, archive } = await fixture(t)
+  const extractedPath = path.join(layout.staging, `${metadata.transferId}.part`)
+  const cleanupFailure = new Error('injected extracted staging cleanup failure')
+  let failCleanup = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (failCleanup && name === 'unlink' && target === extractedPath) throw cleanupFailure
+    }
+  })
+  const store = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize,
+    storage
+  })
+  await store.init()
+  const corrupt = b4a.from(archive)
+  corrupt[512] ^= 0xff
+  await store.admit(OWNER, metadata)
+  await store.append(OWNER, metadata, 0, corrupt)
+
+  failCleanup = true
+  let failure: unknown = null
+  try {
+    await store.verify(OWNER, metadata)
+  } catch (error) {
+    failure = error
+  }
+  t.is((failure as { cause?: { code?: string } }).cause?.code, ERRORS.CHECKSUM_MISMATCH)
+  t.is((failure as { cleanupCause?: unknown }).cleanupCause, cleanupFailure)
+  await t.exception(store.admit(OWNER, metadata), { code: ERRORS.FILE_BUSY })
+  await t.exception(store.admit(OWNER, { ...metadata, reset: true }), { code: ERRORS.FILE_BUSY })
+  await t.exception(store.append(OWNER, metadata, metadata.tarSize, b4a.alloc(1)), {
+    code: ERRORS.FILE_BUSY
+  })
+  await t.exception(store.delete(b4a.from(metadata.transferId, 'hex')), {
+    code: ERRORS.FILE_BUSY
+  })
+  await store.close()
+
+  failCleanup = false
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: metadata.tarSize + metadata.fileSize,
+    storage
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  t.is(restarted.reservedBytes, 0)
+  for (const residue of [
+    extractedPath,
+    path.join(layout.staging, `${metadata.transferId}.tar.part`),
+    path.join(layout.sessions, `${metadata.transferId}.json`)
+  ]) {
+    await t.exception(() => fs.promises.lstat(residue), { code: 'ENOENT' })
+  }
+  t.alike(await restarted.admit(OWNER, metadata), { status: 'ACCEPT', offset: 0 })
 })
 
 test('direct TAR verified staging commits and cleans both staging files', async (t) => {

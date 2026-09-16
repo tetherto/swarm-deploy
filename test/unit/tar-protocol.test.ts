@@ -225,6 +225,28 @@ test('TAR regeneration detects a changed source and closes its descriptor', asyn
   t.pass('source descriptor was closed')
 })
 
+test('TAR regeneration settles when a backpressured consumer fails', async (t) => {
+  const dir = await createTempDir(t)
+  const file = path.join(dir, 'large.bin')
+  await fs.promises.writeFile(file, b4a.alloc(256 * 1024, 7))
+  const manifest = await buildTarManifest(file, CLIENT_KEY)
+  const consumerFailure = new Error('consumer write failed')
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const outcome = await Promise.race([
+    regenerateTarSuffix(manifest, 0, () => Promise.reject(consumerFailure)).then(
+      () => ({ status: 'resolved' as const, error: null }),
+      (error: unknown) => ({ status: 'rejected' as const, error })
+    ),
+    new Promise<{ status: 'timed-out'; error: null }>((resolve) => {
+      timer = setTimeout(() => resolve({ status: 'timed-out', error: null }), 250)
+    })
+  ]).finally(() => clearTimeout(timer))
+
+  t.is(outcome.status, 'rejected')
+  t.is(outcome.error, consumerFailure)
+})
+
 test('bounded control records round-trip exact strict schemas', (t) => {
   const metadata = metadataForTar(b4a.alloc(deterministicTarSize(7)))
   t.alike(decodeMetadataRecord(encodeMetadataRecord(metadata)), metadata)

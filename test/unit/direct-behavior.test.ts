@@ -27,6 +27,7 @@ import {
 } from '../../dist/tar-protocol/manifest.js'
 import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
 import type { CommitStore } from '../../dist/storage/commit-store.js'
+import type { SessionStore } from '../../dist/storage/session-store.js'
 import { createTempDir } from '../helpers/files.js'
 import { waitFor } from '../helpers/testnet.js'
 
@@ -168,7 +169,7 @@ function statuses(socket: FakeSocket): string[] {
 async function manifest(
   t: Assert,
   name: string,
-  contents = name
+  contents: string | Uint8Array = name
 ): Promise<{
   manifest: TarManifest
   tar: Buffer
@@ -306,6 +307,122 @@ test('Server reserves active upload capacity atomically and releases failure and
   afterSuccess.feed(metadataFrame(second.manifest))
   await waitFor(() => statuses(afterSuccess).includes('ACCEPT'))
   t.is(decodeAdmissionRecord(afterSuccess.writes[0].subarray(4)).status, 'ACCEPT')
+})
+
+test('Server batches tiny TAR fragments into bounded durable appends', async (t) => {
+  const batchBytes = 1024 * 1024
+  const complete = await manifest(t, 'batched.bin', b4a.alloc(2 * batchBytes + 123, 0x5a))
+  const resumed = await manifest(t, 'resumed.bin', b4a.alloc(2 * batchBytes + 321, 0x4c))
+  const interrupted = await manifest(t, 'interrupted.bin', b4a.alloc(batchBytes, 0x6b))
+  const { server, node } = await createServer(t, {
+    maxFileBytes: 3 * batchBytes,
+    maxStagingBytes: 8 * batchBytes,
+    idleTimeout: 10_000
+  })
+  const sessions = (server as unknown as { sessions: SessionStore }).sessions
+  const originalAppend = sessions.append.bind(sessions)
+  const appends: Array<{ offset: number; bytes: Buffer }> = []
+  sessions.append = (...args: Parameters<SessionStore['append']>) => {
+    appends.push({ offset: args[2], bytes: b4a.from(args[3]) })
+    return originalAppend(...args)
+  }
+  const progress: number[] = []
+  server.on('progress', (event) => progress.push(event.bytesReceived))
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(metadataFrame(complete.manifest))
+  await waitFor(() => statuses(socket).includes('ACCEPT'))
+  for (let offset = 0; offset < complete.tar.byteLength; offset += 257) {
+    socket.feed(complete.tar.subarray(offset, offset + 257))
+  }
+  socket.finishInput()
+  await waitFor(() => statuses(socket).includes('COMMITTED'))
+
+  const expectedCalls = Math.ceil(complete.tar.byteLength / batchBytes)
+  t.is(appends.length, expectedCalls)
+  t.alike(
+    appends.map(({ offset }) => offset),
+    Array.from({ length: expectedCalls }, (_value, index) => index * batchBytes)
+  )
+  t.alike(
+    appends.map(({ bytes }) => bytes.byteLength),
+    [
+      ...Array(expectedCalls - 1).fill(batchBytes),
+      complete.tar.byteLength - (expectedCalls - 1) * batchBytes
+    ]
+  )
+  t.alike(
+    progress,
+    appends.map(({ offset, bytes }) => offset + bytes.byteLength)
+  )
+  t.is(progress.at(-1), complete.tar.byteLength)
+  t.alike(b4a.concat(appends.map(({ bytes }) => bytes)), complete.tar)
+
+  const resumeOffset = 12_345
+  await sessions.admit(CLIENT_KEY, metadataFromManifest(resumed.manifest))
+  await sessions.append(
+    CLIENT_KEY,
+    metadataFromManifest(resumed.manifest),
+    0,
+    resumed.tar.subarray(0, resumeOffset)
+  )
+  appends.length = 0
+  progress.length = 0
+  const resumedSocket = new FakeSocket(CLIENT_KEY)
+  node.accept(resumedSocket)
+  resumedSocket.feed(metadataFrame(resumed.manifest))
+  await waitFor(() => statuses(resumedSocket).includes('RESUME'))
+  const resumeAdmission = decodeAdmissionRecord(resumedSocket.writes[0].subarray(4))
+  if (resumeAdmission.status !== 'RESUME') throw new Error('Expected resumed admission')
+  t.is(resumeAdmission.offset, resumeOffset)
+  for (let offset = resumeOffset; offset < resumed.tar.byteLength; offset += 263) {
+    resumedSocket.feed(resumed.tar.subarray(offset, offset + 263))
+  }
+  resumedSocket.finishInput()
+  await waitFor(() => statuses(resumedSocket).includes('COMMITTED'))
+
+  const suffixBytes = resumed.tar.byteLength - resumeOffset
+  const expectedResumeCalls = Math.ceil(suffixBytes / batchBytes)
+  t.alike(
+    appends.map(({ offset }) => offset),
+    Array.from(
+      { length: expectedResumeCalls },
+      (_value, index) => resumeOffset + index * batchBytes
+    )
+  )
+  t.alike(
+    appends.map(({ bytes }) => bytes.byteLength),
+    [
+      ...Array(expectedResumeCalls - 1).fill(batchBytes),
+      suffixBytes - (expectedResumeCalls - 1) * batchBytes
+    ]
+  )
+  t.alike(b4a.concat(appends.map(({ bytes }) => bytes)), resumed.tar.subarray(resumeOffset))
+  t.alike(
+    progress,
+    appends.map(({ offset, bytes }) => offset + bytes.byteLength)
+  )
+  t.is(progress.at(-1), resumed.tar.byteLength)
+
+  appends.length = 0
+  progress.length = 0
+  const failures: string[] = []
+  server.on('failure', (event) => failures.push(event.reason))
+  const disconnected = new FakeSocket(CLIENT_KEY)
+  node.accept(disconnected)
+  disconnected.feed(metadataFrame(interrupted.manifest))
+  await waitFor(() => statuses(disconnected).includes('ACCEPT'))
+  disconnected.feed(interrupted.tar.subarray(0, batchBytes - 1))
+  disconnected.destroy()
+  await waitFor(() => failures.length === 1)
+
+  t.alike(appends, [])
+  t.alike(progress, [])
+  t.alike(await sessions.admit(CLIENT_KEY, metadataFromManifest(interrupted.manifest)), {
+    status: 'ACCEPT',
+    offset: 0
+  })
 })
 
 test('Server applies the inactivity timeout independently to metadata and TAR phases', async (t) => {

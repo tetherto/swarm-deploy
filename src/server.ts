@@ -49,6 +49,7 @@ const DEFAULT_MIN_FREE_BYTES = 1024 * 1024 * 1024
 const MAX_CONNECTIONS = 1024
 const MAX_ACTIVE_UPLOADS = 1024
 const FINGERPRINT_LENGTH = 12
+const TAR_DURABILITY_BATCH_BYTES = 1024 * 1024
 
 export type ServerLogger = Logger
 export type AllowlistKey = PublicKeyInput | string
@@ -485,20 +486,42 @@ export class Server extends EventEmitter {
         offset: admission.offset
       })
       let offset = admission.offset
+      const batch = b4a.allocUnsafe(TAR_DURABILITY_BATCH_BYTES)
+      let bufferedBytes = 0
+      const append = async (chunk: Buffer): Promise<void> => {
+        offset = await this.sessions!.append(owner, metadata, offset, chunk)
+        this.emitSafe('progress', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          bytesReceived: offset,
+          totalBytes: metadata.tarSize
+        })
+      }
+      const flush = async (): Promise<void> => {
+        if (bufferedBytes === 0) return
+        const bytes = batch.subarray(0, bufferedBytes)
+        await append(bytes)
+        bufferedBytes = 0
+      }
       await reader.tar(
         metadata.tarSize - offset,
         async (chunk) => {
-          offset = await this.sessions!.append(owner, metadata, offset, chunk)
-          this.emitSafe('progress', {
-            ...event,
-            fingerprint: fingerprint(owner),
-            bytesReceived: offset,
-            totalBytes: metadata.tarSize
-          })
+          let position = 0
+          while (position < chunk.byteLength) {
+            const take = Math.min(
+              TAR_DURABILITY_BATCH_BYTES - bufferedBytes,
+              chunk.byteLength - position
+            )
+            batch.set(chunk.subarray(position, position + take), bufferedBytes)
+            bufferedBytes += take
+            position += take
+            if (bufferedBytes === TAR_DURABILITY_BATCH_BYTES) await flush()
+          }
         },
         this.signal,
         this.idleTimeout
       )
+      await flush()
       await reader.requireEnd(this.signal, this.idleTimeout)
       this.emitSafe('verification', {
         ...event,

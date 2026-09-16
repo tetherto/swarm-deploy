@@ -51,9 +51,8 @@ function octal(value: number, digits: number): Buffer {
 /**
  * Builds the single canonical USTAR header block for `name`/`fileSize`.
  *
- * The send path frames with `tar-stream`'s packer while the receive path
- * byte-compares against this, so the two must agree exactly. That equivalence
- * is pinned by a test rather than left to inspection.
+ * Both the send path and receive validator use this exact block. A test also
+ * pins it byte-for-byte against tar-stream's portable USTAR representation.
  */
 export function canonicalUstarHeader(name: string, fileSize: number): Buffer {
   assertUstarFileSize(fileSize)

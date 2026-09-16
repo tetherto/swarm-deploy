@@ -2,7 +2,6 @@ import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
 import sodium from 'sodium-native'
-import { pack, type Header } from 'tar-stream'
 import { throwIfAborted, type AbortSignalLike } from '../abort.js'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { isReservedHistoryName, validateBasename } from '../files.js'
@@ -16,7 +15,9 @@ import {
 import { digestMatches, SodiumSha256 } from './hash.js'
 import {
   assertUstarFileSize,
+  canonicalUstarHeader,
   deterministicTarSize,
+  TAR_BLOCK_BYTES,
   TAR_GID,
   TAR_GNAME,
   TAR_MODE,
@@ -133,30 +134,6 @@ async function openStableSource(
   }
 }
 
-function canonicalHeader(name: string, size: number): Partial<Header> & Pick<Header, 'name'> {
-  return {
-    name,
-    type: 'file',
-    size,
-    mode: TAR_MODE,
-    uid: TAR_UID,
-    gid: TAR_GID,
-    mtime: new Date(TAR_MTIME_MS),
-    uname: TAR_UNAME,
-    gname: TAR_GNAME,
-    linkname: '',
-    devmajor: 0,
-    devminor: 0,
-    pax: null
-  }
-}
-
-function waitForDrain(stream: {
-  once(event: 'drain', listener: () => void): unknown
-}): Promise<void> {
-  return new Promise((resolve) => stream.once('drain', resolve))
-}
-
 async function* generateTar(
   handle: fs.promises.FileHandle,
   name: string,
@@ -164,53 +141,24 @@ async function* generateTar(
   fileHash: SodiumSha256,
   signal: AbortSignalLike | null | undefined
 ): AsyncGenerator<Buffer> {
-  const archive = pack()
-  let entryDoneResolve: () => void = () => {}
-  let entryDoneReject: (error: unknown) => void = () => {}
-  const entryDone = new Promise<void>((resolve, reject) => {
-    entryDoneResolve = resolve
-    entryDoneReject = reject
-  })
-  const entry = archive.entry(canonicalHeader(name, size), (error) => {
-    if (error) entryDoneReject(error)
-    else entryDoneResolve()
-  })
-  const producer = (async () => {
-    try {
-      let position = 0
-      while (position < size) {
-        throwIfAborted(signal)
-        const chunk = b4a.alloc(Math.min(READ_BYTES, size - position))
-        const read = await handle.read(chunk, 0, chunk.byteLength, position)
-        const count = typeof read === 'number' ? read : read.bytesRead
-        if (count !== chunk.byteLength) {
-          throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Source file was truncated')
-        }
-        fileHash.update(chunk)
-        position += count
-        if (!entry.write(chunk)) await waitForDrain(entry)
-      }
-      entry.end(b4a.alloc(0))
-      await entryDone
-      archive.finalize()
-    } catch (error) {
-      archive.destroy(error instanceof Error ? error : invalid('TAR generation failed', error))
-      throw error
+  throwIfAborted(signal)
+  yield canonicalUstarHeader(name, size)
+  let position = 0
+  while (position < size) {
+    throwIfAborted(signal)
+    const chunk = b4a.alloc(Math.min(READ_BYTES, size - position))
+    const read = await handle.read(chunk, 0, chunk.byteLength, position)
+    const count = typeof read === 'number' ? read : read.bytesRead
+    if (count !== chunk.byteLength) {
+      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Source file was truncated')
     }
-  })()
-
-  let completed = false
-  try {
-    for await (const value of archive) {
-      if (!b4a.isBuffer(value)) throw invalid('Invalid TAR stream chunk')
-      yield b4a.from(value)
-    }
-    await producer
-    completed = true
-  } finally {
-    if (!completed) archive.destroy()
-    await producer.catch(() => {})
+    fileHash.update(chunk)
+    position += count
+    yield chunk
   }
+  const padding = (TAR_BLOCK_BYTES - (size % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES
+  if (padding > 0) yield b4a.alloc(padding)
+  yield b4a.alloc(2 * TAR_BLOCK_BYTES)
 }
 
 async function assertSourceFinal(

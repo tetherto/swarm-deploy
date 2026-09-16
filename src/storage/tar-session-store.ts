@@ -157,9 +157,13 @@ export class TarSessionStore {
   strandedSessions = 0
   initialized = false
   closed = false
+  private closing = false
   private pending: Promise<unknown> = Promise.resolve()
+  private closePromise: Promise<void> | null = null
+  private readonly verifying = new Set<string>()
+  private readonly verificationTasks = new Set<Promise<unknown>>()
 
-  private run<T>(operation: () => Promise<T>): Promise<T> {
+  private run<T>(operation: () => Promise<T> | T): Promise<T> {
     const result = this.pending.then(operation, operation)
     this.pending = result.catch(() => {})
     return result
@@ -214,7 +218,9 @@ export class TarSessionStore {
   }
 
   private assertReady(): void {
-    if (!this.initialized || this.closed) throw problem('Session store is not available')
+    if (!this.initialized || this.closing || this.closed) {
+      throw problem('Session store is not available')
+    }
   }
 
   private metadata(metadata: MetadataRecord): MetadataRecord {
@@ -501,7 +507,12 @@ export class TarSessionStore {
             'Transfer ID belongs to different immutable metadata'
           )
         }
-        if (session.state === DELETING) throw problem('TAR session is quarantined')
+        if (this.verifying.has(id)) {
+          throw new SwarmDeployError(ERRORS.FILE_BUSY, 'TAR session is being verified')
+        }
+        if (session.state === DELETING) {
+          throw new SwarmDeployError(ERRORS.FILE_BUSY, 'TAR session is quarantined')
+        }
         if (session.state === VERIFIED) {
           if (metadata.reset) throw problem('Cannot reset verified TAR session')
           return { status: 'VERIFIED' }
@@ -571,6 +582,12 @@ export class TarSessionStore {
       const session = this.sessions.get(metadata.transferId)
       if (!session || !sameMetadata(session, metadata, ownerKey)) {
         throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Unknown or mismatched TAR session')
+      }
+      if (this.verifying.has(session.id)) {
+        throw new SwarmDeployError(ERRORS.FILE_BUSY, 'TAR session is being verified')
+      }
+      if (session.state === DELETING) {
+        throw new SwarmDeployError(ERRORS.FILE_BUSY, 'TAR session is quarantined')
       }
       if (session.state !== RECEIVING) throw problem('Cannot append to verified TAR session')
       if (
@@ -666,16 +683,46 @@ export class TarSessionStore {
     await this.writeSession(session)
   }
 
+  private async quarantineVerificationFailure(
+    session: TarSession,
+    cause: unknown,
+    cleanupCause: unknown
+  ): Promise<never> {
+    const failure = Object.assign(problem('TAR verification cleanup failed', cause), {
+      cleanupCause
+    })
+    try {
+      await this.run(async () => {
+        session.state = DELETING
+        session.updatedAt = this.clock.now()
+        await this.writeSession(session)
+      })
+    } catch (quarantineCause) {
+      throw Object.assign(failure, { quarantineCause })
+    }
+    throw failure
+  }
+
   verify(ownerKey: Uint8Array, input: MetadataRecord): Promise<TarSession> {
-    return this.run(async () => {
-      this.assertReady()
-      key(ownerKey, 'owner key')
-      const metadata = this.metadata(input)
-      const session = this.sessions.get(metadata.transferId)
-      if (!session || session.state !== RECEIVING || !sameMetadata(session, metadata, ownerKey)) {
-        throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Unknown or mismatched TAR session')
-      }
-      if (session.partialTarSize !== session.tarSize) throw problem('TAR transfer is incomplete')
+    const task = (async (): Promise<TarSession> => {
+      const prepared = await this.run(() => {
+        this.assertReady()
+        key(ownerKey, 'owner key')
+        const metadata = this.metadata(input)
+        const session = this.sessions.get(metadata.transferId)
+        if (
+          !session ||
+          session.state !== RECEIVING ||
+          !sameMetadata(session, metadata, ownerKey) ||
+          this.verifying.has(session.id)
+        ) {
+          throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Unknown or mismatched TAR session')
+        }
+        if (session.partialTarSize !== session.tarSize) throw problem('TAR transfer is incomplete')
+        this.verifying.add(session.id)
+        return { metadata, session }
+      })
+      const { metadata, session } = prepared
       let file: StorageFileHandle | null = null
       let fileOffset = 0
       try {
@@ -701,15 +748,50 @@ export class TarSessionStore {
         await withSafeDirectoryIdentity(this.layout.staging, this.storage, () =>
           syncDirectory(this.layout.staging, this.storage)
         )
-        session.state = VERIFIED
-        session.updatedAt = this.clock.now()
-        await this.writeSession(session)
+        await this.run(async () => {
+          if (
+            this.sessions.get(session.id) !== session ||
+            session.state !== RECEIVING ||
+            !this.verifying.has(session.id)
+          ) {
+            throw new SwarmDeployError(ERRORS.FILE_BUSY, 'TAR session changed during verification')
+          }
+          const previousUpdatedAt = session.updatedAt
+          session.state = VERIFIED
+          session.updatedAt = this.clock.now()
+          try {
+            await this.writeSession(session)
+          } catch (error) {
+            if (!atomicWriteRenamed(error)) {
+              session.state = RECEIVING
+              session.updatedAt = previousUpdatedAt
+            }
+            throw error
+          }
+        })
         return session
       } catch (error) {
         if (file) await file.close().catch(() => {})
+        if (session.state !== VERIFIED) {
+          try {
+            await this.remove(this.filePath(session.id), this.layout.staging)
+          } catch (cleanupCause) {
+            await this.quarantineVerificationFailure(session, error, cleanupCause)
+          }
+        }
         throw error
+      } finally {
+        await this.run(() => {
+          this.verifying.delete(session.id)
+        })
       }
-    })
+    })()
+    this.verificationTasks.add(task)
+    const settled = (): void => {
+      this.verificationTasks.delete(task)
+    }
+    task.then(settled, settled)
+    return task
   }
 
   private async *readTar(session: TarSession): AsyncGenerator<Buffer> {
@@ -766,8 +848,15 @@ export class TarSessionStore {
     return this.run(async () => {
       this.assertReady()
       key(transferId, 'transfer ID')
-      const session = this.sessions.get(hex(transferId))
+      const id = hex(transferId)
+      const session = this.sessions.get(id)
       if (!session) return false
+      if (this.verifying.has(id)) {
+        throw new SwarmDeployError(ERRORS.FILE_BUSY, 'TAR session is being verified')
+      }
+      if (session.state === DELETING) {
+        throw new SwarmDeployError(ERRORS.FILE_BUSY, 'TAR session is quarantined')
+      }
       await this.removeSession(session)
       return true
     })
@@ -789,6 +878,8 @@ export class TarSessionStore {
     let failure: unknown = null
     for (const session of [...this.sessions.values()]) {
       if (
+        this.verifying.has(session.id) ||
+        session.state === DELETING ||
         this.clock.now() - session.updatedAt <= ttl ||
         !predicate(session) ||
         this.isSessionActive(session)
@@ -820,9 +911,16 @@ export class TarSessionStore {
   }
 
   close(): Promise<void> {
-    return this.run(() => {
-      this.closed = true
-      return Promise.resolve()
-    })
+    if (this.closePromise) return this.closePromise
+    this.closePromise = (async () => {
+      await this.run(() => {
+        this.closing = true
+      })
+      await Promise.allSettled([...this.verificationTasks])
+      await this.run(() => {
+        this.closed = true
+      })
+    })()
+    return this.closePromise
   }
 }
