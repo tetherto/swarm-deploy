@@ -1,10 +1,11 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
+import { errorCode, isMissing } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { assertSafeDirectory, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
-import { assertSafeUint } from '../protocol/validation.js'
+import { digestMatches, SodiumSha256 } from '../tar-protocol/hash.js'
+import { assertSafeUint } from '../validation.js'
 import { withRootLease } from './root-coordinator.js'
 import type { CommitRecord } from './commit-journal.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
@@ -25,8 +26,12 @@ interface SessionStore {
 interface CommitStore {
   storage?: StorageAdapter
   list(): Promise<CommitRecord[]>
+  scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }>
   delete(record: CommitRecord): Promise<boolean>
-  purge(record: CommitRecord): Promise<false | { purged: true; preservedPath: boolean }>
+  purge(
+    record: CommitRecord,
+    options?: { preservePath?: boolean }
+  ): Promise<false | { purged: true; preservedPath: boolean }>
 }
 
 interface Logger {
@@ -97,11 +102,6 @@ interface RetentionManagerOptions {
   onEvent?: ((event: RetentionEvent) => void) | null
 }
 
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -112,16 +112,6 @@ function storageError(message: string, cause: unknown | null = null): SwarmDeplo
 
 function cleanupError(message: string, cause: unknown | null = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.CLEANUP_FAILED, message, cause)
-}
-
-function isMissing(error: unknown): boolean {
-  if (errorCode(error) === 'ENOENT') return true
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'cause' in error &&
-    errorCode(error.cause) === 'ENOENT'
-  )
 }
 
 function assertPositiveSafeUint(value: unknown, name: string): asserts value is number {
@@ -192,7 +182,7 @@ function inspectManagedFinal(
     if (initial.size !== record.size) return 'WRONG_SIZE'
     if (!hash) return 'VALID'
 
-    const digest = crypto.createHash('sha256')
+    const digest = new SodiumSha256()
     let handle = null
     try {
       handle = await openSafeRegularFile(finalPath, 'read', storage)
@@ -208,13 +198,19 @@ function inspectManagedFinal(
         position += bytes.byteLength
       }
       const after = await handle.stat()
-      if (
-        !after.isFile() ||
-        after.size !== record.size ||
-        !identityMatches(before, after) ||
-        !b4a.equals(digest.digest(), b4a.from(record.sha256, 'hex'))
-      ) {
-        return 'DIGEST_INVALID'
+      if (!after.isFile() || after.size !== record.size || !identityMatches(before, after)) {
+        return 'CHANGED'
+      }
+      if (!digestMatches(digest.digest(), b4a.from(record.sha256, 'hex'))) return 'DIGEST_INVALID'
+      let visible
+      try {
+        visible = await storage.lstat(finalPath)
+      } catch (err) {
+        if (isMissing(err)) return 'CHANGED'
+        throw err
+      }
+      if (!visible.isFile() || visible.size !== record.size || !identityMatches(initial, visible)) {
+        return 'CHANGED'
       }
       return 'VALID'
     } finally {
@@ -270,6 +266,7 @@ class RetentionManager {
     if (
       !commitStore ||
       typeof commitStore.list !== 'function' ||
+      typeof commitStore.scrubRecords !== 'function' ||
       typeof commitStore.delete !== 'function' ||
       typeof commitStore.purge !== 'function'
     ) {
@@ -352,7 +349,13 @@ class RetentionManager {
     for (const directory of [this.layout.root, this.layout.internal, this.layout.commits]) {
       await assertSafeDirectory(directory, this.storage)
     }
-    const records = await this.commitStore.list()
+    let scanned
+    try {
+      scanned = await this.commitStore.scrubRecords()
+    } catch (err) {
+      throw cleanupError('Unable to scrub managed commit metadata', err)
+    }
+    const records = scanned.records
     const knownNames = new Set(records.map((record) => record.name))
     const rootNames = await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
       this.storage.readdir(this.layout.root)
@@ -365,7 +368,7 @@ class RetentionManager {
     }
 
     const valid = []
-    let deleted = 0
+    let deleted = scanned.deleted
     for (const record of records) {
       const status = await inspectManagedFinal(record, {
         layout: this.layout,
@@ -378,7 +381,7 @@ class RetentionManager {
       }
       let purged
       try {
-        purged = await this.commitStore.purge(record)
+        purged = await this.commitStore.purge(record, { preservePath: status === 'CHANGED' })
         if (!purged) {
           throw storageError('Managed commit record disappeared during scrub')
         }
@@ -457,32 +460,6 @@ class RetentionManager {
       this._emit({ trigger, status: 'failed', reason: errorCode(err) || ERRORS.CLEANUP_FAILED })
       throw err
     }
-  }
-
-  admit(incomingBytes: number): Promise<boolean> {
-    return withRootLease(this.layout.root, () => this._admitUnlocked(incomingBytes))
-  }
-
-  async _admitUnlocked(incomingBytes: number): Promise<boolean> {
-    assertSafeUint(incomingBytes, 'incomingBytes')
-    if (this.maxStorageBytes === undefined) return true
-    if (incomingBytes > this.maxStorageBytes) {
-      throw new SwarmDeployError(
-        ERRORS.FILE_TOO_LARGE,
-        'Incoming artifact exceeds committed storage limit'
-      )
-    }
-    let records
-    try {
-      records = await this.commitStore.list()
-    } catch (err) {
-      throw cleanupError('Unable to inspect committed storage capacity', err)
-    }
-    const total = this._totalSize(records)
-    if (this.cleanupFailure && total > this.maxStorageBytes - incomingBytes) {
-      throw cleanupError('Committed storage cleanup is unhealthy', this.cleanupFailure)
-    }
-    return true
   }
 
   async _run({ incomingBytes = 0 }: RetentionRunOptions = {}): Promise<{

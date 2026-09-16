@@ -1,7 +1,7 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
 import fs from '#fs'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { sodiumSha256 } from '../tar-protocol/hash.js'
 import { assertSafeDirectory, withSafeDirectoryIdentity } from './layout.js'
 import { CorruptJournalError } from './commit-store.js'
 import { RetentionManager } from './retention.js'
@@ -23,7 +23,8 @@ interface SessionStore {
     name: string
     size: number
     digest: Uint8Array
-    chunkSize: number
+    tarSize: number
+    tarDigest: Uint8Array
     state: string
   }>
   expire(ttl: number, shouldExpire: (session: { state: string }) => boolean): Promise<number>
@@ -46,8 +47,12 @@ interface CommitStore {
     options: { isAuthorized: ((ownerKey: Uint8Array) => boolean) | null }
   ): Promise<RecoveryResult>
   list(): Promise<CommitRecord[]>
+  scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }>
   delete(record: CommitRecord): Promise<boolean>
-  purge(record: CommitRecord): Promise<false | { purged: true; preservedPath: boolean }>
+  purge(
+    record: CommitRecord,
+    options?: { preservePath?: boolean }
+  ): Promise<false | { purged: true; preservedPath: boolean }>
 }
 
 type RecoveryEvent =
@@ -90,9 +95,11 @@ function isJournalName(name: string): boolean {
 }
 
 function transferFingerprint(id: string): string {
-  return b4a
-    .toString(crypto.createHash('sha256').update(b4a.from(id, 'hex')).digest(), 'hex')
-    .slice(0, 12)
+  return b4a.toString(sodiumSha256(b4a.from(id, 'hex')), 'hex').slice(0, 12)
+}
+
+function pathFingerprint(name: string): string {
+  return b4a.toString(sodiumSha256(b4a.from(name)), 'hex').slice(0, 12)
 }
 
 function report(
@@ -240,7 +247,9 @@ async function recoverStorage({
   const results: RecoveryResult[] = []
   for (const name of names.sort()) {
     if (!isJournalName(name)) {
-      report(logger, 'warn', 'Ignoring unknown journal path', { name })
+      report(logger, 'warn', 'Ignoring unknown journal path', {
+        fingerprint: pathFingerprint(name)
+      })
       continue
     }
     const id = name.slice(0, -'.json'.length)

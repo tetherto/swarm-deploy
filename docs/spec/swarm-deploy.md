@@ -1,273 +1,227 @@
-# Swarm Deploy Specification
+# Swarm Deploy direct-HyperDHT specification
 
-## Purpose and scope
+## Status and scope
 
-Swarm Deploy is a Node.js and Bare package for secure, resumable, one-way
-artifact uploads from authorized CI clients to one server over Hyperswarm on
-Linux and macOS. It receives and stores regular files only; it never executes,
-unpacks, installs, serves, scans, downloads, or redistributes them.
+This document is the authoritative target design for the direct-HyperDHT
+refactor. Swarm Deploy is a Node.js and Bare package for authenticated,
+encrypted, resumable, one-way artifact uploads to one server on Linux and
+macOS. It stores regular files and never executes or serves them.
 
-Version 1 supports a file or a lexical, one-shot batch of a directory's
-immediate regular-file children. Names match
-`^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`; directories, symlinks, and unsafe names
-are not uploaded. The internal `.swarm-deploy` path is reserved. A direct file
-in the top-level `history-` namespace is rejected with `INVALID_FILENAME`; a
-regular child with that prefix in a directory batch is skipped with
-`reserved-history`, and remaining entries continue.
+A client uploads either one regular file or the immediate regular-file
+children of one directory. Directory children are processed in lexical order;
+each child is an independent upload on a fresh connection. Directories,
+symlinks, nested entries, and unsafe names are rejected or skipped before
+connecting. Names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`;
+names are limited to 100 UTF-8 bytes, and the server-managed `history-`
+namespace is reserved.
 
-The server OS account and a dedicated storage root are trusted against
-concurrent local tampering. Existing or detected symlinks and parent-directory
-identity changes fail closed. Native `openat`-style protection against a
-malicious local writer is outside this version's scope.
+The refactor has no peer discovery, topic, Hyperswarm, Protomux channel, chunk
+protocol, chunk hash, bitmap, or multi-file connection.
 
-## Identity, discovery, and authorization
+## Identity, transport, and authorization
 
-Server and client identities use separate random persistent 32-byte seeds.
-Seeds are represented as lowercase 64-character hexadecimal values in files
-and environment variables, are never command-line arguments, and are never
-logged. A public key is derived from each seed. The server identity remains
-explicitly configured through its seed file or role-specific environment
-variable. Operators must preserve that seed for the lifetime of a deployment:
-a stable server seed produces a stable public key and topic.
+Server and client have separate, persistent Ed25519 identities. Each identity
+starts from an independently generated random 32-byte seed, represented to
+operators as 64 lowercase hexadecimal characters. Seeds are read from
+role-specific files or environment variables, never command-line arguments,
+and are never logged.
 
-The discovery topic is:
+`sodium-native` is the cryptographic implementation. Seeded keypairs use its
+Ed25519 keypair primitive, SHA-256 uses its SHA-256 primitive, and
+security-sensitive byte comparisons use its constant-time `sodium_memcmp`.
+Public keys are exactly 32 bytes.
 
-```text
-SHA-256(UTF8("swarm-deploy/topic/v1\0") || serverPublicKey)
-```
-
-The topic is one 32-byte value, represented to operators as lowercase
-64-character hexadecimal. It is both the discovery value and a cryptographic
-commitment to the intended server public key; it is not a secret or an
-authorization capability. The client is configured with this topic and does
-not receive or pin a separate server public key. After discovery, it recomputes
-the topic from the authenticated socket's `remotePublicKey` and rejects an
-invalid or missing socket key before creating a Protomux channel or sending
-metadata or application data. If `peerInfo.publicKey` is present, it must be a
-valid 32-byte key equal to `remotePublicKey`.
-
-Changing the server seed changes its public key and topic, so every client
-configuration must be updated. An arbitrary topic combined with an ephemeral
-server identity is not supported: that design would let a rogue receiver join
-the advertised topic and report fake upload success. Knowledge of the committed
-topic does not enable receiver impersonation under SHA-256 preimage-resistance
-assumptions because an attacker must find a transport public key that hashes to
-the committed topic.
-
-HyperDHT Noise authenticates transport identities and encrypts the connection.
-The server allowlists client public keys; its firewall and connection handler
-both check the current allowlist. The receiver never serves stored binaries.
-An allowlist reload is all-or-nothing; removing a key closes its connections
-and deletes its active or resumable uploads, but does not delete committed
-artifacts.
-
-The protocol is `swarm-deploy/upload/1`. It uses SHA-256 whole-file and 1 MiB
-chunk hashes, bounded compact-encoding control frames, a maximum of four
-in-flight chunks, and deterministic transfer IDs over the authenticated client
-key, name, size, digest, and chunk size. There is no wire-protocol change for
-replacement support.
-
-## Public interface and CLI
-
-`ClientOptions` requires `seed: SeedInput` and `topic: BinaryInput`, where
-`topic` is exactly 32 bytes. It has no `serverPublicKey` option. The existing
-connection timeout, idle timeout, DHT, scheduler, clock, swarm factory, and
-logger options remain optional. `maxReconnectAttempts` is an optional integer
-from 0 through 100 and defaults to 3.
-
-`ServerOptions` includes all existing required identity, storage, allowlist,
-limit, lifecycle, retention, logging, timer, filesystem, and swarm options,
-plus:
+The server creates a HyperDHT instance and listens directly:
 
 ```ts
-replaceNames?: Iterable<string>
+const server = dht.createServer({ firewall })
+await server.listen(serverKeyPair)
 ```
 
-`replaceNames` defaults to an empty iterable. Its values must be valid upload
-names and must not begin with `history-`. The CLI server command accepts
-repeatable `--replace-name <name>` and passes the resulting names as
-`replaceNames`. An omitted option preserves create-only behavior for every
-name.
+The client is configured with the server's public key and connects directly
+using its own identity:
 
-Only exact names in `replaceNames` are mutable. Every other name is
-create-only, including unknown top-level paths and names that merely share a
-prefix with a configured mutable name. For a mutable name, an offer whose
-current managed content has the same size and digest is
-`ALREADY_COMMITTED`; different content replaces it. A mutable name occupied by
-an unmanaged path is never replaced and returns the existing-name conflict.
+```ts
+const socket = dht.connect(serverPublicKey, { keyPair: clientKeyPair })
+```
 
-`history-` paths are server-managed historical artifacts, not a restore
-interface. The package has no restore API or CLI operation.
+HyperDHT Noise authenticates both peers and encrypts the connection. The
+authenticated remote client public key is the authorization identity.
 
-The root runtime API is exactly `Client`, `Server`, `ERRORS`,
-`SwarmDeployError`, `generateSeed`, `keyPairFromSeed`, `parseAllowlist`,
-`parsePublicKey`, `parseSeed`, `parseTopic`, `publicKeyFromSeed`, and
-`topicFromServerPublicKey`, plus the public types needed to construct, inject,
-and observe Client and Server. Storage implementations, file-manifest helpers,
-protocol codecs/constants, and transfer-ID primitives remain internal
-submodules.
+The server's allowlist is required, parsed once during startup, and immutable
+for that process lifetime. Startup fails on malformed or duplicate entries.
+The `firewall` rejects every key absent from that snapshot before an
+application connection is accepted. The connection handler also verifies the
+authenticated remote key against the same snapshot as defense in depth.
+There is no reload, revocation message, or mid-process allowlist mutation.
 
-The CLI provides `topic --seed-file <server.seed>`, which derives and prints
-the full lowercase 64-character topic without printing the seed. The server
-startup output includes that full topic rather than a topic fingerprint before
-printing `ready`. The upload command accepts `--topic <64-lower-hex>` and does
-not accept `--server-key`. Seed files and the role-specific seed environment
-variables retain their existing precedence and secrecy rules.
+## Transfer lifecycle
 
-## Storage, replacement, and accounting
+One connection carries exactly one file and follows this sequence:
 
-The storage root contains visible current artifacts and managed historical
-artifacts. `.swarm-deploy/` contains protected staging, session, commit
-sidecar, journal, and lock state. Commit sidecars identify managed artifacts
-by transfer ID and record the visible name, size, SHA-256, server commit time,
-uploader fingerprint, and replacement metadata.
+1. The client sends bounded metadata: protocol version, file name, file size,
+   file SHA-256, and deterministic TAR length.
+2. The server validates identity, metadata, limits, name policy, destination
+   policy, and persistent staging capacity.
+3. The server replies `ACCEPT` at offset zero or `RESUME` with a TAR byte offset
+   and SHA-256 of the staged TAR prefix.
+4. The client deterministically creates the one-entry TAR stream. For a resume,
+   it hashes its locally generated prefix through the supplied offset and uses
+   constant-time comparison with the server digest.
+5. If the prefix matches, the client sends bytes beginning exactly at the
+   offset. If it does not match, the client requests `RESET`; the server
+   truncates and synchronizes the staged TAR, then replies `ACCEPT` at zero.
+6. The server acknowledges transport completion, validates the exact TAR
+   length and TAR SHA-256, checks the stream against the one permitted
+   canonical framing and takes its payload by offset, and commits it using the
+   storage protocol below.
+7. The server sends one explicit terminal result (`COMMITTED`,
+   `ALREADY_COMMITTED`, or a stable error) before either peer closes.
 
-Replacing `release.tar.gz` preserves the previous managed inode as:
+Control records are length-bounded and cannot be interleaved with TAR bytes.
+EOF, socket close, or an implicit acknowledgment is never upload success.
+Connection setup, metadata, transfer inactivity, result drain, and shutdown
+remain bounded by explicit timeouts and cancellation.
+
+### Deterministic one-entry TAR
+
+For metadata `(name, size, mode, mtime)`, every runtime must emit identical
+bytes. The archive contains exactly one regular-file entry whose path is
+`name`, followed by the standard end-of-archive blocks. It uses the portable
+USTAR subset with:
+
+- no PAX, GNU, global, sparse, link, device, directory, or extended entries;
+- canonical UTF-8 path bytes and no path prefix;
+- declared size equal to the source file size;
+- mode normalized to `0644`;
+- uid, gid, mtime, uname, and gname normalized to zero or empty;
+- canonical octal fields, checksum, zero padding, and two 512-byte end blocks.
+
+The implementation rejects any archive whose byte length differs from the
+deterministic length derived from the file size.
+
+Because every byte outside the payload is fixed by the offered metadata,
+extraction is a comparison rather than a parse. The receiver derives the one
+canonical 512-byte header from `(name, size)`, requires the stream to match it
+exactly, requires every byte after the payload to be zero, and requires the
+total length to equal the deterministic length. A stream that satisfies those
+checks is by construction a single regular entry whose contents are exactly
+`tar[512 .. 512 + size)`, so the payload is taken by offset. Any deviation —
+a second entry, a non-canonical or non-file header, PAX or GNU extensions,
+trailing bytes, or truncation — fails one of those checks. The extracted size
+and digest must equal the metadata before commit.
+
+`tar-stream` supplies streaming packing on the send path. The receive path
+depends on no TAR parser; these canonical rules, byte counts, and validation
+are Swarm Deploy protocol requirements. The two must agree byte for byte, and
+a test pins the canonical header against the packer's output.
+
+### Resume state
+
+Resume offsets are byte offsets in the deterministic TAR, not source-file
+offsets. The server only advertises a durable staged length. Before replying
+`RESUME`, it hashes the complete staged prefix and returns that SHA-256.
+Staging writes are synchronized before their offset becomes resumable.
+
+Sessions are keyed by authenticated client public key plus immutable offered
+metadata. Inactive incomplete sessions expire seven days after their last
+durable progress. Expiration never removes an active receive. A mismatch reset
+reuses the admitted session after durably truncating it to zero; it does not
+append to or trust a divergent prefix.
+
+Startup purges all legacy chunk-session state, including chunk maps, partial
+chunk payloads, and obsolete reservations. It preserves committed current
+artifacts, history artifacts, commit sidecars, and v2 journals, which remain
+subject to normal validation and recovery.
+
+## Storage accounting
+
+`maxFileBytes` limits the extracted artifact size. Required
+`maxStagingBytes` is a persistent reservation limit across active and
+resumable sessions. Each admitted session reserves its full worst-case
+transfer peak:
 
 ```text
-history-<full-old-transfer-id>
+deterministic TAR length + extracted file size
 ```
 
-The full lowercase hexadecimal prior transfer ID makes the history name
-globally unambiguous and valid under the existing filename rule. The new
-sidecar maps the original mutable name to its current transfer and records the
-history transfer/name it superseded. The old sidecar becomes the record for its
-history path while retaining its original transfer ID and content metadata.
+The complete reservation persists across restart and for the session's
+seven-day resume lifetime, even when fewer TAR bytes have arrived. This covers
+the phase where the staged TAR and extracted staging file coexist and prevents
+restart, concurrency, or delayed extraction from overcommitting disk.
+Admission first expires eligible inactive sessions under serialization, then
+checks the limit. Cleanup releases reservations only after durable commit,
+durable reset/removal, or expiry.
 
-Committed retention accounting includes the current artifact and every
-history artifact exactly once, using each logical record's size. A replacement
-therefore reserves the complete new logical size before publication; it does
-not subtract the prior current file merely because both names temporarily
-refer to the old inode. Normal age and storage-quota retention may evict
-history records. The currently configured mutable name is pinned against
-age- and quota-based retention, so retention does not remove its current
-artifact. A later replacement may still create history from that current
-artifact. Create-only artifacts and history artifacts participate in normal
-retention. If capacity cannot be made available, the verified new session
-remains resumable and no replacement is published.
+Committed retention is separate. Optional `maxAge` and `maxStorageBytes`
+account for every current and historical artifact exactly once.
 
-Per-name serialization covers inspection, retention admission, replacement,
-and recovery for a mutable name. It prevents concurrent replacements of the
-same name without serializing unrelated names.
+## Commit, replacement, and recovery
 
-## Crash-safe v2 replacement protocol
+The existing create-only commit behavior and retained replacement/history
+model remain:
 
-Replacement uses a version-2 journal. The journal names the mutable final
-path, expected old managed record and inode identity, destination history
-path, new transfer record, staging inode identity, and phase. It is durable
-before any visible mutation.
+- names are create-only unless present in the configured `replaceNames`;
+- identical managed content returns `ALREADY_COMMITTED`;
+- different content for a replaceable name atomically becomes current;
+- the prior managed inode is retained as
+  `history-<full-old-transfer-id>`;
+- unmanaged destination and history paths are never overwritten or deleted;
+- current replaceable artifacts are pinned against age/quota retention, while
+  create-only and history artifacts participate in normal retention.
 
-For a different-content replacement of a managed mutable name:
+The v2 journal remains the crash-recovery authority for replacement. It
+records the expected old record and inode, history destination, verified new
+staging inode, new record, and phase before visible mutation. Before the
+durable new current sidecar, rollback restores the old current and preserves a
+valid verified new session. After that sidecar is durable, recovery finishes
+the new current/history state and cleanup without rolling back committed
+content.
 
-1. Re-read and hash the verified staging inode; validate the current sidecar
-   and pin the old record and inode identity under the per-name lock.
-2. Admit the full new logical size through retention while the old current is
-   pinned. Persist and synchronize the v2 journal.
-3. Hard-link the pinned old inode to its unique top-level history name and
-   synchronize the root.
-4. Hard-link the verified new staging inode to a private publication name.
-5. Atomically rename that publication name over the mutable final path, then
-   synchronize the root.
-6. Persist the new current sidecar and transition the old sidecar to the
-   history record, synchronizing the relevant metadata directory after each
-   durable transition. The durable new current sidecar is the replacement
-   linearization point.
-7. Remove staging/session state, remove the journal, and run post-commit
-   retention. Cleanup failure after linearization leaves the new current
-   artifact authoritative and is retried by recovery.
+Startup recovers journals before listening, validates journal-owned identities
+before mutation, re-hashes managed committed files, removes invalid managed
+records, reports unknown paths, restores valid direct-TAR sessions, then runs
+retention. Recovery and retention preserve the create/replace/history
+linearization and fail closed on corruption.
 
-Before the new current sidecar is durable, any failure or access revocation
-restores the old final from the pinned old inode, removes the history and
-private-new publication only when their inode identities match the journal,
-and preserves the verified new staging session for retry. After the durable
-new current sidecar, recovery treats the new content as linearized and must
-preserve it; it finishes or repairs the history sidecar and cleanup rather
-than rolling back to the old content.
+## Public API, CLI, and observability migration
 
-Recovery recognizes every v2 phase and validates all journal-owned inode
-identities, sizes, digests, sidecars, and names before acting. It can restore
-the old current before linearization, finalize the new current after
-linearization, retain valid staging for retry, or fail closed on corruption.
-It never overwrites or deletes an unmanaged top-level path, including one at a
-mutable or history name. Startup still recovers journals before accepting
-uploads, re-hashes every managed committed file, removes invalid managed
-records, preserves and reports unknown paths, restores valid resumable
-sessions, and runs retention.
+The root API is simplified around `Client`, `Server`, stable errors, identity
+helpers, allowlist parsing, and the public option/result/event types needed to
+use them. Client configuration uses a client seed and
+`serverPublicKey`; server configuration uses a server seed, immutable
+allowlist, storage limits, replacement policy, and optional injected DHT.
+Topic parsing/derivation, swarm factories, discovery controls, reconnect
+budgets, Protomux types, and chunk protocol internals are removed.
 
-## Existing guarantees
+The CLI keeps role-specific seed generation and server/upload commands. Server
+startup prints the server public key and then `ready`. Upload requires
+`--server-key <64-lower-hex>` plus client seed configuration. Topic commands
+and `--topic` are removed. A directory upload is a lexical loop over immediate
+files and reports each independent result.
 
-Staging bytes and resumable reservations remain separately limited by required
-`maxFileBytes` and `maxStagingBytes`. Optional committed retention uses
-`maxAge` and `maxStorageBytes`; age deletion precedes oldest-record quota
-deletion, with filename tie-breaking. Active receives are not removed by
-scheduled cleanup. A committed success contains exactly the declared digest
-and size, and failed or incomplete content never becomes visible as a final
-artifact.
+Events and logs expose lifecycle milestones for direct connection, offer,
+accept/resume/reset, transfer progress, verification, commit, recovery,
+retention, and failure. They use short SHA-256 fingerprints and never expose
+seeds, secret keys, full public keys, TAR contents, or session material.
+Listener and logger failures cannot affect protocol correctness.
 
-The serialized SessionStore offer path expires TTL-dead sessions that are not
-active before checking the staging limit, then checks capacity again. Its
-activity predicate includes only reservations whose staging offer has
-successfully completed; a pending resume cannot make its own expired session
-active before expiration runs. An active accepted session is never expired.
-Expiration is internal to the store's serialized operation, so RetentionManager
-does not re-enter SessionStore while an offer is in progress.
+## Test and package migration
 
-Initial discovery, including the discovery flush itself, is bounded by one
-`connectTimeout` window. Every established
-transport loss starts a fresh window so a long upload can reconnect, but each
-loss consumes the total reconnect-attempt budget. Missing discovery,
-reconnect-window expiry, and budget exhaustion use `CONNECT_TIMEOUT`.
-`UPLOAD_IDLE_TIMEOUT` applies only to active transfer, response-drain, or
-transport inactivity. Active-upload admission rejection uses
-`ACTIVE_UPLOAD_LIMIT`; invalid textual topic parsing uses `INVALID_TOPIC`.
+Tests cover deterministic TAR equality across Node and Bare, direct mutual
+authentication, immutable firewall allowlisting, one-file connections,
+directory looping, bounded controls, explicit terminal results, offset resume,
+prefix mismatch reset, seven-day expiry, restart-safe peak reservations,
+malicious TAR rejection, create/replace/history v2 crash points, recovery,
+retention, cancellation, events, CLI behavior, and package import/type smoke.
 
-Events and logs use short SHA-256 fingerprints for peers and transfers; they
-never expose seeds, session keys, or full public keys. Listener and logger
-failures cannot change transfer or lifecycle correctness.
+Legacy discovery/topic, Protomux, chunk bitmap, chunk scheduling, reconnect,
+and revocation-reload tests are deleted rather than retained as current
+behavior. The package has no application dependency on `hyperswarm`,
+`protomux`, `compact-encoding`, or `bare-crypto`; transitive HyperDHT
+dependencies remain an implementation detail of HyperDHT itself.
 
-## TypeScript package and tests
-
-Production code and tests are strict TypeScript: production sources live under
-`src/`, and tests are `test/**/*.ts`. TypeScript targets ES2022 with
-Node16 module and resolution behavior, while the published package remains
-CommonJS. Supported production runtimes are Node.js 22 and 24 and the current
-stable Bare runtime on Linux and macOS. Production JavaScript, declarations,
-and source maps are generated under untracked `dist/`; test output is generated
-under untracked `.test-dist/` and executed with Node and Bare.
-
-Generated declarations are emitted under `dist/`. `main`, `types`, `bin`, and
-public `exports` point only at `dist/`; internal modules are not public
-exports. `npm test` builds before executing compiled Node and Bare tests.
-`prepack` performs a clean build and validates the types and package. An
-installed-tarball gate loads CommonJS and ESM under Node, require and import
-under Bare, executes the CLI, and verifies key generation does not overwrite or
-print seed material. There is no `prepare` script.
-
-The public package is `@tetherto/swarm-deploy` version `0.1.0` with
-`publishConfig.access` set to `public` and `publishConfig.provenance` set to
-`true`. The README's primary API installation command is
-`npm install @tetherto/swarm-deploy`; its primary CLI installation command is
-`npm install --global @tetherto/swarm-deploy`. Primary user instructions do not
-use `npx` or invoke `dist/` directly. Checkout build and direct-runtime commands
-are contributor-only instructions.
-
-CI owns the full pull-request and `main` test matrix: build, types, lint,
-package, supported Node versions and operating systems, Bare operating systems,
-and protocol property tests. The tag-triggered workflow performs only the
-explicit release checks for an exact `vX.Y.Z` tag, a tag commit on `main`, a
-matching `package.json` version, a clean distribution build, and a valid
-package. It then invokes `holepunchto/actions/publish` at the reviewed immutable
-revision `146b86c4d0237c124df06ecc992ddf2c585b3405`; it does not duplicate
-the full CI test matrix. The workflow must build `dist/` before invoking the
-action because the action publishes with `npm publish --ignore-scripts`. The
-publish job grants `id-token: write` for npm trusted publishing and
-`contents: write` for the GitHub release the action creates. The reviewed
-composite action currently references `create-release@v1` internally; this
-repository pins the composite action itself without vendoring that upstream
-implementation.
-
-npm trusted publishing is configured externally for the GitHub workflow and
-its `npm` environment; the repository stores no npm publication token.
-Rollback installs a previous immutable package version; a server must not be
-downgraded across an in-flight v2 replacement journal, which the current
-version must drain or recover first.
+Production and tests remain strict TypeScript targeting ES2022 with Node16
+module behavior. Generated `dist/`, `.test-dist/`, coverage, task reports, and
+tool plans remain untracked. The package continues to support Node.js 22 and
+24 and the current stable Bare runtime on Linux and macOS.

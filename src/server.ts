@@ -1,163 +1,97 @@
 import b4a from 'b4a'
-import Hyperswarm from 'hyperswarm'
-import Protomux from 'protomux'
-import crypto from '#crypto'
-import fs from '#fs'
 import events from '#events'
-import { SwarmDeployError, ERRORS, type ErrorCode } from './errors.js'
+import fs from '#fs'
+import sodium from 'sodium-native'
+import { createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
 import {
-  abortError,
-  throwIfAborted,
-  onAbort,
-  createAbortController,
-  type AbortSignalLike
-} from './abort.js'
-import { keyPairFromSeed } from './identity.js'
+  DirectDhtServer,
+  type DirectDhtFactory,
+  type DirectDhtNode,
+  type DirectDhtSocket
+} from './direct-dht.js'
+import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
 import { validateReplaceNames } from './files.js'
-import { topicFromServerPublicKey } from './topic.js'
-import { AllowlistWatcher } from './allowlist.js'
-import { ServerSession, UPLOAD_PROTOCOL, DEFAULT_IDLE_TIMEOUT } from './protocol/server-session.js'
-import type { ProtocolChannel } from './protocol/types.js'
-import type {
-  AuthenticationEvent,
-  FingerprintEvent,
-  KeyPair,
-  Logger,
-  PublicKey,
-  PublicKeyInput,
-  ReplacementDetails,
-  SeedInput,
-  ServerScheduler,
-  Swarm,
-  SwarmDiscovery,
-  SwarmFactory,
-  SwarmFactoryOptions,
-  SwarmPeerInfo,
-  SwarmSocket,
-  Topic,
-  TransferEvent,
-  TransferLifecycleEvent
-} from './types.js'
-import { initLayout, acquireStorageLock } from './storage/layout.js'
-import { SessionStore } from './storage/session-store.js'
+import { keyPairFromSeed } from './identity.js'
 import { CommitStore } from './storage/commit-store.js'
-import { prepareStorageRecovery, recoverStorage } from './storage/recovery.js'
+import { acquireStorageLock, initLayout } from './storage/layout.js'
+import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
 import {
   RetentionManager,
   DEFAULT_CLEANUP_INTERVAL,
-  DEFAULT_RESUME_TTL,
-  MAX_CLEANUP_INTERVAL
+  DEFAULT_RESUME_TTL
 } from './storage/retention.js'
+import { SessionStore } from './storage/session-store.js'
 import type { StorageAdapter, StorageLayout } from './storage/types.js'
+import {
+  decodeDirectMetadata,
+  DirectWireReader,
+  writeAdmission,
+  writeFinal
+} from './tar-protocol/direct-wire.js'
+import { sodiumSha256 } from './tar-protocol/hash.js'
+import { assertMetadataTransferId } from './tar-protocol/manifest.js'
+import type {
+  AuthenticationEvent,
+  FingerprintEvent,
+  Logger,
+  PublicKey,
+  PublicKeyInput,
+  SeedInput,
+  ServerScheduler,
+  TransferEvent,
+  TransferLifecycleEvent
+} from './types.js'
 
 const EventEmitter = events.EventEmitter
-
 const DEFAULT_MAX_CONNECTIONS = 64
 const DEFAULT_MAX_ACTIVE_UPLOADS = 8
 const DEFAULT_MIN_FREE_BYTES = 1024 * 1024 * 1024
 const MAX_CONNECTIONS = 1024
 const MAX_ACTIVE_UPLOADS = 1024
 const FINGERPRINT_LENGTH = 12
-
-export type {
-  AuthenticationEvent,
-  FingerprintEvent,
-  ReplacementDetails,
-  TransferEvent,
-  TransferLifecycleEvent
-}
+const TAR_DURABILITY_BATCH_BYTES = 1024 * 1024
 
 export type ServerLogger = Logger
-export type ServerSocket = SwarmSocket
-export type ServerPeerInfo = SwarmPeerInfo
-export type ServerDiscovery = SwarmDiscovery
-export type ServerSwarm = Swarm
-export type ServerSwarmOptions = SwarmFactoryOptions
-export type ServerSwarmFactory = SwarmFactory
-export type { ServerScheduler }
-
-/** A public key accepted in an allowlist: a 32-byte buffer or canonical lowercase hex. */
 export type AllowlistKey = PublicKeyInput | string
 
 export interface ServerOptions {
-  /** Required 32-byte persistent server seed. */
   seed: SeedInput
-  /** Trusted local directory in which final artifacts and internal state live. */
   storageDir: string
-  /** Required uploader allowlist. Entries are 32-byte keys or canonical lowercase hex. */
   allowedKeys: Iterable<AllowlistKey>
-  /** Required positive maximum uploaded artifact size, in bytes. */
   maxFileBytes: number
-  /** Required positive aggregate resumable staging allocation, in bytes. */
   maxStagingBytes: number
-  /** Maximum authenticated transport connections; defaults to 64 and is at most 1024. */
   maxConnections?: number
-  /** Maximum active uploads; defaults to 8, is at most 1024, and cannot exceed maxConnections. */
   maxActiveUploads?: number
-  /** Per-transport and upload idle timeout in milliseconds; defaults to 60,000. */
   idleTimeout?: number
-  /** Retention cleanup interval in milliseconds; defaults to 900,000. */
   cleanupInterval?: number
-  /** Partial-upload expiration in milliseconds; defaults to seven days. */
   resumeTtl?: number
-  /** Bytes which must remain free before accepting a staged upload; defaults to 1 GiB. */
   minFreeBytes?: number
-  /** Optional maximum age, in milliseconds, for committed managed artifacts. */
   maxAge?: number
-  /** Optional aggregate committed managed-artifact limit, in bytes. */
   maxStorageBytes?: number
-  /** Optional HyperDHT instance passed to Hyperswarm. */
-  dht?: unknown
-  /** Optional trusted filesystem adapter; defaults to fs.promises. */
+  dht?: DirectDhtNode
+  dhtFactory?: DirectDhtFactory
   storage?: StorageAdapter
-  /** Optional timer adapter; defaults to global timers. */
   scheduler?: ServerScheduler
-  /** Optional Hyperswarm constructor seam; defaults to Hyperswarm. */
-  swarmFactory?: SwarmFactory
-  /** Optional allowlist text file to load at start and poll for revocations. */
-  allowlistPath?: string
-  /** Optional diagnostic sink. Logger failures are ignored. */
   logger?: Logger | null
-  /**
-   * Exact artifact names whose committed content a later upload may replace.
-   * Defaults to none, so every name stays create-only. Values must be valid
-   * upload names and must not begin with the reserved `history-` prefix.
-   */
   replaceNames?: Iterable<string>
 }
 
 export interface ServerConnectionEvent extends FingerprintEvent {
   connections: number
 }
-
-export type ConnectionOpenEvent = ServerConnectionEvent
-export type ConnectionCloseEvent = ServerConnectionEvent
-
 export interface ServerListeningEvent {
-  /** The server public-key fingerprint, despite this historical property name. */
-  publicKey: string
+  fingerprint: string
 }
-
 export interface ServerOfferEvent extends TransferEvent, FingerprintEvent {
-  status: 'accepted' | 'resumed' | 'rejected' | 'already-committed'
-  resumed?: boolean
-  reason?: string
+  status: 'accepted' | 'resumed' | 'reset' | 'rejected' | 'already-committed'
+  offset?: number
+  reason?: ErrorCode
 }
-
 export interface ServerProgressEvent extends TransferEvent, FingerprintEvent {
-  chunkIndex: number
-  chunksReceived: number
-  totalChunks: number
   bytesReceived: number
   totalBytes: number
 }
-
-export type ServerTransferLifecycleEvent = TransferLifecycleEvent &
-  FingerprintEvent & {
-    /** Present only on a succeeded commit that replaced a configured name. */
-    replaced?: ReplacementDetails
-  }
-
+export type ServerTransferLifecycleEvent = TransferLifecycleEvent & FingerprintEvent
 export interface RecoveryEvent {
   status:
     | 'started'
@@ -175,14 +109,6 @@ export interface RecoveryEvent {
   journals?: number
   purgedSessions?: number
 }
-
-export interface ScrubEvent {
-  status: 'started' | 'completed' | 'failed'
-  reason?: string
-  deleted?: number
-  unknownCount?: number
-}
-
 export interface RetentionEvent {
   trigger: 'startup' | 'scheduled' | 'manual' | 'commit' | 'post-commit'
   status: 'completed' | 'deferred' | 'failed'
@@ -192,227 +118,81 @@ export interface RetentionEvent {
   ageDeleted?: number
   storageDeleted?: number
 }
-
-export interface CleanupEvent {
-  transfer: string
-  name: string | null
-  reason:
-    | 'delete'
-    | 'revocation'
-    | 'offline-revocation'
-    | 'expiry'
-    | 'checksum'
-    | 'recovery'
-    | 'corrupt-journal'
-}
-
-export interface AllowlistEvent {
-  status: 'completed' | 'failed'
-  appliedCount: number
-  pendingCount: number
-  reason?: string
-}
-
 export interface ServerCloseEvent {
   status: 'closed' | 'failed'
 }
-
 export interface ServerEventMap {
   authentication: AuthenticationEvent
   connection: ServerConnectionEvent
-  'connection-open': ConnectionOpenEvent
-  'connection-close': ConnectionCloseEvent
+  'connection-open': ServerConnectionEvent
+  'connection-close': ServerConnectionEvent
   offer: ServerOfferEvent
   progress: ServerProgressEvent
   verification: ServerTransferLifecycleEvent
   commit: ServerTransferLifecycleEvent
   recovery: RecoveryEvent
-  scrub: ScrubEvent
   retention: RetentionEvent
-  cleanup: CleanupEvent
-  allowlist: AllowlistEvent
-  revocation: FingerprintEvent
-  revoked: FingerprintEvent
+  failure: FingerprintEvent & { reason: ErrorCode }
   listening: ServerListeningEvent
   close: ServerCloseEvent
 }
-
 export type ServerEventName = keyof ServerEventMap
 export type ServerEvent = ServerEventMap[ServerEventName]
 
 type SafeLogger = Required<Logger>
+type Active = { owner: Buffer; transfer: string | null }
 
-interface UploadReservation {
-  id: string
-  name: string
-  active: boolean
+function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDeployError {
+  return new SwarmDeployError(code, message, cause)
 }
-
-interface Connection {
-  owner: string
-  ownerKey: Buffer
-  sessions: Set<ServerSession>
-  socket: ServerSocket
-  transportTimer: unknown | null
-  refreshTransport: () => void
+function codeOf(error: unknown): ErrorCode {
+  return error instanceof SwarmDeployError &&
+    Object.values(ERRORS).includes(error.code as ErrorCode)
+    ? (error.code as ErrorCode)
+    : ERRORS.PROTOCOL_INVALID
 }
-
-interface PendingRevocation {
-  transferIds: Set<string>
-}
-
-function configurationError(message: string, cause: unknown | null = null): SwarmDeployError {
-  return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
-}
-
-function assertPositiveSafeUint(
-  value: unknown,
-  name: string,
-  maximum = Number.MAX_SAFE_INTEGER
-): asserts value is number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0 || value > maximum) {
-    throw configurationError(`Invalid ${name}`)
+function positive(value: unknown, name: string, max = Number.MAX_SAFE_INTEGER): number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > max) {
+    throw fail(ERRORS.PROTOCOL_INVALID, `Invalid ${name}`)
   }
+  return value as number
 }
-
-function assertOptionalSafeUint(
-  value: unknown,
-  name: string,
-  maximum = Number.MAX_SAFE_INTEGER
-): void {
-  if (value !== undefined) assertPositiveSafeUint(value, name, maximum)
-}
-
-function assertNonnegativeSafeUint(value: unknown, name: string): asserts value is number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-    throw configurationError(`Invalid ${name}`)
+function key(value: unknown, label: string): Buffer {
+  if (typeof value === 'string') {
+    if (!/^[0-9a-f]{64}$/.test(value)) throw fail(ERRORS.INVALID_PUBLIC_KEY, `Invalid ${label}`)
+    return b4a.from(value, 'hex')
   }
-}
-
-function assertSeed(seed: unknown): asserts seed is Uint8Array {
-  if (!b4a.isBuffer(seed) || seed.byteLength !== 32) throw configurationError('Invalid seed')
-}
-
-function keyHex(key: Uint8Array): string {
-  return b4a.toString(key, 'hex')
-}
-
-function assertPublicKey(key: unknown): asserts key is Uint8Array {
-  if (!b4a.isBuffer(key) || key.byteLength !== 32) throw configurationError('Invalid allowed key')
-}
-
-function isIterable(value: unknown): value is Iterable<unknown> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    Symbol.iterator in value &&
-    typeof value[Symbol.iterator] === 'function'
-  )
-}
-
-function normalizeAllowlist(keys: unknown): Set<string> {
-  if (!isIterable(keys)) {
-    throw configurationError('Invalid allowed keys')
+  if (!b4a.isBuffer(value) || value.byteLength !== 32) {
+    throw fail(ERRORS.INVALID_PUBLIC_KEY, `Invalid ${label}`)
   }
-  const normalized = new Set<string>()
-  for (const key of keys) {
-    if (typeof key === 'string') {
-      if (!/^[0-9a-f]{64}$/.test(key)) throw configurationError('Invalid allowed key')
-      normalized.add(key)
-      continue
-    }
-    assertPublicKey(key)
-    normalized.add(keyHex(key))
+  return b4a.from(value)
+}
+function fingerprint(value: Uint8Array): string {
+  return b4a.toString(sodiumSha256(value), 'hex').slice(0, FINGERPRINT_LENGTH)
+}
+function safeLogger(logger: Logger | null | undefined): SafeLogger {
+  const call = (method: keyof Logger, message: string, details?: Record<string, unknown>): void => {
+    try {
+      logger?.[method]?.(message, details)
+    } catch {}
   }
-  return normalized
-}
-
-function fingerprint(key: unknown): string {
-  if (!b4a.isBuffer(key) || key.byteLength !== 32) return 'invalid'
-  return keyHex(crypto.createHash('sha256').update(key).digest()).slice(0, FINGERPRINT_LENGTH)
-}
-
-function eventFailureReason(err: unknown): string {
-  if (typeof err !== 'object' || err === null || !('code' in err)) return ERRORS.PROTOCOL_INVALID
-  return typeof err.code === 'string' && err.code.length > 0 ? err.code : ERRORS.PROTOCOL_INVALID
-}
-
-export function createSafeLogger(logger: ServerLogger | null | undefined): SafeLogger {
   return {
-    info(message, details) {
-      if (!logger || typeof logger.info !== 'function') return
-      try {
-        logger.info(message, details)
-      } catch {}
-    },
-    warn(message, details) {
-      if (!logger || typeof logger.warn !== 'function') return
-      try {
-        logger.warn(message, details)
-      } catch {}
-    },
-    error(message, details) {
-      if (!logger || typeof logger.error !== 'function') return
-      try {
-        logger.error(message, details)
-      } catch {}
-    }
+    info: (m, d) => call('info', m, d),
+    warn: (m, d) => call('warn', m, d),
+    error: (m, d) => call('error', m, d)
   }
 }
 
-function awaitAbortable<T>(promise: PromiseLike<T>, signal: AbortSignalLike): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const removeAbort = onAbort(signal, () => reject(abortError()))
-    Promise.resolve(promise).then(
-      (value) => {
-        removeAbort()
-        resolve(value)
-      },
-      (err) => {
-        removeAbort()
-        reject(err)
-      }
-    )
-  })
-}
-
-function isProtocolChannel(value: unknown): value is ProtocolChannel {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'open' in value &&
-    typeof value.open === 'function' &&
-    'close' in value &&
-    typeof value.close === 'function' &&
-    'addMessage' in value &&
-    typeof value.addMessage === 'function'
-  )
-}
-
-/**
- * Known events narrow their payload; the trailing overload keeps the historical
- * dynamic-name compatibility. Its rest element is `never[]` rather than
- * `unknown[]` because `strictFunctionTypes` compares listener parameters
- * contravariantly, so `never[]` accepts every listener the old `any[]`
- * signature accepted while still keeping `any` out of the surface.
- */
+/** A static-allowlist direct HyperDHT artifact receiver. */
 export interface Server {
   on<EventName extends ServerEventName>(
     event: EventName,
     listener: (event: ServerEventMap[EventName]) => void
   ): this
   on(event: string | symbol, listener: (...args: never[]) => void): this
-  once<EventName extends ServerEventName>(
-    event: EventName,
-    listener: (event: ServerEventMap[EventName]) => void
-  ): this
-  once(event: string | symbol, listener: (...args: never[]) => void): this
 }
-
 export class Server extends EventEmitter {
-  private readonly _keyPair: KeyPair
   readonly publicKey: PublicKey
-  readonly topic: Topic
   readonly storageDir: string
   readonly maxFileBytes: number
   readonly maxStagingBytes: number
@@ -424,761 +204,542 @@ export class Server extends EventEmitter {
   readonly minFreeBytes: number
   readonly maxAge: number | undefined
   readonly maxStorageBytes: number | undefined
-  readonly dht: unknown
+  private readonly allowedKeySnapshot: readonly Buffer[]
+  readonly logger: SafeLogger
+  readonly dht: DirectDhtNode | undefined
+  readonly dhtFactory: DirectDhtFactory | undefined
   readonly storage: StorageAdapter
   readonly scheduler: ServerScheduler
-  readonly swarmFactory: SwarmFactory
-  readonly allowlistPath: string | undefined
-  readonly logger: Required<Logger>
-  private readonly replaceNames: Set<string>
-  listening: boolean
-  closed: boolean
-  private _allowlist: Set<string>
-  private _connections: Map<SwarmSocket, Connection>
-  private _sockets: Map<string, Set<SwarmSocket>>
-  private _sessions: Set<ServerSession>
-  private _activeUploads: Map<string, UploadReservation>
-  private _activeNames: Map<string, UploadReservation>
-  private layout: StorageLayout | null
-  private sessionStore: SessionStore | null
-  private commitStore: CommitStore | null
-  private retentionManager: RetentionManager | null
-  private allowlistWatcher: AllowlistWatcher | null
-  private swarm: Swarm | null
-  private discovery: SwarmDiscovery | null
-  private releaseStorageLock: (() => Promise<void>) | null
-  private listenPromise: Promise<this> | null
-  private closePromise: Promise<void> | null
-  private reloadPromise: Promise<unknown>
-  private pendingRevocations: Map<string, PendingRevocation>
-  private readonly abortController: ReturnType<typeof createAbortController>
+  readonly replaceNames: ReadonlySet<string>
+  listening = false
+  closed = false
+  private readonly keyPair
   private readonly signal: AbortSignalLike
-  private abortDisposals: Promise<void>[]
-  private abortErrors: unknown[]
-  private disposePromise: Promise<void> | null
+  private readonly abort = createAbortController()
+  private readonly active = new Map<DirectDhtSocket, Active>()
+  private readonly activeUploads = new Set<DirectDhtSocket>()
+  private readonly receives = new Set<Promise<void>>()
+  private layout: StorageLayout | null = null
+  private sessions: SessionStore | null = null
+  private commits: CommitStore | null = null
+  private retention: RetentionManager | null = null
+  private transport: DirectDhtServer | null = null
+  private releaseLock: (() => Promise<void>) | null = null
+  private listenPromise: Promise<this> | null = null
+  private closePromise: Promise<void> | null = null
 
   constructor(options: ServerOptions) {
     super()
-    if (!options || typeof options !== 'object') throw configurationError('Invalid server options')
-    assertSeed(options.seed)
-    if (typeof options.storageDir !== 'string' || options.storageDir.length === 0) {
-      throw configurationError('Invalid storageDir')
+    if (!options || typeof options !== 'object') {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid server options')
     }
-    const allowlist = normalizeAllowlist(options.allowedKeys)
-    assertPositiveSafeUint(options.maxFileBytes, 'maxFileBytes')
-    assertPositiveSafeUint(options.maxStagingBytes, 'maxStagingBytes')
-
-    const maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS
-    const maxActiveUploads = options.maxActiveUploads ?? DEFAULT_MAX_ACTIVE_UPLOADS
-    const idleTimeout = options.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
-    const cleanupInterval = options.cleanupInterval ?? DEFAULT_CLEANUP_INTERVAL
-    const resumeTtl = options.resumeTtl ?? DEFAULT_RESUME_TTL
-    const minFreeBytes = options.minFreeBytes ?? DEFAULT_MIN_FREE_BYTES
-    assertPositiveSafeUint(maxConnections, 'maxConnections', MAX_CONNECTIONS)
-    assertPositiveSafeUint(maxActiveUploads, 'maxActiveUploads', MAX_ACTIVE_UPLOADS)
-    assertPositiveSafeUint(idleTimeout, 'idleTimeout', MAX_CLEANUP_INTERVAL)
-    assertPositiveSafeUint(cleanupInterval, 'cleanupInterval', MAX_CLEANUP_INTERVAL)
-    assertPositiveSafeUint(resumeTtl, 'resumeTtl')
-    assertNonnegativeSafeUint(minFreeBytes, 'minFreeBytes')
-    assertOptionalSafeUint(options.maxAge, 'maxAge')
-    assertOptionalSafeUint(options.maxStorageBytes, 'maxStorageBytes')
-    if (maxActiveUploads > maxConnections) {
-      throw configurationError('maxActiveUploads exceeds maxConnections')
+    this.keyPair = keyPairFromSeed(key(options.seed, 'server seed'))
+    this.publicKey = b4a.from(this.keyPair.publicKey)
+    this.storageDir =
+      typeof options.storageDir === 'string' && options.storageDir
+        ? options.storageDir
+        : (() => {
+            throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid storage directory')
+          })()
+    this.maxFileBytes = positive(options.maxFileBytes, 'maxFileBytes')
+    this.maxStagingBytes = positive(options.maxStagingBytes, 'maxStagingBytes')
+    this.maxConnections = positive(
+      options.maxConnections ?? DEFAULT_MAX_CONNECTIONS,
+      'maxConnections',
+      MAX_CONNECTIONS
+    )
+    this.maxActiveUploads = positive(
+      options.maxActiveUploads ?? DEFAULT_MAX_ACTIVE_UPLOADS,
+      'maxActiveUploads',
+      MAX_ACTIVE_UPLOADS
+    )
+    if (this.maxActiveUploads > this.maxConnections) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'maxActiveUploads exceeds maxConnections')
     }
-    if (
-      options.scheduler &&
-      (typeof options.scheduler.setTimeout !== 'function' ||
-        typeof options.scheduler.clearTimeout !== 'function' ||
-        typeof options.scheduler.setInterval !== 'function' ||
-        typeof options.scheduler.clearInterval !== 'function')
-    ) {
-      throw configurationError('Invalid server scheduler')
+    this.idleTimeout = positive(options.idleTimeout ?? 60_000, 'idleTimeout', 0x7fffffff)
+    this.cleanupInterval = positive(
+      options.cleanupInterval ?? DEFAULT_CLEANUP_INTERVAL,
+      'cleanupInterval',
+      0x7fffffff
+    )
+    this.resumeTtl = positive(options.resumeTtl ?? DEFAULT_RESUME_TTL, 'resumeTtl')
+    this.minFreeBytes = options.minFreeBytes ?? DEFAULT_MIN_FREE_BYTES
+    if (!Number.isSafeInteger(this.minFreeBytes) || this.minFreeBytes < 0) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid minFreeBytes')
     }
-    if (
-      options.storage &&
-      (typeof options.storage.open !== 'function' ||
-        typeof options.storage.lstat !== 'function' ||
-        typeof options.storage.readdir !== 'function')
-    ) {
-      throw configurationError('Invalid storage adapter')
+    if (options.maxAge !== undefined) {
+      positive(options.maxAge, 'maxAge')
     }
-    if (options.swarmFactory !== undefined && typeof options.swarmFactory !== 'function') {
-      throw configurationError('Invalid swarm factory')
+    if (options.maxStorageBytes !== undefined) {
+      positive(options.maxStorageBytes, 'maxStorageBytes')
     }
-    if (options.allowlistPath !== undefined && typeof options.allowlistPath !== 'string') {
-      throw configurationError('Invalid allowlist path')
-    }
-    const replaceNames = validateReplaceNames(options.replaceNames)
-
-    this._keyPair = keyPairFromSeed(b4a.from(options.seed))
-    this.publicKey = b4a.from(this._keyPair.publicKey)
-    this.topic = topicFromServerPublicKey(this.publicKey)
-    this.storageDir = options.storageDir
-    this.maxFileBytes = options.maxFileBytes
-    this.maxStagingBytes = options.maxStagingBytes
-    this.maxConnections = maxConnections
-    this.maxActiveUploads = maxActiveUploads
-    this.idleTimeout = idleTimeout
-    this.cleanupInterval = cleanupInterval
-    this.resumeTtl = resumeTtl
-    this.minFreeBytes = minFreeBytes
     this.maxAge = options.maxAge
     this.maxStorageBytes = options.maxStorageBytes
+    const allow: Buffer[] = []
+    if (
+      !options.allowedKeys ||
+      typeof (options.allowedKeys as Iterable<unknown>)[Symbol.iterator] !== 'function'
+    ) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid allowed keys')
+    }
+    for (const candidate of options.allowedKeys) {
+      const candidateKey = key(candidate, 'allowed key')
+      if (allow.some((allowed) => sodium.sodium_memcmp(allowed, candidateKey))) {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'Duplicate allowed key')
+      }
+      allow.push(candidateKey)
+    }
+    this.allowedKeySnapshot = allow.map((candidate) => b4a.from(candidate))
     this.dht = options.dht
+    this.dhtFactory = options.dhtFactory
     this.storage = options.storage || fs.promises
     this.scheduler = options.scheduler || { setTimeout, clearTimeout, setInterval, clearInterval }
-    this.swarmFactory = options.swarmFactory || ((opts: ServerSwarmOptions) => new Hyperswarm(opts))
-    this.allowlistPath = options.allowlistPath
-    this.logger = createSafeLogger(options.logger)
-    this.replaceNames = replaceNames
-    this._allowlist = allowlist
-    this._connections = new Map()
-    this._sockets = new Map()
-    this._sessions = new Set()
-    this._activeUploads = new Map()
-    this._activeNames = new Map()
-    this.layout = null
-    this.sessionStore = null
-    this.commitStore = null
-    this.retentionManager = null
-    this.allowlistWatcher = null
-    this.swarm = null
-    this.discovery = null
-    this.releaseStorageLock = null
-    this.listening = false
-    this.closed = false
-    this.listenPromise = null
-    this.closePromise = null
-    this.reloadPromise = Promise.resolve()
-    this.pendingRevocations = new Map()
-    this.abortController = createAbortController()
-    this.signal = this.abortController.signal
-    this.abortDisposals = []
-    this.abortErrors = []
-    this.disposePromise = null
+    this.replaceNames = validateReplaceNames(options.replaceNames)
+    this.logger = safeLogger(options.logger)
+    this.signal = this.abort.signal
   }
 
-  get allowedKeys() {
-    return new Set(this._allowlist)
-  }
-
-  private _isAllowed(key: unknown): key is Uint8Array {
-    return b4a.isBuffer(key) && key.byteLength === 32 && this._allowlist.has(keyHex(key))
-  }
-
-  private _emitSafe(event: string, details: Record<string, unknown>): void {
+  private emitSafe(type: string, payload: Record<string, unknown>): void {
     try {
-      this.emit(event, details)
+      this.emit(type, payload)
     } catch {}
   }
-
-  private _assertStarting() {
-    if (this.closed) throw abortError()
-    throwIfAborted(this.signal)
+  private allowed(owner: Uint8Array | null): owner is Buffer {
+    if (!owner || !b4a.isBuffer(owner) || owner.byteLength !== 32) return false
+    let accepted = false
+    for (const allowed of this.allowedKeySnapshot) {
+      accepted = sodium.sodium_memcmp(owner, allowed) || accepted
+    }
+    return accepted
+  }
+  private transfer(metadata: { transferId: string; name: string; fileSize: number }) {
+    return {
+      transfer: fingerprint(b4a.from(metadata.transferId, 'hex')),
+      name: metadata.name,
+      size: metadata.fileSize
+    }
   }
 
-  private _firewall(key: unknown): boolean {
-    const rejected = !this._isAllowed(key)
-    if (rejected) {
-      const details = {
-        status: 'rejected',
-        fingerprint: fingerprint(key),
-        reason: ERRORS.AUTH_REJECTED
-      }
-      this.logger.warn('Rejected unauthorised connection', details)
-      this._emitSafe('authentication', details)
-    }
-    return rejected
-  }
-
-  private _reserveUpload(
-    transferId: Uint8Array,
-    name: string
-  ): UploadReservation | { rejected: true; reason: 'ACTIVE_UPLOAD_LIMIT' | 'FILE_BUSY' } {
-    const id = keyHex(transferId)
-    if (this._activeUploads.has(id) || this._activeNames.has(name)) {
-      return { rejected: true, reason: 'FILE_BUSY' }
-    }
-    if (this._activeUploads.size >= this.maxActiveUploads) {
-      return { rejected: true, reason: ERRORS.ACTIVE_UPLOAD_LIMIT }
-    }
-    const reservation = { id, name, active: false }
-    this._activeUploads.set(id, reservation)
-    this._activeNames.set(name, reservation)
-    return reservation
-  }
-
-  private _activateUpload(reservation: unknown): void {
-    if (
-      typeof reservation !== 'object' ||
-      reservation === null ||
-      !('id' in reservation) ||
-      typeof reservation.id !== 'string'
-    ) {
-      return
-    }
-    const active = this._activeUploads.get(reservation.id)
-    if (active === reservation) active.active = true
-  }
-
-  private _releaseUpload(reservation: unknown): void {
-    if (
-      typeof reservation !== 'object' ||
-      reservation === null ||
-      !('id' in reservation) ||
-      typeof reservation.id !== 'string'
-    ) {
-      return
-    }
-    const active = this._activeUploads.get(reservation.id)
-    if (active !== reservation) return
-    this._activeUploads.delete(active.id)
-    if (this._activeNames.get(active.name) === active) this._activeNames.delete(active.name)
-  }
-
-  private _isSessionActive(session: unknown): boolean {
-    return (
-      typeof session === 'object' &&
-      session !== null &&
-      'id' in session &&
-      typeof session.id === 'string' &&
-      this._activeUploads.get(session.id)?.active === true
-    )
-  }
-
-  private _destroySocket(socket: SwarmSocket, error?: unknown): void {
-    try {
-      socket.destroy(error)
-    } catch {}
-  }
-
-  private _removeConnection(socket: SwarmSocket, connection: Connection): void {
-    if (connection.transportTimer) this.scheduler.clearTimeout(connection.transportTimer)
-    this._connections.delete(socket)
-    const sockets = this._sockets.get(connection.owner)
-    if (!sockets) return
-    sockets.delete(socket)
-    if (sockets.size === 0) this._sockets.delete(connection.owner)
-  }
-
-  private _onSessionTerminal(session: ServerSession, connection: Connection): void {
-    connection.sessions.delete(session)
-    this._sessions.delete(session)
-  }
-
-  private _onPair(
-    mux: { createChannel(options: { protocol: string; id: Uint8Array }): unknown },
-    socket: ServerSocket,
-    connection: Connection,
-    id: Uint8Array
-  ): void {
-    if (connection.sessions.size > 0 || !this._isAllowed(connection.ownerKey)) {
-      this._destroySocket(socket, new SwarmDeployError(ERRORS.REVOKED, 'Uploader access revoked'))
-      return
-    }
-    const candidate = mux.createChannel({ protocol: UPLOAD_PROTOCOL, id })
-    if (!isProtocolChannel(candidate)) {
-      this._destroySocket(
-        socket,
-        new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid upload channel')
-      )
-      return
-    }
-    if (!this.sessionStore || !this.commitStore) {
-      this._destroySocket(socket, new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Server not ready'))
-      return
-    }
-    let session: ServerSession
-    session = new ServerSession({
-      channel: candidate,
-      ownerKey: connection.ownerKey,
-      sessionStore: this.sessionStore,
-      commitStore: this.commitStore,
-      retentionManager: this.retentionManager,
-      maxFileBytes: this.maxFileBytes,
-      replaceNames: this.replaceNames,
-      reserveUpload: (transferId, name) => this._reserveUpload(transferId, name),
-      activateUpload: (reservation) => this._activateUpload(reservation),
-      releaseUpload: (reservation) => this._releaseUpload(reservation),
-      isAuthorized: () => this._isAllowed(connection.ownerKey),
-      idleTimeout: this.idleTimeout,
-      scheduler: this.scheduler,
-      destroy: (err) => this._destroySocket(socket, err),
-      onTerminal: () => this._onSessionTerminal(session, connection),
-      onProgress: () => connection.refreshTransport(),
-      onEvent: (event: Record<string, unknown>) => {
-        const { type, ...details } = event
-        if (typeof type === 'string') {
-          this._emitSafe(type, { fingerprint: fingerprint(connection.ownerKey), ...details })
-        }
-      }
-    })
-    connection.sessions.add(session)
-    this._sessions.add(session)
-  }
-
-  private _onConnection(socket: SwarmSocket, peerInfo: SwarmPeerInfo | null = null): void {
-    if (socket && typeof socket.on === 'function') socket.on('error', () => {})
-    const socketKey = socket?.remotePublicKey
-    const peerKey = peerInfo?.publicKey
-    const ownerKey =
-      b4a.isBuffer(socketKey) &&
-      socketKey.byteLength === 32 &&
-      (peerKey === undefined ||
-        (b4a.isBuffer(peerKey) && peerKey.byteLength === 32 && b4a.equals(socketKey, peerKey)))
-        ? socketKey
-        : null
-    if (this.closed || !this._isAllowed(ownerKey)) {
-      this._emitSafe('authentication', {
-        status: 'rejected',
-        fingerprint: fingerprint(ownerKey),
-        reason: ERRORS.AUTH_REJECTED
-      })
-      this._destroySocket(
-        socket,
-        new SwarmDeployError(ERRORS.AUTH_REJECTED, 'Unauthorised uploader')
-      )
-      return
-    }
-    if (this._connections.size >= this.maxConnections) {
-      this._emitSafe('authentication', {
-        status: 'rejected',
-        fingerprint: fingerprint(ownerKey),
-        reason: ERRORS.FILE_BUSY
-      })
-      this._destroySocket(
-        socket,
-        new SwarmDeployError(ERRORS.FILE_BUSY, 'Connection capacity exceeded')
-      )
-      return
-    }
-
-    const owner = keyHex(ownerKey)
-    const connection: Connection = {
-      owner,
-      ownerKey: b4a.from(ownerKey),
-      sessions: new Set(),
-      socket,
-      transportTimer: null,
-      refreshTransport: () => {}
-    }
-    connection.refreshTransport = () => {
-      if (connection.transportTimer) this.scheduler.clearTimeout(connection.transportTimer)
-      connection.transportTimer = this.scheduler.setTimeout(() => {
-        this._destroySocket(
-          socket,
-          new SwarmDeployError(ERRORS.UPLOAD_IDLE_TIMEOUT, 'Transport idle timeout')
-        )
-      }, this.idleTimeout)
-      if (
-        typeof connection.transportTimer === 'object' &&
-        connection.transportTimer !== null &&
-        'unref' in connection.transportTimer &&
-        typeof connection.transportTimer.unref === 'function'
-      ) {
-        connection.transportTimer.unref()
-      }
-    }
-    connection.refreshTransport()
-    this._connections.set(socket, connection)
-    let sockets = this._sockets.get(owner)
-    if (!sockets) this._sockets.set(owner, (sockets = new Set()))
-    sockets.add(socket)
-    socket.once('close', () => {
-      this._removeConnection(socket, connection)
-      for (const session of [...connection.sessions]) {
-        session.close().catch(() => {})
-      }
-      this._emitSafe('connection-close', {
-        fingerprint: fingerprint(connection.ownerKey),
-        connections: this._connections.size
-      })
-    })
-
-    const mux = Protomux.from(socket)
-    mux.pair({ protocol: UPLOAD_PROTOCOL }, (id) => this._onPair(mux, socket, connection, id))
-    const details = { fingerprint: fingerprint(ownerKey), connections: this._connections.size }
-    this._emitSafe('authentication', { status: 'accepted', fingerprint: details.fingerprint })
-    this.logger.info('Authenticated uploader connected', details)
-    this._emitSafe('connection', details)
-    this._emitSafe('connection-open', details)
-  }
-
-  reloadAllowlist(keys: Iterable<AllowlistKey>): Promise<Set<string>> {
-    let next
-    try {
-      next = normalizeAllowlist(keys)
-    } catch (err) {
-      this._emitSafe('allowlist', {
-        status: 'failed',
-        appliedCount: this._allowlist.size,
-        pendingCount: this.pendingRevocations.size,
-        reason: eventFailureReason(err)
-      })
-      return Promise.reject(err)
-    }
-    const run = this.reloadPromise.then(
-      () => this._applyAllowlist(next),
-      () => this._applyAllowlist(next)
-    )
-    this.reloadPromise = run.catch(() => {})
-    return run
-  }
-
-  private async _applyAllowlist(next: Set<string>): Promise<Set<string>> {
-    let swapped = false
-    try {
-      for (const key of this.pendingRevocations.keys()) {
-        await this._revokeOwner(key)
-      }
-      const previous = this._allowlist
-      const removed = []
-      for (const key of previous) {
-        if (!next.has(key)) removed.push(key)
-      }
-      this._allowlist = next
-      swapped = true
-      for (const key of removed) await this._revokeOwner(key)
-    } catch (err: unknown) {
-      if (typeof err === 'object' && err !== null) Object.assign(err, { allowlistApplied: swapped })
-      this._emitSafe('allowlist', {
-        status: 'failed',
-        appliedCount: this._allowlist.size,
-        pendingCount: this.pendingRevocations.size,
-        reason: eventFailureReason(err)
-      })
-      throw err
-    }
-    this._emitSafe('allowlist', {
-      status: 'completed',
-      appliedCount: this._allowlist.size,
-      pendingCount: this.pendingRevocations.size
-    })
-    return new Set(this._allowlist)
-  }
-
-  private async _revokeOwner(key: string): Promise<void> {
-    let pending = this.pendingRevocations.get(key)
-    if (!pending) {
-      pending = { transferIds: new Set() }
-      this.pendingRevocations.set(key, pending)
-    }
-    const sockets = this._sockets.get(key)
-    const sessions = new Set<ServerSession>()
-    const errors: unknown[] = []
-    if (sockets) {
-      for (const socket of [...sockets]) {
-        const connection = this._connections.get(socket)
-        if (connection) {
-          for (const session of connection.sessions) {
-            if (session.transferId) pending.transferIds.add(keyHex(session.transferId))
-            try {
-              session.revoke()
-            } catch (err) {
-              errors.push(err)
-            }
-            sessions.add(session)
-          }
-        }
-        try {
-          socket.destroy(new SwarmDeployError(ERRORS.REVOKED, 'Uploader access revoked'))
-        } catch (err) {
-          errors.push(err)
-        }
-      }
-    }
-    const settled = await Promise.allSettled([...sessions].map((session) => session.settle()))
-    for (const result of settled) if (result.status === 'rejected') errors.push(result.reason)
-    if (errors.length) throw new AggregateError(errors, 'Uploader revocation cleanup failed')
-    for (const id of pending.transferIds) {
+  private async receive(socket: DirectDhtSocket): Promise<void> {
+    const owner = socket.remotePublicKey
+    if (this.closed || !this.allowed(owner) || !this.sessions || !this.commits) {
       try {
-        const commitStore = this.commitStore
-        if (!commitStore) {
-          throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Server storage is not ready')
-        }
-        await commitStore.retryAbortedAttempt(b4a.from(id, 'hex'), this.sessionStore)
-      } catch (err) {
-        errors.push(err)
-      }
+        socket.destroy(fail(ERRORS.AUTH_REJECTED, 'Unauthorised direct connection'))
+      } catch {}
+      return
     }
-    if (errors.length) throw new AggregateError(errors, 'Uploader revocation cleanup failed')
+    if (this.active.size >= this.maxConnections) {
+      try {
+        socket.destroy(fail(ERRORS.FILE_BUSY, 'Connection capacity exceeded'))
+      } catch {}
+      return
+    }
+    const current: Active = { owner: b4a.from(owner), transfer: null }
+    this.active.set(socket, current)
+    socket.on('error', () => {})
+    socket.once('close', () => {
+      this.active.delete(socket)
+      this.emitSafe('connection-close', {
+        fingerprint: fingerprint(owner),
+        connections: this.active.size
+      })
+    })
+    this.emitSafe('authentication', { status: 'accepted', fingerprint: fingerprint(owner) })
+    this.emitSafe('connection', { fingerprint: fingerprint(owner), connections: this.active.size })
+    this.emitSafe('connection-open', {
+      fingerprint: fingerprint(owner),
+      connections: this.active.size
+    })
+    const reader = new DirectWireReader(socket)
+    let sentAdmission = false
+    let event: ReturnType<Server['transfer']> | null = null
+    let verificationStarted = false
+    let verificationSucceeded = false
+    let commitStarted = false
+    let commitSucceeded = false
     try {
-      const sessionStore = this.sessionStore
-      if (sessionStore) await sessionStore.deleteByOwner(b4a.from(key, 'hex'))
-    } catch (err) {
-      errors.push(err)
+      const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
+      assertMetadataTransferId(owner, metadata)
+      event = this.transfer(metadata)
+      if (
+        metadata.fileSize > this.maxFileBytes ||
+        this.activeUploads.size >= this.maxActiveUploads
+      ) {
+        const reason =
+          metadata.fileSize > this.maxFileBytes ? ERRORS.FILE_TOO_LARGE : ERRORS.ACTIVE_UPLOAD_LIMIT
+        await writeAdmission(
+          socket,
+          { v: 1, status: 'REJECTED', code: reason },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
+        sentAdmission = true
+        this.emitSafe('offer', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'rejected',
+          reason
+        })
+        return
+      }
+      const inspected = await this.commits.inspect(
+        metadata.name,
+        {
+          name: metadata.name,
+          size: metadata.fileSize,
+          digest: b4a.from(metadata.fileSha256, 'hex'),
+          transferId: b4a.from(metadata.transferId, 'hex')
+        },
+        { replaceNames: this.replaceNames }
+      )
+      if (inspected.status === 'ALREADY_COMMITTED') {
+        await writeAdmission(
+          socket,
+          { v: 1, status: 'ALREADY_COMMITTED' },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
+        sentAdmission = true
+        this.emitSafe('offer', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'already-committed'
+        })
+        return
+      }
+      if (inspected.status === 'FILE_EXISTS') {
+        throw fail(ERRORS.FILE_EXISTS, 'Destination already exists')
+      }
+      if (this.activeUploads.size >= this.maxActiveUploads) {
+        await writeAdmission(
+          socket,
+          { v: 1, status: 'REJECTED', code: ERRORS.ACTIVE_UPLOAD_LIMIT },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
+        sentAdmission = true
+        this.emitSafe('offer', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'rejected',
+          reason: ERRORS.ACTIVE_UPLOAD_LIMIT
+        })
+        return
+      }
+      this.activeUploads.add(socket)
+      const admission = await this.sessions.admit(owner, metadata)
+      current.transfer = metadata.transferId
+      if (admission.status === 'VERIFIED') {
+        await writeAdmission(
+          socket,
+          { v: 1, status: 'VERIFIED' },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
+        sentAdmission = true
+        this.emitSafe('verification', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'started'
+        })
+        verificationStarted = true
+        const verified = await this.sessions.readVerified(b4a.from(metadata.transferId, 'hex'))
+        this.emitSafe('verification', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'succeeded'
+        })
+        verificationSucceeded = true
+        commitStarted = true
+        await this.commits.commit(verified, {
+          retentionManager: this.retention,
+          signal: this.signal,
+          replaceNames: this.replaceNames
+        })
+        this.emitSafe('commit', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'succeeded'
+        })
+        commitSucceeded = true
+        await this.retireQuietly(b4a.from(metadata.transferId, 'hex'), owner)
+        await writeFinal(
+          socket,
+          { v: 1, status: 'COMMITTED' },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
+        return
+      }
+      await writeAdmission(
+        socket,
+        admission.status === 'ACCEPT'
+          ? { v: 1, status: 'ACCEPT', offset: 0 }
+          : {
+              v: 1,
+              status: 'RESUME',
+              offset: admission.offset,
+              prefixSha256: b4a.toString(admission.prefixSha256, 'hex')
+            },
+        { signal: this.signal, timeout: this.idleTimeout }
+      )
+      sentAdmission = true
+      this.emitSafe('offer', {
+        ...event,
+        fingerprint: fingerprint(owner),
+        status: metadata.reset ? 'reset' : admission.status === 'ACCEPT' ? 'accepted' : 'resumed',
+        offset: admission.offset
+      })
+      let offset = admission.offset
+      const batch = b4a.allocUnsafe(TAR_DURABILITY_BATCH_BYTES)
+      let bufferedBytes = 0
+      const append = async (chunk: Buffer): Promise<void> => {
+        offset = await this.sessions!.append(owner, metadata, offset, chunk)
+        this.emitSafe('progress', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          bytesReceived: offset,
+          totalBytes: metadata.tarSize
+        })
+      }
+      const flush = async (): Promise<void> => {
+        if (bufferedBytes === 0) return
+        const bytes = batch.subarray(0, bufferedBytes)
+        await append(bytes)
+        bufferedBytes = 0
+      }
+      await reader.tar(
+        metadata.tarSize - offset,
+        async (chunk) => {
+          let position = 0
+          while (position < chunk.byteLength) {
+            const take = Math.min(
+              TAR_DURABILITY_BATCH_BYTES - bufferedBytes,
+              chunk.byteLength - position
+            )
+            batch.set(chunk.subarray(position, position + take), bufferedBytes)
+            bufferedBytes += take
+            position += take
+            if (bufferedBytes === TAR_DURABILITY_BATCH_BYTES) await flush()
+          }
+        },
+        this.signal,
+        this.idleTimeout
+      )
+      await flush()
+      await reader.requireEnd(this.signal, this.idleTimeout)
+      this.emitSafe('verification', {
+        ...event,
+        fingerprint: fingerprint(owner),
+        status: 'started'
+      })
+      verificationStarted = true
+      const verified = await this.sessions.verify(owner, metadata)
+      this.emitSafe('verification', {
+        ...event,
+        fingerprint: fingerprint(owner),
+        status: 'succeeded'
+      })
+      verificationSucceeded = true
+      commitStarted = true
+      await this.commits.commit(verified, {
+        retentionManager: this.retention,
+        signal: this.signal,
+        replaceNames: this.replaceNames
+      })
+      this.emitSafe('commit', {
+        ...event,
+        fingerprint: fingerprint(owner),
+        status: 'succeeded'
+      })
+      commitSucceeded = true
+      await this.retireQuietly(verified.transferId, owner)
+      await writeFinal(
+        socket,
+        { v: 1, status: 'COMMITTED' },
+        { signal: this.signal, timeout: this.idleTimeout }
+      )
+    } catch (error) {
+      const reason = codeOf(error)
+      this.logger.warn('Direct upload failed', {
+        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        reason
+      })
+      this.emitSafe('failure', { fingerprint: owner ? fingerprint(owner) : 'invalid', reason })
+      if (event && verificationStarted && !verificationSucceeded) {
+        this.emitSafe('verification', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'failed',
+          reason
+        })
+      }
+      if (event && commitStarted && !commitSucceeded) {
+        this.emitSafe('commit', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'failed',
+          reason
+        })
+      }
+      try {
+        if (!sentAdmission) {
+          await writeAdmission(
+            socket,
+            { v: 1, status: 'REJECTED', code: reason },
+            { timeout: this.idleTimeout }
+          )
+        } else if (!commitSucceeded) {
+          await writeFinal(
+            socket,
+            { v: 1, status: 'FAILED', code: reason },
+            { timeout: this.idleTimeout }
+          )
+        }
+      } catch {}
+      try {
+        socket.destroy()
+      } catch {}
+    } finally {
+      this.activeUploads.delete(socket)
+      reader.closeReader()
     }
-    if (errors.length) throw new AggregateError(errors, 'Uploader revocation cleanup failed')
-    this.pendingRevocations.delete(key)
-    const details = { fingerprint: fingerprint(b4a.from(key, 'hex')) }
-    this.logger.info('Uploader access revoked', details)
-    this._emitSafe('revoked', details)
-    this._emitSafe('revocation', details)
   }
 
-  private async _start(): Promise<this> {
+  /**
+   * Retires a committed session without letting cleanup undo a durable commit.
+   *
+   * The artifact is already published at this point, so a failure to unlink the
+   * session leaves recoverable residue that `init()` purges on the next start.
+   * Propagating it here would abort before the terminal record and tell the
+   * client its upload failed after it had in fact succeeded.
+   */
+  private async retireQuietly(transferId: Uint8Array, owner: Uint8Array | null): Promise<void> {
     try {
-      this._assertStarting()
+      await this.sessions!.retireCommitted(transferId)
+    } catch (error) {
+      this.logger.warn('Committed session cleanup failed', {
+        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        reason: codeOf(error)
+      })
+    }
+  }
+
+  private async start(): Promise<this> {
+    try {
       this.layout = initLayout(this.storageDir)
-      this.releaseStorageLock = await acquireStorageLock(this.layout, { storage: this.storage })
-      this._assertStarting()
-      this.sessionStore = new SessionStore({
+      this.releaseLock = await acquireStorageLock(this.layout, { storage: this.storage })
+      this.sessions = new SessionStore({
         layout: this.layout,
         maxStagingBytes: this.maxStagingBytes,
         minFreeBytes: this.minFreeBytes,
         resumeTtl: this.resumeTtl,
-        isSessionActive: (session) => this._isSessionActive(session),
         storage: this.storage,
-        replaceNames: this.replaceNames,
-        onEvent: (event: { type: string } & Record<string, unknown>) => {
-          const { type, ...details } = event
-          this._emitSafe(type, details)
-        }
+        isSessionActive: (session) =>
+          [...this.active.values()].some(
+            (active) => active.transfer === (session as { id: string }).id
+          )
       })
-      this.commitStore = new CommitStore({
+      this.commits = new CommitStore({
         layout: this.layout,
         storage: this.storage,
         logger: this.logger
       })
-      this._emitSafe('recovery', { status: 'started' })
+      this.emitSafe('recovery', { status: 'started' })
       await prepareStorageRecovery({
         layout: this.layout,
-        commitStore: this.commitStore,
+        commitStore: this.commits,
         logger: this.logger,
-        onEvent: (event: { type: string } & Record<string, unknown>) => {
-          const { type, ...details } = event
-          this._emitSafe(type, details)
-        }
+        onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
-      try {
-        await this.sessionStore.init()
-      } catch (err) {
-        this._emitSafe('recovery', {
-          status: 'failed',
-          phase: 'sessions',
-          reason: eventFailureReason(err)
-        })
-        throw err
-      }
-      this._assertStarting()
-      if (this.allowlistPath) {
-        let initialLoad = true
-        this.allowlistWatcher = new AllowlistWatcher({
-          filePath: this.allowlistPath,
-          storage: this.storage,
-          onReload: (keys: Set<string>) => {
-            if (initialLoad) {
-              this._allowlist = normalizeAllowlist(keys)
-              this._emitSafe('allowlist', {
-                status: 'completed',
-                appliedCount: this._allowlist.size,
-                pendingCount: this.pendingRevocations.size
-              })
-              return
-            }
-            return this.reloadAllowlist(keys).then(() => undefined)
-          },
-          onFailure: ({ reason }: { reason: string }) => {
-            this._emitSafe('allowlist', {
-              status: 'failed',
-              appliedCount: this._allowlist.size,
-              pendingCount: this.pendingRevocations.size,
-              reason
-            })
-          },
-          scheduler: this.scheduler,
-          logger: this.logger
-        })
-        await this.allowlistWatcher.load()
-        initialLoad = false
-        this._assertStarting()
-      }
+      await this.sessions.init()
       const recovered = await recoverStorage({
         layout: this.layout,
-        sessionStore: this.sessionStore,
-        commitStore: this.commitStore,
+        sessionStore: this.sessions,
+        commitStore: this.commits,
         logger: this.logger,
-        isAuthorized: (key: Uint8Array) => this._isAllowed(key),
-        onEvent: (event: { type: string } & Record<string, unknown>) => {
-          const { type, ...details } = event
-          this._emitSafe(type, details)
-        }
+        isAuthorized: (owner) => this.allowed(owner),
+        onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
-      this._assertStarting()
-      const purged = await this.sessionStore.deleteUnauthorized((key) => this._isAllowed(key))
-      this._emitSafe('recovery', {
+      this.emitSafe('recovery', {
         status: 'completed',
         journals: recovered.length,
-        purgedSessions: purged
+        purgedSessions: this.sessions.purgedSessions
       })
-      this._assertStarting()
-      this.retentionManager = new RetentionManager({
+      this.logger.info('Storage recovery completed', {
+        journals: recovered.length,
+        purgedSessions: this.sessions.purgedSessions
+      })
+      this.retention = new RetentionManager({
         layout: this.layout,
-        sessionStore: this.sessionStore,
-        commitStore: this.commitStore,
+        sessionStore: this.sessions,
+        commitStore: this.commits,
         maxAge: this.maxAge,
         maxStorageBytes: this.maxStorageBytes,
         resumeTtl: this.resumeTtl,
         cleanupInterval: this.cleanupInterval,
         storage: this.storage,
-        isSessionActive: (session) => this._isSessionActive(session),
-        hasActiveUploads: () => this._activeUploads.size > 0,
+        scheduler: this.scheduler,
+        isSessionActive: (session) =>
+          [...this.active.values()].some(
+            (active) => active.transfer === (session as unknown as { id: string }).id
+          ),
+        hasActiveUploads: () => this.activeUploads.size > 0,
         isPinned: (record) => this.replaceNames.has(record.name),
         logger: this.logger,
-        scheduler: this.scheduler,
-        onEvent: (event: { type: string } & Record<string, unknown>) => {
-          const { type, ...details } = event
-          this._emitSafe(type, details)
+        onEvent: ({ type, ...event }) => this.emitSafe(type, event)
+      })
+      await this.retention.start()
+      throwIfAborted(this.signal)
+      this.transport = new DirectDhtServer({
+        keyPair: this.keyPair,
+        allowedClientPublicKeys: this.allowedKeySnapshot.map((value) => b4a.from(value)),
+        dht: this.dht,
+        dhtFactory: this.dhtFactory,
+        onConnection: (socket) => {
+          const receive = this.receive(socket)
+          this.receives.add(receive)
+          const settled = (): void => {
+            this.receives.delete(receive)
+          }
+          receive.then(settled, settled)
         }
       })
-      await this.retentionManager.start()
-      this._assertStarting()
-      if (this.allowlistWatcher) this.allowlistWatcher.startPolling()
-
-      this._assertStarting()
-      this.swarm = this.swarmFactory({
-        keyPair: this._keyPair,
-        dht: this.dht,
-        maxPeers: this.maxConnections,
-        maxServerConnections: this.maxConnections,
-        maxClientConnections: 0,
-        firewall: (key: Uint8Array) => this._firewall(key)
-      })
-      if (
-        !this.swarm ||
-        typeof this.swarm.on !== 'function' ||
-        typeof this.swarm.join !== 'function' ||
-        typeof this.swarm.destroy !== 'function'
-      ) {
-        throw configurationError('Invalid swarm')
-      }
-      this._assertStarting()
-      this.swarm.on('connection', (socket: ServerSocket, peerInfo?: ServerPeerInfo) =>
-        this._onConnection(socket, peerInfo ?? null)
-      )
-      this.discovery = this.swarm.join(this.topic, { server: true, client: false })
-      if (!this.discovery || typeof this.discovery.flushed !== 'function') {
-        throw configurationError('Invalid swarm discovery')
-      }
-      await awaitAbortable(this.discovery.flushed(), this.signal)
-      this._assertStarting()
+      await this.transport.listen()
       this.listening = true
-      this.logger.info('Server listening', { publicKey: fingerprint(this.publicKey) })
-      this._emitSafe('listening', { publicKey: fingerprint(this.publicKey) })
+      this.emitSafe('listening', { fingerprint: fingerprint(this.publicKey) })
+      this.logger.info('Direct DHT server listening', { fingerprint: fingerprint(this.publicKey) })
       return this
-    } catch (err) {
-      await this._dispose()
-      throw err
+    } catch (error) {
+      await this.dispose()
+      throw error
     }
   }
-
   listen(): Promise<this> {
-    if (this.closed) return Promise.reject(configurationError('Server is closed'))
-    if (this.listenPromise) return this.listenPromise
-    this.listenPromise = this._start()
-    return this.listenPromise
+    if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Server is closed'))
+    return (this.listenPromise ||= this.start())
   }
-
-  private _abortStartupResources(): void {
-    this.abortController.abort()
-    const discovery = this.discovery
-    const swarm = this.swarm
-    this.discovery = null
-    this.swarm = null
-    if (discovery && typeof discovery.destroy === 'function') {
-      try {
-        this.abortDisposals.push(Promise.resolve(discovery.destroy()))
-      } catch (err) {
-        this.abortErrors.push(err)
-      }
-    }
-    if (swarm) {
-      try {
-        this.abortDisposals.push(Promise.resolve(swarm.destroy()))
-      } catch (err) {
-        this.abortErrors.push(err)
-      }
-    }
-  }
-
-  private _dispose(): Promise<void> {
-    if (this.disposePromise) return this.disposePromise
-    this.disposePromise = this._disposeResources()
-    return this.disposePromise
-  }
-
-  private async _disposeResources(): Promise<void> {
-    const errors = [...this.abortErrors]
-    const attempt = async (operation: () => void | Promise<void>): Promise<void> => {
-      try {
-        await operation()
-      } catch (err) {
-        errors.push(err)
-      }
-    }
-
-    const aborted = await Promise.allSettled(this.abortDisposals)
-    for (const result of aborted) {
-      if (result.status === 'rejected') errors.push(result.reason)
-    }
-
-    const allowlistWatcher = this.allowlistWatcher
-    if (allowlistWatcher) await attempt(() => allowlistWatcher.close())
-    this.allowlistWatcher = null
-    const retentionManager = this.retentionManager
-    if (retentionManager) await attempt(() => retentionManager.stop())
-    this.retentionManager = null
-
-    for (const session of [...this._sessions]) await attempt(() => session.close())
-    this._sessions.clear()
-    for (const socket of this._connections.keys()) {
+  private async dispose(): Promise<void> {
+    for (const socket of this.active.keys()) {
       try {
         socket.destroy()
-      } catch (err) {
-        errors.push(err)
-      }
+      } catch {}
     }
-    this._connections.clear()
-    this._sockets.clear()
-    this._activeUploads.clear()
-    this._activeNames.clear()
-
-    const swarm = this.swarm
-    if (swarm) await attempt(() => swarm.destroy())
-    this.swarm = null
-    this.discovery = null
-    const sessionStore = this.sessionStore
-    if (sessionStore) await attempt(() => sessionStore.close())
-    this.sessionStore = null
-    this.commitStore = null
-    const releaseStorageLock = this.releaseStorageLock
-    if (releaseStorageLock) await attempt(() => releaseStorageLock())
-    this.releaseStorageLock = null
+    await this.transport?.close().catch(() => {})
+    this.transport = null
+    await Promise.allSettled([...this.receives])
+    this.active.clear()
+    await this.retention?.stop().catch(() => {})
+    this.retention = null
+    await this.sessions?.close().catch(() => {})
+    this.sessions = null
+    if (this.releaseLock) await this.releaseLock().catch(() => {})
+    this.releaseLock = null
     this.listening = false
-    if (errors.length > 0) throw new AggregateError(errors, 'Server cleanup failed')
   }
-
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise
     this.closed = true
-    this._abortStartupResources()
+    this.abort.abort()
     this.closePromise = (async () => {
-      const errors = []
-      if (this.listenPromise) {
-        try {
-          await this.listenPromise
-        } catch (err: unknown) {
-          if (eventFailureReason(err) !== ERRORS.ABORTED) errors.push(err)
-        }
-      }
-      try {
-        await this._dispose()
-      } catch (err: unknown) {
-        if (err instanceof AggregateError) errors.push(...err.errors)
-        else errors.push(err)
-      }
-      this._emitSafe('close', { status: errors.length === 0 ? 'closed' : 'failed' })
-      if (errors.length > 0) throw new AggregateError(errors, 'Server close failed')
+      await this.listenPromise?.catch(() => {})
+      await this.dispose()
+      this.emitSafe('close', { status: 'closed' })
     })()
     return this.closePromise
   }
@@ -1191,6 +752,5 @@ export {
   MAX_CONNECTIONS,
   MAX_ACTIVE_UPLOADS,
   FINGERPRINT_LENGTH,
-  fingerprint,
-  normalizeAllowlist
+  fingerprint
 }

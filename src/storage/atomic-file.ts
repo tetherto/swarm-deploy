@@ -1,12 +1,13 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
+import { errorCode } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
+import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
 import type { StorageAdapter, StorageFileHandle } from './types.js'
 
-// Enough for 262,144 hex chunk digests while bounding untrusted on-disk reads.
+// Bounds untrusted on-disk metadata before allocation.
 const MAX_SESSION_METADATA_BYTES = 32 * 1024 * 1024
 export const ATOMIC_WRITE_PHASE = Object.freeze({
   BEFORE_RENAME: 'before-rename',
@@ -46,12 +47,9 @@ export function atomicWriteRenamed(error: unknown): boolean {
 }
 
 function randomSuffix(): string {
-  return b4a.toString(crypto.randomBytes(16), 'hex')
-}
-
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
+  const bytes = b4a.allocUnsafe(16)
+  sodium.randombytes_buf(bytes)
+  return b4a.toString(bytes, 'hex')
 }
 
 async function assertRegularOrAbsent(filePath: string, storage: StorageAdapter): Promise<void> {

@@ -1,7 +1,8 @@
 import b4a from 'b4a'
-import crypto from '#crypto'
+import { errorCode, isMissing } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
+import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import {
   historyName,
@@ -9,8 +10,9 @@ import {
   validateBasename,
   validateReplaceNames
 } from '../files.js'
-import { transferId } from '../protocol/transfer-id.js'
-import { assertFixed32, assertSafeUint } from '../protocol/validation.js'
+import { digestMatches, SodiumSha256, sodiumSha256 } from '../tar-protocol/hash.js'
+import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
+import { assertFixed32, assertSafeUint } from '../validation.js'
 import {
   assertSafeDirectory,
   assertSafeFile,
@@ -18,7 +20,7 @@ import {
   protectedDirectories,
   withSafeDirectoryIdentity
 } from './layout.js'
-import { readJson, writeAtomic } from './atomic-file.js'
+import { MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
 import {
   CorruptJournalError,
   JOURNAL_VERSION,
@@ -56,7 +58,9 @@ interface CommitSession {
   name: string
   size: number
   digest: Uint8Array
-  chunkSize: number
+  /** Direct-TAR sessions carry these immutable archive fields. */
+  tarSize: number
+  tarDigest: Uint8Array
   state: string
 }
 
@@ -106,11 +110,6 @@ type ReplacementPlan =
   | { mode: 'idempotent'; record: CommitRecord }
   | { mode: 'replace'; oldRecord: CommitRecord; finalIdentity: FileIdentity }
 
-function errorCode(error: unknown): string | null {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return null
-  return typeof error.code === 'string' ? error.code : null
-}
-
 function storageError(message: string, cause: unknown | null = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
 }
@@ -124,33 +123,32 @@ function existsError(message: string): SwarmDeployError {
 }
 
 function assertNotAborted(signal: AbortSignalLike | null): void {
-  if (signal?.aborted) throw new SwarmDeployError(ERRORS.REVOKED, 'Upload access was revoked')
+  if (signal?.aborted) throw new SwarmDeployError(ERRORS.ABORTED, 'Upload was aborted')
 }
 
 function toHex(bytes: Uint8Array): string {
   return b4a.toString(bytes, 'hex')
+}
+function sameHex32(left: string, right: string): boolean {
+  return (
+    /^[0-9a-f]{64}$/.test(left) &&
+    /^[0-9a-f]{64}$/.test(right) &&
+    sodium.sodium_memcmp(b4a.from(left, 'hex'), b4a.from(right, 'hex'))
+  )
 }
 
 function isCommitRecordName(name: unknown): name is string {
   return typeof name === 'string' && /^[0-9a-f]{64}\.json$/.test(name)
 }
 
-function isMissing(error: unknown): boolean {
-  if (errorCode(error) === 'ENOENT') return true
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'cause' in error &&
-    errorCode(error.cause) === 'ENOENT'
-  )
-}
-
 function attemptId(): string {
-  return toHex(crypto.randomBytes(32))
+  const bytes = b4a.allocUnsafe(32)
+  sodium.randombytes_buf(bytes)
+  return toHex(bytes)
 }
 
 function fingerprint(ownerKey: Uint8Array): string {
-  return toHex(crypto.createHash('sha256').update(ownerKey).digest())
+  return toHex(sodiumSha256(ownerKey))
 }
 
 function replacementsEqual(
@@ -160,7 +158,7 @@ function replacementsEqual(
   if (left === undefined || right === undefined) return left === right
   return (
     left.name === right.name &&
-    left.transferId === right.transferId &&
+    sameHex32(left.transferId, right.transferId) &&
     left.historyName === right.historyName
   )
 }
@@ -170,16 +168,16 @@ function recordsEqual(left: CommitRecord, right: CommitRecord): boolean {
     left.version === right.version &&
     left.name === right.name &&
     left.size === right.size &&
-    left.sha256 === right.sha256 &&
+    sameHex32(left.sha256, right.sha256) &&
     left.committedAt === right.committedAt &&
     left.uploaderFingerprint === right.uploaderFingerprint &&
-    left.transferId === right.transferId &&
+    sameHex32(left.transferId, right.transferId) &&
     replacementsEqual(left.replaces, right.replaces)
   )
 }
 
 function sameContent(left: CommitRecord, right: CommitRecord): boolean {
-  return left.size === right.size && left.sha256 === right.sha256
+  return left.size === right.size && sameHex32(left.sha256, right.sha256)
 }
 
 /** The record the old sidecar becomes once its inode is only reachable as history. */
@@ -198,17 +196,22 @@ function assertSession(session: unknown): asserts session is CommitSession {
   validateBasename(candidate.name)
   assertSafeUint(candidate.size, 'session size')
   assertFixed32(candidate.digest, 'session digest')
-  assertSafeUint(candidate.chunkSize, 'session chunk size')
-  if (candidate.id !== toHex(candidate.transferId)) throw storageError('Session ID mismatch')
+  if (!sameHex32(candidate.id, toHex(candidate.transferId))) {
+    throw storageError('Session ID mismatch')
+  }
 
-  const expectedId = transferId({
-    clientPublicKey: candidate.ownerKey,
-    name: candidate.name,
-    size: candidate.size,
-    digest: candidate.digest,
-    chunkSize: candidate.chunkSize
+  assertSafeUint(candidate.tarSize, 'session TAR size')
+  assertFixed32(candidate.tarDigest, 'session TAR digest')
+  assertMetadataTransferId(candidate.ownerKey as Uint8Array, {
+    v: 1,
+    name: candidate.name as string,
+    fileSize: candidate.size as number,
+    fileSha256: toHex(candidate.digest as Uint8Array),
+    tarSize: candidate.tarSize as number,
+    tarSha256: toHex(candidate.tarDigest as Uint8Array),
+    transferId: candidate.id,
+    reset: false
   })
-  if (!b4a.equals(expectedId, candidate.transferId)) throw storageError('Noncanonical session ID')
 }
 
 async function readExactly(
@@ -260,7 +263,7 @@ function digestExactFile(
       const before = await handle.stat()
       if (!before.isFile() || before.size !== size) return null
 
-      const hash = crypto.createHash('sha256')
+      const hash = new SodiumSha256()
       let position = 0
       while (position < size) {
         const bytes = b4a.alloc(Math.min(64 * 1024, size - position))
@@ -309,6 +312,10 @@ class CommitStore {
 
   _stagingPath(id: string): string {
     return path.join(this.layout.staging, `${id}.part`)
+  }
+
+  _tarStagingPath(id: string): string {
+    return path.join(this.layout.staging, `${id}.tar.part`)
   }
 
   _sessionPath(id: string): string {
@@ -669,7 +676,7 @@ class CommitStore {
   _reportCleanupPending(record: CommitRecord, err: unknown): void {
     try {
       this.logger?.warn?.('Committed artifact cleanup remains pending', {
-        transferId: record.transferId,
+        fingerprint: record.uploaderFingerprint,
         name: record.name,
         code: errorCode(err),
         reason: err instanceof Error ? err.message : String(err)
@@ -681,16 +688,16 @@ class CommitStore {
     record: CommitRecord,
     expectedIdentity: FileIdentity,
     attemptId: string,
-    revoked: unknown
+    aborted: unknown
   ): Promise<never> {
     try {
       await this._markAttemptAborting(record.transferId, attemptId)
       await this._removeAbortedPublication(record, expectedIdentity)
       await this._discardJournal(record.transferId, attemptId)
     } catch (cleanupError) {
-      throw new AggregateError([revoked, cleanupError], 'Unable to clean up revoked commit')
+      throw new AggregateError([aborted, cleanupError], 'Unable to clean up aborted commit')
     }
-    throw revoked
+    throw aborted
   }
 
   async _removeOwnedFile(
@@ -712,7 +719,7 @@ class CommitStore {
     const stat = await this._safeFileOrAbsent(filePath, directory)
     if (!stat) return false
     const result = await digestExactFile(filePath, record.size, this.storage, syncFirst)
-    return result !== null && b4a.equals(result.digest, b4a.from(record.sha256, 'hex'))
+    return result !== null && digestMatches(result.digest, b4a.from(record.sha256, 'hex'))
   }
 
   _recordFromSession(session: CommitSession): CommitRecord {
@@ -774,8 +781,8 @@ class CommitStore {
       record &&
       record.name === name &&
       record.size === offer.size &&
-      record.sha256 === toHex(offer.digest) &&
-      record.transferId === id &&
+      sameHex32(record.sha256, toHex(offer.digest)) &&
+      sameHex32(record.transferId, id) &&
       (await this._matchesRecord(finalPath, this.layout.root, record))
     ) {
       return { status: 'ALREADY_COMMITTED', record }
@@ -786,7 +793,10 @@ class CommitStore {
     if (!current || !identitiesEqual(current.identity, fileIdentity(final))) {
       return { status: 'FILE_EXISTS' }
     }
-    if (current.record.size === offer.size && current.record.sha256 === toHex(offer.digest)) {
+    if (
+      current.record.size === offer.size &&
+      sameHex32(current.record.sha256, toHex(offer.digest))
+    ) {
       return { status: 'ALREADY_COMMITTED', record: current.record }
     }
     return { status: 'REPLACEABLE', record: current.record }
@@ -802,7 +812,7 @@ class CommitStore {
     if (matches.length > 1) throw storageError('Duplicate managed commit filename')
     const record = matches[0]
     const digested = await digestExactFile(finalPath, record.size, this.storage)
-    if (!digested || !b4a.equals(digested.digest, b4a.from(record.sha256, 'hex'))) return null
+    if (!digested || !digestMatches(digested.digest, b4a.from(record.sha256, 'hex'))) return null
     return { record, identity: digested.identity }
   }
 
@@ -816,26 +826,6 @@ class CommitStore {
     ) {
       throw new CorruptJournalError(message)
     }
-  }
-
-  async _inspectJournalPublication(
-    journal: CommitJournal
-  ): Promise<{ final: StorageStat | null; sidecar: CommitRecord | null; committed: boolean }> {
-    const { record, sourceStagingIdentity } = journal
-    const finalPath = this._finalPath(record.name)
-    const final = await this._safeFileOrAbsent(finalPath, this.layout.root)
-    const sidecar = await this._readRecordOrAbsent(this._recordPath(record.transferId))
-    if (
-      final &&
-      (!identitiesEqual(fileIdentity(final), sourceStagingIdentity) ||
-        !(await this._matchesRecord(finalPath, this.layout.root, record)))
-    ) {
-      throw storageError('Final publication does not match commit journal')
-    }
-    if (sidecar && !recordsEqual(sidecar, record)) {
-      throw storageError('Commit sidecar does not match journal')
-    }
-    return { final, sidecar, committed: !!final && !!sidecar }
   }
 
   async _validateAttemptLeftovers(
@@ -867,94 +857,6 @@ class CommitStore {
       throw storageError('Staging file does not match commit journal')
     }
     return { sessionFile, staging }
-  }
-
-  async _cleanupCommittedAttempt(
-    id: string,
-    journal: CommitJournal,
-    sessionStore: SessionStore
-  ): Promise<{ status: 'COMMITTED'; record: CommitRecord }> {
-    const leftovers = await this._validateAttemptLeftovers(id, journal, sessionStore)
-    if (leftovers.sessionFile) {
-      await this._removeFile(this._sessionPath(id), this.layout.sessions)
-    }
-    if (leftovers.staging) {
-      await this._removeFile(this._stagingPath(id), this.layout.staging)
-    }
-    await this._discardJournal(id, journal.attemptId)
-    return { status: 'COMMITTED', record: journal.record }
-  }
-
-  async retryAbortedAttempt(
-    transferId: Uint8Array,
-    sessionStore: SessionStore | null
-  ): Promise<false | { status: 'COMMITTED' | 'ABORTED'; record: CommitRecord }> {
-    assertFixed32(transferId, 'revoked transfer ID')
-    if (!sessionStore || typeof sessionStore.readVerified !== 'function') {
-      throw storageError('Invalid session store for revoked attempt retry')
-    }
-    const id = toHex(transferId)
-    const pending = await this._readJournal(id).catch((err: unknown) => {
-      if (err instanceof CorruptJournalError) return null
-      throw err
-    })
-    const leaseName = isReplacementJournal(pending) ? pending.name : null
-    const run = (): Promise<false | { status: 'COMMITTED' | 'ABORTED'; record: CommitRecord }> =>
-      withRootLease(this.layout.root, async () => {
-        await this._assertLayout()
-        const journal = await this._readJournal(id)
-        if (!journal) return false
-        if (isReplacementJournal(journal)) {
-          const converged = await this._convergeReplacement(id, journal, sessionStore, {
-            forceAbort: true
-          })
-          if (converged.status === 'RESUMABLE') {
-            throw storageError('Replacement journal is not aborting')
-          }
-          return { status: converged.status, record: converged.record }
-        }
-        return this._retryAbortedCommit(id, journal, sessionStore)
-      })
-    return leaseName === null ? run() : withNameLease(this.layout.root, leaseName, run)
-  }
-
-  async _retryAbortedCommit(
-    id: string,
-    initial: CommitJournal,
-    sessionStore: SessionStore
-  ): Promise<false | { status: 'COMMITTED' | 'ABORTED'; record: CommitRecord }> {
-    {
-      let journal: CommitJournal = initial
-      const publication = await this._inspectJournalPublication(journal)
-      if (publication.committed) {
-        return this._cleanupCommittedAttempt(id, journal, sessionStore)
-      }
-      const session = await sessionStore.readVerified(b4a.from(id, 'hex'))
-      this._assertSessionMatchesRecord(
-        session,
-        journal.record,
-        'Revoked commit journal does not match verified session'
-      )
-      const stagingPath = this._stagingPath(id)
-      const staging = await assertSafeFile(stagingPath, this.storage)
-      if (
-        !identitiesEqual(fileIdentity(staging), journal.sourceStagingIdentity) ||
-        !(await this._matchesRecord(stagingPath, this.layout.staging, journal.record))
-      ) {
-        throw storageError('Staging file changed before revoked attempt retry')
-      }
-      if (journal.state === 'committing') {
-        const marked = await this._markAttemptAborting(id, journal.attemptId)
-        if (marked.version !== JOURNAL_VERSION) {
-          throw storageError('Commit journal changed before abort')
-        }
-        journal = marked
-      }
-      if (journal.state !== 'aborting') throw storageError('Commit journal is not aborting')
-      await this._removeAbortedPublication(journal.record, journal.sourceStagingIdentity)
-      await this._discardJournal(id, journal.attemptId)
-      return { status: 'ABORTED', record: journal.record }
-    }
   }
 
   commit(
@@ -1012,7 +914,7 @@ class CommitStore {
     const stagingDigest = await digestExactFile(stagingPath, record.size, this.storage, true)
     if (
       stagingDigest === null ||
-      !b4a.equals(stagingDigest.digest, b4a.from(record.sha256, 'hex'))
+      !digestMatches(stagingDigest.digest, b4a.from(record.sha256, 'hex'))
     ) {
       throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Staging file checksum mismatch')
     }
@@ -1051,6 +953,7 @@ class CommitStore {
       await this._removeFile(this._sessionPath(record.transferId), this.layout.sessions)
       assertNotAborted(signal)
       await this._removeFile(stagingPath, this.layout.staging)
+      await this._removeFile(this._tarStagingPath(record.transferId), this.layout.staging)
       assertNotAborted(signal)
       await this._discardJournal(record.transferId, journalAttemptId)
       if (retentionManager) await retentionManager._afterCommitUnlocked()
@@ -1060,7 +963,7 @@ class CommitStore {
         this._reportCleanupPending(record, err)
         return record
       }
-      if (errorCode(err) === ERRORS.REVOKED) {
+      if (errorCode(err) === ERRORS.ABORTED) {
         return this._abortAttempt(record, stagingDigest.identity, journalAttemptId, err)
       }
       if (!linked && errorCode(err) !== 'EEXIST') {
@@ -1127,7 +1030,7 @@ class CommitStore {
     if (!state.present) return { name, identity: null }
     if (!state.stat) throw existsError('History destination already exists')
     const digested = await digestExactFile(this._finalPath(name), existing.size, this.storage)
-    if (!digested || !b4a.equals(digested.digest, b4a.from(existing.sha256, 'hex'))) {
+    if (!digested || !digestMatches(digested.digest, b4a.from(existing.sha256, 'hex'))) {
       throw existsError('History destination already exists')
     }
     return { name, identity: digested.identity }
@@ -1241,6 +1144,7 @@ class CommitStore {
 
       await this._removeFile(this._sessionPath(newRecord.transferId), this.layout.sessions)
       await this._removeFile(stagingPath, this.layout.staging)
+      await this._removeFile(this._tarStagingPath(newRecord.transferId), this.layout.staging)
       await this._discardJournal(newRecord.transferId, attempt)
       if (retentionManager) await retentionManager._afterCommitUnlocked()
       return newRecord
@@ -1249,16 +1153,16 @@ class CommitStore {
         this._reportCleanupPending(newRecord, err)
         return newRecord
       }
-      const revoked = errorCode(err) === ERRORS.REVOKED
+      const aborted = errorCode(err) === ERRORS.ABORTED
       try {
-        if (revoked) await this._markAttemptAborting(newRecord.transferId, attempt)
+        if (aborted) await this._markAttemptAborting(newRecord.transferId, attempt)
         await this._rollbackReplacement(journal)
         await this._discardJournal(newRecord.transferId, attempt)
       } catch (cleanupError) {
         throw new AggregateError(
           [err, cleanupError],
-          revoked
-            ? 'Unable to clean up revoked replacement'
+          aborted
+            ? 'Unable to clean up aborted replacement'
             : 'Unable to roll back failed replacement'
         )
       }
@@ -1458,6 +1362,7 @@ class CommitStore {
       }
       await this._removeFile(stagingPath, this.layout.staging)
     }
+    await this._removeFile(this._tarStagingPath(id), this.layout.staging)
   }
 
   /** Proves the verified session and staging an aborted attempt must retain. */
@@ -1515,13 +1420,14 @@ class CommitStore {
     ) {
       await this._removeFile(this._sessionPath(id), this.layout.sessions)
       await this._removeFile(this._stagingPath(id), this.layout.staging)
+      await this._removeFile(this._tarStagingPath(id), this.layout.staging)
       await this._discardJournal(id, journalAttemptId)
       return { status: 'COMMITTED', record }
     }
 
     if (journal.state === 'aborting') {
       if (!sessionStore || typeof sessionStore.readVerified !== 'function') {
-        throw storageError('Session store cannot validate revoked commit journal')
+        throw storageError('Session store cannot validate aborted commit journal')
       }
       const session = await sessionStore.readVerified(b4a.from(id, 'hex'))
       if (
@@ -1581,6 +1487,7 @@ class CommitStore {
       }
       await this._removeFile(this._sessionPath(id), this.layout.sessions)
       await this._removeFile(this._stagingPath(id), this.layout.staging)
+      await this._removeFile(this._tarStagingPath(id), this.layout.staging)
       await this._discardJournal(id, journalAttemptId)
       return { status: 'COMMITTED', record }
     }
@@ -1628,15 +1535,42 @@ class CommitStore {
     return records
   }
 
-  /**
-   * A replacement makes the old sidecar the history record after its new
-   * current sidecar is durable, so one name can briefly carry two records.
-   * Only a journal-owned duplicate is tolerated, reported at the history name
-   * that recovery will persist; anything else fails closed.
-   */
-  async list(): Promise<CommitRecord[]> {
+  async scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }> {
     await this._assertLayout()
-    const records = await this._scanRecords()
+    const names = await withSafeDirectoryIdentity(this.layout.commits, this.storage, () =>
+      this.storage.readdir(this.layout.commits)
+    )
+    const records: CommitRecord[] = []
+    let deleted = 0
+    for (const filename of names.filter(isCommitRecordName).sort()) {
+      const id = filename.slice(0, -'.json'.length)
+      const recordPath = this._recordPath(id)
+      let record: CommitRecord | null = null
+      let invalid = false
+      try {
+        const parsed = await readJson(recordPath, this.storage, MAX_COMMIT_METADATA_BYTES)
+        try {
+          record = assertRecord(parsed)
+          invalid = record.transferId !== id
+        } catch {
+          invalid = true
+        }
+      } catch (err) {
+        if (!(err instanceof MetadataFormatError)) throw err
+        invalid = true
+      }
+      if (invalid) {
+        await this._removeFile(recordPath, this.layout.commits)
+        deleted++
+        continue
+      }
+      if (!record) throw storageError('Commit record disappeared during scrub')
+      records.push(record)
+    }
+    return { records: await this._resolveRecords(records), deleted }
+  }
+
+  async _resolveRecords(records: CommitRecord[]): Promise<CommitRecord[]> {
     const counts = new Map<string, number>()
     for (const record of records) counts.set(record.name, (counts.get(record.name) ?? 0) + 1)
 
@@ -1663,6 +1597,17 @@ class CommitStore {
       seen.add(record.name)
     }
     return resolved
+  }
+
+  /**
+   * A replacement makes the old sidecar the history record after its new
+   * current sidecar is durable, so one name can briefly carry two records.
+   * Only a journal-owned duplicate is tolerated, reported at the history name
+   * that recovery will persist; anything else fails closed.
+   */
+  async list(): Promise<CommitRecord[]> {
+    await this._assertLayout()
+    return this._resolveRecords(await this._scanRecords())
   }
 
   /**
@@ -1700,12 +1645,29 @@ class CommitStore {
     return true
   }
 
-  async purge(record: CommitRecord): Promise<false | { purged: true; preservedPath: boolean }> {
+  async purge(
+    record: CommitRecord,
+    { preservePath = false }: { preservePath?: boolean } = {}
+  ): Promise<false | { purged: true; preservedPath: boolean }> {
     await this._assertLayout()
     assertRecord(record)
     if (!(await this._storedRecordFor(record))) return false
 
-    const final = await this._removeManagedFinalOrAbsent(record)
+    let final
+    if (preservePath) {
+      let preservedPath = false
+      await withSafeDirectoryIdentity(this.layout.root, this.storage, async () => {
+        try {
+          await this.storage.lstat(this._finalPath(record.name))
+          preservedPath = true
+        } catch (err) {
+          if (!isMissing(err)) throw err
+        }
+      })
+      final = { removed: false, preservedPath }
+    } else {
+      final = await this._removeManagedFinalOrAbsent(record)
+    }
     await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
     return { purged: true, preservedPath: final.preservedPath }
   }

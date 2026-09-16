@@ -87,9 +87,7 @@ try {
     'parseAllowlist',
     'parsePublicKey',
     'parseSeed',
-    'parseTopic',
-    'publicKeyFromSeed',
-    'topicFromServerPublicKey'
+    'publicKeyFromSeed'
   ].sort()
   const expectedRuntimeJson = JSON.stringify(expectedRuntimeExports)
   const loadProbe = `const api = require('@tetherto/swarm-deploy'); const actual = JSON.stringify(Object.keys(api).sort()); if (actual !== ${JSON.stringify(expectedRuntimeJson)}) throw new Error('unexpected root exports: ' + actual)`
@@ -119,9 +117,12 @@ try {
   )
   assert.equal(fs.statSync(seedFile).mode & 0o777, 0o600, 'seed permissions are not owner-only')
 
-  const topic = run(executable, ['topic', '--seed-file', seedFile])
-  assert.match(topic.stdout, /^[0-9a-f]{64}\n$/)
-  assert.ok(!`${topic.stdout}${topic.stderr}`.includes(secret), 'topic printed seed material')
+  const publicKey = run(executable, ['public-key', '--seed-file', seedFile])
+  assert.match(publicKey.stdout, /^[0-9a-f]{64}\n$/)
+  assert.ok(
+    !`${publicKey.stdout}${publicKey.stderr}`.includes(secret),
+    'public-key printed seed material'
+  )
 
   const before = fs.readFileSync(seedFile)
   const overwrite = spawnSync(executable, ['keygen', '--out', seedFile], {
@@ -148,8 +149,8 @@ try {
   ])
   const globalBin = path.join(globalPrefix, 'bin/swarm-deploy')
   run(globalBin, ['--help'])
-  const globalTopic = run(globalBin, ['topic', '--seed-file', seedFile])
-  assert.equal(globalTopic.stdout, topic.stdout)
+  const globalPublicKey = run(globalBin, ['public-key', '--seed-file', seedFile])
+  assert.equal(globalPublicKey.stdout, publicKey.stdout)
 
   console.log(
     `package smoke: ${manifest.entryCount} files, ${manifest.size} packed bytes, ${manifest.unpackedSize} unpacked bytes`

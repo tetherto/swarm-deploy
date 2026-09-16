@@ -1,7 +1,7 @@
 {
   "name": "@tetherto/swarm-deploy",
   "version": "0.1.0",
-  "description": "Secure resumable artifact uploads over Hyperswarm",
+  "description": "Secure resumable artifact uploads over direct HyperDHT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tetherto/swarm-deploy.git"
@@ -35,6 +35,7 @@
     "test:types": "tsc --ignoreConfig --noEmit --strict --module node16 --moduleResolution node16 --types node test/types/public-api.ts",
     "test:node": "npm run build && npm run build:test && brittle-node .test-dist/run.js",
     "test:bare": "npm run build && npm run build:test && brittle-bare .test-dist/run.js",
+    "test:property": "npm run build && npm run build:test && brittle-node .test-dist/unit/tar-property.test.js",
     "test": "npm run build && npm run build:test && brittle-node .test-dist/run.js && brittle-bare .test-dist/run.js",
     "test:package": "node scripts/package-smoke.mjs",
     "test:release-tag": "node scripts/test-release-tag.mjs",
@@ -46,10 +47,6 @@
     "provenance": true
   },
   "imports": {
-    "#crypto": {
-      "bare": "bare-crypto",
-      "default": "./dist/crypto-node.js"
-    },
     "#events": {
       "bare": "bare-events",
       "default": "./dist/events-node.js"
@@ -83,16 +80,14 @@
   "license": "Apache-2.0",
   "dependencies": {
     "b4a": "^1.8.1",
-    "bare-crypto": "^1.15.3",
     "bare-events": "^2.9.2",
     "bare-fs": "^4.8.1",
     "bare-os": "^3.9.3",
     "bare-path": "^3.1.1",
     "bare-process": "^4.5.1",
-    "compact-encoding": "^3.3.2",
     "hyperdht": "^6.33.2",
-    "hyperswarm": "^4.17.0",
-    "protomux": "^3.11.0"
+    "sodium-native": "^5.1.0",
+    "tar-stream": "3.2.1"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
