@@ -427,17 +427,17 @@ test('Server batches tiny TAR fragments into bounded durable appends', async (t)
 
 test('Server applies the inactivity timeout independently to metadata and TAR phases', async (t) => {
   for (const phase of ['metadata', 'tar'] as const) {
+    const input = phase === 'tar' ? await manifest(t, `${phase}.txt`) : null
     const { server, node } = await createServer(t, {
       maxConnections: 1,
       maxActiveUploads: 1,
-      idleTimeout: 5
+      idleTimeout: 50
     })
     const failures: string[] = []
     server.on('failure', (event) => failures.push(event.reason))
     const socket = new FakeSocket(CLIENT_KEY)
     node.accept(socket)
-    if (phase === 'tar') {
-      const input = await manifest(t, `${phase}.txt`)
+    if (input) {
       socket.feed(metadataFrame(input.manifest))
       await waitFor(() => statuses(socket).includes('ACCEPT'))
     }
