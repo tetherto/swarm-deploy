@@ -33,13 +33,13 @@ protocol for stored artifacts.
 Install the runtime API in an application:
 
 ```sh
-npm install @tetherto/swarm-deploy
+npm install swarm-deploy
 ```
 
 Install the CLI globally for a receiving server or CI uploader:
 
 ```sh
-npm install --global @tetherto/swarm-deploy
+npm install --global swarm-deploy
 swarm-deploy --help
 ```
 
@@ -232,7 +232,7 @@ nonsecret variable:
 
 ```yaml
 - name: Install uploader
-  run: npm install --global @tetherto/swarm-deploy
+  run: npm install --global swarm-deploy
 
 - name: Upload artifact
   env:
@@ -339,7 +339,7 @@ import {
   parsePublicKey,
   parseSeed,
   publicKeyFromSeed
-} from '@tetherto/swarm-deploy'
+} from 'swarm-deploy'
 
 const seed = generateSeed() // 32 random bytes
 const restored = parseSeed(process.env.SEED!) // strict lowercase hex
@@ -359,7 +359,7 @@ duplicate keys throw. It returns a `Set<string>` suitable for
 ### Server
 
 ```ts
-import { Server, parsePublicKey, parseSeed } from '@tetherto/swarm-deploy'
+import { Server, parsePublicKey, parseSeed } from 'swarm-deploy'
 
 const server = new Server({
   seed: parseSeed(process.env.SWARM_DEPLOY_SERVER_SEED!),
@@ -412,7 +412,7 @@ Advanced integration and test seams:
 ### Client
 
 ```ts
-import { Client, parsePublicKey, parseSeed } from '@tetherto/swarm-deploy'
+import { Client, parsePublicKey, parseSeed } from 'swarm-deploy'
 
 const client = new Client({
   seed: parseSeed(process.env.SWARM_DEPLOY_CLIENT_SEED!),
@@ -545,7 +545,7 @@ may propagate while selecting or opening a local input, initializing or locking
 the server storage root, or performing filesystem operations:
 
 ```ts
-import { ERRORS, SwarmDeployError } from '@tetherto/swarm-deploy'
+import { ERRORS, SwarmDeployError } from 'swarm-deploy'
 
 try {
   await client.upload('./artifact.tgz')
