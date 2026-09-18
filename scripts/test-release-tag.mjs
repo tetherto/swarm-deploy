@@ -118,7 +118,7 @@ const policy = [
   { uses: `holepunchto/actions/setup-node@${reviewedAction}` },
   { name: 'Validate release tag', run: 'node scripts/validate-release-tag.mjs' },
   { name: 'Verify tagged commit is on main' },
-  { run: 'npm ci' },
+  { run: 'npm install' },
   { name: 'Build untracked distribution', run: '|' },
   { run: 'npm run test:types' },
   { run: 'npm run validate:package' },

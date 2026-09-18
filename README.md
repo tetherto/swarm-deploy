@@ -617,7 +617,7 @@ untracked `dist/` and `.test-dist/`. Tests generate binary payloads in temporary
 directories and use an isolated local HyperDHT testnet, not the public DHT.
 
 ```sh
-npm ci
+npm install
 npm run build
 npm run build:test
 npm run test:types

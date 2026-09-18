@@ -11,14 +11,14 @@ Releases are immutable npm versions published by the tag-triggered GitHub Action
 
 ## Preflight
 
-1. Update `package.json` and `package-lock.json` to the same SemVer version and update `CHANGELOG.md`.
+1. Update `package.json` to the new SemVer version and update `CHANGELOG.md`.
    Confirm the README and CLI examples use direct `--server-key` uploads and
    repeatable static `--allow-key` server configuration; topics and discovery
    are not release interfaces.
 2. From a clean checkout, run:
 
    ```sh
-   npm ci
+   npm install
    npm run build
    npm run build:test
    npm run lint
