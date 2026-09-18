@@ -181,10 +181,7 @@ test('CLI accepts canonical --seed strings and rejects competing seed sources', 
   t.is(publicKeyOut.text(), `${b4a.toString(CLIENT_KEY, 'hex')}\n`)
   const malformedSeed = output()
   const uppercaseSeed = 'AB'.repeat(32)
-  t.is(
-    await main(['public-key', '--seed', uppercaseSeed], {}, { stderr: malformedSeed.stream }),
-    2
-  )
+  t.is(await main(['public-key', '--seed', uppercaseSeed], {}, { stderr: malformedSeed.stream }), 2)
   t.absent(malformedSeed.text().includes(uppercaseSeed))
 
   let clientOptions: ClientOptions | null = null
