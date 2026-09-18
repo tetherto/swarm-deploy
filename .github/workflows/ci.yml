@@ -17,7 +17,7 @@ jobs:
       - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
         with:
           version: 24.x
-      - run: npm ci
+      - run: npm install
       - run: npm run build && npm run build:test && npm run test:types
       - run: npm run lint
       - run: npm run test:property
@@ -40,7 +40,7 @@ jobs:
       - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
         with:
           version: ${{ matrix.node }}
-      - run: npm ci
+      - run: npm install
       - run: npm run test:node
 
   bare:
@@ -56,7 +56,7 @@ jobs:
       - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
         with:
           version: 24.x
-      - run: npm ci
+      - run: npm install
       - uses: holepunchto/actions/setup-bare@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
       - run: bare --version
       - run: npm run test:bare

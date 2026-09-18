@@ -36,7 +36,7 @@ jobs:
         run: |
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-      - run: npm ci
+      - run: npm install
       - name: Build untracked distribution
         run: |
           test ! -e dist
