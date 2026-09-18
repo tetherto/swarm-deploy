@@ -22,9 +22,12 @@ protocol, chunk hash, bitmap, or multi-file connection.
 
 Server and client have separate, persistent Ed25519 identities. Each identity
 starts from an independently generated random 32-byte seed, represented to
-operators as 64 lowercase hexadecimal characters. Seeds are read from
-role-specific files or environment variables, never command-line arguments,
-and are never logged.
+operators as 64 lowercase hexadecimal characters. Runtime constructors accept
+the seed as a 32-byte Buffer or canonical hex string. The CLI accepts exactly
+one role-specific seed source: file, environment variable, or explicit
+`--seed`. Files and environment variables are preferred because command
+arguments may be exposed through shell history, process listings, CI tracing,
+and diagnostic tooling. Seeds are never logged by Swarm Deploy.
 
 `sodium-native` is the cryptographic implementation. Seeded keypairs use its
 Ed25519 keypair primitive, SHA-256 uses its SHA-256 primitive, and

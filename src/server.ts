@@ -233,7 +233,7 @@ export class Server extends EventEmitter {
     if (!options || typeof options !== 'object') {
       throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid server options')
     }
-    this.keyPair = keyPairFromSeed(key(options.seed, 'server seed'))
+    this.keyPair = keyPairFromSeed(options.seed)
     this.publicKey = b4a.from(this.keyPair.publicKey)
     this.storageDir =
       typeof options.storageDir === 'string' && options.storageDir

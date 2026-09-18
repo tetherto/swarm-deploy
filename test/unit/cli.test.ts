@@ -167,6 +167,131 @@ test('CLI snapshots repeatable --allow-key values for the direct server', async 
   t.is(stderr.text(), '')
 })
 
+test('CLI accepts canonical --seed strings and rejects competing seed sources', async (t) => {
+  const root = await createTempDir(t)
+  const artifact = path.join(root, 'string-seed.txt')
+  const seedPath = path.join(root, 'client.seed')
+  const clientSeed = b4a.toString(CLIENT_SEED, 'hex')
+  const serverSeed = b4a.toString(SERVER_SEED, 'hex')
+  await fs.promises.writeFile(artifact, 'string seed upload')
+  await fs.promises.writeFile(seedPath, `${clientSeed}\n`)
+
+  const publicKeyOut = output()
+  t.is(await main(['public-key', '--seed', clientSeed], {}, { stdout: publicKeyOut.stream }), 0)
+  t.is(publicKeyOut.text(), `${b4a.toString(CLIENT_KEY, 'hex')}\n`)
+  const malformedSeed = output()
+  const uppercaseSeed = 'AB'.repeat(32)
+  t.is(
+    await main(['public-key', '--seed', uppercaseSeed], {}, { stderr: malformedSeed.stream }),
+    2
+  )
+  t.absent(malformedSeed.text().includes(uppercaseSeed))
+
+  let clientOptions: ClientOptions | null = null
+  class Client {
+    constructor(options: ClientOptions) {
+      clientOptions = options
+    }
+    upload() {
+      return Promise.resolve({
+        status: 'COMMITTED' as const,
+        name: 'string-seed.txt',
+        size: 18,
+        digest: b4a.alloc(32),
+        transferId: b4a.alloc(32)
+      })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const uploadOut = output()
+  const uploadErr = output()
+  t.is(
+    await main(
+      ['upload', '--seed', clientSeed, '--server-key', b4a.toString(SERVER_KEY, 'hex'), artifact],
+      {},
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: uploadOut.stream,
+        stderr: uploadErr.stream
+      }
+    ),
+    0
+  )
+  t.alike((clientOptions as unknown as ClientOptions).seed, CLIENT_SEED)
+  t.absent(`${uploadOut.text()}${uploadErr.text()}`.includes(clientSeed))
+
+  const proc = new EventEmitter()
+  let serverOptions: ServerOptions | null = null
+  class Server {
+    publicKey = SERVER_KEY
+    constructor(options: ServerOptions) {
+      serverOptions = options
+    }
+    listen() {
+      queueMicrotask(() => proc.emit('SIGTERM'))
+      return Promise.resolve(this)
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const serverOut = output()
+  t.is(
+    await main(
+      [
+        'server',
+        '--seed',
+        serverSeed,
+        '--storage',
+        root,
+        '--allow-key',
+        b4a.toString(CLIENT_KEY, 'hex'),
+        '--max-file-bytes',
+        '1024',
+        '--max-staging-bytes',
+        '4096'
+      ],
+      {},
+      {
+        Server: Server as unknown as new (
+          options: ServerOptions
+        ) => import('../../dist/server.js').Server,
+        process: proc,
+        stdout: serverOut.stream
+      }
+    ),
+    0
+  )
+  t.alike((serverOptions as unknown as ServerOptions).seed, SERVER_SEED)
+  t.absent(serverOut.text().includes(serverSeed))
+
+  for (const extra of [['--seed-file', seedPath], [] as string[]]) {
+    const stderr = output()
+    const env = extra.length === 0 ? { SWARM_DEPLOY_CLIENT_SEED: clientSeed } : {}
+    t.is(
+      await main(
+        [
+          'upload',
+          '--seed',
+          clientSeed,
+          ...extra,
+          '--server-key',
+          b4a.toString(SERVER_KEY, 'hex'),
+          artifact
+        ],
+        env,
+        { stderr: stderr.stream }
+      ),
+      2
+    )
+    t.absent(stderr.text().includes(clientSeed))
+  }
+})
+
 test('CLI accepts role-specific environment seeds, rejects file conflicts, and hides secrets', async (t) => {
   const root = await createTempDir(t)
   const clientSeedPath = path.join(root, 'client.seed')

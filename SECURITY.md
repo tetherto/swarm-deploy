@@ -19,11 +19,14 @@ and disclosure may use a private GitHub Security Advisory.
 
 ## Operator precautions
 
-- Generate independent server and client seeds, store them as owner-readable
-  secrets, and never pass or log them as command-line arguments. A client pins
-  the server's full public key; the server's immutable startup allowlist names
-  permitted client public keys. If a seed may be exposed, rotate it, restart
-  with a revised allowlist, and purge the compromised secret from logs and caches.
+- Generate independent server and client seeds and prefer owner-readable files
+  or protected environment variables. The CLI accepts `--seed` for explicit
+  inline configuration, but command arguments may be exposed through shell
+  history, process listings, CI tracing, and diagnostic tooling. Never log a
+  seed. A client pins the server's full public key; the server's immutable
+  startup allowlist names permitted client public keys. If a seed may be
+  exposed, rotate it, restart with a revised allowlist, and purge the
+  compromised secret from logs and caches.
 - Run under a dedicated non-root account with a dedicated storage root.
   Swarm Deploy protects against detected symlink and directory-identity
   changes, but it does not defend against a malicious process with the same OS

@@ -40,11 +40,11 @@ const CLIENT_SEED_ENV = 'SWARM_DEPLOY_CLIENT_SEED'
 const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
-  '  swarm-deploy public-key --seed-file <seed-file>',
-  '  swarm-deploy server --seed-file <seed-file> --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
-  '  swarm-deploy upload --seed-file <seed-file> --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <file-or-directory>',
+  '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
+  '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <file-or-directory>',
   '',
-  'Use --seed-file. A command-specific environment variable is also accepted.'
+  'Use exactly one seed source. A command-specific environment variable is also accepted.'
 ].join('\n')
 
 class CliError extends Error {
@@ -291,14 +291,8 @@ function isCanonicalHexToken(value: unknown): boolean {
   return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
 }
 
-function isRawSeedOption(arg: unknown): boolean {
-  if (typeof arg !== 'string') return false
-  if (arg === '--seed-file' || arg.startsWith('--seed-file=')) return false
-  return arg === '--seed' || arg.startsWith('--seed')
-}
-
-function rejectRawSeed() {
-  throw usageError('Raw seeds are not accepted as command-line arguments')
+function rejectUnexpectedSeed() {
+  throw usageError('Seed strings must be passed with --seed')
 }
 
 function parseOptions(
@@ -322,8 +316,8 @@ function parseOptions(
   const positionals: string[] = []
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
-    if (isRawSeedOption(arg) || (isCanonicalHexToken(arg) && !keyValues.has(args[i - 1]))) {
-      rejectRawSeed()
+    if (isCanonicalHexToken(arg) && !keyValues.has(args[i - 1])) {
+      rejectUnexpectedSeed()
     }
     if (arg.startsWith('-')) {
       if (arg.includes('=') || !allowed.has(arg)) throw usageError('Unknown option')
@@ -336,12 +330,9 @@ function parseOptions(
       }
       const value = args[i + 1]
       if (value === undefined || value.startsWith('-')) {
-        if (value !== undefined && (isRawSeedOption(value) || isCanonicalHexToken(value))) {
-          rejectRawSeed()
-        }
         throw usageError('Missing option value')
       }
-      if (isCanonicalHexToken(value) && !keyValues.has(arg)) rejectRawSeed()
+      if (isCanonicalHexToken(value) && !keyValues.has(arg)) rejectUnexpectedSeed()
       if (repeatable.has(arg)) {
         const values = repeatedOptions[arg] || []
         values.push(value)
@@ -371,21 +362,25 @@ function requirePositionals(positionals: string[], count: number, label: string)
 
 async function resolveSeed({
   seedFile,
+  seedText,
   env,
   envName,
   role
 }: {
   seedFile: string | undefined
+  seedText: string | undefined
   env: Env
   envName: string
   role: string
 }): Promise<Buffer> {
   const hasFile = seedFile !== undefined
+  const hasText = seedText !== undefined
   const hasEnv = envHas(env, envName)
-  if (hasFile && hasEnv) {
-    throw configError(`${role} seed cannot be provided by both file and environment`)
+  if (Number(hasFile) + Number(hasText) + Number(hasEnv) > 1) {
+    throw configError(`${role} seed must be provided by exactly one source`)
   }
   if (hasFile) return await readSeedFile(seedFile)
+  if (hasText) return parseSeedText(seedText, `${role} seed`)
   if (hasEnv) return parseSeedText(String(env[envName]), `${role} seed`)
   throw usageError(`${role} seed is required`)
 }
@@ -502,9 +497,19 @@ async function runKeygen(args: string[]): Promise<string> {
 }
 
 async function runPublicKey(args: string[]): Promise<string> {
-  const { options, positionals } = parseOptions(args, new Set(['--seed-file']))
+  const { options, positionals } = parseOptions(
+    args,
+    new Set(['--seed-file', '--seed']),
+    new Set(),
+    new Set(['--seed'])
+  )
   requirePositionals(positionals, 0, 'public-key does not accept positional arguments')
-  const seed = await readSeedFile(requireOption(options, '--seed-file'))
+  const hasFile = options['--seed-file'] !== undefined
+  const hasText = options['--seed'] !== undefined
+  if (hasFile === hasText) throw usageError('public-key requires exactly one seed source')
+  const seed = hasFile
+    ? await readSeedFile(requireOption(options, '--seed-file'))
+    : parseSeedText(requireOption(options, '--seed'), 'seed')
   return b4a.toString(publicKeyFromSeed(seed), 'hex')
 }
 
@@ -513,6 +518,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     args,
     new Set([
       '--seed-file',
+      '--seed',
       '--storage',
       '--allow-key',
       '--max-file-bytes',
@@ -522,7 +528,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--replace-name'
     ]),
     new Set(['--replace-name', '--allow-key']),
-    new Set(['--allow-key'])
+    new Set(['--allow-key', '--seed'])
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
@@ -548,6 +554,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   }
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
+    seedText: options['--seed'],
     env,
     envName: SERVER_SEED_ENV,
     role: 'server'
@@ -641,13 +648,14 @@ function printUploadResult(result: ClientUploadResult, io: CliIo): number {
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, positionals } = parseOptions(
     args,
-    new Set(['--seed-file', '--server-key', '--idle-timeout']),
+    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout']),
     new Set(),
-    new Set(['--server-key'])
+    new Set(['--server-key', '--seed'])
   )
   const [inputPath] = requirePositionals(positionals, 1, 'upload requires a file or directory')
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
+    seedText: options['--seed'],
     env,
     envName: CLIENT_SEED_ENV,
     role: 'client'
@@ -714,7 +722,7 @@ async function dispatch(argv: string[], env: Env, io: CliIo): Promise<number> {
   }
   if (argv.length === 0) throw usageError('Missing command')
   const command = argv[0]
-  if (isRawSeedOption(command) || isCanonicalHexToken(command)) rejectRawSeed()
+  if (isCanonicalHexToken(command)) rejectUnexpectedSeed()
   if (!COMMANDS.has(command)) throw usageError('Unknown command')
   const args = argv.slice(1)
   if (command === 'keygen') {

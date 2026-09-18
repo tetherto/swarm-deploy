@@ -164,6 +164,26 @@ test('canonical TAR is deterministic and bound into its manifest', async (t) => 
   )
 })
 
+test('arbitrary binary input produces stable USTAR and round-trips exact bytes', async (t) => {
+  const dir = await createTempDir(t)
+  const file = path.join(dir, 'firmware.bin')
+  const binary = b4a.alloc(8193)
+  for (let index = 0; index < binary.byteLength; index++) binary[index] = (index * 197) & 0xff
+  await fs.promises.writeFile(file, binary)
+
+  const first = await buildTarManifest(file, CLIENT_KEY)
+  const second = await buildTarManifest(file, CLIENT_KEY)
+  const firstTar = await collectTar(first)
+  const secondTar = await collectTar(second)
+
+  t.alike(firstTar, secondTar)
+  t.alike(first.fileSha256, sha256(binary))
+  t.alike(first.tarSha256, second.tarSha256)
+  t.alike(first.transferId, second.transferId)
+  t.alike(firstTar.subarray(512, 512 + binary.byteLength), binary)
+  t.is(firstTar.byteLength, deterministicTarSize(binary.byteLength))
+})
+
 test('canonical TAR resume works at every archive region', async (t) => {
   const dir = await createTempDir(t)
   const file = path.join(dir, 'artifact.bin')

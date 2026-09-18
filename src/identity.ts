@@ -31,17 +31,19 @@ export function generateSeed(): Seed {
   return seed
 }
 
-function assertValidSeed(seed: SeedInput): asserts seed is Seed {
+function normalizeSeed(seed: SeedInput): Seed {
+  if (typeof seed === 'string') return parseSeed(seed)
   if (!b4a.isBuffer(seed) || seed.byteLength !== 32) {
     throw new SwarmDeployError(ERRORS.INVALID_SEED, 'Expected 32-byte seed')
   }
+  return b4a.from(seed)
 }
 
 export function keyPairFromSeed(seed: SeedInput): KeyPair {
-  assertValidSeed(seed)
+  const normalized = normalizeSeed(seed)
   const publicKey = b4a.alloc(32)
   const secretKey = b4a.alloc(64)
-  sodium.crypto_sign_seed_keypair(publicKey, secretKey, seed)
+  sodium.crypto_sign_seed_keypair(publicKey, secretKey, normalized)
   return { publicKey, secretKey }
 }
 

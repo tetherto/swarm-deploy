@@ -47,8 +47,10 @@ swarm-deploy --help
 
 Three values have different roles:
 
-- **Seed:** private 32-byte identity material. Never pass a seed as a command
-  argument, put it in an allowlist, or print it in logs.
+- **Seed:** private 32-byte identity material. Prefer a protected seed file or
+  environment secret. The CLI also accepts `--seed <64-lower-hex>`, but command
+  arguments can be exposed through shell history, process listings, and CI
+  tracing. Never put a seed in an allowlist or application log.
 - **Client public key:** derived from a client seed and installed in the
   server's allowlist.
 - **Server public key:** derived from the server seed and pinned by every
@@ -109,13 +111,13 @@ Upload a file:
 
 ```sh
 swarm-deploy upload --seed-file client.seed --server-key "$SERVER_KEY" \
-  --idle-timeout 60000 ./artifact.tgz
+  --idle-timeout 60000 ./artifact.bin
 ```
 
 Successful output is:
 
 ```text
-artifact.tgz COMMITTED
+artifact.bin COMMITTED
 ```
 
 Uploading the same managed content again returns `ALREADY_COMMITTED` without
@@ -136,9 +138,10 @@ The destination must not already exist.
 
 ```sh
 swarm-deploy public-key --seed-file <seed-file>
+swarm-deploy public-key --seed <64-lower-hex>
 ```
 
-Reads a seed safely and prints its public key.
+Reads a seed file or canonical seed string and prints its public key.
 
 ### `server`
 
@@ -155,9 +158,13 @@ swarm-deploy server \
   [--replace-name <safe-basename>]...
 ```
 
+Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>` to provide the
+seed inline.
+
 Required options:
 
-- `--seed-file`: persistent server seed.
+- Exactly one seed source: `--seed-file`, `--seed`, or
+  `SWARM_DEPLOY_SERVER_SEED`.
 - `--storage`: dedicated artifact and internal-state root.
 - `--allow-key`: authorized client public key. Repeat for multiple identities;
   duplicates and malformed keys are rejected.
@@ -188,9 +195,14 @@ swarm-deploy upload \
   <file-or-directory>
 ```
 
+Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>` to provide the
+seed inline.
+
 - `--server-key` is the full pinned server public key.
 - `--idle-timeout` defaults to 60 seconds and bounds inactive protocol reads and
   backpressured writes.
+- The input may be any regular binary file; Swarm Deploy creates the canonical
+  one-entry USTAR stream automatically. Pre-tarring is not required.
 - A direct file retains its basename.
 - A directory processes immediate regular-file children once, in lexical
   order, with one independent connection and result per file.
@@ -203,18 +215,28 @@ Accepted names start with an ASCII letter or digit, contain only letters,
 digits, `.`, `_`, and `-`, and occupy at most 100 UTF-8 bytes. `history-` is
 reserved for server-managed replacement history.
 
-### Seed environment variables
+If a basename is exactly 64 lowercase hexadecimal characters, pass it with a
+directory component such as `./<name>` so the CLI does not treat it as an
+accidentally pasted seed.
 
-The server and uploader accept role-specific environment variables:
+### Seed sources
 
-- `SWARM_DEPLOY_SERVER_SEED`
-- `SWARM_DEPLOY_CLIENT_SEED`
+Server and upload commands accept exactly one of:
 
-Each value is the lowercase 64-character hex content of the corresponding seed
-file. Supplying both an environment seed and `--seed-file` is an error.
+- `--seed-file <seed-file>`
+- `--seed <64-lower-hex>`
+- the role-specific `SWARM_DEPLOY_SERVER_SEED` or
+  `SWARM_DEPLOY_CLIENT_SEED` environment variable
 
-The `public-key` command intentionally reads a seed file and does not consume a
-seed environment variable.
+String values must contain exactly 64 lowercase hexadecimal characters.
+Combining seed sources is an error.
+
+The `public-key` command accepts `--seed-file` or `--seed`; it does not consume a
+role-specific environment variable.
+
+Prefer seed files or protected environment variables in production. Use
+`--seed` only when exposure through command history, process inspection, and
+tooling logs is acceptable.
 
 ### CLI exit codes
 
@@ -246,7 +268,7 @@ nonsecret variable:
 ```
 
 Do not enable shell tracing around commands that read seed environment
-variables.
+variables or pass `--seed`.
 
 ## Transfer and resume behavior
 
@@ -359,10 +381,10 @@ duplicate keys throw. It returns a `Set<string>` suitable for
 ### Server
 
 ```ts
-import { Server, parsePublicKey, parseSeed } from 'swarm-deploy'
+import { Server, parsePublicKey } from 'swarm-deploy'
 
 const server = new Server({
-  seed: parseSeed(process.env.SWARM_DEPLOY_SERVER_SEED!),
+  seed: process.env.SWARM_DEPLOY_SERVER_SEED!,
   storageDir: '/srv/artifacts',
   allowedKeys: [
     parsePublicKey(process.env.CLIENT_A_PUBLIC_KEY!),
@@ -390,7 +412,7 @@ await server.close()
 
 Required `ServerOptions`:
 
-- `seed: Buffer`
+- `seed: Buffer | string`
 - `storageDir: string`
 - `allowedKeys: Iterable<Buffer | string>`
 - `maxFileBytes: number`
@@ -412,10 +434,10 @@ Advanced integration and test seams:
 ### Client
 
 ```ts
-import { Client, parsePublicKey, parseSeed } from 'swarm-deploy'
+import { Client, parsePublicKey } from 'swarm-deploy'
 
 const client = new Client({
-  seed: parseSeed(process.env.SWARM_DEPLOY_CLIENT_SEED!),
+  seed: process.env.SWARM_DEPLOY_CLIENT_SEED!,
   serverPublicKey: parsePublicKey(process.env.SWARM_DEPLOY_SERVER_KEY!),
   connectTimeout: 30_000,
   idleTimeout: 60_000
@@ -427,7 +449,8 @@ console.log(result.status, result.name, result.size)
 await client.close()
 ```
 
-`ClientOptions` requires `seed` and `serverPublicKey` as Buffer values. Optional
+`ClientOptions.seed` accepts a Buffer or canonical lowercase 64-character hex
+string. `serverPublicKey` is a Buffer produced by `parsePublicKey`. Optional
 values are `connectTimeout`, `idleTimeout`, `dht`, `dhtFactory`, and `logger`.
 
 `connectTimeout` defaults to 30 seconds. `idleTimeout` defaults to 60 seconds.

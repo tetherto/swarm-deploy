@@ -11,8 +11,8 @@ export type BinaryInput = Uint8Array
 
 /** A 32-byte seed used to derive a HyperDHT identity. */
 export type Seed = Binary
-/** A 32-byte seed accepted by identity and constructor APIs. */
-export type SeedInput = BinaryInput
+/** A 32-byte buffer or canonical lowercase 64-character hex seed string. */
+export type SeedInput = BinaryInput | string
 /** A 32-byte HyperDHT public key. */
 export type PublicKey = Binary
 /** A 32-byte public key accepted by identity, constructor, and allowlist APIs. */
