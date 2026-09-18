@@ -90,15 +90,15 @@ try {
     'publicKeyFromSeed'
   ].sort()
   const expectedRuntimeJson = JSON.stringify(expectedRuntimeExports)
-  const loadProbe = `const api = require('@tetherto/swarm-deploy'); const actual = JSON.stringify(Object.keys(api).sort()); if (actual !== ${JSON.stringify(expectedRuntimeJson)}) throw new Error('unexpected root exports: ' + actual)`
+  const loadProbe = `const api = require('swarm-deploy'); const actual = JSON.stringify(Object.keys(api).sort()); if (actual !== ${JSON.stringify(expectedRuntimeJson)}) throw new Error('unexpected root exports: ' + actual)`
   const importProbe =
-    "import('@tetherto/swarm-deploy').then(api => { if (typeof api.Client !== 'function') process.exit(1) }, err => { console.error(err); process.exit(1) })"
+    "import('swarm-deploy').then(api => { if (typeof api.Client !== 'function') process.exit(1) }, err => { console.error(err); process.exit(1) })"
   run(process.execPath, ['-e', loadProbe])
   run(process.execPath, ['--input-type=module', '-e', importProbe])
   run('bare', ['-e', loadProbe])
   run('bare', ['-e', importProbe])
 
-  const packageRoot = path.join(consumer, 'node_modules/@tetherto/swarm-deploy')
+  const packageRoot = path.join(consumer, 'node_modules/swarm-deploy')
   const cliModule = path.join(packageRoot, 'dist/bin/swarm-deploy.js')
   const executable = path.join(consumer, 'node_modules/.bin/swarm-deploy')
   run(executable, ['--help'])

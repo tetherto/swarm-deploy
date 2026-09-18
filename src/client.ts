@@ -178,7 +178,7 @@ export class Client extends EventEmitter {
     if (!options || typeof options !== 'object') {
       throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid client options')
     }
-    const seed = key(options.seed, 'client seed', ERRORS.INVALID_SEED)
+    const keyPair = keyPairFromSeed(options.seed)
     this.serverPublicKey = key(
       options.serverPublicKey,
       'server public key',
@@ -190,9 +190,9 @@ export class Client extends EventEmitter {
       DEFAULT_CONNECT_TIMEOUT
     )
     this.idleTimeout = duration(options.idleTimeout, 'idle timeout', DEFAULT_IDLE_TIMEOUT)
-    this.publicKey = b4a.from(keyPairFromSeed(seed).publicKey)
+    this.publicKey = b4a.from(keyPair.publicKey)
     this.direct = new DirectDhtClient({
-      keyPair: keyPairFromSeed(seed),
+      keyPair,
       dht: options.dht,
       dhtFactory: options.dhtFactory,
       connectTimeout: this.connectTimeout

@@ -39,6 +39,29 @@ test('public Client and Server use direct server-key configuration', (t) => {
   t.absent('topic' in server)
 })
 
+test('runtime identities accept canonical seed strings', (t) => {
+  const serverSeed = b4a.toString(SERVER_SEED, 'hex')
+  const clientSeed = b4a.toString(CLIENT_A_SEED, 'hex')
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: '/temporary/direct-dht-string-seed',
+    allowedKeys: [keyPairFromSeed(CLIENT_A_SEED).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey
+  })
+  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
+
+  t.alike(server.publicKey, keyPairFromSeed(SERVER_SEED).publicKey)
+  t.alike(client.publicKey, keyPairFromSeed(CLIENT_A_SEED).publicKey)
+  t.alike(keyPairFromSeed(serverSeed).publicKey, server.publicKey)
+  t.exception(() => keyPairFromSeed('AB'.repeat(32)), { code: ERRORS.INVALID_SEED })
+  t.exception(() => keyPairFromSeed('not-a-seed'), { code: ERRORS.INVALID_SEED })
+})
+
 function inertSocket(remotePublicKey: Buffer, opened: Promise<boolean>): DirectDhtSocket {
   let destroyed = false
   const errorListeners: Array<(error: Error) => void> = []

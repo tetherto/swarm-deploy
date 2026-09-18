@@ -22,9 +22,22 @@ const server = new Server({
   maxFileBytes: 1024,
   maxStagingBytes: 4096
 } satisfies ServerOptions)
+const stringSeedClientOptions = {
+  seed: '11'.repeat(32),
+  serverPublicKey: parsePublicKey('00'.repeat(32))
+} satisfies ClientOptions
+const stringSeedServerOptions = {
+  seed: '22'.repeat(32),
+  storageDir: '/srv/swarm-deploy',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096
+} satisfies ServerOptions
 
 void client
 void server
+void stringSeedClientOptions
+void stringSeedServerOptions
 const result: UploadResult | null = null
 void result
 

@@ -4,7 +4,7 @@ Releases are immutable npm versions published by the tag-triggered GitHub Action
 
 ## One-time setup
 
-1. In npm, create the `@tetherto/swarm-deploy` package or grant the maintainers access to the `@tetherto` scope.
+1. In npm, grant the maintainers publish access to the unscoped `swarm-deploy` package.
 2. Configure npm trusted publishing for this GitHub repository, workflow `publish.yml`, and environment `npm`.
 3. Protect the `npm` environment with the required reviewers and deployment-branch/tag rules. Do not add an npm token: the workflow uses OIDC.
 4. Protect release tags and require the CI checks on `main`.
@@ -44,8 +44,8 @@ git push origin vX.Y.Z
 Approve the protected `npm` environment if required. Confirm the workflow used provenance, then verify the registry metadata, provenance statement, tarball contents, and a fresh install:
 
 ```sh
-npm view @tetherto/swarm-deploy@X.Y.Z version dist.integrity
-npm install --global @tetherto/swarm-deploy@X.Y.Z
+npm view swarm-deploy@X.Y.Z version dist.integrity
+npm install --global swarm-deploy@X.Y.Z
 swarm-deploy --help
 ```
 
@@ -65,7 +65,7 @@ Roll the package into one canary client/server pair first. Confirm `ready`, auth
 Package versions and deployment configuration are immutable inputs. Roll clients and servers back by reinstalling and redeploying the last known-good exact version; never republish an existing version. If the bad version should not be selected by users, deprecate it with a clear replacement:
 
 ```sh
-npm deprecate @tetherto/swarm-deploy@X.Y.Z "Use X.Y.(Z+1); reason: <summary>"
+npm deprecate swarm-deploy@X.Y.Z "Use X.Y.(Z+1); reason: <summary>"
 ```
 
 Do not roll a server back while a v2 replacement journal is in flight. Stop new uploads, drain active work, and allow the current version to recover or finish every replacement journal first. Back up the dedicated storage root after a clean shutdown, and test the previous version against a copy before production rollback. An older server may not understand v2 replacement state.
