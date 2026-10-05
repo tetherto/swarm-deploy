@@ -86,12 +86,14 @@
     "bare-path": "^3.1.1",
     "bare-process": "^4.5.1",
     "hyperdht": "^6.33.2",
+    "semver": "^7.8.5",
     "sodium-native": "^5.1.0",
     "tar-stream": "3.2.1"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
-    "bare-runtime": "^1.31.0",
+    "@types/semver": "^7.8.0",
+    "bare-runtime": "^1.34.1",
     "brittle": "^4.1.0",
     "lunte": "^1.8.4",
     "prettier": "^3.9.6",
