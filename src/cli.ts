@@ -8,6 +8,8 @@ import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS } from './errors.js'
 import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './identity.js'
 import { validateReplaceNames } from './files.js'
+import { loadHooksModule } from './hooks-module.js'
+import type { ServerHooks } from './hooks.js'
 import { Server, type ServerLogger, type ServerOptions } from './server.js'
 import { Client, type ClientOptions, type ClientUploadResult } from './client.js'
 import type { DirectDhtNode } from './direct-dht.js'
@@ -28,6 +30,8 @@ type CliIo = {
   dht?: DirectDhtNode
   connectTimeout?: number
   idleTimeout?: number
+  /** Directory that relative `--hooks` paths resolve against; defaults to `process.cwd()`. */
+  cwd?: string
 }
 
 const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload'])
@@ -41,7 +45,7 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--hooks <module>]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <file-or-directory>',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
@@ -525,9 +529,14 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--max-staging-bytes',
       '--max-storage-bytes',
       '--max-age-days',
-      '--replace-name'
+      '--replace-name',
+      '--artifact-pattern',
+      '--max-count',
+      '--max-versions',
+      '--version-granularity',
+      '--hooks'
     ]),
-    new Set(['--replace-name', '--allow-key']),
+    new Set(['--replace-name', '--allow-key', '--artifact-pattern']),
     new Set(['--allow-key', '--seed'])
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
@@ -552,6 +561,19 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   } catch {
     throw usageError('Invalid --replace-name')
   }
+  const artifactPatterns = repeatedOptions['--artifact-pattern']
+  const maxCount =
+    options['--max-count'] === undefined
+      ? undefined
+      : parsePositiveSafeInteger(options['--max-count'], 'max-count')
+  const maxVersions =
+    options['--max-versions'] === undefined
+      ? undefined
+      : parsePositiveSafeInteger(options['--max-versions'], 'max-versions')
+  const granularity = options['--version-granularity']
+  if (granularity !== undefined && granularity !== 'major' && granularity !== 'minor') {
+    throw usageError('Invalid --version-granularity')
+  }
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
     seedText: options['--seed'],
@@ -575,6 +597,15 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     throw usageError('Invalid --allow-key')
   }
 
+  let hooks: ServerHooks | undefined
+  if (options['--hooks'] !== undefined) {
+    try {
+      hooks = await loadHooksModule(options['--hooks'], io.cwd ?? process.cwd())
+    } catch (err) {
+      throw configError(errorMessage(err))
+    }
+  }
+
   const ServerImpl = io.Server || Server
   let server: Server
   try {
@@ -587,6 +618,11 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       maxStorageBytes,
       maxAge,
       replaceNames,
+      artifactPatterns,
+      maxCount,
+      maxVersions,
+      versionGranularity: granularity,
+      hooks,
       dht: io.dht,
       logger: createLogger(io)
     })
