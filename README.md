@@ -773,7 +773,9 @@ original failure.
 
 ### Hook modules
 
-`--hooks <module>` accepts `.js`, `.mjs`, and `.cjs`. ESM and CommonJS examples:
+`--hooks <module>` accepts `.js`, `.mjs`, and `.cjs`; any other extension is
+rejected at startup with exit code `2` before the module is loaded. ESM and
+CommonJS examples:
 
 ```js
 // hooks.mjs

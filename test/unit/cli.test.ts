@@ -868,6 +868,40 @@ test('CLI rejects unusable hook modules as startup configuration errors', async 
   }
 })
 
+test('CLI rejects a hooks module whose extension is not .js, .mjs, or .cjs', async (t) => {
+  const root = await createTempDir(t)
+  const body = 'module.exports = { onFailure () {} }\n'
+  const rejectedNames = [
+    'hooks.ts',
+    'hooks.json',
+    'hooks.node',
+    'hooks',
+    'hooks.CJS',
+    'hooks.js.bak'
+  ]
+  for (const name of rejectedNames) {
+    await fs.promises.writeFile(path.join(root, name), body)
+  }
+  for (const name of rejectedNames) {
+    const result = await runServerCli(root, ['--hooks', name], { cwd: root })
+    t.is(result.code, 2, name)
+    t.is(result.constructed, 0, `${name} never constructs the server`)
+    t.ok(result.stderr.includes('unsupported module extension'), `${name} says why`)
+    t.absent(result.stderr.includes(root), `${name} does not leak the module directory`)
+  }
+
+  for (const name of ['ok.js', 'ok.cjs']) {
+    await fs.promises.writeFile(path.join(root, name), body)
+    const result = await runServerCli(root, ['--hooks', name], { cwd: root })
+    t.is(result.code, 0, name)
+    t.alike(Object.keys(result.options?.hooks || {}), ['onFailure'], name)
+  }
+  await fs.promises.writeFile(path.join(root, 'ok.mjs'), 'export function onFailure () {}\n')
+  const esm = await runServerCli(root, ['--hooks', 'ok.mjs'], { cwd: root })
+  t.is(esm.code, 0)
+  t.alike(Object.keys(esm.options?.hooks || {}), ['onFailure'])
+})
+
 test('CLI rejects a missing, empty, or repeated --hooks option before construction', async (t) => {
   const root = await createTempDir(t)
   await fs.promises.writeFile(path.join(root, 'a.cjs'), 'module.exports = { onFailure () {} }\n')

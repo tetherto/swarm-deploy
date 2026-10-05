@@ -3,6 +3,7 @@ import { ERRORS, SwarmDeployError } from './errors.js'
 import { snapshotHooks, type ServerHooks } from './hooks.js'
 
 const HOOK_NAMES = ['beforeCommit', 'afterCommit', 'onFailure'] as const
+const HOOK_EXTENSIONS = ['.js', '.mjs', '.cjs']
 
 function rejected(modulePath: string, reason: string): SwarmDeployError {
   // Only the basename and a fixed reason: module text, stack traces, causes and
@@ -77,6 +78,11 @@ export async function loadHooksModule(modulePath: string, cwd: string): Promise<
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid working directory')
   }
   const resolved = path.resolve(cwd, modulePath)
+  // Checked before the import so an unsupported extension gives a precise
+  // startup error instead of whatever the runtime's loader happens to say.
+  if (!HOOK_EXTENSIONS.includes(path.extname(resolved))) {
+    throw rejected(modulePath, 'unsupported module extension')
+  }
 
   let namespace: Record<string, unknown>
   try {

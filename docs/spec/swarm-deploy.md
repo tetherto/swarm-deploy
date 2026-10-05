@@ -253,10 +253,12 @@ CLI exit code 2.
 A server may be configured with `beforeCommit`, `afterCommit`, and `onFailure`
 callbacks. Direct `ServerOptions.hooks` accepts only a hook object whose own keys
 are those names and whose values are functions; it is snapshotted at
-construction. The CLI `--hooks` option loads a `.js`, `.mjs`, or `.cjs` module
-before the server listens, selecting only those names (named exports win over a
-default object; one `__esModule` interop level is unwrapped; other exports are
-ignored) and failing with exit code 2 on any load or shape error. Hooks are
+construction. The CLI `--hooks` option loads a module before the server listens,
+selecting only those names (named exports win over a default object; one
+`__esModule` interop level is unwrapped; other exports are ignored) and failing
+with exit code 2 on any load or shape error. The path's extension must be
+exactly `.js`, `.mjs`, or `.cjs`; any other extension is rejected before the
+load is attempted. Hooks are
 trusted code; contexts are frozen and exclude seeds, keys, TAR data, and session
 material. Callbacks are invoked without a receiver. There is no hook timeout;
 only server shutdown abandons a pending callback, which then continues detached.
