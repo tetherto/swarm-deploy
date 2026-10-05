@@ -262,6 +262,12 @@ load is attempted. Hooks are
 trusted code; contexts are frozen and exclude seeds, keys, TAR data, and session
 material. Callbacks are invoked without a receiver. There is no hook timeout;
 only server shutdown abandons a pending callback, which then continues detached.
+A callback on a fresh or resumed upload runs while its connection still holds an
+active-upload slot and its session's staging reservation, so hung callbacks
+consume upload capacity and can make further offers fail with
+`ACTIVE_UPLOAD_LIMIT` until the server closes. Only the already-committed path
+holds no upload slot. Bounded timeout and anti-spam controls are deferred to
+issue #8.
 
 A transfer ID has a single owner. From the moment metadata authenticates until
 the connection's lifecycle ends, a second connection offering the same transfer
@@ -299,6 +305,12 @@ staging file during transfer and for fresh-upload verification; the extracted
 `.part` staging file for `beforeCommit`, `commit`, and verified-reconnect
 verification; and the final path for `afterCommit`. An `onFailure` exception is
 logged as a secondary warning and never replaces the original failure.
+
+An `offer`-phase context is assembled from decoded metadata before the transfer
+ID is authenticated, and is reported even when that authentication is the
+failure. Its artifact fields are then unauthenticated peer input and must not be
+used as audit or idempotency keys. Contexts for all later phases follow
+successful authentication.
 
 ### Rollout compatibility
 

@@ -20,6 +20,8 @@ All notable changes to this package are documented here.
 - Write a resumable session at on-disk version 3 only when it carries a `sourceParent`, and at version 2 otherwise. Both are readable. A downgrade therefore loses the resumability of parent-bearing sessions only, instead of every session written by this version; draining in-flight uploads before a rollback still avoids it.
 - Never rewrite the durable release identity of a commit record. Enabling or changing `artifactPatterns` while uploads are in flight makes a retry of already-committed bytes fail closed (`FILE_EXISTS` for a create-only name, a release-identity conflict for a replaceable name retried under the same transfer ID), so drain in-flight uploads before changing patterns.
 - Commit-record compatibility is asserted only in the reading direction: records without release coordinates are read and excluded from count and version rotation. Whether older code tolerates records this version writes is untested.
+- Document that a hung hook callback on a fresh or resumed upload also holds an active-upload slot and its staging reservation, so enough hung callbacks exhaust upload capacity until the server closes. Bounded timeout and anti-spam controls are tracked in issue #8.
+- Document that an `offer`-phase `onFailure` context is built before the transfer ID is authenticated and is delivered even when that authentication failed, so its artifact fields must not be used as audit or idempotency keys.
 - Document rollout, retry, path, and compatibility semantics.
 
 ## 0.1.0

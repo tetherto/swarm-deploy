@@ -687,9 +687,17 @@ fields come from decoded offer metadata, not yet from verified content.
 | `onFailure`    | `path` (`string \| null`), `phase`, `resumed`, `alreadyCommitted`, `error` |
 
 `resumed` is `true` when the server admitted the connection as `RESUME` or
-`VERIFIED`. There is no hook timeout: a hung callback holds only its own
-connection. Closing the server aborts the wait; a callback that outlives the
+`VERIFIED`. Closing the server aborts the wait; a callback that outlives the
 abort continues detached and its later result is ignored.
+
+There is no hook timeout, and a hung callback holds more than its own
+connection. On a fresh or resumed upload it also holds an `maxActiveUploads`
+slot and the session's staging reservation for as long as it runs, so enough
+simultaneously hung callbacks stop the server from admitting new uploads
+(`ACTIVE_UPLOAD_LIMIT`) until the server is closed and the waits are aborted.
+Only the already-committed path holds no upload slot. Write callbacks that
+finish or throw; bounded hook timeout and anti-spam controls are tracked in
+issue #8.
 
 Hooks never run concurrently for one transfer. Once a transfer ID
 authenticates, that connection owns it until its lifecycle ends; a second
@@ -753,6 +761,14 @@ finishes and skip repeated calls.
 or `afterCommit`. `offer` covers every failure before a staging path exists:
 metadata or transfer-ID problems, unmatched patterns, file-size, capacity and
 destination rejections, and inspection errors.
+
+An `offer`-phase context is built from decoded metadata **before** the transfer
+ID is authenticated, and it is also reported when that authentication is exactly
+what failed. Its `transferId`, `name`, `size`, `sha256`, and `sourceParent` are
+therefore attacker-chosen values from an allowlisted key, not verified identity.
+Use them for logging and alerting only; never as audit records or idempotency
+keys. Every later phase runs after authentication, so only `offer` carries this
+caveat.
 
 `error` is the original failure. For an exception thrown by `beforeCommit` or
 `afterCommit`, hooks receive the **raw thrown value** (not a wrapper) because
