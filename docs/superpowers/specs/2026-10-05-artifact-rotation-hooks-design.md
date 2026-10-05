@@ -170,8 +170,9 @@ operation key when coordinating external systems.
 
 The server invokes `onFailure` at most once per failed connection after
 metadata has been decoded. Context identifies whether failure occurred during
-verification, `beforeCommit`, commit, or `afterCommit`, and whether the
-connection represented a resumed or already-committed transfer.
+offer inspection, transfer, verification, `beforeCommit`, commit, or
+`afterCommit`, and whether the connection represented a resumed or
+already-committed transfer.
 
 ## Error handling and compatibility
 
