@@ -587,8 +587,11 @@ test('count and version rotation each remove records the other would keep', asyn
   )
 })
 
-test('build metadata is ignored by identity and equal-precedence releases share a group', async (t) => {
+test('source-parent build metadata is normalized before persistence and then groups as an ordinary version', async (t) => {
   const harness = await createHarness(t)
+  // The matcher strips `+build` metadata, so persisted versions never carry it and
+  // retention only sees ordinary versions. This test does not exercise SemVer build
+  // precedence (covered by compareReleaseVersions in release.test.ts).
   const matcher = new ReleaseMatcher(['{version}/{series}.tar.gz'])
   const kept: CommitRecord[] = []
   for (const [parent, expectKept] of [
