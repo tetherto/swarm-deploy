@@ -754,8 +754,14 @@ test('CLI rejects unusable hook modules as startup configuration errors', async 
     'throws.cjs': `throw new Error('${secret}')\n`,
     'throws.mjs': `throw new Error('${secret}')\n`,
     'syntax.cjs': `module.exports = { ${secret} \n`,
-    'unknown.cjs': `module.exports = { beforeComit () {} }\n`,
-    'unknown-named.mjs': `export function beforeCommit () {}\nexport const ${'helper'} = 1\n`,
+    'typo-only.cjs': `module.exports = { beforeComit () {}, helper: 1 }\n`,
+    'typo-only.mjs': `export function beforeComit () {}\nexport default { helper: 1 }\n`,
+    'known-non-function-named.mjs': `export const beforeCommit = '${secret}'\nexport default { beforeCommit () {} }\n`,
+    'known-non-function-default.cjs': `module.exports = { afterCommit: null, beforeCommit () {} }\n`,
+    'throws-object.cjs': `throw { code: 'ERR_MODULE_NOT_FOUND', message: '${secret}' }\n`,
+    'throws-code-getter.cjs': `throw { get code () { throw new Error('${secret}') }, message: '${secret}' }\n`,
+    'throws-code-proxy.cjs': `throw new Proxy({}, { get () { throw new Error('${secret}') }, getPrototypeOf () { throw new Error('${secret}') } })\n`,
+    'throws-code-getter.mjs': `throw { get code () { throw new Error('${secret}') } }\n`,
     'not-function.cjs': `module.exports = { beforeCommit: '${secret}' }\n`,
     'not-function.mjs': `export default { afterCommit: 42 }\n`,
     'primitive.cjs': `module.exports = '${secret}'\n`,
@@ -786,7 +792,8 @@ test('CLI rejects a missing, empty, or repeated --hooks option before constructi
   const cases = [
     ['--hooks', 'a.cjs', '--hooks', 'b.cjs'],
     ['--hooks', 'a.cjs', '--hooks', 'a.cjs'],
-    ['--hooks']
+    ['--hooks'],
+    ['--hooks', '']
   ]
   for (const args of cases) {
     const result = await runServerCli(root, args, { cwd: root })
@@ -1001,4 +1008,122 @@ test('CLI loads hook modules from paths containing URL-significant characters', 
     t.is(result.code, 0, file)
     t.alike(Object.keys(result.options?.hooks || {}), [name], file)
   }
+})
+
+test('CLI ignores harmless non-hook exports and picks only known hook names', async (t) => {
+  const root = await createTempDir(t)
+  const record = (name: string) => `globalThis.${HOOK_LOG}.push('${name}')`
+  const files: Record<string, string> = {
+    'cjs-helpers.cjs': `const config = { retries: 3 }
+module.exports = {
+  config,
+  helper () { return 1 },
+  limit: 5,
+  beforeComit () {},
+  afterCommit () { ${record('cjs:after')} }
+}\n`,
+    'esm-helpers.mjs': `export const config = { retries: 3 }
+export function helper () {}
+export const limit = 5
+export function beforeComit () {}
+export function onFailure () { ${record('esm:failure')} }\n`,
+    'esm-default-helpers.mjs': `export const limit = 1
+export default { limit: 2, nested: { a: 1 }, typo () {}, beforeCommit () { ${record('default:before')} } }\n`,
+    'mixed.mjs': `export const beforeCommit = undefined
+export const afterCommit = () => { ${record('named:after')} }
+export default {
+  beforeCommit () { ${record('default:before')} },
+  afterCommit () { ${record('default:after')} },
+  helper: 1
+}\n`
+  }
+  for (const [name, source] of Object.entries(files)) {
+    await fs.promises.writeFile(path.join(root, name), source)
+  }
+  const cases: [string, string[], string[]][] = [
+    ['cjs-helpers.cjs', ['afterCommit'], ['cjs:after']],
+    ['esm-helpers.mjs', ['onFailure'], ['esm:failure']],
+    ['esm-default-helpers.mjs', ['beforeCommit'], ['default:before']],
+    ['mixed.mjs', ['afterCommit', 'beforeCommit'], ['default:before', 'named:after']]
+  ]
+  for (const [file, names, expected] of cases) {
+    const log = hookLog()
+    const result = await runServerCli(root, ['--hooks', file], { cwd: root })
+    t.is(result.code, 0, file)
+    t.is(result.stderr, '', file)
+    const hooks = result.options?.hooks
+    t.alike(Object.keys(hooks || {}).sort(), names, `${file} hook names`)
+    await callAll(hooks)
+    t.alike(log, expected, `${file} callbacks`)
+  }
+})
+
+test('CLI hook selection ignores prototypes, symbols, and __proto__ and reads each hook once', async (t) => {
+  const root = await createTempDir(t)
+  await fs.promises.writeFile(
+    path.join(root, 'proto.cjs'),
+    `const inherited = { onFailure () { globalThis.${HOOK_LOG}.push('inherited') } }
+const hooks = Object.create(inherited)
+hooks.afterCommit = () => {}
+hooks[Symbol('beforeCommit')] = () => {}
+Object.defineProperty(hooks, '__proto__', { value: { beforeCommit () {} }, enumerable: true })
+module.exports = hooks\n`
+  )
+  await fs.promises.writeFile(
+    path.join(root, 'once.cjs'),
+    `let reads = 0
+const hooks = {}
+Object.defineProperty(hooks, 'beforeCommit', {
+  enumerable: true,
+  get () {
+    reads++
+    if (reads > 1) throw new Error('read twice')
+    return () => {}
+  }
+})
+module.exports = hooks\n`
+  )
+  const log = hookLog()
+  const proto = await runServerCli(root, ['--hooks', 'proto.cjs'], { cwd: root })
+  t.is(proto.code, 0)
+  t.alike(Object.keys(proto.options?.hooks || {}), ['afterCommit'])
+  await callAll(proto.options?.hooks)
+  t.alike(log, [])
+  t.is(Object.getPrototypeOf(proto.options?.hooks), Object.prototype)
+
+  const once = await runServerCli(root, ['--hooks', 'once.cjs'], { cwd: root })
+  t.is(once.code, 0)
+  t.alike(Object.keys(once.options?.hooks || {}), ['beforeCommit'])
+})
+
+test('CLI unwraps one explicit __esModule default level for compiled CommonJS hooks', async (t) => {
+  const root = await createTempDir(t)
+  await fs.promises.writeFile(
+    path.join(root, 'compiled.cjs'),
+    `Object.defineProperty(exports, '__esModule', { value: true })
+exports.default = { afterCommit () {}, helper: 1 }\n`
+  )
+  await fs.promises.writeFile(
+    path.join(root, 'twice.cjs'),
+    `Object.defineProperty(exports, '__esModule', { value: true })
+exports.default = { __esModule: true, default: { __esModule: true, default: { afterCommit () {} } } }\n`
+  )
+  const ok = await runServerCli(root, ['--hooks', 'compiled.cjs'], { cwd: root })
+  t.is(ok.code, 0)
+  t.alike(Object.keys(ok.options?.hooks || {}), ['afterCommit'])
+  const nested = await runServerCli(root, ['--hooks', 'twice.cjs'], { cwd: root })
+  t.is(nested.code, 2)
+  t.is(nested.constructed, 0)
+})
+
+test('CLI loads hooks from a .js ES module inside a type=module package', async (t) => {
+  const root = await createTempDir(t)
+  await fs.promises.writeFile(path.join(root, 'package.json'), '{"type":"module"}\n')
+  await fs.promises.writeFile(
+    path.join(root, 'hooks.js'),
+    'export const config = { retries: 1 }\nexport async function afterCommit () {}\n'
+  )
+  const result = await runServerCli(root, ['--hooks', 'hooks.js'], { cwd: root })
+  t.is(result.code, 0)
+  t.alike(Object.keys(result.options?.hooks || {}), ['afterCommit'])
 })
