@@ -27,7 +27,11 @@ const OWNER = b4a.alloc(32, 7)
 const MUTABLE = 'release.tar.gz'
 const OLD_BYTES = b4a.from('old direct TAR payload')
 const NEW_BYTES = b4a.from('new direct TAR payload')
+const OLD_RELEASE = { series: 'api', version: '2.4.0' }
+const RELEASE = { series: 'api', version: '2.4.1' }
 const MUTATIONS = new Set(['link', 'rename', 'unlink', 'rmdir', 'rm', 'write', 'sync', 'truncate'])
+
+type ReleaseCoordinates = { series: string; version?: string }
 
 type ReplacementBoundary =
   | 'journal-durable'
@@ -53,8 +57,13 @@ interface Harness {
   layout: StorageLayout
   sessions: TarSessionStore
   commits: CommitStore
-  stage(content: Buffer, name?: string): Promise<TarSession>
-  publish(content: Buffer, name?: string): Promise<CommitRecord>
+  stage(content: Buffer, name?: string, sourceParent?: string): Promise<TarSession>
+  publish(
+    content: Buffer,
+    name?: string,
+    release?: ReleaseCoordinates,
+    sourceParent?: string
+  ): Promise<CommitRecord>
 }
 
 interface CrashedReplacement {
@@ -95,13 +104,27 @@ async function archive(manifest: TarManifest): Promise<Buffer> {
 async function tarInput(
   t: Assert,
   content: Buffer,
-  name: string
+  name: string,
+  sourceParent = 'release'
 ): Promise<{ metadata: MetadataRecord; archive: Buffer }> {
   const sourceRoot = await createTempDir(t)
-  const source = path.join(sourceRoot, name)
+  const releaseRoot = path.join(sourceRoot, sourceParent)
+  await fs.promises.mkdir(releaseRoot)
+  const source = path.join(releaseRoot, name)
   await fs.promises.writeFile(source, content)
   const manifest = await buildTarManifest(source, OWNER)
   return { metadata: metadataFromManifest(manifest), archive: await archive(manifest) }
+}
+
+function commitRelease(
+  commits: CommitStore,
+  session: TarSession,
+  {
+    replaceNames,
+    release
+  }: { replaceNames?: Iterable<string>; release?: ReleaseCoordinates | null } = {}
+): Promise<CommitRecord> {
+  return commits.commit(session, { replaceNames, release })
 }
 
 async function createHarness(t: Assert, storage: TestStorage = createStorage()): Promise<Harness> {
@@ -111,8 +134,12 @@ async function createHarness(t: Assert, storage: TestStorage = createStorage()):
   t.teardown(() => sessions.close())
   const commits = new CommitStore({ layout, storage, logger: { warn() {} } })
 
-  async function stage(content: Buffer, name = MUTABLE): Promise<TarSession> {
-    const input = await tarInput(t, content, name)
+  async function stage(
+    content: Buffer,
+    name = MUTABLE,
+    sourceParent = 'release'
+  ): Promise<TarSession> {
+    const input = await tarInput(t, content, name, sourceParent)
     await sessions.admit(OWNER, input.metadata)
     await sessions.append(OWNER, input.metadata, 0, input.archive)
     return sessions.verify(OWNER, input.metadata)
@@ -123,9 +150,14 @@ async function createHarness(t: Assert, storage: TestStorage = createStorage()):
     sessions,
     commits,
     stage,
-    async publish(content: Buffer, name = MUTABLE): Promise<CommitRecord> {
-      const session = await stage(content, name)
-      const record = await commits.commit(session, { replaceNames: [name] })
+    async publish(
+      content: Buffer,
+      name = MUTABLE,
+      release?: ReleaseCoordinates,
+      sourceParent = 'release'
+    ): Promise<CommitRecord> {
+      const session = await stage(content, name, sourceParent)
+      const record = await commitRelease(commits, session, { replaceNames: [name], release })
       await sessions.retireCommitted(session.transferId)
       return record
     }
@@ -189,11 +221,14 @@ async function crashReplacement(
     }
   })
   const harness = await createHarness(t, storage)
-  const oldRecord = await harness.publish(OLD_BYTES)
-  const next = await harness.stage(NEW_BYTES)
+  const oldRecord = await harness.publish(OLD_BYTES, MUTABLE, OLD_RELEASE, OLD_RELEASE.version)
+  const next = await harness.stage(NEW_BYTES, MUTABLE, RELEASE.version)
   paths = pathsFor(harness.layout, oldRecord, id(next))
   armed = true
-  await harness.commits.commit(next, { replaceNames: [MUTABLE] }).then(
+  await commitRelease(harness.commits, next, {
+    replaceNames: [MUTABLE],
+    release: RELEASE
+  }).then(
     () => undefined,
     () => undefined
   )
@@ -211,7 +246,9 @@ async function assertCommittedReplacement(
   const { paths, oldRecord } = crash
   t.alike(await fs.promises.readFile(paths.final), NEW_BYTES, `${label} current`)
   t.alike(await fs.promises.readFile(paths.history), OLD_BYTES, `${label} history`)
-  t.is((await readRecord(paths.record)).version, 2, `${label} v2 sidecar`)
+  const current = await readRecord(paths.record)
+  t.is(current.version, 2, `${label} v2 sidecar`)
+  t.alike(current.release, RELEASE, `${label} current release`)
   t.alike(await readRecord(paths.oldRecord), {
     ...oldRecord,
     name: historyName(oldRecord.transferId)
@@ -247,9 +284,14 @@ test('pre-linearized direct-TAR replacement recovery restores old current and re
     for (const retained of [crash.paths.staging, crash.paths.tar, crash.paths.session]) {
       t.is(await exists(retained), true, `${boundary} retained ${path.basename(retained)}`)
     }
-    const retried = await commits.commit(await sessions.readVerified(transferId(crash.id)), {
-      replaceNames: [MUTABLE]
-    })
+    const retried = await commitRelease(
+      commits,
+      await sessions.readVerified(transferId(crash.id)),
+      {
+        replaceNames: [MUTABLE],
+        release: RELEASE
+      }
+    )
     t.is(retried.version, 2, `${boundary} retry`)
     await assertCommittedReplacement(t, crash, commits, `${boundary} retry`)
     await sessions.close()
@@ -291,6 +333,59 @@ test('direct-TAR replacement recovery is idempotent after convergence', async (t
   t.is(second.length, 0)
   await assertCommittedReplacement(t, crash, commits, 'rerun')
   await sessions.close()
+})
+
+test('commit release identity survives sidecars, replacement history, and A-B-A dedup', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish(OLD_BYTES, MUTABLE, OLD_RELEASE, OLD_RELEASE.version)
+  t.alike(first.release, OLD_RELEASE)
+  t.alike(
+    (await readRecord(path.join(harness.layout.commits, `${first.transferId}.json`))).release,
+    OLD_RELEASE
+  )
+
+  const second = await harness.publish(NEW_BYTES, MUTABLE, RELEASE, RELEASE.version)
+  t.alike(second.release, RELEASE)
+  t.alike(
+    (await readRecord(path.join(harness.layout.commits, `${first.transferId}.json`))).release,
+    OLD_RELEASE
+  )
+
+  const returning = await harness.stage(OLD_BYTES, MUTABLE, OLD_RELEASE.version)
+  t.is(returning.id, first.transferId)
+  const third = await commitRelease(harness.commits, returning, {
+    replaceNames: [MUTABLE],
+    release: OLD_RELEASE
+  })
+  await harness.sessions.retireCommitted(returning.transferId)
+  t.alike(third.release, OLD_RELEASE)
+  const records = await harness.commits.list()
+  const current = records.find((record) => record.name === MUTABLE)
+  const history = records.find((record) => record.name === historyName(second.transferId))
+  t.alike(current?.release, OLD_RELEASE)
+  t.alike(history?.release, RELEASE)
+})
+
+test('commit snapshots and validates release coordinates before publication', async (t) => {
+  const harness = await createHarness(t)
+  const session = await harness.stage(NEW_BYTES, 'snapshot.bin', RELEASE.version)
+  await t.exception(
+    commitRelease(harness.commits, session, {
+      release: { series: '../api', version: RELEASE.version }
+    }),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  await t.exception(
+    commitRelease(harness.commits, session, {
+      release: { series: 'api', version: 'v2.4.1' }
+    }),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+
+  const mutable = { ...RELEASE }
+  const committed = commitRelease(harness.commits, session, { release: mutable })
+  mutable.series = 'changed'
+  t.alike((await committed).release, RELEASE)
 })
 
 test('replacement recovery rejects changed staging provenance without publishing attacker bytes', async (t) => {

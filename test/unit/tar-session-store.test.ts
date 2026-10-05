@@ -89,6 +89,11 @@ test('TAR admission reconstructs a durable offset and rehashes its prefix on res
   await first.admit(OWNER, metadata)
   await first.append(OWNER, metadata, 0, archive.subarray(0, 777))
   await first.close()
+  const persisted = JSON.parse(
+    await fs.promises.readFile(path.join(layout.sessions, `${metadata.transferId}.json`), 'utf8')
+  ) as { version: number; sourceParent?: string }
+  t.is(persisted.version, 3)
+  t.is(persisted.sourceParent, 'source')
 
   const restarted = new SessionStore({
     layout,
@@ -102,6 +107,63 @@ test('TAR admission reconstructs a durable offset and rehashes its prefix on res
   t.is(admission.offset, 777)
   t.alike(admission.prefixSha256, sodiumSha256(archive.subarray(0, 777)))
   t.is(restarted.reservedBytes, metadata.tarSize + metadata.fileSize)
+  t.is(
+    (restarted.sessions.get(metadata.transferId) as { sourceParent?: string } | undefined)
+      ?.sourceParent,
+    'source'
+  )
+})
+
+test('restart restores legacy v2 sessions without a source parent and rejects it on v2', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const legacy = { ...metadata } as typeof metadata & { sourceParent?: string }
+  delete legacy.sourceParent
+  legacy.transferId = b4a.toString(
+    computeTarTransferId(OWNER, {
+      name: legacy.name,
+      fileSize: legacy.fileSize,
+      fileSha256: b4a.from(legacy.fileSha256, 'hex'),
+      tarSize: legacy.tarSize,
+      tarSha256: b4a.from(legacy.tarSha256, 'hex')
+    }),
+    'hex'
+  )
+
+  const first = new SessionStore({ layout, maxStagingBytes: legacy.tarSize + legacy.fileSize })
+  await first.init()
+  await first.admit(OWNER, legacy)
+  await first.close()
+  const sessionPath = path.join(layout.sessions, `${legacy.transferId}.json`)
+  const persisted = JSON.parse(await fs.promises.readFile(sessionPath, 'utf8')) as {
+    version: number
+    sourceParent?: string
+  }
+  persisted.version = 2
+  delete persisted.sourceParent
+  await fs.promises.writeFile(sessionPath, JSON.stringify(persisted))
+
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: legacy.tarSize + legacy.fileSize
+  })
+  await restarted.init()
+  t.is(
+    (restarted.sessions.get(legacy.transferId) as { sourceParent?: string } | undefined)
+      ?.sourceParent,
+    undefined
+  )
+  await restarted.close()
+
+  persisted.sourceParent = '2.4.1'
+  await fs.promises.writeFile(sessionPath, JSON.stringify(persisted))
+  const invalid = new SessionStore({
+    layout,
+    maxStagingBytes: legacy.tarSize + legacy.fileSize
+  })
+  await invalid.init()
+  t.teardown(() => invalid.close())
+  t.is(invalid.sessions.has(legacy.transferId), false)
+  t.is(invalid.purgedSessions, 1)
 })
 
 test('restart purges malformed TAR session metadata and its discardable TAR staging', async (t) => {
@@ -275,6 +337,7 @@ test('restart purges corrupt canonical metadata and reconstructs valid reservati
     transferId: b4a.toString(
       computeTarTransferId(OTHER_OWNER, {
         name: validName,
+        sourceParent: metadata.sourceParent,
         fileSize: metadata.fileSize,
         fileSha256: b4a.from(metadata.fileSha256, 'hex'),
         tarSize: metadata.tarSize,
@@ -322,6 +385,7 @@ test('TAR admission rejects owner mismatch and reset durably truncates the admit
     transferId: b4a.toString(
       computeTarTransferId(OTHER_OWNER, {
         name: metadata.name,
+        sourceParent: metadata.sourceParent,
         fileSize: metadata.fileSize,
         fileSha256: b4a.from(metadata.fileSha256, 'hex'),
         tarSize: metadata.tarSize,
@@ -901,6 +965,7 @@ test('admission free-space checks include prior TAR peak reservations', async (t
     transferId: b4a.toString(
       computeTarTransferId(OTHER_OWNER, {
         name: 'second.bin',
+        sourceParent: metadata.sourceParent,
         fileSize: metadata.fileSize,
         fileSha256: b4a.from(metadata.fileSha256, 'hex'),
         tarSize: metadata.tarSize,

@@ -11,6 +11,7 @@ import { ERRORS } from '../../dist/errors.js'
 import {
   assertMetadataTransferId,
   buildTarManifest,
+  computeTarTransferId,
   deterministicTarSize,
   metadataFromManifest,
   regenerateTarSuffix,
@@ -154,8 +155,27 @@ test('canonical TAR is deterministic and bound into its manifest', async (t) => 
     '00e2b1271cceb3d62531532827f9487ed0253365ad311822ce3b2e1ec734f3d6'
   )
   t.is(
-    b4a.toString(first.transferId, 'hex'),
+    b4a.toString(
+      computeTarTransferId(CLIENT_KEY, {
+        name: first.name,
+        fileSize: first.fileSize,
+        fileSha256: first.fileSha256,
+        tarSize: first.tarSize,
+        tarSha256: first.tarSha256
+      }),
+      'hex'
+    ),
     '1c1e719f9bb199367352c667f1e9edbf7cc8f2b73630c832cd9ab6d558615e7c'
+  )
+  t.unlike(
+    first.transferId,
+    computeTarTransferId(CLIENT_KEY, {
+      name: first.name,
+      fileSize: first.fileSize,
+      fileSha256: first.fileSha256,
+      tarSize: first.tarSize,
+      tarSha256: first.tarSha256
+    })
   )
   t.is(firstTar.readUInt8(156), 48)
   t.is(
@@ -286,6 +306,72 @@ test('bounded control records round-trip exact strict schemas', (t) => {
     { v: 1, status: 'FAILED', code: ERRORS.CHECKSUM_MISMATCH } as const
   ]
   for (const value of finals) t.alike(decodeFinalRecord(encodeFinalRecord(value)), value)
+})
+
+test('source parent is authenticated while legacy metadata keeps its transfer ID', async (t) => {
+  const dir = await createTempDir(t)
+  const releaseDir = path.join(dir, 'releases', '2.4.1')
+  await fs.promises.mkdir(releaseDir, { recursive: true })
+  const file = path.join(releaseDir, 'api.tar.gz')
+  await fs.promises.writeFile(file, b4a.from('payload'))
+
+  const manifest = await buildTarManifest(file, CLIENT_KEY)
+  const metadata = metadataFromManifest(manifest)
+  t.is((manifest as TarManifest & { sourceParent?: string }).sourceParent, '2.4.1')
+  t.is((metadata as MetadataRecord & { sourceParent?: string }).sourceParent, '2.4.1')
+  assertMetadataTransferId(CLIENT_KEY, metadata)
+  t.exception(
+    () =>
+      assertMetadataTransferId(CLIENT_KEY, {
+        ...metadata,
+        sourceParent: '2.4.2'
+      } as MetadataRecord),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+
+  const legacy = { ...metadata } as MetadataRecord & { sourceParent?: string }
+  delete legacy.sourceParent
+  legacy.transferId = b4a.toString(
+    computeTarTransferId(CLIENT_KEY, {
+      name: legacy.name,
+      fileSize: legacy.fileSize,
+      fileSha256: b4a.from(legacy.fileSha256, 'hex'),
+      tarSize: legacy.tarSize,
+      tarSha256: b4a.from(legacy.tarSha256, 'hex')
+    }),
+    'hex'
+  )
+  const encoded = encodeMetadataRecord(legacy)
+  t.alike(decodeMetadataRecord(encoded), legacy)
+  assertMetadataTransferId(CLIENT_KEY, legacy)
+})
+
+test('source parent is one bounded safe component with SemVer build metadata', (t) => {
+  const valid = {
+    ...metadataForTar(b4a.alloc(deterministicTarSize(7))),
+    sourceParent: '1.2.3+build.1'
+  } as MetadataRecord
+  t.alike(decodeMetadataRecord(encodeMetadataRecord(valid)), valid)
+  t.alike(
+    (
+      decodeMetadataRecord(
+        encodeMetadataRecord({ ...valid, sourceParent: 'history-release' } as MetadataRecord)
+      ) as MetadataRecord & { sourceParent?: string }
+    ).sourceParent,
+    'history-release'
+  )
+
+  for (const sourceParent of [
+    '.',
+    '..',
+    '/absolute',
+    'nested/release',
+    'nested\\release',
+    'white space',
+    'x'.repeat(101)
+  ]) {
+    t.exception(() => encodeMetadataRecord({ ...valid, sourceParent } as MetadataRecord))
+  }
 })
 
 test('control decoders reject unknown fields, versions, types, hex, and bounds', (t) => {
@@ -612,6 +698,7 @@ test('manifest metadata conversion is exact and reset-aware', async (t) => {
   t.alike(Object.keys(metadata), [
     'v',
     'name',
+    'sourceParent',
     'fileSize',
     'fileSha256',
     'tarSize',

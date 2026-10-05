@@ -6,12 +6,14 @@ export const CONTROL_VERSION = 1
 export const MAX_CONTROL_RECORD_BYTES = 4 * 1024
 const HEX_32 = /^[0-9a-f]{64}$/
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
+const SAFE_SOURCE_PARENT = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$/
 const HISTORY_PREFIX = 'history-'
 const STABLE_CODES = new Set<string>(Object.values(ERRORS))
 
 export interface MetadataRecord {
   v: typeof CONTROL_VERSION
   name: string
+  sourceParent?: string
   fileSize: number
   fileSha256: string
   tarSize: number
@@ -77,6 +79,16 @@ function assertName(value: unknown): asserts value is string {
   }
 }
 
+export function assertSourceParent(value: unknown): asserts value is string {
+  if (
+    typeof value !== 'string' ||
+    !SAFE_SOURCE_PARENT.test(value) ||
+    b4a.from(value).byteLength > 100
+  ) {
+    throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Invalid source parent')
+  }
+}
+
 function assertStableCode(value: unknown): asserts value is ErrorCode {
   if (typeof value !== 'string' || !STABLE_CODES.has(value)) throw invalid('Invalid error code')
 }
@@ -103,7 +115,7 @@ function encodeRecord<T>(value: T, validate: (value: unknown) => T): Buffer {
 
 function validateMetadata(value: unknown): MetadataRecord {
   if (!isRecord(value)) throw invalid('Metadata record must be an object')
-  exactKeys(value, [
+  const expected = [
     'v',
     'name',
     'fileSize',
@@ -112,9 +124,16 @@ function validateMetadata(value: unknown): MetadataRecord {
     'tarSha256',
     'transferId',
     'reset'
-  ])
+  ]
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
+    expected.push('sourceParent')
+  }
+  exactKeys(value, expected)
   assertVersion(value.v)
   assertName(value.name)
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
+    assertSourceParent(value.sourceParent)
+  }
   assertSafeUint(value.fileSize, 'file size')
   assertHex32(value.fileSha256, 'file digest')
   assertSafeUint(value.tarSize, 'TAR size')

@@ -1,6 +1,7 @@
 import b4a from 'b4a'
 import { isMissing } from '../error-code.js'
 import path from '#path'
+import { SemVer } from 'semver'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { historyName, isReservedHistoryName, validateBasename } from '../files.js'
@@ -87,6 +88,11 @@ export interface CommitReplacement {
   historyName: string
 }
 
+export interface CommitRelease {
+  series: string
+  version?: string
+}
+
 export interface CommitRecord {
   version: number
   name: string
@@ -95,6 +101,7 @@ export interface CommitRecord {
   committedAt: number
   uploaderFingerprint: string
   transferId: string
+  release?: CommitRelease
   replaces?: CommitReplacement
 }
 
@@ -114,6 +121,36 @@ function assertReplacement(value: unknown): asserts value is CommitReplacement {
   }
 }
 
+export function assertCommitRelease(value: unknown): asserts value is CommitRelease {
+  if (!isRecordLike(value)) throw storageError('Invalid commit release metadata')
+  const keys = Object.keys(value)
+  if (keys.some((key) => key !== 'series' && key !== 'version') || !keys.includes('series')) {
+    throw storageError('Invalid commit release metadata')
+  }
+  try {
+    validateBasename(typeof value.series === 'string' ? value.series : '')
+  } catch (error: unknown) {
+    throw storageError('Invalid commit release series', error)
+  }
+  if (value.version === undefined) return
+  if (
+    typeof value.version !== 'string' ||
+    b4a.from(value.version).byteLength > 100 ||
+    value.version.trim() !== value.version ||
+    /^[vV]/.test(value.version) ||
+    /[/\\]/.test(value.version)
+  ) {
+    throw storageError('Invalid commit release version')
+  }
+  try {
+    const parsed = new SemVer(value.version, { loose: false })
+    if (parsed.version !== value.version) throw storageError('Invalid commit release version')
+  } catch (error: unknown) {
+    if (error instanceof SwarmDeployError) throw error
+    throw storageError('Invalid commit release version', error)
+  }
+}
+
 function assertCommitRecordShape(record: unknown): asserts record is CommitRecord {
   if (!isRecordLike(record)) throw storageError('Invalid commit record')
   const candidate = record
@@ -126,6 +163,7 @@ function assertCommitRecordShape(record: unknown): asserts record is CommitRecor
   assertSafeUint(candidate.committedAt, 'commit timestamp')
   if (!isHex(candidate.uploaderFingerprint)) throw storageError('Invalid uploader fingerprint')
   if (!isHex(candidate.transferId)) throw storageError('Invalid commit transfer ID')
+  if (candidate.release !== undefined) assertCommitRelease(candidate.release)
   if (candidate.version === REPLACEMENT_COMMIT_VERSION) {
     assertReplacement(candidate.replaces)
   } else if (candidate.replaces !== undefined) {

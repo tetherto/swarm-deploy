@@ -18,7 +18,8 @@ import type { StorageAdapter, StorageFileHandle, StorageLayout } from './types.j
 import type { Clock } from '../types.js'
 import { assertSafeUint } from '../validation.js'
 
-const VERSION = 2
+const VERSION = 3
+const LEGACY_VERSION = 2
 const RECEIVING = 'receiving'
 const VERIFIED = 'verified'
 const DELETING = 'deleting'
@@ -31,6 +32,7 @@ export interface TarSession {
   transferId: Buffer
   ownerKey: Buffer
   name: string
+  sourceParent?: string
   size: number
   digest: Buffer
   tarSize: number
@@ -52,6 +54,7 @@ interface PersistedTarSession {
   transferId: string
   ownerKey: string
   name: string
+  sourceParent?: string
   fileSize: number
   fileSha256: string
   tarSize: number
@@ -99,6 +102,7 @@ function sameMetadata(session: TarSession, metadata: MetadataRecord, owner: Uint
   return (
     sodium.sodium_memcmp(session.ownerKey, owner) &&
     session.name === metadata.name &&
+    session.sourceParent === metadata.sourceParent &&
     session.size === metadata.fileSize &&
     session.tarSize === metadata.tarSize &&
     sodium.sodium_memcmp(session.digest, b4a.from(metadata.fileSha256, 'hex')) &&
@@ -229,7 +233,12 @@ export class TarSessionStore {
 
   private fromDisk(id: string, record: Record<string, unknown>): TarSession {
     const persisted = record as unknown as PersistedTarSession
-    if (persisted.version !== VERSION || persisted.transferId !== id) {
+    if (
+      (persisted.version !== LEGACY_VERSION && persisted.version !== VERSION) ||
+      persisted.transferId !== id ||
+      (persisted.version === LEGACY_VERSION &&
+        Object.prototype.hasOwnProperty.call(record, 'sourceParent'))
+    ) {
       throw problem('Invalid TAR session')
     }
     const ownerKey = bytes(persisted.ownerKey, 'owner key')
@@ -252,6 +261,7 @@ export class TarSessionStore {
     const metadata = this.metadata({
       v: 1,
       name: persisted.name,
+      ...(persisted.sourceParent === undefined ? {} : { sourceParent: persisted.sourceParent }),
       fileSize: persisted.fileSize,
       fileSha256: hex(bytes(persisted.fileSha256, 'file digest')),
       tarSize: persisted.tarSize,
@@ -265,6 +275,7 @@ export class TarSessionStore {
       transferId,
       ownerKey,
       name: metadata.name,
+      sourceParent: metadata.sourceParent,
       size: metadata.fileSize,
       digest: b4a.from(metadata.fileSha256, 'hex'),
       tarSize: metadata.tarSize,
@@ -283,6 +294,7 @@ export class TarSessionStore {
       transferId: session.id,
       ownerKey: hex(session.ownerKey),
       name: session.name,
+      sourceParent: session.sourceParent,
       fileSize: session.size,
       fileSha256: hex(session.digest),
       tarSize: session.tarSize,
@@ -546,6 +558,7 @@ export class TarSessionStore {
         transferId: b4a.from(id, 'hex'),
         ownerKey: b4a.from(ownerKey),
         name: metadata.name,
+        sourceParent: metadata.sourceParent,
         size: metadata.fileSize,
         digest: b4a.from(metadata.fileSha256, 'hex'),
         tarSize: metadata.tarSize,

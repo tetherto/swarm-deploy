@@ -4,6 +4,7 @@ import fs from '#fs'
 import path from '#path'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import type { ReleaseCoordinates } from '../release.js'
 import {
   historyName,
   isReservedHistoryName,
@@ -28,6 +29,7 @@ import {
   REPLACEMENT_COMMIT_VERSION,
   REPLACEMENT_JOURNAL_VERSION,
   MAX_COMMIT_METADATA_BYTES,
+  assertCommitRelease,
   assertCommitRecord as assertRecord,
   isReplacementJournal,
   readCommitJournal,
@@ -41,6 +43,7 @@ import type {
   AnyCommitJournal,
   CommitJournal,
   CommitRecord,
+  CommitRelease,
   FileIdentity,
   ReplacementJournal,
   ReplacementPhase
@@ -56,6 +59,7 @@ interface CommitSession {
   transferId: Uint8Array
   ownerKey: Uint8Array
   name: string
+  sourceParent?: string
   size: number
   digest: Uint8Array
   /** Direct-TAR sessions carry these immutable archive fields. */
@@ -163,6 +167,11 @@ function replacementsEqual(
   )
 }
 
+function releasesEqual(left: CommitRecord['release'], right: CommitRecord['release']): boolean {
+  if (left === undefined || right === undefined) return left === right
+  return left.series === right.series && left.version === right.version
+}
+
 function recordsEqual(left: CommitRecord, right: CommitRecord): boolean {
   return (
     left.version === right.version &&
@@ -172,12 +181,25 @@ function recordsEqual(left: CommitRecord, right: CommitRecord): boolean {
     left.committedAt === right.committedAt &&
     left.uploaderFingerprint === right.uploaderFingerprint &&
     sameHex32(left.transferId, right.transferId) &&
+    releasesEqual(left.release, right.release) &&
     replacementsEqual(left.replaces, right.replaces)
   )
 }
 
 function sameContent(left: CommitRecord, right: CommitRecord): boolean {
   return left.size === right.size && sameHex32(left.sha256, right.sha256)
+}
+
+function snapshotRelease(
+  release: ReleaseCoordinates | null | undefined
+): CommitRelease | undefined {
+  if (release === null || release === undefined) return undefined
+  const snapshot: CommitRelease = {
+    series: release.series,
+    ...(release.version === undefined ? {} : { version: release.version })
+  }
+  assertCommitRelease(snapshot)
+  return snapshot
 }
 
 /** The record the old sidecar becomes once its inode is only reachable as history. */
@@ -205,6 +227,9 @@ function assertSession(session: unknown): asserts session is CommitSession {
   assertMetadataTransferId(candidate.ownerKey as Uint8Array, {
     v: 1,
     name: candidate.name as string,
+    ...(candidate.sourceParent === undefined
+      ? {}
+      : { sourceParent: candidate.sourceParent as string }),
     fileSize: candidate.size as number,
     fileSha256: toHex(candidate.digest as Uint8Array),
     tarSize: candidate.tarSize as number,
@@ -722,7 +747,7 @@ class CommitStore {
     return result !== null && digestMatches(result.digest, b4a.from(record.sha256, 'hex'))
   }
 
-  _recordFromSession(session: CommitSession): CommitRecord {
+  _recordFromSession(session: CommitSession, release?: CommitRelease): CommitRecord {
     assertSession(session)
     const record = {
       version: COMMIT_VERSION,
@@ -731,7 +756,8 @@ class CommitStore {
       sha256: toHex(session.digest),
       committedAt: this.clock.now(),
       uploaderFingerprint: fingerprint(session.ownerKey),
-      transferId: session.id
+      transferId: session.id,
+      ...(release === undefined ? {} : { release })
     }
     return assertRecord(record)
   }
@@ -864,15 +890,18 @@ class CommitStore {
     {
       retentionManager = null,
       signal = null,
-      replaceNames
+      replaceNames,
+      release = null
     }: {
       retentionManager?: RetentionManager | null
       signal?: AbortSignalLike | null
       replaceNames?: Iterable<string>
+      release?: ReleaseCoordinates | null
     } = {}
   ): Promise<CommitRecord> {
     try {
       assertSession(session)
+      const releaseSnapshot = snapshotRelease(release)
       if (
         retentionManager !== null &&
         (typeof retentionManager.run !== 'function' ||
@@ -888,7 +917,7 @@ class CommitStore {
       const mutable = validateReplaceNames(replaceNames)
       return withNameLease(this.layout.root, session.name, () =>
         withRootLease(this.layout.root, () =>
-          this._commit(session, retentionManager, signal, mutable)
+          this._commit(session, retentionManager, signal, mutable, releaseSnapshot)
         )
       )
     } catch (error) {
@@ -900,11 +929,12 @@ class CommitStore {
     session: CommitSession,
     retentionManager: RetentionManager | null,
     signal: AbortSignalLike | null,
-    mutable: Set<string> = new Set()
+    mutable: Set<string> = new Set(),
+    release?: CommitRelease
   ): Promise<CommitRecord> {
     assertNotAborted(signal)
     await this._assertLayout()
-    const record = this._recordFromSession(session)
+    const record = this._recordFromSession(session, release)
     if (isReservedHistoryName(record.name)) {
       throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
     }
@@ -1008,7 +1038,12 @@ class CommitStore {
     if (!current || !identitiesEqual(current.identity, fileIdentity(state.stat))) {
       throw existsError('Destination already exists')
     }
-    if (sameContent(current.record, record)) return { mode: 'idempotent', record: current.record }
+    if (
+      sameContent(current.record, record) &&
+      releasesEqual(current.record.release, record.release)
+    ) {
+      return { mode: 'idempotent', record: current.record }
+    }
     return { mode: 'replace', oldRecord: current.record, finalIdentity: current.identity }
   }
 
@@ -1023,7 +1058,11 @@ class CommitStore {
     const name = historyName(record.transferId)
     const existing = await this._readRecordOrAbsent(this._recordPath(record.transferId))
     if (!existing) return null
-    if (existing.name !== name || !sameContent(existing, record)) {
+    if (
+      existing.name !== name ||
+      !sameContent(existing, record) ||
+      !releasesEqual(existing.release, record.release)
+    ) {
       throw storageError('Conflicting commit record')
     }
     const state = await this._rootPathState(name)

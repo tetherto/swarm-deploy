@@ -7,6 +7,7 @@ import { ERRORS, SwarmDeployError } from '../errors.js'
 import { isReservedHistoryName, validateBasename } from '../files.js'
 import { safeFileOpenFlags } from '../storage/layout.js'
 import {
+  assertSourceParent,
   CONTROL_VERSION,
   decodeMetadataRecord,
   encodeMetadataRecord,
@@ -49,6 +50,7 @@ export interface TarSourceIdentity {
 export interface TarManifest {
   path: string
   name: string
+  sourceParent: string
   fileSize: number
   fileSha256: Buffer
   tarSize: number
@@ -87,6 +89,12 @@ function canonicalName(filePath: string): string {
     throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Filename cannot be encoded as USTAR')
   }
   return name
+}
+
+function canonicalSourceParent(filePath: string): string {
+  const sourceParent = path.basename(path.dirname(path.resolve(filePath)))
+  assertSourceParent(sourceParent)
+  return sourceParent
 }
 
 function identity(stat: fs.Stats): TarSourceIdentity {
@@ -194,6 +202,7 @@ export function computeTarTransferId(
   clientPublicKey: Uint8Array,
   immutable: {
     name: string
+    sourceParent?: string
     fileSize: number
     fileSha256: Uint8Array
     tarSize: number
@@ -212,6 +221,10 @@ export function computeTarTransferId(
   transferField(hash, 'domain', TAR_TRANSFER_DOMAIN)
   transferField(hash, 'clientPublicKey', clientPublicKey)
   transferField(hash, 'name', immutable.name)
+  if (immutable.sourceParent !== undefined) {
+    assertSourceParent(immutable.sourceParent)
+    transferField(hash, 'sourceParent', immutable.sourceParent)
+  }
   transferField(hash, 'fileSize', immutable.fileSize)
   transferField(hash, 'fileSha256', immutable.fileSha256)
   transferField(hash, 'tarSize', immutable.tarSize)
@@ -234,6 +247,7 @@ export async function buildTarManifest(
 ): Promise<TarManifest> {
   assertClientKey(clientPublicKey)
   const name = canonicalName(filePath)
+  const sourceParent = canonicalSourceParent(filePath)
   const opened = await openStableSource(filePath, null, signal)
   assertSafeSize(opened.source.size)
   const fileHash = new SodiumSha256()
@@ -261,6 +275,7 @@ export async function buildTarManifest(
   const tarSha256 = tarHash.digest()
   const transferId = computeTarTransferId(clientPublicKey, {
     name,
+    sourceParent,
     fileSize: opened.source.size,
     fileSha256,
     tarSize,
@@ -269,6 +284,7 @@ export async function buildTarManifest(
   return {
     path: filePath,
     name,
+    sourceParent,
     fileSize: opened.source.size,
     fileSha256,
     tarSize,
@@ -366,6 +382,7 @@ export function metadataFromManifest(manifest: TarManifest, reset = false): Meta
   return {
     v: CONTROL_VERSION,
     name: manifest.name,
+    sourceParent: manifest.sourceParent,
     fileSize: manifest.fileSize,
     fileSha256: b4a.toString(manifest.fileSha256, 'hex'),
     tarSize: manifest.tarSize,
@@ -382,6 +399,7 @@ export function assertMetadataTransferId(
   const metadata = decodeMetadataRecord(encodeMetadataRecord(offeredMetadata))
   const expected = computeTarTransferId(clientPublicKey, {
     name: metadata.name,
+    ...(metadata.sourceParent === undefined ? {} : { sourceParent: metadata.sourceParent }),
     fileSize: metadata.fileSize,
     fileSha256: b4a.from(metadata.fileSha256, 'hex'),
     tarSize: metadata.tarSize,
