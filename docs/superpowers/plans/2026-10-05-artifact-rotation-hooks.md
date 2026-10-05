@@ -224,10 +224,13 @@ with the same safe basename rules as artifact names but permit no
 `history-` special case. `validateMetadata()` must accept exactly either the
 old key set or the new key set.
 
-Derive the immediate parent from `path.resolve(filePath)`, include it in
-`computeTarTransferId()` only when present, and pass it through
-`metadataFromManifest()` and `assertMetadataTransferId()`. This conditional
-field preserves old transfer IDs for old metadata.
+Derive the immediate parent from `path.resolve(filePath)`. Include it only when
+it is one valid 100-byte metadata component; otherwise omit it so ordinary
+uploads remain valid when no server patterns are configured. Explicit unsafe
+wire metadata still fails strict decoding. Include a present parent in
+`computeTarTransferId()` and pass it through `metadataFromManifest()` and
+`assertMetadataTransferId()`. This conditional field preserves old transfer
+IDs for old or omitted metadata.
 
 - [ ] **Step 4: Persist source-parent sessions with backward compatibility**
 
@@ -383,6 +386,18 @@ Add one record without `release`, one with a different series, and a pinned
 current record; assert the legacy/different-series records are untouched and
 the pinned current survives even when outside the calculated keep set.
 
+Add server/commit tests proving:
+
+- with no `artifactPatterns`, an unmatched upload follows existing behavior;
+- with patterns configured, an unmatched filename or required-parent mismatch
+  is rejected with `INVALID_FILENAME` before session admission;
+- matching filename-only and parent/name offers pass normalized release
+  coordinates into inspection and commit;
+- `CommitStore.inspect()` returns `ALREADY_COMMITTED` only when transfer and
+  release identity agree;
+- same content under a different matched release is replaceable for mutable
+  names and is not silently collapsed into the prior release.
+
 - [ ] **Step 2: Run retention tests and verify red**
 
 Run:
@@ -428,7 +443,11 @@ Add deletion reasons `MAX_COUNT` and `MAX_VERSIONS`.
 Validate `ServerOptions.maxCount`, `maxVersions`, and `versionGranularity`.
 Construct a `ReleaseMatcher` from a snapshotted `artifactPatterns` iterable.
 Reject invalid option combinations described in the spec. Pass matcher output
-to each commit and rotation values to `RetentionManager`.
+to `CommitStore.inspect()` and each commit, and pass rotation values to
+`RetentionManager`. When matcher size is nonzero, reject a null match with
+`ERRORS.INVALID_FILENAME` before session admission. Extend `CommitOffer` with
+the matched release so idempotent and replacement inspection compares release
+identity rather than digest alone.
 
 Extend `RetentionEvent` and behavior-observability assertions with
 `countDeleted` and `versionDeleted`.
@@ -768,6 +787,7 @@ README sections must include:
 - template examples for filename and source-parent folder versions;
 - count versus major/minor SemVer selection;
 - unmatched legacy behavior and pinned mutable limits;
+- mandatory matching for new uploads when artifact patterns are configured;
 - CommonJS and ESM hook module examples;
 - exact fresh, verified-resumed, and already-committed invocation sequences;
 - explicit idempotency guidance using transfer ID;
@@ -775,8 +795,9 @@ README sections must include:
 
 Update the protocol specification with optional authenticated `sourceParent`,
 session version compatibility, persisted release coordinates, cleanup order,
-and hook observability. Add an unreleased changelog section summarizing issue
-#6.
+hook observability, and the rollout rule that servers must be upgraded before
+clients because old exact-key decoders reject the new metadata field. Add an
+unreleased changelog section summarizing issue #6.
 
 - [ ] **Step 4: Run formatting and focused package checks**
 

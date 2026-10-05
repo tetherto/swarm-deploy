@@ -46,9 +46,16 @@ The server validates `{version}` with strict SemVer rules and stores the
 normalized `{series, version}` release coordinates in the commit record.
 Coordinates are decided at commit time and remain stable across restarts and
 later configuration changes. Replacement history inherits the old record's
-coordinates. Legacy records and artifacts that match no pattern remain subject
-to age and storage-quota retention but are not deleted by count or version
-rotation.
+coordinates. Legacy commit records remain subject to age and storage-quota
+retention but are not deleted by count or version rotation.
+
+Configuring one or more artifact patterns makes matching mandatory for new
+uploads. An offered basename plus optional source parent that matches no
+configured pattern is rejected with `INVALID_FILENAME` before staging,
+verification, commit, or hooks. A server with no artifact patterns preserves
+the existing accept behavior. If a local source parent cannot be represented
+as one safe metadata component, the client omits it; a server pattern that
+requires that parent then rejects the unmatched offer.
 
 For a pattern without `{series}`, the normalized template itself is the fixed
 series key. For a pattern with `{series}`, the captured safe text is the series
@@ -182,9 +189,11 @@ snapshotted during server construction. Caller mutations after construction do
 not alter behavior.
 
 Old clients, sessions, and commit records remain readable. Missing
-`sourceParent` and release coordinates mean only that new rotation policies do
-not select that record. Existing create-only, replacement, recovery, scrub,
-age, quota, cancellation, and protocol guarantees remain unchanged.
+`sourceParent` remains valid protocol metadata, although a configured
+parent-dependent pattern can reject that offer as unmatched. Missing release
+coordinates on legacy commit records mean that count/version rotation does not
+select that record. Existing create-only, replacement, recovery, scrub, age,
+quota, cancellation, and protocol guarantees remain unchanged.
 
 Release coordinates become validated optional commit-record fields. Record
 comparison, journal serialization, recovery, history conversion, and
