@@ -653,6 +653,13 @@ fields come from decoded offer metadata, not yet from verified content.
 connection. Closing the server aborts the wait; a callback that outlives the
 abort continues detached and its later result is ignored.
 
+Hooks never run concurrently for one transfer. Once a transfer ID
+authenticates, that connection owns it until its lifecycle ends; a second
+connection offering the same transfer ID — fresh, resumed, verified, or already
+committed — is rejected with `FILE_BUSY` before any hook runs, and that
+rejection is reported to `onFailure` once with `phase: 'offer'`. Hooks for
+**different** transfers still run concurrently.
+
 ### Invocation sequences
 
 Fresh upload:

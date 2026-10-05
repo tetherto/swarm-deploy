@@ -254,6 +254,14 @@ trusted code; contexts are frozen and exclude seeds, keys, TAR data, and session
 material. Callbacks are invoked without a receiver. There is no hook timeout;
 only server shutdown abandons a pending callback, which then continues detached.
 
+A transfer ID has a single owner. From the moment metadata authenticates until
+the connection's lifecycle ends, a second connection offering the same transfer
+ID is rejected with `FILE_BUSY` during the offer phase, before any hook or
+staging work runs, so hooks and commit never execute concurrently against one
+transfer identity. The guard is per process and in memory, holds at most one
+entry per connection, and is released when the connection finishes or the
+server closes.
+
 Observable order:
 
 - fresh or partially resumed upload: offer, ACCEPT or RESUME, TAR receipt,

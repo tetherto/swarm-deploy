@@ -1325,6 +1325,152 @@ test('Server close does not wait for a hung beforeCommit hook', async (t) => {
   })
 })
 
+function gate(): { wait: Promise<void>; open(): void } {
+  let open = (): void => {}
+  const wait = new Promise<void>((resolve) => {
+    open = (): void => resolve()
+  })
+  return { wait, open }
+}
+
+function offerEvents(server: Server): string[] {
+  const events: string[] = []
+  server.on('offer', (event) => events.push(`${event.status}:${event.reason}`))
+  return events
+}
+
+test('Server rejects a concurrent duplicate transfer with FILE_BUSY instead of running hooks twice', async (t) => {
+  const calls: HookCall[] = []
+  const held = gate()
+  let entered = 0
+  const { server, node } = await createServer(t, {
+    hooks: recordingHooks(
+      calls,
+      { current: null },
+      {
+        beforeCommit: async () => {
+          entered++
+          await held.wait
+        }
+      }
+    )
+  })
+  const offers = offerEvents(server)
+  const input = await manifest(t, 'concurrent-hook.txt', 'concurrent hook payload')
+  const metadata = metadataFromManifest(input.manifest)
+
+  const first = new FakeSocket(CLIENT_KEY)
+  node.accept(first)
+  first.feed(metadataFrame(input.manifest))
+  await waitFor(() => statuses(first).includes('ACCEPT'))
+  first.feed(input.tar)
+  first.finishInput()
+  await waitFor(() => entered === 1)
+
+  offers.length = 0
+  const duplicate = new FakeSocket(CLIENT_KEY)
+  node.accept(duplicate)
+  duplicate.feed(metadataFrame(input.manifest))
+  await waitFor(() => isTerminal(duplicate))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  t.alike(statuses(duplicate), ['REJECTED'])
+  t.is(finalCode(duplicate), ERRORS.FILE_BUSY)
+  t.alike(offers, [`rejected:${ERRORS.FILE_BUSY}`])
+  t.is(entered, 1, 'the duplicate never enters beforeCommit')
+  const reported = calls.filter((call) => call.hook === 'onFailure')
+  t.is(reported.length, 1, 'the duplicate reports onFailure exactly once')
+  const context = reported[0].context as HookFailureContext
+  t.is(context.phase, 'offer')
+  t.is(context.path, null)
+  t.is((context.error as SwarmDeployError).code, ERRORS.FILE_BUSY)
+  t.is(context.artifact.transferId, metadata.transferId)
+
+  held.open()
+  await waitFor(() => isTerminal(first))
+  t.is(statuses(first).at(-1), 'COMMITTED')
+
+  const released = reconnect(node, input)
+  await waitFor(() => isTerminal(released))
+  t.alike(statuses(released), ['ALREADY_COMMITTED'], 'the guard is released in finally')
+})
+
+test('Server rejects a duplicate of a VERIFIED reconnect whose beforeCommit is still running', async (t) => {
+  const calls: HookCall[] = []
+  const held = gate()
+  let entered = 0
+  const { server, node } = await createServer(t, {
+    hooks: recordingHooks(
+      calls,
+      { current: null },
+      {
+        beforeCommit: async () => {
+          entered++
+          await held.wait
+        }
+      }
+    )
+  })
+  const input = await manifest(t, 'verified-race.txt', 'verified race payload')
+  const metadata = metadataFromManifest(input.manifest)
+  const sessions = (server as unknown as { sessions: SessionStore }).sessions
+  await sessions.admit(CLIENT_KEY, metadata)
+  await sessions.append(CLIENT_KEY, metadata, 0, input.tar)
+  await sessions.verify(CLIENT_KEY, metadata)
+
+  const first = reconnect(node, input)
+  await waitFor(() => entered === 1)
+  const duplicate = reconnect(node, input)
+  await waitFor(() => isTerminal(duplicate))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  t.alike(statuses(duplicate), ['REJECTED'])
+  t.is(finalCode(duplicate), ERRORS.FILE_BUSY)
+  t.is(entered, 1, 'beforeCommit is never entered twice for one transfer')
+  t.is(calls.filter((call) => call.hook === 'onFailure').length, 1)
+
+  held.open()
+  await waitFor(() => isTerminal(first))
+  t.is(statuses(first).at(-1), 'COMMITTED')
+})
+
+test('Server rejects a duplicate of an already-committed offer whose afterCommit is still running', async (t) => {
+  let holding: { wait: Promise<void>; open(): void } | null = null
+  let entered = 0
+  const { node } = await createServer(t, {
+    hooks: {
+      async afterCommit() {
+        entered++
+        if (holding) await holding.wait
+      }
+    }
+  })
+  const input = await manifest(t, 'already-race.txt', 'already race payload')
+  t.is(statuses(await uploadAll(node, input)).at(-1), 'COMMITTED')
+  t.is(entered, 1)
+
+  holding = gate()
+  const retry = reconnect(node, input)
+  await waitFor(() => entered === 2)
+  const duplicate = reconnect(node, input)
+  await waitFor(() => isTerminal(duplicate))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  t.alike(statuses(duplicate), ['REJECTED'])
+  t.is(finalCode(duplicate), ERRORS.FILE_BUSY)
+  t.is(entered, 2, 'afterCommit never runs concurrently for one transfer')
+
+  holding.open()
+  holding = null
+  await waitFor(() => isTerminal(retry))
+  t.alike(statuses(retry), ['ALREADY_COMMITTED'])
+
+  const released = reconnect(node, input)
+  await waitFor(() => isTerminal(released))
+  t.alike(statuses(released), ['ALREADY_COMMITTED'])
+  t.is(entered, 3, 'only the committing, retrying, and released offers ran the hook')
+})
+
 type EarlyRejection = {
   name: string
   reason: string

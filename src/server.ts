@@ -257,6 +257,14 @@ export class Server extends EventEmitter {
    * is the next startup, scheduled, or commit-triggered pass.
    */
   private readonly pendingAfterCommit = new Set<string>()
+  /**
+   * Authenticated transfer IDs a connection currently owns. One connection
+   * holds at most one entry and releases it in a `finally`, so the set is
+   * bounded by `maxConnections`. A second connection offering the same
+   * transfer is rejected with `FILE_BUSY` rather than running the lifecycle
+   * and its hooks concurrently against one staging and commit identity.
+   */
+  private readonly activeTransfers = new Set<string>()
   private readonly receives = new Set<Promise<void>>()
   private layout: StorageLayout | null = null
   private sessions: SessionStore | null = null
@@ -518,6 +526,7 @@ export class Server extends EventEmitter {
     let hooksFinished = false
     let finalStarted = false
     let failureReported = false
+    let guardedTransfer: string | null = null
     // Runs onFailure at most once per connection, after the client was answered.
     const reportFailure = async (error: unknown): Promise<void> => {
       if (failureReported || !event || !artifact) return
@@ -540,6 +549,14 @@ export class Server extends EventEmitter {
       event = this.transfer(metadata)
       artifact = this.hookArtifact(metadata, null)
       assertMetadataTransferId(owner, metadata)
+      // The transfer ID is authenticated from here on, so it is safe to key
+      // the single-owner guard on it.
+      if (this.activeTransfers.has(metadata.transferId)) {
+        await rejectEarly(ERRORS.FILE_BUSY, 'Transfer is already in progress')
+        return
+      }
+      this.activeTransfers.add(metadata.transferId)
+      guardedTransfer = metadata.transferId
       let release: ReleaseCoordinates | null = null
       if (this.releaseMatcher.size > 0) {
         release = this.releaseMatcher.match(metadata.name, metadata.sourceParent)
@@ -816,6 +833,7 @@ export class Server extends EventEmitter {
       if (!hooksFinished) await reportFailure(callbackError(error))
     } finally {
       this.activeUploads.delete(socket)
+      if (guardedTransfer !== null) this.activeTransfers.delete(guardedTransfer)
       reader.closeReader()
     }
   }
@@ -970,6 +988,7 @@ export class Server extends EventEmitter {
     this.transport = null
     await Promise.allSettled([...this.receives])
     this.active.clear()
+    this.activeTransfers.clear()
     this.pendingAfterCommit.clear()
     await this.retention?.stop().catch(() => {})
     this.retention = null
