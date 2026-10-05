@@ -47,6 +47,7 @@ export interface ServerHooks {
   onFailure?(context: HookFailureContext): void | Promise<void>
 }
 
+const WRAPPED_CALLBACK_ERRORS = new WeakMap<SwarmDeployError, unknown>()
 const HOOK_NAMES = ['beforeCommit', 'afterCommit', 'onFailure'] as const
 
 /**
@@ -86,7 +87,24 @@ export function snapshotHooks(hooks: ServerHooks | null | undefined): Readonly<S
  * carry secrets) never reaches the wire; the original error stays on `cause`.
  */
 export function hookError(phase: HookFailurePhase, cause: unknown): SwarmDeployError {
-  return new SwarmDeployError(ERRORS.HOOK_FAILED, `Deployment hook failed during ${phase}`, cause)
+  const error = new SwarmDeployError(
+    ERRORS.HOOK_FAILED,
+    `Deployment hook failed during ${phase}`,
+    cause
+  )
+  WRAPPED_CALLBACK_ERRORS.set(error, cause)
+  return error
+}
+
+/**
+ * The error an `onFailure` hook should see: the raw exception for failures this
+ * module wrapped, otherwise the error unchanged. Only identity-tracked wrappers
+ * unwrap, so a forged `HOOK_FAILED` error cannot masquerade as one.
+ */
+export function callbackError(error: unknown): unknown {
+  return error instanceof SwarmDeployError && WRAPPED_CALLBACK_ERRORS.has(error)
+    ? WRAPPED_CALLBACK_ERRORS.get(error)
+    : error
 }
 
 /**

@@ -913,7 +913,7 @@ test('Server runs beforeCommit and afterCommit around a fresh durable commit', a
     hooks: recordingHooks(calls, ref, {
       beforeCommit: async (call) => {
         const context = call.context as BeforeCommitContext
-        existence.before = String((await fs.promises.lstat(context.path)).size)
+        existence.before = b4a.toString(await fs.promises.readFile(context.path))
         await t.exception(
           () => fs.promises.lstat(path.join(storageDir, 'fresh-hook.txt')),
           { code: 'ENOENT' },
@@ -953,10 +953,11 @@ test('Server runs beforeCommit and afterCommit around a fresh durable commit', a
   t.is(before.alreadyCommitted, false)
   t.is(path.isAbsolute(before.path), true)
   t.is(
-    before.path.startsWith(path.join(path.resolve(storageDir), '.swarm-deploy', 'staging')),
-    true
+    before.path,
+    path.join(path.resolve(storageDir), '.swarm-deploy', 'staging', `${metadata.transferId}.part`),
+    'beforeCommit receives the extracted artifact, not the TAR'
   )
-  t.is(existence.before, String(input.tar.byteLength))
+  t.is(existence.before, 'fresh hook payload')
   t.is(after.path, path.join(path.resolve(storageDir), 'fresh-hook.txt'))
   t.is(after.resumed, false)
   t.is(after.alreadyCommitted, false)
@@ -1014,17 +1015,14 @@ test('Server marks both hooks resumed after a partial resume', async (t) => {
 test('Server reruns beforeCommit for a verified reconnect and keeps the session after a beforeCommit failure', async (t) => {
   const calls: HookCall[] = []
   let failBefore = true
+  const ref: { current: FakeSocket | null } = { current: null }
   const injected = new Error('deploy gate said no')
   const { server, node } = await createServer(t, {
-    hooks: recordingHooks(
-      calls,
-      { current: null },
-      {
-        beforeCommit: () => {
-          if (failBefore) throw injected
-        }
+    hooks: recordingHooks(calls, ref, {
+      beforeCommit: () => {
+        if (failBefore) throw injected
       }
-    )
+    })
   })
   const failures: string[] = []
   server.on('failure', (event) => failures.push(event.reason))
@@ -1036,7 +1034,9 @@ test('Server reruns beforeCommit for a verified reconnect and keeps the session 
   await sessions.verify(CLIENT_KEY, metadata)
 
   const first = reconnect(node, input)
+  ref.current = first
   await waitFor(() => isTerminal(first))
+  await waitFor(() => calls.length === 2)
   t.alike(hookNames(calls), ['beforeCommit', 'onFailure'])
   t.is(finalCode(first), ERRORS.HOOK_FAILED)
   t.alike(failures, [ERRORS.HOOK_FAILED])
@@ -1045,8 +1045,12 @@ test('Server reruns beforeCommit for a verified reconnect and keeps the session 
   t.is(failure.resumed, true)
   t.is(failure.alreadyCommitted, false)
   t.is(failure.path, (calls[0].context as BeforeCommitContext).path)
-  t.is((failure.error as SwarmDeployError).code, ERRORS.HOOK_FAILED)
-  t.is((failure.error as SwarmDeployError).cause, injected)
+  t.is(failure.error, injected, 'onFailure receives the raw callback exception')
+  t.absent(
+    b4a.toString(first.writes.at(-1)!).includes('deploy gate said no'),
+    'callback text never reaches the wire'
+  )
+  t.ok(calls[1].seen.includes('FAILED'), 'client is answered before onFailure runs')
   await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'verified-hook.txt')), {
     code: 'ENOENT'
   })
@@ -1115,7 +1119,7 @@ test('Server keeps a committed artifact when afterCommit fails and retries after
   t.is(failure.phase, 'afterCommit')
   t.is(failure.path, path.join(path.resolve(server.storageDir), 'after-fail.txt'))
   t.is(failure.alreadyCommitted, false)
-  t.is((failure.error as SwarmDeployError).cause, injected)
+  t.is(failure.error, injected)
 
   calls.length = 0
   const second = reconnect(node, input)
@@ -1126,6 +1130,7 @@ test('Server keeps a committed artifact when afterCommit fails and retries after
   const retryFailure = calls[1].context as HookFailureContext
   t.is(retryFailure.phase, 'afterCommit')
   t.is(retryFailure.alreadyCommitted, true)
+  t.is(retryFailure.error, injected)
 
   calls.length = 0
   const third = reconnect(node, input)
@@ -1271,4 +1276,201 @@ test('Server close does not wait for a hung beforeCommit hook', async (t) => {
   await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'hung-hook.txt')), {
     code: 'ENOENT'
   })
+})
+
+type EarlyRejection = {
+  name: string
+  reason: string
+  options: Partial<ConstructorParameters<typeof Server>[0]>
+  contents?: string
+  release: boolean
+  arrange?: (server: Server, node: FakeServerNode) => Promise<() => void> | (() => void)
+}
+
+test('Server reports every early offer rejection to onFailure exactly once after the rejection', async (t) => {
+  const cases: EarlyRejection[] = [
+    {
+      name: 'plain.txt',
+      reason: ERRORS.INVALID_FILENAME,
+      options: { artifactPatterns: ['{series}-{version}.bin'] },
+      release: false
+    },
+    {
+      name: 'too-large-1.0.0.bin',
+      reason: ERRORS.FILE_TOO_LARGE,
+      options: { artifactPatterns: ['{series}-{version}.bin'] },
+      contents: 'x'.repeat(16 * 1024 + 1),
+      release: true
+    },
+    {
+      name: 'busy-first.txt',
+      reason: ERRORS.ACTIVE_UPLOAD_LIMIT,
+      options: { maxConnections: 4, maxActiveUploads: 1 },
+      release: false,
+      arrange: (server) => {
+        const active = (server as unknown as { activeUploads: Set<unknown> }).activeUploads
+        const placeholder = {}
+        active.add(placeholder)
+        return () => active.delete(placeholder)
+      }
+    },
+    {
+      name: 'busy-second.txt',
+      reason: ERRORS.ACTIVE_UPLOAD_LIMIT,
+      options: { maxConnections: 4, maxActiveUploads: 1 },
+      release: false,
+      arrange: (server) => {
+        const internals = server as unknown as {
+          activeUploads: Set<unknown>
+          commits: CommitStore
+        }
+        const placeholder = {}
+        const inspect = internals.commits.inspect.bind(internals.commits)
+        internals.commits.inspect = async (...args: Parameters<CommitStore['inspect']>) => {
+          const result = await inspect(...args)
+          internals.activeUploads.add(placeholder)
+          return result
+        }
+        return () => {
+          internals.commits.inspect = inspect
+          internals.activeUploads.delete(placeholder)
+        }
+      }
+    }
+  ]
+
+  for (const entry of cases) {
+    const calls: HookCall[] = []
+    const ref: { current: FakeSocket | null } = { current: null }
+    const { server, node } = await createServer(t, {
+      ...entry.options,
+      maxFileBytes: 16 * 1024,
+      hooks: recordingHooks(calls, ref)
+    })
+    const offers: string[] = []
+    server.on('offer', (event) => offers.push(`${event.status}:${event.reason}`))
+    const input = await manifest(t, entry.name, entry.contents ?? entry.name)
+    const metadata = metadataFromManifest(input.manifest)
+    const restore = await entry.arrange?.(server, node)
+
+    const socket = new FakeSocket(CLIENT_KEY)
+    ref.current = socket
+    node.accept(socket)
+    socket.feed(metadataFrame(input.manifest))
+    await waitFor(() => isTerminal(socket) && calls.length > 0)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    restore?.()
+
+    t.alike(statuses(socket), ['REJECTED'], entry.name)
+    t.is(finalCode(socket), entry.reason, entry.name)
+    t.alike(offers, [`rejected:${entry.reason}`], entry.name)
+    t.alike(hookNames(calls), ['onFailure'], `${entry.name} reports exactly once`)
+    t.alike(calls[0].seen, ['REJECTED'], `${entry.name} reports after the rejection is sent`)
+    const context = calls[0].context as HookFailureContext
+    t.is(context.phase, 'offer', entry.name)
+    t.is(context.path, null, entry.name)
+    t.is(context.resumed, false, entry.name)
+    t.is(context.alreadyCommitted, false, entry.name)
+    t.is((context.error as SwarmDeployError).code, entry.reason, entry.name)
+    t.is(context.artifact.name, entry.name, entry.name)
+    t.is(context.artifact.size, metadata.fileSize, entry.name)
+    t.is(context.artifact.transferId, metadata.transferId, entry.name)
+    t.is(context.artifact.release !== undefined, entry.release, entry.name)
+    t.ok(Object.isFrozen(context) && Object.isFrozen(context.artifact), entry.name)
+    await server.close()
+  }
+})
+
+test('Server reports a noncanonical transfer ID to onFailure once and keeps PROTOCOL_INVALID on the wire', async (t) => {
+  const calls: HookCall[] = []
+  const ref: { current: FakeSocket | null } = { current: null }
+  const { server, node } = await createServer(t, { hooks: recordingHooks(calls, ref) })
+  const rejections: string[] = []
+  server.on('failure', (event) => rejections.push(event.reason))
+  const input = await manifest(t, 'forged-id.txt', 'forged transfer id payload')
+  const genuine = metadataFromManifest(input.manifest)
+  const forged = { ...genuine, transferId: 'ab'.repeat(32) }
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  ref.current = socket
+  node.accept(socket)
+  socket.feed(encodeControlFrame(encodeMetadataRecord(forged)))
+  await waitFor(() => isTerminal(socket) && calls.length > 0)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  t.alike(statuses(socket), ['REJECTED'])
+  t.is(finalCode(socket), ERRORS.PROTOCOL_INVALID)
+  t.alike(rejections, [ERRORS.PROTOCOL_INVALID])
+  t.alike(hookNames(calls), ['onFailure'])
+  t.alike(calls[0].seen, ['REJECTED'])
+  const context = calls[0].context as HookFailureContext
+  t.is(context.phase, 'offer')
+  t.is(context.path, null)
+  t.is((context.error as SwarmDeployError).code, ERRORS.PROTOCOL_INVALID)
+  t.is(context.artifact.transferId, forged.transferId)
+  for (const key of Object.keys(context.artifact)) {
+    t.ok(['name', 'size', 'sha256', 'transferId', 'sourceParent', 'release'].includes(key), key)
+  }
+})
+
+test('Server reports a VERIFIED reconnect read failure with the extracted .part path', async (t) => {
+  const calls: HookCall[] = []
+  const { server, node } = await createServer(t, {
+    hooks: recordingHooks(calls, { current: null })
+  })
+  const input = await manifest(t, 'verified-read.txt', 'verified read payload')
+  const metadata = metadataFromManifest(input.manifest)
+  const sessions = (server as unknown as { sessions: SessionStore }).sessions
+  await sessions.admit(CLIENT_KEY, metadata)
+  await sessions.append(CLIENT_KEY, metadata, 0, input.tar)
+  await sessions.verify(CLIENT_KEY, metadata)
+  const injected = new SwarmDeployError(ERRORS.COMMIT_FAILED, 'staging file vanished')
+  sessions.readVerified = () => Promise.reject(injected)
+
+  const socket = reconnect(node, input)
+  await waitFor(() => calls.length > 0)
+
+  t.alike(hookNames(calls), ['onFailure'])
+  const context = calls[0].context as HookFailureContext
+  t.is(context.phase, 'verification')
+  t.is(context.resumed, true)
+  t.is(context.error, injected)
+  t.is(
+    context.path,
+    path.join(
+      path.resolve(server.storageDir),
+      '.swarm-deploy',
+      'staging',
+      `${metadata.transferId}.part`
+    )
+  )
+  t.is(finalCode(socket), ERRORS.COMMIT_FAILED)
+})
+
+test('Server close aborts a hung onFailure hook without losing the original failure', async (t) => {
+  const calls: HookCall[] = []
+  const ref: { current: FakeSocket | null } = { current: null }
+  const { server, node } = await createServer(t, {
+    hooks: recordingHooks(calls, ref, { onFailure: () => new Promise<void>(() => {}) })
+  })
+  const input = await manifest(t, 'hung-failure.txt', 'hung failure payload')
+  const garbage = { manifest: input.manifest, tar: b4a.alloc(input.tar.byteLength, 0xff) }
+  const socket = new FakeSocket(CLIENT_KEY)
+  ref.current = socket
+  node.accept(socket)
+  socket.feed(metadataFrame(garbage.manifest))
+  await waitFor(() => statuses(socket).includes('ACCEPT'))
+  socket.feed(garbage.tar)
+  socket.finishInput()
+  await waitFor(() => calls.some((call) => call.hook === 'onFailure'))
+
+  t.is(statuses(socket).at(-1), 'FAILED', 'the client already has the original failure')
+  t.ok(calls[0].seen.includes('FAILED'))
+  const code = finalCode(socket)
+  t.not(code, ERRORS.HOOK_FAILED)
+  t.is((calls[0].context as HookFailureContext).phase, 'verification')
+
+  await promptly(server.close(), 'server close with hung onFailure')
+  t.is(finalCode(socket), code, 'client response is unchanged by close')
+  t.is(calls.length, 1, 'onFailure ran once')
 })

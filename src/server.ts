@@ -13,6 +13,7 @@ import {
 import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
 import { validateReplaceNames } from './files.js'
 import {
+  callbackError,
   hookError,
   invokeHook,
   snapshotHooks,
@@ -507,30 +508,51 @@ export class Server extends EventEmitter {
     let alreadyCommitted = false
     let hooksFinished = false
     let finalStarted = false
+    let failureReported = false
+    // Runs onFailure at most once per connection, after the client was answered.
+    const reportFailure = async (error: unknown): Promise<void> => {
+      if (failureReported || !event || !artifact) return
+      failureReported = true
+      await this.runFailureHook(
+        Object.freeze({ artifact, path: hookPath, phase, resumed, alreadyCommitted, error }),
+        owner,
+        event.transfer
+      )
+    }
+    const rejectEarly = async (reason: ErrorCode, message: string): Promise<void> => {
+      await this.rejectOffer(socket, event!, owner, reason)
+      sentAdmission = true
+      await reportFailure(fail(reason, message))
+    }
     try {
       const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
-      assertMetadataTransferId(owner, metadata)
+      // The decoded record is shape-validated but not yet authenticated; the
+      // artifact context carries only its non-secret descriptive fields.
       event = this.transfer(metadata)
+      artifact = this.hookArtifact(metadata, null)
+      assertMetadataTransferId(owner, metadata)
       let release: ReleaseCoordinates | null = null
       if (this.releaseMatcher.size > 0) {
         release = this.releaseMatcher.match(metadata.name, metadata.sourceParent)
         if (release === null) {
-          await this.rejectOffer(socket, event, owner, ERRORS.INVALID_FILENAME)
-          sentAdmission = true
+          await rejectEarly(
+            ERRORS.INVALID_FILENAME,
+            'Artifact name does not match a configured pattern'
+          )
           return
         }
+        artifact = this.hookArtifact(metadata, release)
       }
-      const hookArtifact = this.hookArtifact(metadata, release)
-      artifact = hookArtifact
+      const hookArtifact = artifact
       const finish = async (verified: TarSession): Promise<void> => {
         phase = 'beforeCommit'
-        hookPath = verified.tarPath
+        hookPath = path.join(this.layout!.staging, `${metadata.transferId}.part`)
         await this.runHook<BeforeCommitContext>(
           'beforeCommit',
           this.hooks.beforeCommit,
           Object.freeze({
             artifact: hookArtifact,
-            path: verified.tarPath,
+            path: hookPath,
             resumed,
             alreadyCommitted: false as const
           })
@@ -574,10 +596,11 @@ export class Server extends EventEmitter {
         metadata.fileSize > this.maxFileBytes ||
         this.activeUploads.size >= this.maxActiveUploads
       ) {
-        const reason =
-          metadata.fileSize > this.maxFileBytes ? ERRORS.FILE_TOO_LARGE : ERRORS.ACTIVE_UPLOAD_LIMIT
-        await this.rejectOffer(socket, event, owner, reason)
-        sentAdmission = true
+        if (metadata.fileSize > this.maxFileBytes) {
+          await rejectEarly(ERRORS.FILE_TOO_LARGE, 'File exceeds the maximum size')
+        } else {
+          await rejectEarly(ERRORS.ACTIVE_UPLOAD_LIMIT, 'Active upload capacity exceeded')
+        }
         return
       }
       const inspected = await this.commits.inspect(
@@ -623,8 +646,7 @@ export class Server extends EventEmitter {
         throw fail(ERRORS.FILE_EXISTS, 'Destination already exists')
       }
       if (this.activeUploads.size >= this.maxActiveUploads) {
-        await this.rejectOffer(socket, event, owner, ERRORS.ACTIVE_UPLOAD_LIMIT)
-        sentAdmission = true
+        await rejectEarly(ERRORS.ACTIVE_UPLOAD_LIMIT, 'Active upload capacity exceeded')
         return
       }
       this.activeUploads.add(socket)
@@ -639,6 +661,7 @@ export class Server extends EventEmitter {
         )
         sentAdmission = true
         phase = 'verification'
+        hookPath = path.join(this.layout!.staging, `${metadata.transferId}.part`)
         this.emitSafe('verification', {
           ...event,
           fingerprint: fingerprint(owner),
@@ -771,20 +794,7 @@ export class Server extends EventEmitter {
         socket.destroy()
       } catch {}
       this.activeUploads.delete(socket)
-      if (event && artifact && !hooksFinished) {
-        await this.runFailureHook(
-          Object.freeze({
-            artifact,
-            path: hookPath,
-            phase,
-            resumed,
-            alreadyCommitted,
-            error
-          }),
-          owner,
-          event.transfer
-        )
-      }
+      if (!hooksFinished) await reportFailure(callbackError(error))
     } finally {
       this.activeUploads.delete(socket)
       reader.closeReader()

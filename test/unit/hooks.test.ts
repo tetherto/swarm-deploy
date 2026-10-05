@@ -3,7 +3,7 @@
 import test from 'brittle'
 import b4a from 'b4a'
 import { ERRORS, Server, SwarmDeployError, keyPairFromSeed } from '../../dist/index.js'
-import { hookError, snapshotHooks } from '../../dist/hooks.js'
+import { callbackError, hookError, snapshotHooks } from '../../dist/hooks.js'
 
 const SEED = b4a.alloc(32, 0xb1)
 
@@ -114,4 +114,16 @@ test('Server validates and snapshots hooks at construction', (t) => {
   }
   t.is(server.hooks.afterCommit, afterCommit)
   t.is(Object.isFrozen(server.hooks), true)
+})
+
+test('callbackError unwraps only errors created by hookError', (t) => {
+  const raw = new Error('callback failure')
+  t.is(callbackError(hookError('beforeCommit', raw)), raw)
+  t.is(callbackError(hookError('afterCommit', undefined)), undefined)
+
+  const lookalike = new SwarmDeployError(ERRORS.HOOK_FAILED, 'forged', raw)
+  t.is(callbackError(lookalike), lookalike)
+  const ordinary = new SwarmDeployError(ERRORS.COMMIT_FAILED, 'plain', raw)
+  t.is(callbackError(ordinary), ordinary)
+  t.is(callbackError('text'), 'text')
 })
