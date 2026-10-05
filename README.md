@@ -507,21 +507,31 @@ that same pass. The exact ordering depends on hooks:
   commit (the pre-commit quota and age checks still run first), `afterCommit`
   with the final path and sidecar present, and only after the callback
   succeeds the post-commit pass, then `COMMITTED` (or `ALREADY_COMMITTED`).
-  The path is therefore always readable inside `afterCommit`, even for an
-  out-of-window release. This holds for fresh, resumed, `VERIFIED`, and
-  replacement commits (a replaced artifact's history record is also still
-  present). `beforeCommit`-only and `onFailure`-only servers do not defer.
-- If `afterCommit` throws, no post-commit pass runs. The artifact and its record
-  stay, so an immediate retry is `ALREADY_COMMITTED`, runs `afterCommit` again
-  with the existing path, and runs the pass only after that call succeeds. A
-  failing already-committed `afterCommit` likewise skips the pass.
+  Because the deferred pass runs before the terminal reply, a slow retention
+  pass delays `COMMITTED` or `ALREADY_COMMITTED`. `beforeCommit`-only and
+  `onFailure`-only servers do not defer.
+- The final path exists when `afterCommit` begins in the sequential server
+  flow, including for an out-of-window release, and for replacement commits
+  (a replaced artifact's history record is also present). It is not a lock:
+  a concurrent commit's retention pass or a manual retention pass can remove the
+  file while the callback runs. A hook that needs stable bytes should open or
+  copy the file promptly at the start of the callback.
+- If `afterCommit` throws, no post-commit pass runs for that connection. The
+  artifact and its record stay, so an immediate retry normally reaches
+  `ALREADY_COMMITTED`, runs `afterCommit` again with the existing path, and runs
+  the pass only after that call succeeds. A failing already-committed
+  `afterCommit` likewise skips the pass. See the retry caveat below.
 - Post-commit retention failures stay non-fatal: they are logged and reported as
   `retention` events, and never fail the upload.
 
-**Restart caveat.** There is no persistent "hook pending" marker. If
-`afterCommit` failed for an out-of-window artifact, a startup, scheduled, or
-manual retention pass that runs before the client retries can remove it. The
-retry is then a normal fresh upload instead of `ALREADY_COMMITTED`.
+**Retry caveat.** There is no persistent "hook pending" marker. After
+`afterCommit` fails for an out-of-window artifact, any intervening retention
+pass can remove it before the client retries: a startup pass after a restart, a
+scheduled or manual cleanup, or the retention pass of another concurrent commit.
+The retry is then a normal fresh upload (transfer, verification, `beforeCommit`,
+commit, `afterCommit` with `alreadyCommitted: false`), not `ALREADY_COMMITTED`.
+Every statement below that a failed hook is retried as `ALREADY_COMMITTED`
+assumes the artifact was not removed in between.
 
 `retention` events and results report `ageDeleted`, `countDeleted`,
 `versionDeleted`, and `storageDeleted` next to `expiredSessions` and `scrubbed`.
@@ -582,9 +592,12 @@ A new server remains compatible with older clients: they never send
 `sourceParent`, no-pattern servers are unaffected, filename-only patterns still
 match, and patterns that need a parent reject their offers as unmatched. Older
 sessions and commit records stay readable, and older commit records are not
-count or version rotated. Newly created resumable sessions use a newer on-disk
-format, so after a downgrade they cannot be resumed; drain uploads before
-rolling a server back. Roll out the server, then the pattern configuration, then
+count or version rotated. Resumable sessions created by the new server use
+on-disk session version 3 (the older server wrote version 2, which the new
+server still reads). An older server cannot read version 3 sessions, so those
+uploads cannot be resumed after a downgrade; drain or complete in-flight uploads
+before rolling a server back. Commit-record compatibility on older code was not
+verified. Roll out the server, then the pattern configuration, then
 clients that stage into conforming folders.
 
 ## Deployment hooks
@@ -642,7 +655,8 @@ after `beforeCommit` returned but before the commit finished.
 Already committed: identical content is detected during offer inspection, so
 there is no transfer, verification, or `beforeCommit`. The server calls
 `afterCommit` with `resumed: false` and `alreadyCommitted: true`, then replies
-`ALREADY_COMMITTED`.
+`ALREADY_COMMITTED`. This path is reached only while the artifact still exists;
+see the [retry caveat](#artifact-patterns-and-rotation).
 
 Failure sequences:
 
@@ -651,15 +665,18 @@ Failure sequences:
   A retry reconnects as `VERIFIED` and calls `beforeCommit` again.
 - `afterCommit` throws on a fresh or resumed upload: the artifact **stays
   durably committed** and its session is retired. The client receives
-  `HOOK_FAILED`; `onFailure` runs (`phase: 'afterCommit'`, final path). A retry
-  takes the already-committed path and calls `afterCommit` with
-  `alreadyCommitted: true`.
+  `HOOK_FAILED`; `onFailure` runs (`phase: 'afterCommit'`, final path). Unless
+  retention removed the artifact first (see the
+  [retry caveat](#artifact-patterns-and-rotation)), a retry takes the
+  already-committed path and calls `afterCommit` with `alreadyCommitted: true`;
+  otherwise it is a fresh upload.
 - `afterCommit` throws on an already-committed retry: the offer is rejected with
-  `HOOK_FAILED` and a later retry repeats `afterCommit`.
+  `HOOK_FAILED` and a later retry repeats `afterCommit`, subject to the same
+  retry caveat.
 - A failure after both hooks succeeded (for example the terminal reply cannot be
   written) does not call `onFailure`.
 
-Retries therefore call hooks more than once for one transfer. **Make hooks
+Retries therefore can call hooks more than once for one transfer. **Make hooks
 idempotent and key external side effects on `artifact.transferId`.** Treat
 `afterCommit` as at-least-once: record the transfer ID when the deployment step
 finishes and skip repeated calls.

@@ -203,18 +203,27 @@ limit is best-effort when one exceeds it.
 Retention runs before a commit's link step and again after the commit becomes
 durable, so rotation may remove an artifact that falls outside the retained
 window immediately after it is committed. When an `afterCommit` hook is
-configured the post-commit pass is deferred: the order is commit, `afterCommit`
-(the final path and sidecar still exist, including for out-of-window releases and
-for replacement commits and their history), then the post-commit pass only after
-the callback succeeded. A failing `afterCommit` skips the pass and leaves the
-artifact and record, so an immediate retry is `ALREADY_COMMITTED`, reruns
-`afterCommit`, and then runs the pass; an already-committed offer also runs the
-pass after a successful `afterCommit`. Servers without an `afterCommit` hook
-(including `beforeCommit`-only and `onFailure`-only) run the pass immediately
-after the commit. Pre-commit quota and age checks are never deferred, and
-post-commit retention failures remain non-fatal. Because no persistent
-hook-pending marker exists, a startup, scheduled, or manual pass that runs
-before a retry can remove an out-of-window artifact whose `afterCommit` failed.
+configured the post-commit pass is deferred: the order is commit, `afterCommit`,
+then the post-commit pass only after the callback succeeded, then the terminal
+`COMMITTED` or `ALREADY_COMMITTED` reply. The deferred pass therefore runs before
+that reply, and a slow retention pass can delay it. When `afterCommit` begins in
+the sequential server flow, the final path and sidecar exist, including for
+out-of-window releases and for replacement commits and their history. This is
+not a lock: a concurrent commit's retention pass or a manual pass can remove the
+file while the callback runs, so a hook needing stable bytes should open or copy
+it promptly. A failing `afterCommit` skips the pass for that connection and
+leaves the artifact and record, so an immediate retry normally is
+`ALREADY_COMMITTED`, reruns `afterCommit`, and then runs the pass; an
+already-committed offer also runs the pass after a successful `afterCommit`.
+Servers without an `afterCommit` hook (including `beforeCommit`-only and
+`onFailure`-only) run the pass immediately after the commit. Pre-commit quota and
+age checks are never deferred, and post-commit retention failures remain
+non-fatal. Because no persistent hook-pending marker exists, any intervening
+retention pass (startup after a restart, scheduled or manual cleanup, or a
+concurrent commit's retention) can remove an out-of-window artifact whose
+`afterCommit` failed before the retry; the retry is then a fresh upload, not
+`ALREADY_COMMITTED`. Every retry statement in this document is qualified by that
+caveat.
 `retention` events and results expose `ageDeleted`, `countDeleted`,
 `versionDeleted`, and `storageDeleted`; deletions log the stable reasons
 `MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and `MAX_STORAGE`.
@@ -249,7 +258,8 @@ Observable order:
 
 A `beforeCommit` failure prevents commit mutation and leaves the verified
 session resumable. An `afterCommit` failure leaves the artifact durably
-committed, fails the connection, and makes a retry take the already-committed
+committed, fails the connection, and (unless retention removed the artifact
+first; see the retention caveat above) makes a retry take the already-committed
 path, so both callbacks may run more than once for a transfer ID and must be
 idempotent. A callback exception becomes the stable wire code `HOOK_FAILED` with
 a fixed message.
@@ -269,8 +279,11 @@ logged as a secondary warning and never replaces the original failure.
 Servers must be upgraded before clients. A server that predates `sourceParent`
 decodes offers with an exact key set and rejects the new field, so a new client
 that sends it to an old server fails. A new server accepts older clients,
-sessions, and commit records; offers without `sourceParent` can match only
-patterns without a parent segment.
+version-2 sessions, and older commit records; offers without `sourceParent` can
+match only patterns without a parent segment. Sessions the new server writes use
+version 3, which a version-2-only server rejects, so in-flight uploads cannot
+resume after a rollback and uploads should be drained first. Compatibility of
+release-bearing commit records with older code is unverified.
 
 ## Storage accounting
 
