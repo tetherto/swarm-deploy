@@ -79,6 +79,12 @@ restarts, is identical on Node.js and Bare, and keeps distinct templates
 distinct. Validity of the derived key is checked when the matcher is
 constructed, not at commit time.
 
+The derived shape is a reserved namespace: a captured `{series}` of exactly
+`fixed-` plus 64 lowercase hex characters is not a valid capture, so an offered
+filename cannot place itself in the rotation group of a version-only template.
+`fixedSeriesKey` is part of the root API so operators can map a persisted series
+back to its template.
+
 A template is also rejected at construction when its literal text still
 contains `{` or `}` after the exact `{series}` and `{version}` placeholders are
 removed, since literals are matched verbatim and a stray brace is always a
@@ -170,8 +176,10 @@ only those may start a deferred pass from an already-committed retry. An
 ordinary duplicate offer still invokes `afterCommit`, but starts no retention
 pass, so duplicates cannot be used to force repeated full scans. The owed set is
 cleared once the hook succeeds and its pass has been attempted, and on server
-close. Because it is not persisted, a restart falls back to the next startup,
-scheduled, or commit-triggered pass.
+close. It is bounded at 1024 entries, matching the connection ceiling, and
+evicts the oldest owed transfer first when a persistently failing hook fills it.
+Because it is neither persisted nor unbounded, a restart or an eviction falls
+back to the next startup, scheduled, or commit-triggered pass.
 
 ## Hook API and module loading
 
@@ -201,13 +209,22 @@ accepts ESM named callback exports, an ESM default hook object, or the
 equivalent CommonJS export. Module resolution, loading, or shape failures abort
 startup as configuration errors before the server listens.
 
-Hooks never run concurrently for one transfer. An authenticated transfer ID has
-a single in-flight owner: a second connection offering the same ID is rejected
-with `FILE_BUSY` during the offer phase, before any hook or staging work, and
-that rejection is reported once through `onFailure`. The guard is per process,
-holds at most one entry per connection, and is released when the connection
-ends or the server closes. Hooks for different transfers still run
-concurrently.
+The lifecycle hooks never run concurrently for one transfer. An authenticated
+transfer ID has a single in-flight owner: a second connection offering the same
+ID is rejected with `FILE_BUSY` during the offer phase, before any staging work
+or lifecycle hook, and that rejection is reported once through `onFailure`. The
+guard is per process, holds at most one entry per connection, and is released
+when the connection ends or the server closes. Hooks for different transfers
+still run concurrently.
+
+`onFailure` is excluded from that serialization on purpose. It observes an
+outcome the connection has already settled, so the connection hands the
+transfer back before awaiting it; otherwise a slow callback would reject the
+client's own retry with `FILE_BUSY`. The release clears the connection's
+handle, so the later `finally` cannot revoke ownership that a subsequent
+connection has since acquired. A retry may therefore run its lifecycle hooks
+while a previous `onFailure` is still pending, and each connection still
+reports at most once.
 
 There is no hook timeout. A hung callback on a fresh or resumed upload holds its
 connection, an active-upload slot, and its session's staging reservation, so

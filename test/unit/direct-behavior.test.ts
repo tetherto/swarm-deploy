@@ -18,7 +18,7 @@ import {
   type ServerHooks,
   type ServerScheduler
 } from '../../dist/index.js'
-import { fingerprint } from '../../dist/server.js'
+import { fingerprint, MAX_OWED_POST_COMMIT_RETENTION } from '../../dist/server.js'
 import { fixedSeriesKey } from '../../dist/release.js'
 import type {
   DirectDhtNode,
@@ -1471,6 +1471,99 @@ test('Server rejects a duplicate of an already-committed offer whose afterCommit
   t.is(entered, 3, 'only the committing, retrying, and released offers ran the hook')
 })
 
+function activeTransfers(server: Server): Set<string> {
+  return (server as unknown as { activeTransfers: Set<string> }).activeTransfers
+}
+
+test('Server admits a retry while the failed transfer still waits in onFailure', async (t) => {
+  const failureGate = gate()
+  const hookGate = gate()
+  let failAfterCommit = true
+  let holdAfterCommit = false
+  let afterCommits = 0
+  let failures = 0
+  const { server, node } = await createServer(t, {
+    hooks: {
+      async afterCommit() {
+        afterCommits++
+        if (failAfterCommit) {
+          failAfterCommit = false
+          throw new Error('deployment step failed')
+        }
+        if (holdAfterCommit) await hookGate.wait
+      },
+      async onFailure() {
+        failures++
+        await failureGate.wait
+      }
+    }
+  })
+  const input = await manifest(t, 'observational.txt', 'observational payload')
+  const metadata = metadataFromManifest(input.manifest)
+
+  const first = await uploadAll(node, input)
+  t.alike(statuses(first), ['ACCEPT', 'FAILED'])
+  t.is(finalCode(first), ERRORS.HOOK_FAILED)
+  await waitFor(() => failures === 1)
+  t.is(
+    activeTransfers(server).has(metadata.transferId),
+    false,
+    'the guard is released before onFailure is awaited'
+  )
+
+  // onFailure is observational, so the artifact's own retry must not be
+  // blocked by it; the retry takes the already-committed lifecycle.
+  holdAfterCommit = true
+  const retry = reconnect(node, input)
+  await waitFor(() => afterCommits === 2)
+  t.is(activeTransfers(server).has(metadata.transferId), true, 'the retry owns the transfer')
+
+  // The first connection's `finally` must not steal the retry's ownership.
+  failureGate.open()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const duplicate = reconnect(node, input)
+  await waitFor(() => isTerminal(duplicate))
+  t.alike(statuses(duplicate), ['REJECTED'], 'the retry is still the single owner')
+  t.is(finalCode(duplicate), ERRORS.FILE_BUSY)
+
+  holdAfterCommit = false
+  hookGate.open()
+  await waitFor(() => isTerminal(retry))
+  t.alike(statuses(retry), ['ALREADY_COMMITTED'])
+  t.is(activeTransfers(server).size, 0, 'no owner leaks once every connection ends')
+
+  const released = reconnect(node, input)
+  await waitFor(() => isTerminal(released))
+  t.alike(statuses(released), ['ALREADY_COMMITTED'])
+})
+
+test('Server clears transfer ownership on close even while onFailure is pending', async (t) => {
+  const failureGate = gate()
+  let failures = 0
+  const { server, node } = await createServer(t, {
+    hooks: {
+      beforeCommit() {
+        throw new Error('rejected by policy')
+      },
+      async onFailure() {
+        failures++
+        await failureGate.wait
+      }
+    }
+  })
+  const input = await manifest(t, 'close-during-failure.txt', 'close during failure')
+  const metadata = metadataFromManifest(input.manifest)
+
+  const socket = await uploadAll(node, input)
+  t.is(finalCode(socket), ERRORS.HOOK_FAILED)
+  await waitFor(() => failures === 1)
+  t.is(activeTransfers(server).has(metadata.transferId), false)
+
+  await server.close()
+  t.is(activeTransfers(server).size, 0, 'close leaves no in-memory ownership behind')
+  failureGate.open()
+})
+
 type EarlyRejection = {
   name: string
   reason: string
@@ -2041,6 +2134,29 @@ test('Server rotates from an already-committed retry only while the hook is pend
 
   await server.close()
   t.is(pending.size, 0, 'close clears the in-memory pending state')
+})
+
+test('the owed post-commit retention set is bounded and evicts the oldest transfer', async (t) => {
+  const { server } = await createServer(t, { hooks: { afterCommit() {} } })
+  const owe = (transferId: string): void =>
+    (server as unknown as { owePostCommitRetention(id: string): void }).owePostCommitRetention(
+      transferId
+    )
+  const owed = (server as unknown as { pendingAfterCommit: Set<string> }).pendingAfterCommit
+
+  for (let index = 0; index < MAX_OWED_POST_COMMIT_RETENTION; index++) owe(`transfer-${index}`)
+  t.is(owed.size, MAX_OWED_POST_COMMIT_RETENTION)
+  t.is(owed.has('transfer-0'), true)
+
+  owe('overflow')
+  t.is(owed.size, MAX_OWED_POST_COMMIT_RETENTION, 'the set never grows past its bound')
+  t.is(owed.has('transfer-0'), false, 'the oldest owed transfer is evicted first')
+  t.is(owed.has('transfer-1'), true, 'eviction is deterministic, not arbitrary')
+  t.is(owed.has('overflow'), true)
+
+  owe('transfer-1')
+  t.is(owed.size, MAX_OWED_POST_COMMIT_RETENTION, 're-owing a tracked transfer is a no-op')
+  t.is(owed.has('transfer-2'), true, 're-owing evicts nothing')
 })
 
 test('Server leaves a failed-afterCommit out-of-window artifact to later scheduled retention', async (t) => {

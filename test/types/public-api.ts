@@ -1,6 +1,7 @@
 import {
   Client,
   Server,
+  fixedSeriesKey,
   generateSeed,
   parseAllowlist,
   parsePublicKey,
@@ -86,6 +87,8 @@ const hooks = {
 const granularities: VersionGranularity[] = ['major', 'minor']
 const release: ReleaseCoordinates = { series: 'payments', version: '2.4.1' }
 const fixedSeriesRelease: ReleaseCoordinates = { series: 'payments' }
+const derivedSeries: string = fixedSeriesKey('{version}/payments.tar.gz')
+const derivedSeriesRelease: ReleaseCoordinates = { series: fixedSeriesKey('{version}.bin') }
 const hookedServerOptions = {
   seed: serverSeed,
   storageDir: '/srv/swarm-deploy',
@@ -125,6 +128,8 @@ void nullHooksServerOptions
 void granularities
 void release
 void fixedSeriesRelease
+void derivedSeries
+void derivedSeriesRelease
 void emptyHooks
 void phases
 void stringSeedClientOptions

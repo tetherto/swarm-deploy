@@ -407,7 +407,15 @@ A template is literal text plus the placeholders `{series}` and `{version}`:
   the exact template text. `{version}/payments.tar.gz` therefore has the series
   `fixed-594ef13d9808171190f7827f7d2fb1dc33f000f531b69d55c1bd485a70ff8c4b`. The
   key is a 70-character safe basename, so it persists in commit records and
-  stays identical across restarts and between Node.js and Bare.
+  stays identical across restarts and between Node.js and Bare. The root export
+  `fixedSeriesKey(template)` derives the same value, so an operator can map a
+  series in a sidecar or log line back to the template that produced it.
+- That derived shape is a reserved namespace: a captured `{series}` of exactly
+  `fixed-` plus 64 lowercase hex characters never matches, so an uploaded
+  filename cannot place itself in a version-only pattern's rotation group. The
+  offer is simply unmatched, which with mandatory matching means
+  `INVALID_FILENAME`. Look-alikes (different length, uppercase, non-hex) are
+  unaffected.
 - `{version}` must be strict SemVer 2.0.0: no `v` prefix, no leading zeros, no
   padding. The stored version is the normalized `major.minor.patch[-prerelease]`;
   build metadata is accepted in a folder name but dropped, and it never
@@ -625,6 +633,21 @@ count or version rotated.
 Roll out the server, then the pattern configuration, then clients that stage
 into conforming folders.
 
+#### Overlapping retries now get `FILE_BUSY`
+
+**Behavior change.** A transfer ID may have only one in-flight commit
+lifecycle. If a client (or a job runner that fans the same artifact out to
+parallel workers) opens a second connection for a transfer that is still
+verifying or committing, that second connection is now rejected with
+`FILE_BUSY` instead of being admitted alongside the first. Sequential retries,
+resumes, and verified reconnects are unaffected, and so is a retry issued after
+the previous attempt failed — the server releases the transfer before running
+its observational `onFailure`, so a slow callback never blocks the retry.
+
+Audit any automation that uploads the same artifact from more than one worker
+at a time, and treat `FILE_BUSY` on an upload as "retry after the in-flight
+attempt finishes" rather than a permanent failure.
+
 #### Enabling or changing patterns
 
 A commit record's release identity is durable and is never rewritten in place.
@@ -691,7 +714,7 @@ fields come from decoded offer metadata, not yet from verified content.
 abort continues detached and its later result is ignored.
 
 There is no hook timeout, and a hung callback holds more than its own
-connection. On a fresh or resumed upload it also holds an `maxActiveUploads`
+connection. On a fresh or resumed upload it also holds a `maxActiveUploads`
 slot and the session's staging reservation for as long as it runs, so enough
 simultaneously hung callbacks stop the server from admitting new uploads
 (`ACTIVE_UPLOAD_LIMIT`) until the server is closed and the waits are aborted.
@@ -699,12 +722,24 @@ Only the already-committed path holds no upload slot. Write callbacks that
 finish or throw; bounded hook timeout and anti-spam controls are tracked in
 issue #8.
 
-Hooks never run concurrently for one transfer. Once a transfer ID
-authenticates, that connection owns it until its lifecycle ends; a second
-connection offering the same transfer ID — fresh, resumed, verified, or already
-committed — is rejected with `FILE_BUSY` before any hook runs, and that
-rejection is reported to `onFailure` once with `phase: 'offer'`. Hooks for
-**different** transfers still run concurrently.
+The **lifecycle** hooks `beforeCommit` and `afterCommit` never run concurrently
+for one transfer. Once a transfer ID authenticates, that connection owns it for
+the whole verify/commit sequence; a second connection offering the same transfer
+ID — fresh, resumed, verified, or already committed — is rejected with
+`FILE_BUSY` before any lifecycle hook runs, and that rejection is reported to
+`onFailure` once with `phase: 'offer'`.
+
+`onFailure` is observational and is **not** covered by that guarantee. A failed
+connection hands the transfer back before awaiting its `onFailure`, because the
+callback only reports an outcome and the connection has already finished
+mutating state. A slow callback must not reject the client's legitimate retry,
+so a retry of the same transfer can be admitted — and can run its own
+`beforeCommit`/`afterCommit` — while the previous `onFailure` is still running.
+Each connection still calls `onFailure` at most once, so write it to tolerate
+overlapping with the next attempt and key any external effect on
+`artifact.transferId`.
+
+Hooks for **different** transfers always run concurrently.
 
 ### Invocation sequences
 
@@ -867,6 +902,16 @@ characters. `keyPairFromSeed` is deterministic.
 newlines. Blank lines and lines beginning with `#` are ignored; malformed or
 duplicate keys throw. It returns a `Set<string>` suitable for
 `ServerOptions.allowedKeys`.
+
+`fixedSeriesKey(template)` returns the series a template without `{series}`
+persists, so an operator reading `fixed-…` in a commit sidecar, retention log,
+or hook context can identify which configured pattern owns it:
+
+```ts
+import { fixedSeriesKey } from 'swarm-deploy'
+
+const owner = patterns.find((template) => fixedSeriesKey(template) === record.release?.series)
+```
 
 ### Server
 

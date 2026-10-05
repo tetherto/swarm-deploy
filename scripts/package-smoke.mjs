@@ -82,6 +82,7 @@ try {
     'ERRORS',
     'Server',
     'SwarmDeployError',
+    'fixedSeriesKey',
     'generateSeed',
     'keyPairFromSeed',
     'parseAllowlist',

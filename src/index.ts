@@ -27,7 +27,7 @@ export type {
   HookFailurePhase,
   ServerHooks
 } from './hooks.js'
-export type { ReleaseCoordinates, VersionGranularity } from './release.js'
+export { fixedSeriesKey, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 export { parseAllowlist } from './allowlist.js'
 export type { SkippedUploadReason } from './files.js'
 export {

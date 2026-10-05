@@ -212,6 +212,41 @@ test('every documented version-only template yields a valid persistable series',
   }
 })
 
+test('a captured series cannot impersonate a derived fixed-series key', (t) => {
+  const derived = fixedSeriesKey('{version}/payments.tar.gz')
+  const matcher = new ReleaseMatcher(['{series}-{version}.tar.gz'])
+
+  t.is(matcher.match(`${derived}-2.4.1.tar.gz`), null, 'a versioned capture is rejected')
+  t.is(
+    new ReleaseMatcher(['{series}.tar.gz']).match(`${derived}.tar.gz`),
+    null,
+    'a series-only capture is rejected'
+  )
+  t.is(
+    new ReleaseMatcher(['{version}/{series}.tar.gz']).match(`${derived}.tar.gz`, '2.4.1'),
+    null,
+    'a parent-versioned capture is rejected'
+  )
+
+  // Only the exact reserved shape is withheld; look-alikes stay matchable.
+  for (const series of [
+    'fixed-',
+    `fixed-${'a'.repeat(63)}`,
+    `fixed-${'a'.repeat(65)}`,
+    `fixed-${'A'.repeat(64)}`,
+    `fixed-${'g'.repeat(64)}`,
+    `prefixed-${'a'.repeat(64)}`
+  ]) {
+    t.alike(matcher.match(`${series}-2.4.1.tar.gz`), { series, version: '2.4.1' }, series)
+  }
+
+  t.is(
+    new ReleaseMatcher(['{version}/payments.tar.gz']).match('payments.tar.gz', '2.4.1')!.series,
+    derived,
+    'the derived key itself is still assigned by the matcher that owns it'
+  )
+})
+
 test('release matcher rejects residual braces outside exact placeholders', (t) => {
   for (const template of [
     '{serie}-{version}.tar.gz',

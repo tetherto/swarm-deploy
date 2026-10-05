@@ -66,6 +66,16 @@ const MAX_ACTIVE_UPLOADS = 1024
 const FINGERPRINT_LENGTH = 12
 const TAR_DURABILITY_BATCH_BYTES = 1024 * 1024
 
+/**
+ * How many transfers may owe a deferred post-commit retention pass at once.
+ *
+ * The set grows only when an `afterCommit` hook fails after a durable commit,
+ * and entries are removed as soon as a retry succeeds, so reaching the bound
+ * means a persistently failing hook. Capping it at the connection ceiling
+ * keeps a broken deployment step from growing server memory without limit.
+ */
+export const MAX_OWED_POST_COMMIT_RETENTION = MAX_CONNECTIONS
+
 export type ServerLogger = Logger
 export type AllowlistKey = PublicKeyInput | string
 
@@ -253,8 +263,9 @@ export class Server extends EventEmitter {
    * retention is still owed because `afterCommit` has not yet succeeded. Only
    * these may start a retention pass from an already-committed retry, so an
    * ordinary duplicate offer cannot be used to force repeated full passes.
-   * The set is in-memory only; a restart loses it, and the documented fallback
-   * is the next startup, scheduled, or commit-triggered pass.
+   * The set is in-memory only and bounded by `MAX_OWED_POST_COMMIT_RETENTION`;
+   * a restart or an eviction loses an entry, and the documented fallback is the
+   * next startup, scheduled, or commit-triggered pass.
    */
   private readonly pendingAfterCommit = new Set<string>()
   /**
@@ -527,10 +538,24 @@ export class Server extends EventEmitter {
     let finalStarted = false
     let failureReported = false
     let guardedTransfer: string | null = null
+    /**
+     * Hands the transfer back before this connection's last await. Clearing
+     * `guardedTransfer` makes the `finally` a no-op, so a late release can
+     * never take ownership away from the connection that acquired it next.
+     */
+    const releaseTransfer = (): void => {
+      if (guardedTransfer === null) return
+      this.activeTransfers.delete(guardedTransfer)
+      guardedTransfer = null
+    }
     // Runs onFailure at most once per connection, after the client was answered.
     const reportFailure = async (error: unknown): Promise<void> => {
       if (failureReported || !event || !artifact) return
       failureReported = true
+      // The guard serializes the commit lifecycle, and this connection has
+      // finished its own. `onFailure` only observes, so holding the transfer
+      // across a slow callback would reject the client's legitimate retry.
+      releaseTransfer()
       await this.runFailureHook(
         Object.freeze({ artifact, path: hookPath, phase, resumed, alreadyCommitted, error }),
         owner,
@@ -602,7 +627,7 @@ export class Server extends EventEmitter {
         await this.retireQuietly(verified.transferId, owner)
         phase = 'afterCommit'
         if (this.hooks.afterCommit !== undefined) {
-          this.pendingAfterCommit.add(metadata.transferId)
+          this.owePostCommitRetention(metadata.transferId)
         }
         await this.runHook<AfterCommitContext>(
           'afterCommit',
@@ -833,9 +858,27 @@ export class Server extends EventEmitter {
       if (!hooksFinished) await reportFailure(callbackError(error))
     } finally {
       this.activeUploads.delete(socket)
-      if (guardedTransfer !== null) this.activeTransfers.delete(guardedTransfer)
+      releaseTransfer()
       reader.closeReader()
     }
+  }
+
+  /**
+   * Records that a transfer still owes its deferred post-commit retention
+   * pass, keeping at most `MAX_OWED_POST_COMMIT_RETENTION` entries.
+   *
+   * `Set` preserves insertion order, so the oldest owed transfer is evicted
+   * first and eviction is deterministic. An evicted transfer loses nothing
+   * durable: its artifact is already committed and its rotation falls back to
+   * the next startup, scheduled, or commit-triggered pass.
+   */
+  private owePostCommitRetention(transferId: string): void {
+    if (this.pendingAfterCommit.has(transferId)) return
+    if (this.pendingAfterCommit.size >= MAX_OWED_POST_COMMIT_RETENTION) {
+      const oldest = this.pendingAfterCommit.values().next()
+      if (!oldest.done) this.pendingAfterCommit.delete(oldest.value)
+    }
+    this.pendingAfterCommit.add(transferId)
   }
 
   /**

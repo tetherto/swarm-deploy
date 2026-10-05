@@ -20,6 +20,8 @@ const SAFE_ARTIFACT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 /** Immediate source parent: same 100-byte single-component rule; `+` allowed for SemVer build metadata. */
 const SAFE_SOURCE_PARENT = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/
 const FIXED_SERIES_PREFIX = 'fixed-'
+/** The exact shape `fixedSeriesKey` produces; captures may not occupy it. */
+const RESERVED_FIXED_SERIES = /^fixed-[0-9a-f]{64}$/
 
 /**
  * The persisted series of a template that captures no `{series}`.
@@ -110,8 +112,18 @@ function isSafeSourceParent(value: string): boolean {
   )
 }
 
+/**
+ * A captured `{series}` may not take the shape of a derived fixed-series key,
+ * so an upload cannot name itself into the rotation group of a version-only
+ * pattern. The namespace is reserved rather than escaped: a collision is a
+ * non-match, which fails closed as an unmatched offer.
+ */
 function isSafeSeriesCapture(value: string): boolean {
-  return SAFE_ARTIFACT.test(value) && componentByteLength(value) <= MAX_RELEASE_COMPONENT_BYTES
+  return (
+    SAFE_ARTIFACT.test(value) &&
+    componentByteLength(value) <= MAX_RELEASE_COMPONENT_BYTES &&
+    !RESERVED_FIXED_SERIES.test(value)
+  )
 }
 
 function validateStrictReleaseVersion(raw: string): SemVer | undefined {

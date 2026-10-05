@@ -174,8 +174,11 @@ SemVer 2.0.0 and are normalized without build metadata; a template without
 `{series}` is a fixed series whose key is `fixed-` followed by the lowercase hex
 SHA-256 of the exact template text. That key is a 70-byte safe basename, so it
 satisfies commit-record validation and is byte-identical on every runtime and
-across restarts. Matching evaluates templates in declaration order; templates with
-a parent segment are skipped when no `sourceParent` was offered; the first
+across restarts. That shape is reserved: a captured `{series}` of exactly
+`fixed-` followed by 64 lowercase hex characters is not a valid capture, so an
+offered name cannot claim the series of a version-only template; the pattern is
+simply a non-match. Matching evaluates templates in declaration order; templates
+with a parent segment are skipped when no `sourceParent` was offered; the first
 template that yields coordinates wins.
 
 If at least one template is configured, matching is mandatory: an unmatched
@@ -229,7 +232,11 @@ committed whose `afterCommit` has not yet succeeded, and an already-committed
 offer starts a pass only for one of those. Any other duplicate offer still runs
 `afterCommit` but performs no retention pass, so duplicate offers cannot force
 repeated full scans. The owed set is cleared once a hook succeeds and its pass
-has been attempted, and server close clears it.
+has been attempted, and server close clears it. It holds at most 1024 transfers,
+the same ceiling as `maxConnections`; a persistently failing hook that reaches
+the bound evicts the oldest owed transfer first. Eviction is deterministic and
+loses nothing durable: the artifact stays committed and its rotation falls back
+to the next startup, scheduled, or commit-triggered pass.
 Servers without an `afterCommit` hook (including `beforeCommit`-only and
 `onFailure`-only) run the pass immediately after the commit. Pre-commit quota and
 age checks are never deferred, and post-commit retention failures remain
@@ -269,13 +276,21 @@ consume upload capacity and can make further offers fail with
 holds no upload slot. Bounded timeout and anti-spam controls are deferred to
 issue #8.
 
-A transfer ID has a single owner. From the moment metadata authenticates until
-the connection's lifecycle ends, a second connection offering the same transfer
-ID is rejected with `FILE_BUSY` during the offer phase, before any hook or
-staging work runs, so hooks and commit never execute concurrently against one
-transfer identity. The guard is per process and in memory, holds at most one
-entry per connection, and is released when the connection finishes or the
-server closes.
+A transfer ID has a single owner for its commit lifecycle. From the moment
+metadata authenticates until that lifecycle ends, a second connection offering
+the same transfer ID is rejected with `FILE_BUSY` during the offer phase, before
+any staging work, so verification, `beforeCommit`, commit, and `afterCommit`
+never execute concurrently against one transfer identity. The guard is per
+process and in memory, holds at most one entry per connection, and is released
+when the connection finishes or the server closes.
+
+The guard covers the lifecycle, not observation. A failing connection releases
+the transfer before awaiting `onFailure`, since that callback only reports an
+already-settled outcome; the `finally` release is then a no-op and cannot take
+ownership from whichever connection acquired the transfer next. A retry is
+therefore admitted while the previous `onFailure` is still running, and its own
+lifecycle hooks may overlap that callback. Each connection still invokes
+`onFailure` at most once.
 
 Observable order:
 

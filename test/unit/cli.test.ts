@@ -7,7 +7,7 @@ import events from '#events'
 import fs from '#fs'
 import path from '#path'
 import process from '#process'
-import { main } from '../../dist/cli.js'
+import { main, USAGE } from '../../dist/cli.js'
 import { parseAllowlist } from '../../dist/allowlist.js'
 import { keyPairFromSeed } from '../../dist/identity.js'
 import {
@@ -538,6 +538,14 @@ test('upload --no-source-parent takes no value and leaves other options intact',
     'a value option still rejects a following flag as its value'
   )
   t.ok(missing.text().includes('Missing option value'))
+
+  const upload = USAGE.split('\n').find((line) => line.includes('swarm-deploy upload'))!
+  t.ok(upload.includes('[--no-source-parent]'), 'usage documents the flag')
+  t.ok(
+    upload.indexOf('[--no-source-parent]') > upload.indexOf('[--idle-timeout <milliseconds>]'),
+    'optional flags precede the positional argument'
+  )
+  t.ok(upload.endsWith('<file-or-directory>'))
 })
 
 test('CLI keeps configuration and runtime exit classifications stable and private', async (t) => {
