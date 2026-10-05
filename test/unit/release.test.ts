@@ -22,11 +22,35 @@ test('release templates match basenames and immediate source parents in order', 
   t.is(matcher.match('notes.txt'), null)
 })
 
+test('release matcher splits hyphenated series before strict SemVer suffix', (t) => {
+  const matcher = new ReleaseMatcher(['{series}-{version}.tar.gz'])
+  t.alike(matcher.match('my-app-1.0.0.tar.gz'), { series: 'my-app', version: '1.0.0' })
+  t.alike(matcher.match('app2-0.9.10-rc.1.tar.gz'), {
+    series: 'app2',
+    version: '0.9.10-rc.1'
+  })
+})
+
+test('parent-version templates never match without source parent', (t) => {
+  const matcher = new ReleaseMatcher(['{version}/{series}.tar.gz'])
+  t.is(matcher.match('api.tar.gz'), null)
+  t.is(matcher.match('payments.tar.gz'), null)
+  t.alike(matcher.match('api.tar.gz', '2.4.1'), { series: 'api', version: '2.4.1' })
+})
+
 test('release versions use SemVer precedence and major/minor groups', (t) => {
   t.is(compareReleaseVersions('2.0.0-rc.1', '1.9.9') > 0, true)
   t.is(compareReleaseVersions('1.2.3+build.2', '1.2.3+build.1'), 0)
+  t.is(compareReleaseVersions('1.0.0-alpha', '1.0.0-beta') < 0, true)
   t.is(releaseVersionGroup('1.2.3-rc.1', 'major'), '1')
   t.is(releaseVersionGroup('1.2.3-rc.1', 'minor'), '1.2')
+})
+
+test('release helpers reject invalid strict SemVer inputs', (t) => {
+  t.exception(() => compareReleaseVersions('v1.0.0', '1.0.0'), /invalid/i)
+  t.exception(() => compareReleaseVersions('1.0.0', 'not-semver'), /invalid/i)
+  t.exception(() => releaseVersionGroup(' 1.0.0', 'major'), /invalid/i)
+  t.exception(() => releaseVersionGroup('1.0.0', 'patch' as 'major'), /invalid/i)
 })
 
 test('release matcher rejects invalid templates at construction', (t) => {
@@ -42,6 +66,9 @@ test('release matcher rejects invalid templates at construction', (t) => {
   t.exception(() => new ReleaseMatcher(['release.tar.gz']), /placeholder/i)
   t.exception(() => new ReleaseMatcher(['a/b/c/{series}.tar.gz']), /path/i)
   t.exception(() => new ReleaseMatcher(['{series}/nested/{version}.tar.gz']), /path/i)
+  t.exception(() => new ReleaseMatcher(['/{series}.tar.gz']), /segment/i)
+  t.exception(() => new ReleaseMatcher(['{series}/']), /segment/i)
+  t.exception(() => new ReleaseMatcher(['{series}{version}.tar.gz']), /placeholder/i)
 })
 
 test('release matcher treats empty or unsafe captures as non-matches', (t) => {
@@ -49,6 +76,8 @@ test('release matcher treats empty or unsafe captures as non-matches', (t) => {
   t.is(matcher.match('-1.0.0.tar.gz'), null)
   t.is(matcher.match('worker-.tar.gz'), null)
   t.is(matcher.match('worker-not-semver.tar.gz'), null)
+  t.is(matcher.match('api.tar.gz', 'not valid!'), null)
+  t.is(matcher.match('api.tar.gz', ''), null)
 })
 
 test('release matcher exposes pattern metadata', (t) => {
@@ -69,4 +98,10 @@ test('release matcher uses the template as fixed series without a series placeho
     series: '{version}/payments.tar.gz',
     version: '2.4.1'
   })
+})
+
+test('release matcher rejects non-canonical semver version captures', (t) => {
+  const matcher = new ReleaseMatcher(['{series}-{version}.tar.gz'])
+  t.is(matcher.match('app-v1.0.0.tar.gz'), null)
+  t.is(matcher.match('app-01.2.3.tar.gz'), null)
 })
