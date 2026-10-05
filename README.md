@@ -155,7 +155,11 @@ swarm-deploy server \
   [--allow-key <64-lower-hex>]... \
   [--max-storage-bytes <bytes>] \
   [--max-age-days <days>] \
-  [--replace-name <safe-basename>]...
+  [--replace-name <safe-basename>]... \
+  [--artifact-pattern <template>]... \
+  [--max-count <count>] \
+  [--max-versions <count> --version-granularity <major|minor>] \
+  [--hooks <module>]
 ```
 
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>` to provide the
@@ -181,6 +185,25 @@ Optional options:
 - `--max-age-days`: remove eligible committed artifacts at or beyond this age.
 - `--replace-name`: permit replacement of this exact basename. Repeat for
   multiple mutable names.
+- `--artifact-pattern <template>`: identify releases and make matching
+  mandatory. Repeat for multiple templates; declaration order is match order.
+  See [Artifact patterns and rotation](#artifact-patterns-and-rotation).
+- `--max-count <count>`: keep the newest `<count>` releases per series. Requires
+  at least one `--artifact-pattern`.
+- `--max-versions <count>`: keep every release in the newest `<count>` distinct
+  version groups per series. Requires a pattern containing `{version}` and
+  `--version-granularity`.
+- `--version-granularity <major|minor>`: how versions are grouped for
+  `--max-versions`. It is rejected without `--max-versions`, and there is no
+  default.
+- `--hooks <module>`: JavaScript module (`.js`, `.mjs`, or `.cjs`) exporting
+  trusted lifecycle callbacks. The path is resolved against the working
+  directory. See [Deployment hooks](#deployment-hooks).
+
+All counts are positive safe integers. Invalid combinations, malformed or
+duplicate templates, and unloadable hook modules are configuration errors that
+exit `2` before the server listens. Each hooks-module error names only the
+module basename with a fixed reason, never module content.
 
 The CLI requires at least one `--allow-key`. Its snapshot is immutable for the
 life of the process.
@@ -204,6 +227,10 @@ seed inline.
 - The input may be any regular binary file; Swarm Deploy creates the canonical
   one-entry USTAR stream automatically. Pre-tarring is not required.
 - A direct file retains its basename.
+- Each upload also carries the immediate local parent directory name as
+  optional `sourceParent` metadata, but only when that name is a safe single
+  component (see [Source parent](#source-parent)). The upload CLI has no option
+  for it.
 - A directory processes immediate regular-file children once, in lexical
   order, with one independent connection and result per file.
 - Subdirectories, symlinks, non-regular files, unsafe names, and names in the
@@ -279,7 +306,7 @@ Each file follows this lifecycle:
 2. The server firewall and connection handler verify the authenticated client
    key against the startup allowlist.
 3. The client sends bounded metadata containing the name, file size and digest,
-   deterministic TAR size and digest, and transfer ID.
+   deterministic TAR size and digest, transfer ID, and optional `sourceParent`.
 4. The server responds with `ACCEPT`, `RESUME`, `VERIFIED`,
    `ALREADY_COMMITTED`, or a stable rejection.
 5. The client sends exactly the required deterministic one-entry USTAR bytes.
@@ -331,9 +358,13 @@ Optional retention applies to managed artifacts only:
 - `maxAge`/`--max-age-days` removes eligible artifacts by age.
 - `maxStorageBytes`/`--max-storage-bytes` removes the oldest eligible artifacts
   until under quota.
+- `maxCount`/`--max-count` and `maxVersions`/`--max-versions` rotate released
+  artifacts by series; see
+  [Artifact patterns and rotation](#artifact-patterns-and-rotation).
 - Startup recovery re-hashes managed files. Scheduled cleanup validates managed
   metadata and file sizes, removes invalid managed records safely, reports
-  unknown paths without deleting them, and applies age and quota retention.
+  unknown paths without deleting them, and applies age, count, version, and
+  quota retention in that order.
 
 Runtime defaults:
 
@@ -345,7 +376,342 @@ Runtime defaults:
 - 7-day resumable-session lifetime.
 
 The advanced runtime API can override these values; the server CLI intentionally
-exposes only its required limits, committed retention, and replacement policy.
+exposes only its required limits, committed retention and rotation, replacement
+policy, artifact patterns, and hooks module.
+
+## Artifact patterns and rotation
+
+Artifact patterns teach the server which uploads belong to which release
+series and, optionally, which SemVer version each one carries. They drive count
+and version rotation and are configured only on the server:
+`ServerOptions.artifactPatterns` or repeatable `--artifact-pattern`.
+
+### Pattern templates
+
+A template is literal text plus the placeholders `{series}` and `{version}`:
+
+- At least one placeholder is required; each may appear at most once.
+- Two placeholders in one path segment must be separated by literal text.
+- A template has one segment (matched against the basename) or two segments
+  separated by one `/` (`<source-parent>/<basename>`). Empty segments, further
+  `/` characters, and duplicate templates are rejected at startup.
+- `{series}` captures one safe component. A template without `{series}` is a
+  fixed series whose key is the template text itself.
+- `{version}` must be strict SemVer 2.0.0: no `v` prefix, no leading zeros, no
+  padding. The stored version is the normalized `major.minor.patch[-prerelease]`;
+  build metadata is accepted in a folder name but dropped, and it never
+  influences precedence.
+- Basenames never contain `+`, so build metadata can only appear in a
+  source-parent segment.
+- A malformed version is a non-match, not a partial match.
+
+Examples:
+
+| Template                    | Offer (`sourceParent`, basename)    | Series       | Version      |
+| --------------------------- | ----------------------------------- | ------------ | ------------ |
+| `{series}-{version}.tar.gz` | `payments-2.4.1.tar.gz`             | `payments`   | `2.4.1`      |
+| `{series}-{version}.tar.gz` | `payments-3.0.0-rc.1.tar.gz`        | `payments`   | `3.0.0-rc.1` |
+| `{version}/{series}.tar.gz` | `2.4.1+build.7` / `payments.tar.gz` | `payments`   | `2.4.1`      |
+| `releases/{series}.zip`     | `releases` / `payments.zip`         | `payments`   | none         |
+| `{version}/payments.tar.gz` | `1.8.0` / `payments.tar.gz`         | the template | `1.8.0`      |
+| `{series}.tar.gz`           | `payments.tar.gz`                   | `payments`   | none         |
+
+With a series-first template such as `{series}-{version}.tar.gz`, the split
+chosen is the right-most `-` that yields a valid SemVer, so hyphenated series
+names and prereleases both work. A version-first template such as
+`{version}-{series}.tar.gz` splits at the left-most valid position and cannot
+tell a prerelease hyphen from the series separator; prefer series-first or a
+folder-based version for prereleases.
+
+Patterns are tried in declaration order and the first template that produces
+coordinates wins. A template with a parent segment never matches an offer that
+carries no `sourceParent`.
+
+### Source parent
+
+The client sends the immediate parent directory name of the resolved input as
+optional authenticated metadata, never an absolute path or a higher component.
+Uploading `/ci/2.4.1+build.7/payments.tar.gz` sends `sourceParent`
+`2.4.1+build.7`; uploading a directory sends that directory's name for each
+child.
+
+The parent is sent only when it is a safe single component
+(`[A-Za-z0-9][A-Za-z0-9._+-]*`, at most 100 UTF-8 bytes). A parent with a space,
+a leading dot, a non-ASCII character, an overlong name, or the filesystem root
+is omitted, and the upload keeps the pre-existing metadata shape. Consequently a
+folder pattern rejects uploads whose parent is unsafe or omitted: stage release
+files in a conforming directory. `sourceParent` is part of the transfer ID, so
+it cannot change between resume attempts.
+
+### Mandatory matching
+
+When `artifactPatterns` is non-empty, matching is mandatory for new uploads. An
+offer that matches no pattern is rejected with `INVALID_FILENAME` before
+session admission, staging, verification, commit, `beforeCommit`, and
+`afterCommit`; the server then calls `onFailure` once with phase `offer`, a
+`null` path, and no `release`. A server with no patterns accepts every
+otherwise-valid name, and records get no release identity.
+
+Release coordinates (`series` and, if the pattern has one, `version`) are
+decided at commit time and persisted in the commit record, replacement history
+inherits them, and they survive restarts and later pattern changes. A commit
+record written before this feature, or by a server without patterns, has no
+release and is never deleted by count or version rotation; it remains subject
+to age and quota retention.
+
+A new upload whose matched release differs from the persisted release of the
+same transfer fails closed instead of reporting `ALREADY_COMMITTED`.
+
+### Selection rules
+
+Retention runs under the root lease at startup, on schedule, around every
+commit, and manually. After session expiry and a committed-state scrub, its
+stages run in this order, each working from the records the previous stage
+left:
+
+1. age (`maxAge`);
+2. count (`maxCount`);
+3. version (`maxVersions` with `versionGranularity`);
+4. storage quota (`maxStorageBytes`).
+
+**Count.** Records are grouped by series and ordered by commit order: newest
+`committedAt` first, with transfer ID and then name as deterministic
+tie-breakers. The newest `maxCount` records in each series are kept. Replacement
+history records count like any other release.
+
+**Version.** Records with a version are grouped by series and ordered by SemVer
+precedence, not by commit time. With `major`, every record in the newest
+`maxVersions` distinct majors is kept; with `minor`, in the newest
+`maxVersions` distinct `major.minor` groups. Prereleases and history records in
+a retained group are kept, so `2.0.0-rc.1` and `2.0.0` share group `2`. Series-only
+records (no `{version}`) are never selected by version rotation.
+
+**Combined limits.** A record may be removed by either configured bound, so
+`maxCount` plus `maxVersions` retains the intersection of the two keep sets, and
+age and quota then apply to what remains.
+
+**Pinned mutable names.** The current artifact of a `--replace-name` name is
+never deleted by any stage, but it still takes part in the accounting. If it
+occupies a slot or falls outside a keep set, the limit is best-effort: the
+series can hold more than the configured number until a later upload moves the
+name on.
+
+**Immediate effect.** Rotation also runs right after each commit. An upload that
+is older than the retained window (for example version `1.0.0` when `maxVersions`
+is `2` and `3.x` and `2.x` exist) is committed and may be removed in that same
+run, before `afterCommit` receives its path. Hooks must tolerate a missing file.
+
+`retention` events and results report `ageDeleted`, `countDeleted`,
+`versionDeleted`, and `storageDeleted` next to `expiredSessions` and `scrubbed`.
+Logged deletions use the reasons `MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and
+`MAX_STORAGE`.
+
+### Configuration and CLI examples
+
+Filename versions, keeping the newest 5 builds per product and the newest two
+minor lines:
+
+```sh
+swarm-deploy server --seed-file server.seed --storage /srv/artifacts \
+  --allow-key "$CLIENT_KEY" --max-file-bytes 1073741824 --max-staging-bytes 2147483648 \
+  --artifact-pattern '{series}-{version}.tar.gz' \
+  --max-count 5 --max-versions 2 --version-granularity minor
+```
+
+Folder versions (the source parent carries the version, build metadata
+included), keeping the two newest majors:
+
+```sh
+swarm-deploy server --seed-file server.seed --storage /srv/artifacts \
+  --allow-key "$CLIENT_KEY" --max-file-bytes 1073741824 --max-staging-bytes 2147483648 \
+  --artifact-pattern '{version}/{series}.tar.gz' \
+  --max-versions 2 --version-granularity major
+
+# client: /ci/out/2.4.1+build.7/payments.tar.gz is offered as
+# sourceParent "2.4.1+build.7", name "payments.tar.gz"
+swarm-deploy upload --seed-file client.seed --server-key "$SERVER_KEY" \
+  /ci/out/2.4.1+build.7/payments.tar.gz
+```
+
+The runtime API takes the same values:
+
+```ts
+new Server({
+  // ...required options
+  artifactPatterns: ['{series}-{version}.tar.gz', 'releases/{series}.zip'],
+  maxCount: 5,
+  maxVersions: 2,
+  versionGranularity: 'minor'
+})
+```
+
+`maxCount` requires at least one pattern. `maxVersions` requires at least one
+pattern containing `{version}` and a `versionGranularity`; a granularity without
+`maxVersions` is invalid. These errors are raised at construction or CLI startup
+(exit `2`). The pattern list is snapshotted at construction.
+
+### Rollout and compatibility
+
+Upgrade every server before any client. An older server decodes upload metadata
+with an exact key set and rejects the new `sourceParent` field, so a new client
+that sends a parent to an old server fails.
+
+A new server remains compatible with older clients: they never send
+`sourceParent`, no-pattern servers are unaffected, filename-only patterns still
+match, and patterns that need a parent reject their offers as unmatched. Older
+sessions and commit records stay readable, and older commit records are not
+count or version rotated. Newly created resumable sessions use a newer on-disk
+format, so after a downgrade they cannot be resumed; drain uploads before
+rolling a server back. Roll out the server, then the pattern configuration, then
+clients that stage into conforming folders.
+
+## Deployment hooks
+
+Hooks let a trusted server operator run code around the commit. They are
+server-side only, run in the server process with its privileges, and receive no
+seeds, secret keys, TAR bytes, or session material.
+
+### Lifecycle points
+
+- `beforeCommit(context)`: after the TAR and extracted file verified, before
+  any commit mutation. Its failure aborts the commit.
+- `afterCommit(context)`: after the artifact is durably committed, before the
+  terminal success reply. Its failure fails the upload even though the artifact
+  is already stored.
+- `onFailure(context)`: once per failed connection whose metadata was decoded,
+  after the client has been answered.
+
+Callbacks may return `void` or a promise, are called with no receiver, and
+receive a frozen context. The artifact is
+`{ name, size, sha256, transferId, sourceParent?, release? }`, where `release`
+is `{ series, version? }` when patterns are configured. These descriptive
+fields come from decoded offer metadata, not yet from verified content.
+
+| Callback       | Extra context                                                              |
+| -------------- | -------------------------------------------------------------------------- |
+| `beforeCommit` | `path` (verified staging file), `resumed`, `alreadyCommitted: false`       |
+| `afterCommit`  | `path` (committed file), `resumed`, `alreadyCommitted`                     |
+| `onFailure`    | `path` (`string \| null`), `phase`, `resumed`, `alreadyCommitted`, `error` |
+
+`resumed` is `true` when the server admitted the connection as `RESUME` or
+`VERIFIED`. There is no hook timeout: a hung callback holds only its own
+connection. Closing the server aborts the wait; a callback that outlives the
+abort continues detached and its later result is ignored.
+
+### Invocation sequences
+
+Fresh upload:
+
+1. Offer inspected and admitted (`ACCEPT`), TAR received.
+2. Verification.
+3. `beforeCommit` (`resumed: false`).
+4. Commit.
+5. `afterCommit` (`resumed: false`, `alreadyCommitted: false`).
+6. `COMMITTED`.
+
+Partial resume (`RESUME`): the same steps, with `resumed: true` in both hooks.
+
+Verified reconnect (`VERIFIED`): the staged data was already verified, so the
+server re-reads it, calls `beforeCommit` again with `resumed: true`, commits, and
+calls `afterCommit` with `resumed: true`. A previous connection may have ended
+after `beforeCommit` returned but before the commit finished.
+
+Already committed: identical content is detected during offer inspection, so
+there is no transfer, verification, or `beforeCommit`. The server calls
+`afterCommit` with `resumed: false` and `alreadyCommitted: true`, then replies
+`ALREADY_COMMITTED`.
+
+Failure sequences:
+
+- `beforeCommit` throws: nothing is committed and the verified session remains.
+  The client receives `HOOK_FAILED`; `onFailure` runs (`phase: 'beforeCommit'`).
+  A retry reconnects as `VERIFIED` and calls `beforeCommit` again.
+- `afterCommit` throws on a fresh or resumed upload: the artifact **stays
+  durably committed** and its session is retired. The client receives
+  `HOOK_FAILED`; `onFailure` runs (`phase: 'afterCommit'`, final path). A retry
+  takes the already-committed path and calls `afterCommit` with
+  `alreadyCommitted: true`.
+- `afterCommit` throws on an already-committed retry: the offer is rejected with
+  `HOOK_FAILED` and a later retry repeats `afterCommit`.
+- A failure after both hooks succeeded (for example the terminal reply cannot be
+  written) does not call `onFailure`.
+
+Retries therefore call hooks more than once for one transfer. **Make hooks
+idempotent and key external side effects on `artifact.transferId`.** Treat
+`afterCommit` as at-least-once: record the transfer ID when the deployment step
+finishes and skip repeated calls.
+
+### onFailure
+
+`phase` is one of `offer`, `transfer`, `verification`, `beforeCommit`, `commit`,
+or `afterCommit`. `offer` covers every failure before a staging path exists:
+metadata or transfer-ID problems, unmatched patterns, file-size, capacity and
+destination rejections, and inspection errors.
+
+`error` is the original failure. For an exception thrown by `beforeCommit` or
+`afterCommit`, hooks receive the **raw thrown value** (not a wrapper) because
+hooks are trusted. The client and server events see only the stable wire code
+`HOOK_FAILED` with a fixed message, so callback text never reaches the wire. Other
+failures arrive as `SwarmDeployError` (or raw storage errors).
+A failing `onFailure` is logged as a secondary warning and never replaces the
+original failure.
+
+`path` by phase:
+
+| Situation                                                          | `path`                                                  |
+| ------------------------------------------------------------------ | ------------------------------------------------------- |
+| `offer`                                                            | `null`                                                  |
+| `transfer`; fresh-upload `verification`                            | `<storage>/.swarm-deploy/staging/<transferId>.tar.part` |
+| `beforeCommit`, `commit`; `verification` of a `VERIFIED` reconnect | `<storage>/.swarm-deploy/staging/<transferId>.part`     |
+| `afterCommit` (including already committed)                        | `<storage>/<name>`                                      |
+
+### Hook modules
+
+`--hooks <module>` accepts `.js`, `.mjs`, and `.cjs`. ESM and CommonJS examples:
+
+```js
+// hooks.mjs
+export async function afterCommit({ artifact, path, alreadyCommitted }) {
+  // Idempotent: keyed by artifact.transferId.
+  await deploy(artifact.transferId, path)
+}
+
+export function onFailure({ phase, artifact, error }) {
+  console.error('deploy failed', phase, artifact.transferId, error)
+}
+```
+
+```js
+// hooks.cjs
+module.exports = {
+  beforeCommit({ artifact, path }) {
+    // Return or throw; a throw rejects the upload with HOOK_FAILED.
+  },
+  async afterCommit({ artifact, path }) {
+    await deploy(artifact.transferId, path)
+  }
+}
+```
+
+Loader rules:
+
+- Only the own properties `beforeCommit`, `afterCommit`, and `onFailure` are
+  read. Other exports (helpers, configuration) are ignored, including a
+  harmless non-object default export.
+- Named exports take precedence over callbacks on a default export object; a
+  named export set to `undefined` does not override it.
+- A hook name that is present must be a function, the callbacks must be plain
+  own properties, and at least one must exist; otherwise startup fails.
+- One level of compiled-CommonJS interop (`__esModule` with `default`) is
+  unwrapped; deeper nesting is ignored.
+- Modules are loaded once with `import()` and cached by the runtime. Top-level
+  code runs with the server's privileges during startup, so the module is fully
+  trusted.
+
+`ServerOptions.hooks` is stricter: it must be a hook object whose own keys are
+only the three callbacks, every callback a function. Unknown keys and
+non-function values throw `PROTOCOL_INVALID`. The object is snapshotted at
+construction, so later mutation has no effect.
 
 ## Runtime API
 
@@ -423,6 +789,27 @@ Optional operational limits and policies:
 - `maxConnections`, `maxActiveUploads`, `idleTimeout`
 - `cleanupInterval`, `resumeTtl`, `minFreeBytes`
 - `maxAge`, `maxStorageBytes`, `replaceNames`
+- `artifactPatterns?: Iterable<string>`, `maxCount?: number`,
+  `maxVersions?: number`, and `versionGranularity?: 'major' | 'minor'`; see
+  [Artifact patterns and rotation](#artifact-patterns-and-rotation).
+- `hooks?: ServerHooks | null`; see [Deployment hooks](#deployment-hooks).
+
+The root package exports the `ServerHooks`, `BeforeCommitContext`,
+`AfterCommitContext`, `HookFailureContext`, `HookFailurePhase`, `HookArtifact`,
+`ReleaseCoordinates`, and `VersionGranularity` types:
+
+```ts
+import type { ServerHooks } from 'swarm-deploy'
+
+const hooks: ServerHooks = {
+  async afterCommit({ artifact, path, alreadyCommitted }) {
+    // Idempotent: skip work already recorded for artifact.transferId.
+  },
+  onFailure({ phase, path, error }) {
+    console.error(phase, path, error)
+  }
+}
+```
 
 Advanced integration and test seams:
 
@@ -515,7 +902,9 @@ Server events:
 - `commit`: succeeded or failed.
 - `recovery`: startup, per-journal, corruption, resumable, and completion
   outcomes.
-- `retention`: startup, scheduled, manual, commit, or post-commit outcomes.
+- `retention`: startup, scheduled, manual, commit, or post-commit outcomes,
+  with `expiredSessions`, `scrubbed`, `ageDeleted`, `countDeleted`,
+  `versionDeleted`, and `storageDeleted` counters.
 - `failure`: stable failure code and peer fingerprint.
 - `listening`: local server-key fingerprint.
 - `close`: closed or failed outcome.
@@ -584,6 +973,10 @@ try {
 }
 ```
 
+`HOOK_FAILED` is the stable code for a failed `beforeCommit` or `afterCommit`
+callback. Its message is fixed and the original exception is available only as
+`cause` and to `onFailure`.
+
 Stable codes include authentication and server-key rejection, invalid
 configuration and protocol records, file and staging limits, disk reserve,
 filename and replacement conflicts, checksum failures, connection or upload
@@ -596,8 +989,10 @@ than matching exception messages.
 - Restrict the server seed and storage root to that account.
 - Supervise the process and wait for the final `ready` line before marking it
   healthy.
-- Restart with the same seed, allowlist, limits, replacement names, and storage
-  root so interrupted sessions and commit journals can recover.
+- Upgrade servers before clients; see
+  [Rollout and compatibility](#rollout-and-compatibility).
+- Restart with the same seed, allowlist, limits, replacement names, artifact
+  patterns, rotation limits, hooks module, and storage root so interrupted sessions and commit journals can recover.
 - Alert on nonzero CLI exits and failed authentication, recovery, verification,
   commit, retention, and cleanup events.
 - Never edit `.swarm-deploy/` while the server is running.

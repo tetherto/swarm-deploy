@@ -18,10 +18,7 @@ const SAFE_ARTIFACT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 /** Immediate source parent: same 100-byte single-component rule; `+` allowed for SemVer build metadata. */
 const SAFE_SOURCE_PARENT = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/
 
-type TemplatePart =
-  | { kind: 'literal'; text: string }
-  | { kind: 'series' }
-  | { kind: 'version' }
+type TemplatePart = { kind: 'literal'; text: string } | { kind: 'series' } | { kind: 'version' }
 
 interface SegmentPlan {
   parts: TemplatePart[]
@@ -169,7 +166,10 @@ function compileSegmentPlan(template: string): {
 }
 
 function compileParentMatcher(parent: string): ParentMatcher {
-  if (placeholderCount(parent, PLACEHOLDER_SERIES) === 0 && placeholderCount(parent, PLACEHOLDER_VERSION) === 0) {
+  if (
+    placeholderCount(parent, PLACEHOLDER_SERIES) === 0 &&
+    placeholderCount(parent, PLACEHOLDER_VERSION) === 0
+  ) {
     return { literal: parent, plan: null, hasVersion: false }
   }
   const compiled = compileSegmentPlan(parent)
@@ -243,7 +243,12 @@ function assignPlaceholderPair(
 
 function splitSeriesThenVersion(stem: string): MatchGroups | null {
   for (let index = stem.lastIndexOf('-'); index > 0; index = stem.lastIndexOf('-', index - 1)) {
-    const groups = assignPlaceholderPair('series', 'version', stem.slice(0, index), stem.slice(index + 1))
+    const groups = assignPlaceholderPair(
+      'series',
+      'version',
+      stem.slice(0, index),
+      stem.slice(index + 1)
+    )
     if (groups) return groups
   }
   return null
@@ -251,7 +256,12 @@ function splitSeriesThenVersion(stem: string): MatchGroups | null {
 
 function splitVersionThenSeries(stem: string): MatchGroups | null {
   for (let index = stem.indexOf('-'); index > 0; index = stem.indexOf('-', index + 1)) {
-    const groups = assignPlaceholderPair('version', 'series', stem.slice(0, index), stem.slice(index + 1))
+    const groups = assignPlaceholderPair(
+      'version',
+      'series',
+      stem.slice(0, index),
+      stem.slice(index + 1)
+    )
     if (groups) return groups
   }
   return null
@@ -285,7 +295,12 @@ function matchStem(middle: TemplatePart[], stem: string): MatchGroups | null {
     return version ? { version } : null
   }
 
-  if (middle.length === 3 && middle[0]!.kind !== 'literal' && middle[1]!.kind === 'literal' && middle[2]!.kind !== 'literal') {
+  if (
+    middle.length === 3 &&
+    middle[0]!.kind !== 'literal' &&
+    middle[1]!.kind === 'literal' &&
+    middle[2]!.kind !== 'literal'
+  ) {
     const first = middle[0]!.kind
     const separator = (middle[1] as { kind: 'literal'; text: string }).text
     const second = middle[2]!.kind
@@ -402,9 +417,7 @@ export class ReleaseMatcher {
   }
 
   get hasVersionPattern(): boolean {
-    return this.#patterns.some(
-      (pattern) => pattern.versionInBasename || pattern.versionInParent
-    )
+    return this.#patterns.some((pattern) => pattern.versionInBasename || pattern.versionInParent)
   }
 
   match(name: string, sourceParent?: string): ReleaseCoordinates | null {

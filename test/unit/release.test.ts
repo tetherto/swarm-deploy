@@ -2,11 +2,7 @@
 
 import test from 'brittle'
 import b4a from 'b4a'
-import {
-  ReleaseMatcher,
-  compareReleaseVersions,
-  releaseVersionGroup
-} from '../../dist/release.js'
+import { ReleaseMatcher, compareReleaseVersions, releaseVersionGroup } from '../../dist/release.js'
 
 test('release templates match basenames and immediate source parents in order', (t) => {
   const matcher = new ReleaseMatcher([
@@ -127,11 +123,7 @@ test('release helpers reject invalid strict SemVer inputs', (t) => {
 
 test('release matcher rejects invalid templates at construction', (t) => {
   t.exception(
-    () =>
-      new ReleaseMatcher([
-        '{series}-{version}.tar.gz',
-        '{series}-{version}.tar.gz'
-      ]),
+    () => new ReleaseMatcher(['{series}-{version}.tar.gz', '{series}-{version}.tar.gz']),
     /duplicate/i
   )
   t.exception(() => new ReleaseMatcher(['{series}-{series}.tar.gz']), /placeholder/i)

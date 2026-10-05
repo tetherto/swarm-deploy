@@ -62,10 +62,10 @@ There is no reload, revocation message, or mid-process allowlist mutation.
 
 One connection carries exactly one file and follows this sequence:
 
-1. The client sends bounded metadata: protocol version, file name, file size,
-   file SHA-256, and deterministic TAR length.
-2. The server validates identity, metadata, limits, name policy, destination
-   policy, and persistent staging capacity.
+1. The client sends bounded metadata: protocol version, file name, optional
+   `sourceParent`, file size, file SHA-256, and deterministic TAR length.
+2. The server validates identity, metadata, limits, name policy, configured
+   artifact-pattern match, destination policy, and persistent staging capacity.
 3. The server replies `ACCEPT` at offset zero or `RESUME` with a TAR byte offset
    and SHA-256 of the staged TAR prefix.
 4. The client deterministically creates the one-entry TAR stream. For a resume,
@@ -127,7 +127,7 @@ offsets. The server only advertises a durable staged length. Before replying
 Staging writes are synchronized before their offset becomes resumable.
 
 Sessions are keyed by authenticated client public key plus immutable offered
-metadata. Inactive incomplete sessions expire seven days after their last
+metadata, including `sourceParent` when present. Inactive incomplete sessions expire seven days after their last
 durable progress. Expiration never removes an active receive. A mismatch reset
 reuses the admitted session after durably truncating it to zero; it does not
 append to or trust a divergent prefix.
@@ -136,6 +136,129 @@ Startup purges all legacy chunk-session state, including chunk maps, partial
 chunk payloads, and obsolete reservations. It preserves committed current
 artifacts, history artifacts, commit sidecars, and v2 journals, which remain
 subject to normal validation and recovery.
+
+## Release identity, rotation, and hooks
+
+### Source parent
+
+The offer metadata record may carry one optional `sourceParent` string: the
+basename of the client's immediate local parent directory. It is omitted unless
+it matches `^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$` and is at most 100 UTF-8 bytes
+(`+` is permitted for SemVer build metadata, unlike artifact names). Absolute
+paths and higher components are never sent. When present it is a field of the
+transfer-ID derivation, so it is authenticated by the owner key and immutable
+across resume attempts; when absent the derivation and wire shape are identical
+to earlier clients. The field is persisted with the resumable session, so a
+verified reconnect retains its release identity.
+
+Session records carry an on-disk version: version 2 sessions (no
+`sourceParent`) remain readable, and sessions written by this version use
+version 3 and always record the field when present. A version-2 record that
+contains `sourceParent` is invalid.
+
+### Artifact patterns
+
+A server may be configured with an ordered list of templates made of literal
+text and the placeholders `{series}` and `{version}`. A template has at least
+one placeholder, at most one of each, no adjacent placeholders, one or two
+`/`-separated non-empty segments (`basename` or `parent/basename`), and is
+unique. `{version}` values are strict SemVer 2.0.0 and are normalized without
+build metadata; a template without `{series}` is a fixed series whose key is the
+template text. Matching evaluates templates in declaration order; templates with
+a parent segment are skipped when no `sourceParent` was offered; the first
+template that yields coordinates wins.
+
+If at least one template is configured, matching is mandatory: an unmatched
+offer is rejected with `INVALID_FILENAME` before session admission, destination
+inspection, staging, verification, commit, or the `beforeCommit` and
+`afterCommit` hooks. The failure hook still observes the rejection. A server
+with no templates preserves the earlier behavior and stores no release identity.
+
+The normalized `{series, version?}` coordinates are decided at commit time and
+persisted in the commit record, copied to replacement-history records,
+included in record comparison, journal serialization, and recovery, and
+therefore stable across restarts and configuration changes. One transfer ID
+cannot be committed with two different coordinates: the offer fails closed
+instead of reporting `ALREADY_COMMITTED`. Records without coordinates (written
+before the feature or by a server without templates) are legacy: they are
+subject to age and quota retention but never to count or version rotation.
+
+### Rotation and retention order
+
+Retention serializes under the root lease. After session expiry and a
+committed-state scrub, it applies in order: age, count, version, storage quota.
+Each stage sees the records the previous stage kept, so configured count and
+version bounds retain the intersection of their keep sets.
+
+Count rotation groups released records by series, orders them by `committedAt`
+descending then transfer ID and name ascending, and keeps the first `maxCount`.
+Version rotation groups versioned records by series, orders them by SemVer
+precedence descending (ties by the commit order above), maps each version to its
+`major` or `major.minor` group per `versionGranularity`, and keeps every record
+in the first `maxVersions` distinct groups. Prereleases and history records in a
+retained group are kept; build metadata does not exist in stored versions.
+Current mutable artifacts are pinned: they are counted but never deleted, so a
+limit is best-effort when one exceeds it.
+
+Retention runs before a commit's link step and again after the commit becomes
+durable, so rotation may remove an artifact that falls outside the retained
+window immediately after it is committed and before `afterCommit` runs.
+`retention` events and results expose `ageDeleted`, `countDeleted`,
+`versionDeleted`, and `storageDeleted`; deletions log the stable reasons
+`MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and `MAX_STORAGE`.
+
+`maxCount` requires at least one template; `maxVersions` requires a template
+with `{version}` and `versionGranularity`; `versionGranularity` requires
+`maxVersions`. Violations are construction-time `PROTOCOL_INVALID` errors and
+CLI exit code 2.
+
+### Hooks
+
+A server may be configured with `beforeCommit`, `afterCommit`, and `onFailure`
+callbacks. Direct `ServerOptions.hooks` accepts only a hook object whose own keys
+are those names and whose values are functions; it is snapshotted at
+construction. The CLI `--hooks` option loads a `.js`, `.mjs`, or `.cjs` module
+before the server listens, selecting only those names (named exports win over a
+default object; one `__esModule` interop level is unwrapped; other exports are
+ignored) and failing with exit code 2 on any load or shape error. Hooks are
+trusted code; contexts are frozen and exclude seeds, keys, TAR data, and session
+material. Callbacks are invoked without a receiver. There is no hook timeout;
+only server shutdown abandons a pending callback, which then continues detached.
+
+Observable order:
+
+- fresh or partially resumed upload: offer, ACCEPT or RESUME, TAR receipt,
+  verification, `beforeCommit`, commit, `afterCommit`, `COMMITTED`;
+- verified reconnect (`VERIFIED`): re-read of the verified staging file,
+  `beforeCommit` with `resumed: true`, commit, `afterCommit`, `COMMITTED`;
+- already committed: `afterCommit` with `alreadyCommitted: true` and
+  `resumed: false`, then `ALREADY_COMMITTED`, with no verification or
+  `beforeCommit`.
+
+A `beforeCommit` failure prevents commit mutation and leaves the verified
+session resumable. An `afterCommit` failure leaves the artifact durably
+committed, fails the connection, and makes a retry take the already-committed
+path, so both callbacks may run more than once for a transfer ID and must be
+idempotent. A callback exception becomes the stable wire code `HOOK_FAILED` with
+a fixed message.
+
+`onFailure` runs at most once per connection after metadata was decoded and the
+failure was sent, unless both gating hooks already succeeded. Its context phase
+is `offer`, `transfer`, `verification`, `beforeCommit`, `commit`, or
+`afterCommit`; its `error` is the raw callback exception for hook failures and
+the original error otherwise. Its path is `null` for `offer`; the `.tar.part`
+staging file during transfer and for fresh-upload verification; the extracted
+`.part` staging file for `beforeCommit`, `commit`, and verified-reconnect
+verification; and the final path for `afterCommit`. An `onFailure` exception is
+logged as a secondary warning and never replaces the original failure.
+
+### Rollout compatibility
+
+Servers must be upgraded before clients. A server that predates `sourceParent`
+decodes offers with an exact key set and rejects the new field, so a new client
+that sends it to an old server fails. A new server accepts older clients,
+sessions, and commit records; offers without `sourceParent` can match only
+patterns without a parent segment.
 
 ## Storage accounting
 

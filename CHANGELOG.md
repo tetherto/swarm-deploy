@@ -2,6 +2,15 @@
 
 All notable changes to this package are documented here.
 
+## Unreleased
+
+- Add server-configured artifact patterns (`artifactPatterns`, repeatable `--artifact-pattern`) with `{series}` and strict SemVer `{version}` placeholders over basenames and the immediate source parent. Configuring patterns makes matching mandatory: unmatched offers are rejected with `INVALID_FILENAME` before admission.
+- Add optional authenticated `sourceParent` offer metadata, sent only when it is a safe single component. Upgrade servers before clients: older servers reject the new metadata field.
+- Persist normalized release coordinates in commit records, replacement history, journals, and recovery. Legacy records without coordinates are not count or version rotated.
+- Add count rotation (`maxCount`, `--max-count`) and SemVer major/minor rotation (`maxVersions`, `versionGranularity`, `--max-versions`, `--version-granularity`) running after age and before storage-quota retention, with `countDeleted` and `versionDeleted` retention counters.
+- Add `beforeCommit`, `afterCommit`, and `onFailure` server hooks (`ServerOptions.hooks` and `--hooks <module>` for `.js`, `.mjs`, and `.cjs` modules), the `HOOK_FAILED` error code, and exported hook and release types. Hooks run again on retries and must be idempotent by transfer ID; `afterCommit` can fail after the artifact is durably committed.
+- Document rollout, retry, path, and compatibility semantics.
+
 ## 0.1.0
 
 - Initial public release.
