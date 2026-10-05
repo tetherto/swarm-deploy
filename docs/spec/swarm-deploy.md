@@ -151,6 +151,13 @@ across resume attempts; when absent the derivation and wire shape are identical
 to earlier clients. The field is persisted with the resumable session, so a
 verified reconnect retains its release identity.
 
+A client may suppress the field for privacy with `includeSourceParent: false`
+(CLI `--no-source-parent`, which takes no value). The option defaults to `true`,
+applies to every file in a run, and makes the upload indistinguishable on the
+wire from a client that predates the field, including its transfer ID. A server
+pattern with a parent segment therefore rejects an opted-out upload with
+`INVALID_FILENAME`.
+
 Session records carry an on-disk version that follows the field rather than the
 writing code: a session with a `sourceParent` is written as version 3 and a
 session without one as version 2. Both are readable. A version-2 record that

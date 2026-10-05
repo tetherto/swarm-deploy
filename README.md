@@ -215,6 +215,7 @@ swarm-deploy upload \
   --seed-file <seed-file> \
   --server-key <64-lower-hex> \
   [--idle-timeout <milliseconds>] \
+  [--no-source-parent] \
   <file-or-directory>
 ```
 
@@ -229,8 +230,10 @@ seed inline.
 - A direct file retains its basename.
 - Each upload also carries the immediate local parent directory name as
   optional `sourceParent` metadata, but only when that name is a safe single
-  component (see [Source parent](#source-parent)). The upload CLI has no option
-  for it.
+  component (see [Source parent](#source-parent)).
+- `--no-source-parent` takes no value and suppresses that metadata for every
+  file in the run. The upload then keeps the legacy transfer identity and
+  cannot match a server pattern with a parent segment.
 - A directory processes immediate regular-file children once, in lexical
   order, with one independent connection and result per file.
 - Subdirectories, symlinks, non-regular files, unsafe names, and names in the
@@ -450,6 +453,12 @@ is omitted, and the upload keeps the pre-existing metadata shape. Consequently a
 folder pattern rejects uploads whose parent is unsafe or omitted: stage release
 files in a conforming directory. `sourceParent` is part of the transfer ID, so
 it cannot change between resume attempts.
+
+A client can also suppress it deliberately with `includeSourceParent: false`
+(CLI `--no-source-parent`) where the staging folder name itself is sensitive.
+The upload then sends no parent and derives the same transfer ID as a client
+that predates the field, so a server pattern needing a parent segment rejects
+it with `INVALID_FILENAME`.
 
 ### Mandatory matching
 
@@ -935,9 +944,12 @@ await client.close()
 
 `ClientOptions.seed` accepts a Buffer or canonical lowercase 64-character hex
 string. `serverPublicKey` is a Buffer produced by `parsePublicKey`. Optional
-values are `connectTimeout`, `idleTimeout`, `dht`, `dhtFactory`, and `logger`.
+values are `connectTimeout`, `idleTimeout`, `includeSourceParent`, `dht`,
+`dhtFactory`, and `logger`.
 
 `connectTimeout` defaults to 30 seconds. `idleTimeout` defaults to 60 seconds.
+`includeSourceParent` defaults to `true`; set it to `false` to suppress the
+[source parent](#source-parent) for every upload the client makes.
 Calling `close()` aborts pending work, closes active sockets, and is idempotent.
 
 ### Upload results

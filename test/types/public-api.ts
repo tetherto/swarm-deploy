@@ -33,7 +33,8 @@ const server = new Server({
 } satisfies ServerOptions)
 const stringSeedClientOptions = {
   seed: '11'.repeat(32),
-  serverPublicKey: parsePublicKey('00'.repeat(32))
+  serverPublicKey: parsePublicKey('00'.repeat(32)),
+  includeSourceParent: false
 } satisfies ClientOptions
 const stringSeedServerOptions = {
   seed: '22'.repeat(32),

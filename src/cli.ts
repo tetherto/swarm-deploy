@@ -303,10 +303,12 @@ function parseOptions(
   args: string[],
   allowed: ReadonlySet<string>,
   repeatable: ReadonlySet<string> = new Set(),
-  keyValues: ReadonlySet<string> = new Set()
+  keyValues: ReadonlySet<string> = new Set(),
+  flags: ReadonlySet<string> = new Set()
 ): {
   options: Record<string, string | undefined>
   repeatedOptions: Record<string, string[] | undefined>
+  flagOptions: Record<string, true | undefined>
   positionals: string[]
 } {
   const options: Record<string, string | undefined> = Object.create(null) as Record<
@@ -316,6 +318,10 @@ function parseOptions(
   const repeatedOptions: Record<string, string[] | undefined> = Object.create(null) as Record<
     string,
     string[] | undefined
+  >
+  const flagOptions: Record<string, true | undefined> = Object.create(null) as Record<
+    string,
+    true | undefined
   >
   const positionals: string[] = []
   for (let i = 0; i < args.length; i++) {
@@ -328,9 +334,15 @@ function parseOptions(
       if (
         !repeatable.has(arg) &&
         (Object.prototype.hasOwnProperty.call(options, arg) ||
-          Object.prototype.hasOwnProperty.call(repeatedOptions, arg))
+          Object.prototype.hasOwnProperty.call(repeatedOptions, arg) ||
+          Object.prototype.hasOwnProperty.call(flagOptions, arg))
       ) {
         throw usageError('Duplicate option')
+      }
+      // A flag takes no value, so the next argument keeps its own meaning.
+      if (flags.has(arg)) {
+        flagOptions[arg] = true
+        continue
       }
       const value = args[i + 1]
       if (value === undefined || value.startsWith('-')) {
@@ -349,7 +361,7 @@ function parseOptions(
     }
     positionals.push(arg)
   }
-  return { options, repeatedOptions, positionals }
+  return { options, repeatedOptions, flagOptions, positionals }
 }
 
 function requireOption(options: Record<string, string | undefined>, name: string): string {
@@ -682,11 +694,12 @@ function printUploadResult(result: ClientUploadResult, io: CliIo): number {
 }
 
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, positionals } = parseOptions(
+  const { options, flagOptions, positionals } = parseOptions(
     args,
-    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout']),
+    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout', '--no-source-parent']),
     new Set(),
-    new Set(['--server-key', '--seed'])
+    new Set(['--server-key', '--seed']),
+    new Set(['--no-source-parent'])
   )
   const [inputPath] = requirePositionals(positionals, 1, 'upload requires a file or directory')
   const seed = await resolveSeed({
@@ -716,6 +729,7 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
       dht: io.dht,
       connectTimeout: io.connectTimeout,
       idleTimeout,
+      ...(flagOptions['--no-source-parent'] ? { includeSourceParent: false } : {}),
       logger: createLogger(io)
     })
   } catch (err) {

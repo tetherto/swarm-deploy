@@ -63,6 +63,11 @@ export interface TarOperationOptions {
   signal?: AbortSignalLike | null
 }
 
+export interface TarManifestOptions extends TarOperationOptions {
+  /** Set to `false` to keep the legacy identity that names no source parent. */
+  includeSourceParent?: boolean
+}
+
 export interface TarResumeOptions extends TarOperationOptions {
   expectedPrefixSha256?: Uint8Array | null
 }
@@ -252,11 +257,11 @@ export function computeTarTransferId(
 export async function buildTarManifest(
   filePath: string,
   clientPublicKey: Uint8Array,
-  { signal = null }: TarOperationOptions = {}
+  { signal = null, includeSourceParent = true }: TarManifestOptions = {}
 ): Promise<TarManifest> {
   assertClientKey(clientPublicKey)
   const name = canonicalName(filePath)
-  const sourceParent = deriveSourceParent(filePath)
+  const sourceParent = includeSourceParent === false ? undefined : deriveSourceParent(filePath)
   const opened = await openStableSource(filePath, null, signal)
   assertSafeSize(opened.source.size)
   const fileHash = new SodiumSha256()

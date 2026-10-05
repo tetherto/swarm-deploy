@@ -462,6 +462,84 @@ test('CLI rejects malformed and duplicate repeatable allow keys as configuration
   }
 })
 
+test('upload --no-source-parent takes no value and leaves other options intact', async (t) => {
+  const root = await createTempDir(t)
+  const seedPath = path.join(root, 'client.seed')
+  const artifact = path.join(root, 'artifact.txt')
+  await fs.promises.writeFile(seedPath, `${b4a.toString(CLIENT_SEED, 'hex')}\n`)
+  await fs.promises.writeFile(artifact, 'boolean flag upload')
+
+  const seen: ClientOptions[] = []
+  class Client {
+    constructor(options: ClientOptions) {
+      seen.push(options)
+    }
+    upload() {
+      return Promise.resolve({
+        status: 'COMMITTED' as const,
+        name: 'artifact.txt',
+        size: 19,
+        digest: b4a.alloc(32),
+        transferId: b4a.alloc(32)
+      })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const io = () => ({
+    Client: Client as unknown as new (
+      options: ClientOptions
+    ) => import('../../dist/client.js').Client,
+    stdout: output().stream,
+    stderr: output().stream
+  })
+  const common = [
+    'upload',
+    '--seed-file',
+    seedPath,
+    '--server-key',
+    b4a.toString(SERVER_KEY, 'hex')
+  ]
+
+  t.is(await main([...common, artifact], {}, io()), 0)
+  t.is(seen[0].includeSourceParent, undefined, 'the parent is sent unless opted out')
+
+  t.is(await main([...common, '--no-source-parent', artifact], {}, io()), 0)
+  t.is(seen[1].includeSourceParent, false)
+
+  // The flag consumes no value, so a following value option still parses.
+  t.is(
+    await main([...common, '--no-source-parent', '--idle-timeout', '5000', artifact], {}, io()),
+    0
+  )
+  t.is(seen[2].includeSourceParent, false)
+  t.is(seen[2].idleTimeout, 5000)
+
+  const duplicate = output()
+  t.is(
+    await main(
+      [...common, '--no-source-parent', '--no-source-parent', artifact],
+      {},
+      { ...io(), stderr: duplicate.stream }
+    ),
+    2
+  )
+  t.ok(duplicate.text().includes('Duplicate option'))
+
+  const missing = output()
+  t.is(
+    await main(
+      ['upload', '--seed-file', seedPath, '--server-key', '--no-source-parent', artifact],
+      {},
+      { ...io(), stderr: missing.stream }
+    ),
+    2,
+    'a value option still rejects a following flag as its value'
+  )
+  t.ok(missing.text().includes('Missing option value'))
+})
+
 test('CLI keeps configuration and runtime exit classifications stable and private', async (t) => {
   const root = await createTempDir(t)
   const seedPath = path.join(root, 'client.seed')

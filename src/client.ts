@@ -48,6 +48,13 @@ export interface ClientOptions {
   serverPublicKey: PublicKeyInput
   connectTimeout?: number
   idleTimeout?: number
+  /**
+   * Send the immediate source directory name with the offer. Defaults to
+   * `true`. Set it to `false` where the staging folder name is itself
+   * sensitive; uploads then keep the legacy transfer identity and cannot match
+   * a server pattern that needs a parent segment.
+   */
+  includeSourceParent?: boolean
   dht?: DirectDhtNode
   dhtFactory?: DirectDhtFactory
   logger?: Logger | null
@@ -165,6 +172,7 @@ export class Client extends EventEmitter {
   readonly serverPublicKey: PublicKey
   readonly connectTimeout: number
   readonly idleTimeout: number
+  readonly includeSourceParent: boolean
   readonly logger: Required<Logger>
   private readonly direct: DirectDhtClient
   private readonly abort = createAbortController()
@@ -190,6 +198,13 @@ export class Client extends EventEmitter {
       DEFAULT_CONNECT_TIMEOUT
     )
     this.idleTimeout = duration(options.idleTimeout, 'idle timeout', DEFAULT_IDLE_TIMEOUT)
+    if (
+      options.includeSourceParent !== undefined &&
+      typeof options.includeSourceParent !== 'boolean'
+    ) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid source parent option')
+    }
+    this.includeSourceParent = options.includeSourceParent !== false
     this.publicKey = b4a.from(keyPair.publicKey)
     this.direct = new DirectDhtClient({
       keyPair,
@@ -330,7 +345,10 @@ export class Client extends EventEmitter {
     const selection = await selectUploadPaths(inputPath, { signal: this.signal })
     if (!root.isDirectory()) {
       return this.uploadManifest(
-        await buildTarManifest(selection.paths[0], this.publicKey, { signal: this.signal })
+        await buildTarManifest(selection.paths[0], this.publicKey, {
+          signal: this.signal,
+          includeSourceParent: this.includeSourceParent
+        })
       )
     }
     const results: Array<UploadResult | BatchUploadFailure> = []
@@ -346,7 +364,10 @@ export class Client extends EventEmitter {
       try {
         results.push(
           await this.uploadManifest(
-            await buildTarManifest(entry.path, this.publicKey, { signal: this.signal }),
+            await buildTarManifest(entry.path, this.publicKey, {
+              signal: this.signal,
+              includeSourceParent: this.includeSourceParent
+            }),
             false,
             false
           )

@@ -347,6 +347,44 @@ test('source parent is authenticated while legacy metadata keeps its transfer ID
   assertMetadataTransferId(CLIENT_KEY, legacy)
 })
 
+test('opting out of the source parent restores the legacy authenticated identity', async (t) => {
+  const dir = await createTempDir(t)
+  const releaseDir = path.join(dir, 'releases', '2.4.1')
+  await fs.promises.mkdir(releaseDir, { recursive: true })
+  const file = path.join(releaseDir, 'api.tar.gz')
+  await fs.promises.writeFile(file, b4a.from('payload'))
+
+  const included = await buildTarManifest(file, CLIENT_KEY)
+  const omitted = await buildTarManifest(file, CLIENT_KEY, { includeSourceParent: false })
+  t.is(included.sourceParent, '2.4.1')
+  t.is(omitted.sourceParent, undefined, 'the manifest carries no parent')
+
+  const metadata = metadataFromManifest(omitted)
+  t.is(Object.prototype.hasOwnProperty.call(metadata, 'sourceParent'), false, 'no wire key')
+  assertMetadataTransferId(CLIENT_KEY, metadata)
+  t.is(
+    metadata.transferId,
+    b4a.toString(
+      computeTarTransferId(CLIENT_KEY, {
+        name: metadata.name,
+        fileSize: metadata.fileSize,
+        fileSha256: b4a.from(metadata.fileSha256, 'hex'),
+        tarSize: metadata.tarSize,
+        tarSha256: b4a.from(metadata.tarSha256, 'hex')
+      }),
+      'hex'
+    ),
+    'the transfer ID matches a client that never sent a parent'
+  )
+  t.not(b4a.toString(omitted.transferId, 'hex'), b4a.toString(included.transferId, 'hex'))
+
+  t.is(
+    (await buildTarManifest(file, CLIENT_KEY, { includeSourceParent: true })).sourceParent,
+    '2.4.1',
+    'the parent is included by default and on an explicit true'
+  )
+})
+
 test('source parent is one bounded safe component with SemVer build metadata', (t) => {
   const valid = {
     ...metadataForTar(b4a.alloc(deterministicTarSize(7))),
