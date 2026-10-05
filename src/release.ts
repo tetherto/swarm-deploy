@@ -17,15 +17,19 @@ export const MAX_RELEASE_COMPONENT_BYTES = 100
 const SAFE_ARTIFACT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 /** Immediate source parent: same 100-byte single-component rule; `+` allowed for SemVer build metadata. */
 const SAFE_SOURCE_PARENT = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/
-const SAFE_TEXT = '[A-Za-z0-9][A-Za-z0-9._-]{0,199}'
 
-type SegmentMatcher =
-  | { kind: 'regex'; regex: RegExp }
-  | { kind: 'series-version-split'; prefix: string; suffix: string }
+type TemplatePart =
+  | { kind: 'literal'; text: string }
+  | { kind: 'series' }
+  | { kind: 'version' }
+
+interface SegmentPlan {
+  parts: TemplatePart[]
+}
 
 interface ParentMatcher {
   literal: string | null
-  segment: SegmentMatcher | null
+  plan: SegmentPlan | null
   hasVersion: boolean
 }
 
@@ -34,16 +38,12 @@ interface CompiledPattern {
   versionInParent: boolean
   versionInBasename: boolean
   parent: ParentMatcher | null
-  basename: SegmentMatcher
+  basename: SegmentPlan
 }
 
 interface MatchGroups {
   series?: string
   version?: string
-}
-
-function escapeRegexLiteral(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function placeholderCount(template: string, placeholder: string): number {
@@ -93,7 +93,7 @@ function isSafeSeriesCapture(value: string): boolean {
   return SAFE_ARTIFACT.test(value) && componentByteLength(value) <= MAX_RELEASE_COMPONENT_BYTES
 }
 
-function normalizeCapturedVersion(raw: string): string | undefined {
+function validateStrictReleaseVersion(raw: string): SemVer | undefined {
   if (raw.length === 0 || componentByteLength(raw) > MAX_RELEASE_COMPONENT_BYTES) {
     return undefined
   }
@@ -104,61 +104,24 @@ function normalizeCapturedVersion(raw: string): string | undefined {
     const parsed = new SemVer(raw, { loose: false })
     const core = raw.split('+', 1)[0]!
     if (core !== parsed.version) return undefined
-    return parsed.version
+    return parsed
   } catch {
     return undefined
   }
 }
 
+function normalizeCapturedVersion(raw: string): string | undefined {
+  return validateStrictReleaseVersion(raw)?.version
+}
+
 function parseReleaseVersion(raw: string): SemVer {
-  if (typeof raw !== 'string' || raw.length === 0) {
-    throw new Error('Invalid release version')
-  }
-  if (componentByteLength(raw) > MAX_RELEASE_COMPONENT_BYTES) {
-    throw new Error('Invalid release version')
-  }
-  if (raw.trim() !== raw) {
-    throw new Error('Invalid release version')
-  }
-  if (/^[vV]/.test(raw)) {
-    throw new Error('Invalid release version')
-  }
-  try {
-    const parsed = new SemVer(raw, { loose: false })
-    const core = raw.split('+', 1)[0]!
-    if (core !== parsed.version) {
-      throw new Error('Invalid release version')
-    }
-    return parsed
-  } catch (error) {
-    if (error instanceof Error && error.message === 'Invalid release version') throw error
-    throw new Error('Invalid release version')
-  }
+  const parsed = validateStrictReleaseVersion(raw)
+  if (!parsed) throw new Error('Invalid release version')
+  return parsed
 }
 
-function seriesVersionSplitParts(
-  template: string
-): { prefix: string; suffix: string } | null {
-  const seriesAt = template.indexOf(PLACEHOLDER_SERIES)
-  const versionAt = template.indexOf(PLACEHOLDER_VERSION)
-  if (seriesAt === -1 || versionAt === -1 || seriesAt >= versionAt) return null
-  const between = template.slice(seriesAt + PLACEHOLDER_SERIES.length, versionAt)
-  if (between !== '-') return null
-  return {
-    prefix: template.slice(0, seriesAt),
-    suffix: template.slice(versionAt + PLACEHOLDER_VERSION.length)
-  }
-}
-
-function segmentRegex(template: string): { source: string; hasVersion: boolean } {
-  const seriesCount = placeholderCount(template, PLACEHOLDER_SERIES)
-  const versionCount = placeholderCount(template, PLACEHOLDER_VERSION)
-  if (seriesCount > 1 || versionCount > 1) {
-    throw new Error('Invalid release template: repeated placeholder')
-  }
-
-  let hasVersion = false
-  let source = '^'
+function parseSegmentParts(template: string): TemplatePart[] {
+  const parts: TemplatePart[] = []
   let cursor = 0
   while (cursor < template.length) {
     const seriesAt = template.indexOf(PLACEHOLDER_SERIES, cursor)
@@ -174,42 +137,43 @@ function segmentRegex(template: string): { source: string; hasVersion: boolean }
     }
 
     if (next === -1) {
-      source += escapeRegexLiteral(template.slice(cursor))
+      parts.push({ kind: 'literal', text: template.slice(cursor) })
       break
     }
 
-    source += escapeRegexLiteral(template.slice(cursor, next))
-    if (kind === 'series') {
-      source += `(?<series>${SAFE_TEXT})`
-      cursor = next + PLACEHOLDER_SERIES.length
-    } else {
-      source += `(?<version>[^/]+)`
-      hasVersion = true
-      cursor = next + PLACEHOLDER_VERSION.length
+    if (next > cursor) {
+      parts.push({ kind: 'literal', text: template.slice(cursor, next) })
     }
+    parts.push({ kind: kind! })
+    cursor = next + (kind === 'series' ? PLACEHOLDER_SERIES.length : PLACEHOLDER_VERSION.length)
   }
-  source += '$'
-  return { source, hasVersion }
+  return parts
 }
 
-function compileSegmentMatcher(template: string): {
-  matcher: SegmentMatcher
+function compileSegmentPlan(template: string): {
+  plan: SegmentPlan
+  hasSeries: boolean
   hasVersion: boolean
 } {
-  const split = seriesVersionSplitParts(template)
-  if (split) {
-    return { matcher: { kind: 'series-version-split', ...split }, hasVersion: true }
+  const seriesCount = placeholderCount(template, PLACEHOLDER_SERIES)
+  const versionCount = placeholderCount(template, PLACEHOLDER_VERSION)
+  if (seriesCount > 1 || versionCount > 1) {
+    throw new Error('Invalid release template: repeated placeholder')
   }
-  const compiled = segmentRegex(template)
-  return { matcher: { kind: 'regex', regex: new RegExp(compiled.source) }, hasVersion: compiled.hasVersion }
+  const parts = parseSegmentParts(template)
+  return {
+    plan: { parts },
+    hasSeries: seriesCount > 0,
+    hasVersion: versionCount > 0
+  }
 }
 
 function compileParentMatcher(parent: string): ParentMatcher {
   if (placeholderCount(parent, PLACEHOLDER_SERIES) === 0 && placeholderCount(parent, PLACEHOLDER_VERSION) === 0) {
-    return { literal: parent, segment: null, hasVersion: false }
+    return { literal: parent, plan: null, hasVersion: false }
   }
-  const compiled = compileSegmentMatcher(parent)
-  return { literal: null, segment: compiled.matcher, hasVersion: compiled.hasVersion }
+  const compiled = compileSegmentPlan(parent)
+  return { literal: null, plan: compiled.plan, hasVersion: compiled.hasVersion }
 }
 
 function compileTemplate(template: string): CompiledPattern {
@@ -234,86 +198,158 @@ function compileTemplate(template: string): CompiledPattern {
 
   const fixedSeries = seriesCount === 0 ? template : null
   if (segments.length === 1) {
-    const basename = compileSegmentMatcher(template)
+    const basename = compileSegmentPlan(template)
     return {
       fixedSeries,
       versionInParent: false,
       versionInBasename: basename.hasVersion,
       parent: null,
-      basename: basename.matcher
+      basename: basename.plan
     }
   }
 
   const parentSegment = segments[0]!
   const basenameSegment = segments[1]!
   const parent = compileParentMatcher(parentSegment)
-  const basename = compileSegmentMatcher(basenameSegment)
+  const basename = compileSegmentPlan(basenameSegment)
   return {
     fixedSeries,
     versionInParent: parent.hasVersion,
     versionInBasename: basename.hasVersion,
     parent,
-    basename: basename.matcher
+    basename: basename.plan
   }
 }
 
-function splitSeriesVersionStem(stem: string): MatchGroups | null {
-  if (stem.length === 0 || componentByteLength(stem) > MAX_RELEASE_COMPONENT_BYTES) return null
-  for (let index = stem.lastIndexOf('-'); index > 0; index = stem.lastIndexOf('-', index - 1)) {
-    const series = stem.slice(0, index)
-    const versionRaw = stem.slice(index + 1)
-    if (!isSafeSeriesCapture(series)) continue
-    const version = normalizeCapturedVersion(versionRaw)
-    if (version) return { series, version }
+function assignPlaceholderPair(
+  first: 'series' | 'version',
+  second: 'series' | 'version',
+  left: string,
+  right: string
+): MatchGroups | null {
+  if (first === 'series' && second === 'version') {
+    if (!isSafeSeriesCapture(left)) return null
+    const version = normalizeCapturedVersion(right)
+    return version ? { series: left, version } : null
+  }
+  if (first === 'version' && second === 'series') {
+    const version = normalizeCapturedVersion(left)
+    if (!version) return null
+    if (!isSafeSeriesCapture(right)) return null
+    return { series: right, version }
   }
   return null
 }
 
-function matchSegment(matcher: SegmentMatcher, value: string): MatchGroups | null {
-  if (matcher.kind === 'series-version-split') {
-    if (!value.startsWith(matcher.prefix) || !value.endsWith(matcher.suffix)) return null
-    const stem = value.slice(matcher.prefix.length, value.length - matcher.suffix.length)
-    return splitSeriesVersionStem(stem)
+function splitSeriesThenVersion(stem: string): MatchGroups | null {
+  for (let index = stem.lastIndexOf('-'); index > 0; index = stem.lastIndexOf('-', index - 1)) {
+    const groups = assignPlaceholderPair('series', 'version', stem.slice(0, index), stem.slice(index + 1))
+    if (groups) return groups
   }
-
-  const match = matcher.regex.exec(value)
-  if (!match) return null
-  const seriesCapture = match.groups?.series
-  const versionCapture = match.groups?.version
-  const groups: MatchGroups = {}
-  if (typeof seriesCapture === 'string' && seriesCapture.length > 0) {
-    if (!isSafeSeriesCapture(seriesCapture)) return null
-    groups.series = seriesCapture
-  }
-  if (typeof versionCapture === 'string' && versionCapture.length > 0) {
-    const version = normalizeCapturedVersion(versionCapture)
-    if (version === undefined) return null
-    groups.version = version
-  }
-  return groups
+  return null
 }
 
-function matchParent(parent: ParentMatcher, value: string): MatchGroups | null {
+function splitVersionThenSeries(stem: string): MatchGroups | null {
+  for (let index = stem.indexOf('-'); index > 0; index = stem.indexOf('-', index + 1)) {
+    const groups = assignPlaceholderPair('version', 'series', stem.slice(0, index), stem.slice(index + 1))
+    if (groups) return groups
+  }
+  return null
+}
+
+function tryLiteralSeparator(
+  stem: string,
+  separator: string,
+  first: 'series' | 'version',
+  second: 'series' | 'version'
+): MatchGroups | null {
+  if (separator.length === 0) return null
+  let index = stem.indexOf(separator)
+  while (index !== -1) {
+    const left = stem.slice(0, index)
+    const right = stem.slice(index + separator.length)
+    const groups = assignPlaceholderPair(first, second, left, right)
+    if (groups) return groups
+    index = stem.indexOf(separator, index + 1)
+  }
+  return null
+}
+
+function matchStem(middle: TemplatePart[], stem: string): MatchGroups | null {
+  if (middle.length === 1) {
+    const part = middle[0]!
+    if (part.kind === 'series') {
+      return isSafeSeriesCapture(stem) ? { series: stem } : null
+    }
+    const version = normalizeCapturedVersion(stem)
+    return version ? { version } : null
+  }
+
+  if (middle.length === 3 && middle[0]!.kind !== 'literal' && middle[1]!.kind === 'literal' && middle[2]!.kind !== 'literal') {
+    const first = middle[0]!.kind
+    const separator = (middle[1] as { kind: 'literal'; text: string }).text
+    const second = middle[2]!.kind
+    if (first === 'series' && second === 'version' && separator === '-') {
+      const split = splitSeriesThenVersion(stem)
+      if (split) return split
+    }
+    if (first === 'version' && second === 'series' && separator === '-') {
+      const split = splitVersionThenSeries(stem)
+      if (split) return split
+    }
+    return tryLiteralSeparator(stem, separator, first, second)
+  }
+
+  return null
+}
+
+function matchSegmentPlan(plan: SegmentPlan, value: string): MatchGroups | null {
+  const { parts } = plan
+  if (parts.length === 0) return null
+
+  let prefix = ''
+  let start = 0
+  while (start < parts.length && parts[start]!.kind === 'literal') {
+    prefix += (parts[start] as { kind: 'literal'; text: string }).text
+    start++
+  }
+
+  let suffix = ''
+  let end = parts.length - 1
+  while (end >= start && parts[end]!.kind === 'literal') {
+    suffix = (parts[end] as { kind: 'literal'; text: string }).text + suffix
+    end--
+  }
+
+  if (!value.startsWith(prefix) || !value.endsWith(suffix)) return null
+  const stem = value.slice(prefix.length, value.length - suffix.length)
+  if (componentByteLength(stem) > MAX_RELEASE_COMPONENT_BYTES) return null
+
+  const middle = parts.slice(start, end + 1)
+  if (middle.length === 0) {
+    return stem.length === 0 ? {} : null
+  }
+  return matchStem(middle, stem)
+}
+
+function matchWithParent(
+  pattern: CompiledPattern,
+  sourceParent: string,
+  name: string
+): MatchGroups | null {
+  if (!isSafeArtifactName(name)) return null
+
+  let parentGroups: MatchGroups = {}
+  const parent = pattern.parent!
   if (parent.literal !== null) {
-    return parent.literal === value ? {} : null
-  }
-  return matchSegment(parent.segment!, value)
-}
-
-function matchCandidate(pattern: CompiledPattern, candidate: string): MatchGroups | null {
-  if (pattern.parent === null) {
-    return matchSegment(pattern.basename, candidate)
+    if (parent.literal !== sourceParent) return null
+  } else {
+    const matched = matchSegmentPlan(parent.plan!, sourceParent)
+    if (matched === null) return null
+    parentGroups = matched
   }
 
-  const slash = candidate.indexOf('/')
-  if (slash === -1) return null
-  const parentPart = candidate.slice(0, slash)
-  const basePart = candidate.slice(slash + 1)
-  if (!isSafeSourceParent(parentPart) || !isSafeArtifactName(basePart)) return null
-
-  const parentGroups = matchParent(pattern.parent, parentPart)
-  if (parentGroups === null) return null
-  const basenameGroups = matchSegment(pattern.basename, basePart)
+  const basenameGroups = matchSegmentPlan(pattern.basename, name)
   if (basenameGroups === null) return null
   return { ...parentGroups, ...basenameGroups }
 }
@@ -376,14 +412,9 @@ export class ReleaseMatcher {
     if (sourceParent !== undefined && !isSafeSourceParent(sourceParent)) return null
 
     for (const pattern of this.#patterns) {
-      const literalParentOnly =
-        pattern.parent !== null &&
-        pattern.parent.literal !== null &&
-        !pattern.versionInBasename
-
-      if (pattern.versionInParent || literalParentOnly) {
+      if (pattern.parent !== null) {
         if (sourceParent === undefined) continue
-        const groups = matchCandidate(pattern, `${sourceParent}/${name}`)
+        const groups = matchWithParent(pattern, sourceParent, name)
         if (groups) {
           const coords = coordinatesFromGroups(pattern, groups, 'full')
           if (coords) return coords
@@ -391,18 +422,10 @@ export class ReleaseMatcher {
         continue
       }
 
-      const basenameGroups = matchSegment(pattern.basename, name)
+      const basenameGroups = matchSegmentPlan(pattern.basename, name)
       if (basenameGroups) {
         const coords = coordinatesFromGroups(pattern, basenameGroups, 'basename')
         if (coords) return coords
-      }
-
-      if (sourceParent !== undefined) {
-        const groups = matchCandidate(pattern, `${sourceParent}/${name}`)
-        if (groups) {
-          const coords = coordinatesFromGroups(pattern, groups, 'full')
-          if (coords) return coords
-        }
       }
     }
     return null

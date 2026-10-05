@@ -19,6 +19,10 @@ test('release templates match basenames and immediate source parents in order', 
     series: 'worker',
     version: '1.3.0-rc.1'
   })
+  t.alike(matcher.match('worker-1.3.0-rc.1.tar.gz'), {
+    series: 'worker',
+    version: '1.3.0-rc.1'
+  })
   t.alike(matcher.match('web-3.0.0.tar.gz'), { series: 'web', version: '3.0.0' })
   t.is(matcher.match('notes.txt'), null)
 })
@@ -52,6 +56,30 @@ test('release matcher rejects literal parent folder mismatches', (t) => {
   const matcher = new ReleaseMatcher(['releases/{series}.tar.gz'])
   t.is(matcher.match('api.tar.gz', 'staging'), null)
   t.alike(matcher.match('api.tar.gz', 'releases'), { series: 'api' })
+
+  const versioned = new ReleaseMatcher(['releases/{series}-{version}.tar.gz'])
+  t.is(versioned.match('worker-1.0.0.tar.gz', 'staging'), null)
+  t.alike(versioned.match('worker-1.0.0.tar.gz', 'releases'), {
+    series: 'worker',
+    version: '1.0.0'
+  })
+})
+
+test('release matcher supports generic placeholder layouts', (t) => {
+  const versionFirst = new ReleaseMatcher(['{version}-{series}.tar.gz'])
+  t.alike(versionFirst.match('2.4.1-api.tar.gz'), { series: 'api', version: '2.4.1' })
+
+  const underscore = new ReleaseMatcher(['{series}_{version}.tar.gz'])
+  t.alike(underscore.match('my-app_1.0.0.tar.gz'), { series: 'my-app', version: '1.0.0' })
+
+  const vPrefix = new ReleaseMatcher(['{series}-v{version}.tar.gz'])
+  t.alike(vPrefix.match('api-v2-v1.0.0.tar.gz'), { series: 'api-v2', version: '1.0.0' })
+
+  const parentLayout = new ReleaseMatcher(['{version}-{series}/bundle.tar.gz'])
+  t.alike(parentLayout.match('bundle.tar.gz', '2.4.1-api-v2'), {
+    series: 'api-v2',
+    version: '2.4.1'
+  })
 })
 
 test('source parent accepts SemVer build metadata folder names', (t) => {
