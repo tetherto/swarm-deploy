@@ -151,9 +151,9 @@ across resume attempts; when absent the derivation and wire shape are identical
 to earlier clients. The field is persisted with the resumable session, so a
 verified reconnect retains its release identity.
 
-Session records carry an on-disk version: version 2 sessions (no
-`sourceParent`) remain readable, and sessions written by this version use
-version 3 and always record the field when present. A version-2 record that
+Session records carry an on-disk version that follows the field rather than the
+writing code: a session with a `sourceParent` is written as version 3 and a
+session without one as version 2. Both are readable. A version-2 record that
 contains `sourceParent` is invalid.
 
 ### Artifact patterns
@@ -297,10 +297,22 @@ Servers must be upgraded before clients. A server that predates `sourceParent`
 decodes offers with an exact key set and rejects the new field, so a new client
 that sends it to an old server fails. A new server accepts older clients,
 version-2 sessions, and older commit records; offers without `sourceParent` can
-match only patterns without a parent segment. Sessions the new server writes use
-version 3, which a version-2-only server rejects, so in-flight uploads cannot
-resume after a rollback and uploads should be drained first. Compatibility of
-release-bearing commit records with older code is unverified.
+match only patterns without a parent segment. Only a parent-bearing session is
+written as version 3, so a rollback loses the resumability of those sessions
+alone; draining in-flight uploads first avoids it.
+
+Release identity in a commit record is durable and is never rewritten.
+Enabling patterns, or changing one an in-flight upload already matched, makes a
+retry of already-committed bytes compute a different identity, and the server
+fails closed: a create-only name is rejected with `FILE_EXISTS` and a
+replaceable name retried under the same transfer ID with a different release is
+rejected as a release-identity conflict. In-flight uploads should therefore be
+drained before patterns are enabled or changed.
+
+Commit-record compatibility is asserted only in the reading direction: a record
+without release coordinates is read by this version and is excluded from count
+and version rotation. Whether older code tolerates records this version writes
+is untested.
 
 ## Storage accounting
 

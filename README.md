@@ -611,13 +611,42 @@ A new server remains compatible with older clients: they never send
 `sourceParent`, no-pattern servers are unaffected, filename-only patterns still
 match, and patterns that need a parent reject their offers as unmatched. Older
 sessions and commit records stay readable, and older commit records are not
-count or version rotated. Resumable sessions created by the new server use
-on-disk session version 3 (the older server wrote version 2, which the new
-server still reads). An older server cannot read version 3 sessions, so those
-uploads cannot be resumed after a downgrade; drain or complete in-flight uploads
-before rolling a server back. Commit-record compatibility on older code was not
-verified. Roll out the server, then the pattern configuration, then
-clients that stage into conforming folders.
+count or version rotated.
+
+Roll out the server, then the pattern configuration, then clients that stage
+into conforming folders.
+
+#### Enabling or changing patterns
+
+A commit record's release identity is durable and is never rewritten in place.
+Enabling patterns, or editing one that an in-flight upload already matched,
+therefore changes the identity a retry computes for bytes that are already
+committed, and the server fails closed rather than relabelling them:
+
+- A create-only name whose record carries a different release (or none) is no
+  longer recognised as the same commit, so the retry is rejected with
+  `FILE_EXISTS`.
+- A replaceable name retried under the same transfer ID with a different
+  release is rejected as a release-identity conflict.
+
+Drain or complete in-flight uploads before enabling or changing
+`artifactPatterns`. Uploads started after the change are unaffected, and a
+rejected legacy retry is resolved by re-uploading under a new transfer (new
+content or a new staged name), not by editing records on disk.
+
+#### Session records and rollback
+
+A resumable session is written at on-disk version 3 only when it carries a
+`sourceParent`; a session without one is written at version 2, exactly as an
+older server would. The new server reads both. An older server cannot read
+version 3, so only parent-bearing resumable sessions are lost to a downgrade:
+they cannot resume and must be re-uploaded. Draining in-flight uploads before
+rolling a server back avoids this entirely.
+
+Commit-record compatibility with older code is covered only by what this
+version's tests assert: an older record without release coordinates is read by
+this version and is not count or version rotated. Whether older code tolerates
+the release coordinates this version writes is untested.
 
 ## Deployment hooks
 

@@ -114,6 +114,51 @@ test('TAR admission reconstructs a durable offset and rehashes its prefix on res
   )
 })
 
+test('a session without a source parent is written as v2 and resumes after restart', async (t) => {
+  const { layout, metadata, archive } = await fixture(t)
+  const parentless = { ...metadata } as typeof metadata & { sourceParent?: string }
+  delete parentless.sourceParent
+  parentless.transferId = b4a.toString(
+    computeTarTransferId(OWNER, {
+      name: parentless.name,
+      fileSize: parentless.fileSize,
+      fileSha256: b4a.from(parentless.fileSha256, 'hex'),
+      tarSize: parentless.tarSize,
+      tarSha256: b4a.from(parentless.tarSha256, 'hex')
+    }),
+    'hex'
+  )
+
+  const first = new SessionStore({
+    layout,
+    maxStagingBytes: parentless.tarSize + parentless.fileSize
+  })
+  await first.init()
+  await first.admit(OWNER, parentless)
+  await first.append(OWNER, parentless, 0, archive.subarray(0, 512))
+  await first.close()
+
+  const sessionPath = path.join(layout.sessions, `${parentless.transferId}.json`)
+  const record = JSON.parse(await fs.promises.readFile(sessionPath, 'utf8')) as Record<
+    string,
+    unknown
+  >
+  t.is(record.version, 2, 'a parentless session needs no v3 field')
+  t.is(Object.prototype.hasOwnProperty.call(record, 'sourceParent'), false)
+
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: parentless.tarSize + parentless.fileSize
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  const admission = await restarted.admit(OWNER, parentless)
+  t.is(admission.status, 'RESUME')
+  if (admission.status !== 'RESUME') throw new Error('Expected resumable TAR admission')
+  t.is(admission.offset, 512)
+  t.alike(admission.prefixSha256, sodiumSha256(archive.subarray(0, 512)))
+})
+
 test('restart restores legacy v2 sessions without a source parent and rejects it on v2', async (t) => {
   const { layout, metadata } = await fixture(t)
   const legacy = { ...metadata } as typeof metadata & { sourceParent?: string }

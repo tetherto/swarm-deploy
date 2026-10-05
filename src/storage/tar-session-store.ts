@@ -288,9 +288,15 @@ export class TarSessionStore {
     }
   }
 
+  /**
+   * Version 3 only adds `sourceParent`, so a session without one is written as
+   * version 2. An older server can then still read, and resume, every session
+   * whose record it fully understands; only parent-bearing ones are lost to a
+   * downgrade.
+   */
   private serialize(session: TarSession): PersistedTarSession {
     return {
-      version: VERSION,
+      version: session.sourceParent === undefined ? LEGACY_VERSION : VERSION,
       transferId: session.id,
       ownerKey: hex(session.ownerKey),
       name: session.name,
