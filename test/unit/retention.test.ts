@@ -775,6 +775,30 @@ test('rotation options are validated', async (t) => {
   }
 })
 
+test('replacement reclaims space in its own pre-commit pass, not the deferred one', async (t) => {
+  const harness = await createHarness(t)
+  const manager = harness.manager({ maxAge: 10, isPinned: (record) => record.name === MUTABLE })
+  await harness.publish(MUTABLE, b4a.from('old'), true)
+  const stale = await harness.publish('stale.bin', b4a.from('stale'))
+  harness.clock.advance(10)
+
+  const session = await harness.stage(MUTABLE, b4a.from('new'))
+  await harness.commits.commit(session, {
+    replaceNames: [MUTABLE],
+    retentionManager: manager,
+    // The post-commit pass is withheld, so anything reclaimed here was
+    // reclaimed by the replacement's own pre-commit pass.
+    deferPostCommitRetention: true
+  })
+
+  t.is(
+    await exists(path.join(harness.layout.root, stale.name)),
+    false,
+    'the replacement ran a pre-commit retention pass'
+  )
+  t.is(await fs.promises.readFile(path.join(harness.layout.root, MUTABLE), 'utf8'), 'new')
+})
+
 test('commit defers post-commit retention only when asked and keeps pre-commit checks', async (t) => {
   for (const defer of [false, true]) {
     const harness = await createHarness(t)
