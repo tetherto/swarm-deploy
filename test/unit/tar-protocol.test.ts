@@ -12,6 +12,7 @@ import {
   assertMetadataTransferId,
   buildTarManifest,
   computeTarTransferId,
+  deriveSourceParent,
   deterministicTarSize,
   metadataFromManifest,
   regenerateTarSuffix,
@@ -372,6 +373,66 @@ test('source parent is one bounded safe component with SemVer build metadata', (
   ]) {
     t.exception(() => encodeMetadataRecord({ ...valid, sourceParent } as MetadataRecord))
   }
+})
+
+test('unsafe local source parents are omitted and keep the legacy authenticated transfer ID', async (t) => {
+  const dir = await createTempDir(t)
+  for (const parent of ['My Releases', '.hidden', 'x'.repeat(101), 'bad@parent']) {
+    const parentDir = path.join(dir, parent)
+    await fs.promises.mkdir(parentDir)
+    const file = path.join(parentDir, 'api.tar.gz')
+    await fs.promises.writeFile(file, b4a.from('payload'))
+
+    const manifest = await buildTarManifest(file, CLIENT_KEY)
+    t.is(manifest.sourceParent, undefined, `${parent.slice(0, 12)} omitted from manifest`)
+    const metadata = metadataFromManifest(manifest)
+    t.is(Object.prototype.hasOwnProperty.call(metadata, 'sourceParent'), false, 'no wire key')
+    t.alike(decodeMetadataRecord(encodeMetadataRecord(metadata)), metadata)
+    assertMetadataTransferId(CLIENT_KEY, metadata)
+    t.is(
+      metadata.transferId,
+      b4a.toString(
+        computeTarTransferId(CLIENT_KEY, {
+          name: metadata.name,
+          fileSize: metadata.fileSize,
+          fileSha256: b4a.from(metadata.fileSha256, 'hex'),
+          tarSize: metadata.tarSize,
+          tarSha256: b4a.from(metadata.tarSha256, 'hex')
+        }),
+        'hex'
+      ),
+      'legacy-style transfer ID'
+    )
+  }
+})
+
+test('source parent derivation omits unsafe or absent immediate parents', (t) => {
+  t.is(deriveSourceParent('/'), undefined)
+  t.is(deriveSourceParent('/api.tar.gz'), undefined)
+  t.is(deriveSourceParent('/releases/My Releases/api.tar.gz'), undefined)
+  t.is(deriveSourceParent('/releases/.hidden/api.tar.gz'), undefined)
+  t.is(deriveSourceParent(`/releases/${'x'.repeat(101)}/api.tar.gz`), undefined)
+  t.is(deriveSourceParent(`/releases/${'x'.repeat(100)}/api.tar.gz`), 'x'.repeat(100))
+  t.is(deriveSourceParent('/releases/2.4.1+build.5/api.tar.gz'), '2.4.1+build.5')
+  t.is(deriveSourceParent('/releases/old/../2.4.1/api.tar.gz'), '2.4.1')
+})
+
+test('explicit wire metadata with an unsafe source parent is rejected by strict decoding', (t) => {
+  const valid = metadataForTar(b4a.alloc(deterministicTarSize(7)))
+  for (const sourceParent of ['My Releases', '.hidden', '', '..', 'a/b', 'x'.repeat(101)]) {
+    t.exception(
+      () => decodeMetadataRecord(b4a.from(JSON.stringify({ ...valid, sourceParent }))),
+      { code: ERRORS.INVALID_FILENAME },
+      `rejects ${JSON.stringify(sourceParent.slice(0, 12))}`
+    )
+  }
+  t.exception(
+    () =>
+      decodeMetadataRecord(
+        b4a.from(JSON.stringify({ ...valid, sourceParent: undefined, extra: 1 }))
+      ),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
 })
 
 test('control decoders reject unknown fields, versions, types, hex, and bounds', (t) => {

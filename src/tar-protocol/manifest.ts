@@ -50,7 +50,7 @@ export interface TarSourceIdentity {
 export interface TarManifest {
   path: string
   name: string
-  sourceParent: string
+  sourceParent?: string
   fileSize: number
   fileSha256: Buffer
   tarSize: number
@@ -91,9 +91,18 @@ function canonicalName(filePath: string): string {
   return name
 }
 
-function canonicalSourceParent(filePath: string): string {
+/**
+ * The immediate parent directory name, only when it is a valid wire component.
+ * Unsafe or absent parents (spaces, dotfiles, filesystem root, overlong) are
+ * omitted so the upload keeps the legacy authenticated identity.
+ */
+export function deriveSourceParent(filePath: string): string | undefined {
   const sourceParent = path.basename(path.dirname(path.resolve(filePath)))
-  assertSourceParent(sourceParent)
+  try {
+    assertSourceParent(sourceParent)
+  } catch {
+    return undefined
+  }
   return sourceParent
 }
 
@@ -247,7 +256,7 @@ export async function buildTarManifest(
 ): Promise<TarManifest> {
   assertClientKey(clientPublicKey)
   const name = canonicalName(filePath)
-  const sourceParent = canonicalSourceParent(filePath)
+  const sourceParent = deriveSourceParent(filePath)
   const opened = await openStableSource(filePath, null, signal)
   assertSafeSize(opened.source.size)
   const fileHash = new SodiumSha256()
@@ -275,7 +284,7 @@ export async function buildTarManifest(
   const tarSha256 = tarHash.digest()
   const transferId = computeTarTransferId(clientPublicKey, {
     name,
-    sourceParent,
+    ...(sourceParent === undefined ? {} : { sourceParent }),
     fileSize: opened.source.size,
     fileSha256,
     tarSize,
@@ -284,7 +293,7 @@ export async function buildTarManifest(
   return {
     path: filePath,
     name,
-    sourceParent,
+    ...(sourceParent === undefined ? {} : { sourceParent }),
     fileSize: opened.source.size,
     fileSha256,
     tarSize,
@@ -382,7 +391,7 @@ export function metadataFromManifest(manifest: TarManifest, reset = false): Meta
   return {
     v: CONTROL_VERSION,
     name: manifest.name,
-    sourceParent: manifest.sourceParent,
+    ...(manifest.sourceParent === undefined ? {} : { sourceParent: manifest.sourceParent }),
     fileSize: manifest.fileSize,
     fileSha256: b4a.toString(manifest.fileSha256, 'hex'),
     tarSize: manifest.tarSize,

@@ -10,7 +10,12 @@ import { historyName } from '../../dist/files.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
-import type { CommitRecord } from '../../dist/storage/commit-journal.js'
+import {
+  readCommitJournal,
+  serializeJournal,
+  type AnyCommitJournal,
+  type CommitRecord
+} from '../../dist/storage/commit-journal.js'
 import { prepareStorageRecovery, recoverStorage } from '../../dist/storage/recovery.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import {
@@ -386,6 +391,250 @@ test('commit snapshots and validates release coordinates before publication', as
   const committed = commitRelease(harness.commits, session, { release: mutable })
   mutable.series = 'changed'
   t.alike((await committed).release, RELEASE)
+})
+
+function snapshot(...paths: string[]): Promise<Buffer[]> {
+  return Promise.all(paths.map((filePath) => fs.promises.readFile(filePath)))
+}
+
+test('same transfer and content cannot add, remove, or change release identity', async (t) => {
+  const changed = { series: 'api', version: '9.9.9' }
+  const variants = [
+    { label: 'added', first: undefined, next: RELEASE },
+    { label: 'removed', first: RELEASE, next: undefined },
+    { label: 'changed', first: RELEASE, next: changed }
+  ] as const
+  for (const { label, first, next } of variants) {
+    const harness = await createHarness(t)
+    const committed = await harness.publish(NEW_BYTES, MUTABLE, first, RELEASE.version)
+    const sidecar = path.join(harness.layout.commits, `${committed.transferId}.json`)
+    const final = path.join(harness.layout.root, MUTABLE)
+    const before = await snapshot(sidecar, final)
+
+    const again = await harness.stage(NEW_BYTES, MUTABLE, RELEASE.version)
+    t.is(again.id, committed.transferId, `${label} same transfer`)
+    await t.exception(
+      commitRelease(harness.commits, again, { replaceNames: [MUTABLE], release: next }),
+      { code: ERRORS.PROTOCOL_INVALID, message: /release identity/i },
+      `${label} mutable conflict`
+    )
+    await t.exception(
+      commitRelease(harness.commits, again, { release: next }),
+      { code: ERRORS.FILE_EXISTS },
+      `${label} create-only conflict`
+    )
+    t.alike(await snapshot(sidecar, final), before, `${label} unchanged`)
+    t.alike((await readRecord(sidecar)).release, first, `${label} identity preserved`)
+    t.is(await exists(path.join(harness.layout.root, historyName(committed.transferId))), false)
+    t.is((await harness.commits.list()).length, 1, `${label} one managed record`)
+
+    const idempotent = await commitRelease(harness.commits, again, {
+      replaceNames: [MUTABLE],
+      release: first
+    })
+    t.alike(idempotent, committed, `${label} identical identity stays idempotent`)
+  }
+})
+
+test('returning A-B-A content with different release identity conflicts instead of deduping', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish(OLD_BYTES, MUTABLE, OLD_RELEASE, OLD_RELEASE.version)
+  await harness.publish(NEW_BYTES, MUTABLE, RELEASE, RELEASE.version)
+  const historyPath = path.join(harness.layout.root, historyName(first.transferId))
+  const sidecar = path.join(harness.layout.commits, `${first.transferId}.json`)
+  const before = await snapshot(sidecar, historyPath)
+
+  const returning = await harness.stage(OLD_BYTES, MUTABLE, OLD_RELEASE.version)
+  await t.exception(
+    commitRelease(harness.commits, returning, {
+      replaceNames: [MUTABLE],
+      release: { series: 'api', version: '9.9.9' }
+    }),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  t.alike(await snapshot(sidecar, historyPath), before)
+  t.alike((await readRecord(sidecar)).release, OLD_RELEASE)
+})
+
+interface CreateCrash {
+  harness: Harness
+  session: TarSession
+  id: string
+  final: string
+  journal: string
+  record: string
+  staging: string
+}
+
+async function crashCreate(
+  t: Assert,
+  boundary: CreateBoundary,
+  release: ReleaseCoordinates | null = RELEASE
+): Promise<CreateCrash> {
+  let armed = false
+  let crashed = false
+  let final = ''
+  let journal = ''
+  let record = ''
+  const storage = createStorage({
+    beforeOperation(name) {
+      if (crashed && MUTATIONS.has(name)) throw new Error('process stopped at crash boundary')
+    },
+    afterOperation(name, source, destination) {
+      if (!armed || crashed) return
+      const hit =
+        (boundary === 'journal-durable' && name === 'sync' && source === path.dirname(journal)) ||
+        (boundary === 'final-linked' && name === 'link' && destination === final) ||
+        (boundary === 'sidecar-renamed' && name === 'rename' && destination === record)
+      if (!hit) return
+      crashed = true
+      throw new Error(`crash at ${boundary}`)
+    }
+  })
+  const harness = await createHarness(t, storage)
+  const session = await harness.stage(b4a.from(`create ${boundary}`), `${boundary}.bin`, '2.4.1')
+  final = path.join(harness.layout.root, session.name)
+  journal = path.join(harness.layout.journals, `${session.id}.json`)
+  record = path.join(harness.layout.commits, `${session.id}.json`)
+  const staging = path.join(harness.layout.staging, `${session.id}.part`)
+  armed = true
+  await commitRelease(harness.commits, session, { release }).then(
+    () => undefined,
+    () => undefined
+  )
+  t.ok(crashed, `${boundary} reached`)
+  return { harness, session, id: session.id, final, journal, record, staging }
+}
+
+async function recoverCreate(crash: CreateCrash) {
+  await crash.harness.sessions.close()
+  const sessions = await restart(crash.harness.layout)
+  const commits = new CommitStore({ layout: crash.harness.layout })
+  return {
+    sessions,
+    commits,
+    recover: () =>
+      recoverStorage({
+        layout: crash.harness.layout,
+        sessionStore: sessions,
+        commitStore: commits,
+        logger: { warn() {} }
+      })
+  }
+}
+
+test('create-path journal recovery preserves release coordinates through real serialization', async (t) => {
+  for (const boundary of ['journal-durable', 'final-linked', 'sidecar-renamed'] as const) {
+    const crash = await crashCreate(t, boundary)
+    const raw = JSON.parse(await fs.promises.readFile(crash.journal, 'utf8'))
+    t.alike(raw.record.release, RELEASE, `${boundary} durable journal release`)
+    const parsed = await readCommitJournal(crash.id, crash.harness.layout, createStorage())
+    t.alike(parsed?.record.release, RELEASE, `${boundary} parsed journal release`)
+    t.alike(serializeJournal(parsed as AnyCommitJournal), raw, `${boundary} serialize round trip`)
+
+    const { sessions, commits, recover } = await recoverCreate(crash)
+    const results = await recover()
+    t.is(results.length, 1)
+    t.alike(results[0].record?.release, RELEASE, `${boundary} recovery result release`)
+    if (boundary === 'journal-durable') {
+      t.is(results[0].status, 'RESUMABLE')
+      const retried = await commits.commit(await sessions.readVerified(crash.session.transferId), {
+        release: RELEASE
+      })
+      t.alike(retried.release, RELEASE, `${boundary} retry release`)
+    } else {
+      t.is(results[0].status, 'COMMITTED', boundary)
+    }
+    t.alike((await readRecord(crash.record)).release, RELEASE, `${boundary} sidecar release`)
+    t.alike(
+      (await commits.list()).map((record) => record.release),
+      [RELEASE],
+      `${boundary} listed release`
+    )
+    await sessions.close()
+  }
+})
+
+test('create-path crash without release recovers without inventing release identity', async (t) => {
+  const crash = await crashCreate(t, 'final-linked', null)
+  const { sessions, commits, recover } = await recoverCreate(crash)
+  t.is((await recover())[0].status, 'COMMITTED')
+  const stored = await readRecord(crash.record)
+  t.is(Object.prototype.hasOwnProperty.call(stored, 'release'), false)
+  t.is((await commits.list())[0].release, undefined)
+  await sessions.close()
+})
+
+test('retry with different release never mutates a pending create journal', async (t) => {
+  const crash = await crashCreate(t, 'journal-durable')
+  const before = await fs.promises.readFile(crash.journal)
+  const { sessions, commits } = await recoverCreate(crash)
+  const session = await sessions.readVerified(crash.session.transferId)
+  for (const release of [{ series: 'api', version: '9.9.9' }, { series: 'api' }, null]) {
+    await t.exception(commits.commit(session, { release }), { code: ERRORS.PROTOCOL_INVALID })
+    t.alike(await fs.promises.readFile(crash.journal), before, 'journal bytes unchanged')
+  }
+  await sessions.close()
+})
+
+test('recovery conflicts when a sidecar release differs from the create journal', async (t) => {
+  const tampered = [
+    {
+      label: 'changed',
+      apply: (record: CommitRecord) => ({ ...record, release: { series: 'api', version: '9.9.9' } })
+    },
+    {
+      label: 'removed',
+      apply: (record: CommitRecord) => {
+        const { release: _release, ...rest } = record
+        return rest
+      }
+    }
+  ]
+  for (const { label, apply } of tampered) {
+    const crash = await crashCreate(t, 'sidecar-renamed')
+    const original = await readRecord(crash.record)
+    await fs.promises.writeFile(crash.record, JSON.stringify(apply(original)))
+    const { sessions, recover } = await recoverCreate(crash)
+    await t.exception(recover(), { code: ERRORS.PROTOCOL_INVALID }, `${label} sidecar conflict`)
+    t.is(await exists(crash.journal), true, `${label} journal retained`)
+    t.alike(
+      (await readRecord(crash.record)).release,
+      (apply(original) as CommitRecord).release,
+      `${label} sidecar not rewritten`
+    )
+    await sessions.close()
+  }
+})
+
+test('recovered committed create-path release cannot be changed by a later same-transfer retry', async (t) => {
+  const crash = await crashCreate(t, 'sidecar-renamed')
+  const { sessions, commits, recover } = await recoverCreate(crash)
+  t.is((await recover())[0].status, 'COMMITTED')
+  const before = await fs.promises.readFile(crash.record)
+  const input = await tarInput(
+    t,
+    b4a.from('create sidecar-renamed'),
+    'sidecar-renamed.bin',
+    '2.4.1'
+  )
+  await sessions.admit(OWNER, input.metadata)
+  await sessions.append(OWNER, input.metadata, 0, input.archive)
+  const again = await sessions.verify(OWNER, input.metadata)
+  t.is(again.id, crash.id)
+  await t.exception(
+    commitRelease(commits, again, { release: { series: 'api', version: '9.9.9' } }),
+    { code: ERRORS.FILE_EXISTS }
+  )
+  await t.exception(
+    commitRelease(commits, again, {
+      replaceNames: ['sidecar-renamed.bin'],
+      release: { series: 'api', version: '9.9.9' }
+    }),
+    { code: ERRORS.PROTOCOL_INVALID, message: /release identity/i }
+  )
+  t.alike(await fs.promises.readFile(crash.record), before, 'sidecar unchanged')
+  await sessions.close()
 })
 
 test('replacement recovery rejects changed staging provenance without publishing attacker bytes', async (t) => {

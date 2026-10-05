@@ -1038,10 +1038,12 @@ class CommitStore {
     if (!current || !identitiesEqual(current.identity, fileIdentity(state.stat))) {
       throw existsError('Destination already exists')
     }
-    if (
-      sameContent(current.record, record) &&
-      releasesEqual(current.record.release, record.release)
-    ) {
+    const sameRelease = releasesEqual(current.record.release, record.release)
+    if (current.record.transferId === record.transferId && !sameRelease) {
+      // One transfer ID names one authenticated upload; its release identity is immutable.
+      throw storageError('Release identity conflicts with the committed transfer')
+    }
+    if (sameContent(current.record, record) && sameRelease) {
       return { mode: 'idempotent', record: current.record }
     }
     return { mode: 'replace', oldRecord: current.record, finalIdentity: current.identity }
