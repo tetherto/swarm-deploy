@@ -19,6 +19,14 @@ export {
   keyPairFromSeed,
   publicKeyFromSeed
 } from './identity.js'
+export type {
+  AfterCommitContext,
+  BeforeCommitContext,
+  HookArtifact,
+  HookFailureContext,
+  HookFailurePhase,
+  ServerHooks
+} from './hooks.js'
 export { parseAllowlist } from './allowlist.js'
 export type { SkippedUploadReason } from './files.js'
 export {

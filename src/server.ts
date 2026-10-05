@@ -1,8 +1,9 @@
 import b4a from 'b4a'
 import events from '#events'
 import fs from '#fs'
+import path from '#path'
 import sodium from 'sodium-native'
-import { createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
+import { abortError, createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
 import {
   DirectDhtServer,
   type DirectDhtFactory,
@@ -11,6 +12,17 @@ import {
 } from './direct-dht.js'
 import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
 import { validateReplaceNames } from './files.js'
+import {
+  hookError,
+  invokeHook,
+  snapshotHooks,
+  type AfterCommitContext,
+  type BeforeCommitContext,
+  type HookArtifact,
+  type HookFailureContext,
+  type HookFailurePhase,
+  type ServerHooks
+} from './hooks.js'
 import { keyPairFromSeed } from './identity.js'
 import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
@@ -22,6 +34,7 @@ import {
   DEFAULT_RESUME_TTL
 } from './storage/retention.js'
 import { SessionStore } from './storage/session-store.js'
+import type { TarSession } from './storage/tar-session-store.js'
 import type { StorageAdapter, StorageLayout } from './storage/types.js'
 import {
   decodeDirectMetadata,
@@ -80,6 +93,8 @@ export interface ServerOptions {
   scheduler?: ServerScheduler
   logger?: Logger | null
   replaceNames?: Iterable<string>
+  /** Optional deployment lifecycle callbacks; snapshotted at construction. */
+  hooks?: ServerHooks | null
 }
 
 export interface ServerConnectionEvent extends FingerprintEvent {
@@ -224,6 +239,7 @@ export class Server extends EventEmitter {
   readonly storage: StorageAdapter
   readonly scheduler: ServerScheduler
   readonly replaceNames: ReadonlySet<string>
+  readonly hooks: Readonly<ServerHooks>
   listening = false
   closed = false
   private readonly keyPair
@@ -338,6 +354,7 @@ export class Server extends EventEmitter {
     this.storage = options.storage || fs.promises
     this.scheduler = options.scheduler || { setTimeout, clearTimeout, setInterval, clearInterval }
     this.replaceNames = validateReplaceNames(options.replaceNames)
+    this.hooks = snapshotHooks(options.hooks)
     this.logger = safeLogger(options.logger)
     this.signal = this.abort.signal
   }
@@ -382,6 +399,70 @@ export class Server extends EventEmitter {
     })
   }
 
+  private hookArtifact(
+    metadata: {
+      name: string
+      fileSize: number
+      fileSha256: string
+      transferId: string
+      sourceParent?: string
+    },
+    release: ReleaseCoordinates | null
+  ): HookArtifact {
+    return Object.freeze({
+      name: metadata.name,
+      size: metadata.fileSize,
+      sha256: metadata.fileSha256,
+      transferId: metadata.transferId,
+      ...(metadata.sourceParent === undefined ? {} : { sourceParent: metadata.sourceParent }),
+      ...(release === null
+        ? {}
+        : {
+            release: Object.freeze({
+              series: release.series,
+              ...(release.version === undefined ? {} : { version: release.version })
+            })
+          })
+    })
+  }
+
+  /** Runs a gating callback; only callback exceptions become HOOK_FAILED. */
+  private async runHook<Context>(
+    phase: 'beforeCommit' | 'afterCommit',
+    hook: ((context: Context) => void | Promise<void>) | undefined,
+    context: Context
+  ): Promise<void> {
+    if (hook === undefined) return
+    throwIfAborted(this.signal)
+    let outcome: 'completed' | 'aborted'
+    try {
+      outcome = await invokeHook(hook, context, this.signal)
+    } catch (cause) {
+      throw hookError(phase, cause)
+    }
+    if (outcome === 'aborted') throw abortError()
+  }
+
+  /** Runs onFailure once; its own failure is logged and never replaces the original. */
+  private async runFailureHook(
+    context: HookFailureContext,
+    owner: Uint8Array | null,
+    transfer: string
+  ): Promise<void> {
+    const hook = this.hooks.onFailure
+    if (hook === undefined) return
+    try {
+      await invokeHook(hook, context, this.signal)
+    } catch {
+      this.logger.warn('Failure hook failed', {
+        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        transfer,
+        phase: context.phase,
+        reason: ERRORS.HOOK_FAILED
+      })
+    }
+  }
+
   private async receive(socket: DirectDhtSocket): Promise<void> {
     const owner = socket.remotePublicKey
     if (this.closed || !this.allowed(owner) || !this.sessions || !this.commits) {
@@ -419,6 +500,13 @@ export class Server extends EventEmitter {
     let verificationSucceeded = false
     let commitStarted = false
     let commitSucceeded = false
+    let artifact: HookArtifact | null = null
+    let phase: HookFailurePhase = 'offer'
+    let hookPath: string | null = null
+    let resumed = false
+    let alreadyCommitted = false
+    let hooksFinished = false
+    let finalStarted = false
     try {
       const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
       assertMetadataTransferId(owner, metadata)
@@ -431,6 +519,56 @@ export class Server extends EventEmitter {
           sentAdmission = true
           return
         }
+      }
+      const hookArtifact = this.hookArtifact(metadata, release)
+      artifact = hookArtifact
+      const finish = async (verified: TarSession): Promise<void> => {
+        phase = 'beforeCommit'
+        hookPath = verified.tarPath
+        await this.runHook<BeforeCommitContext>(
+          'beforeCommit',
+          this.hooks.beforeCommit,
+          Object.freeze({
+            artifact: hookArtifact,
+            path: verified.tarPath,
+            resumed,
+            alreadyCommitted: false as const
+          })
+        )
+        phase = 'commit'
+        commitStarted = true
+        await this.commits!.commit(verified, {
+          retentionManager: this.retention,
+          signal: this.signal,
+          replaceNames: this.replaceNames,
+          release
+        })
+        this.emitSafe('commit', {
+          ...event,
+          fingerprint: fingerprint(owner),
+          status: 'succeeded'
+        })
+        commitSucceeded = true
+        hookPath = path.join(this.layout!.root, metadata.name)
+        await this.retireQuietly(verified.transferId, owner)
+        phase = 'afterCommit'
+        await this.runHook<AfterCommitContext>(
+          'afterCommit',
+          this.hooks.afterCommit,
+          Object.freeze({
+            artifact: hookArtifact,
+            path: hookPath,
+            resumed,
+            alreadyCommitted: false
+          })
+        )
+        hooksFinished = true
+        finalStarted = true
+        await writeFinal(
+          socket,
+          { v: 1, status: 'COMMITTED' },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
       }
       if (
         metadata.fileSize > this.maxFileBytes ||
@@ -454,6 +592,20 @@ export class Server extends EventEmitter {
         { replaceNames: this.replaceNames }
       )
       if (inspected.status === 'ALREADY_COMMITTED') {
+        alreadyCommitted = true
+        hookPath = path.join(this.layout!.root, metadata.name)
+        phase = 'afterCommit'
+        await this.runHook<AfterCommitContext>(
+          'afterCommit',
+          this.hooks.afterCommit,
+          Object.freeze({
+            artifact: hookArtifact,
+            path: hookPath,
+            resumed: false,
+            alreadyCommitted: true
+          })
+        )
+        hooksFinished = true
         await writeAdmission(
           socket,
           { v: 1, status: 'ALREADY_COMMITTED' },
@@ -478,6 +630,7 @@ export class Server extends EventEmitter {
       this.activeUploads.add(socket)
       const admission = await this.sessions.admit(owner, metadata)
       current.transfer = metadata.transferId
+      resumed = admission.status !== 'ACCEPT'
       if (admission.status === 'VERIFIED') {
         await writeAdmission(
           socket,
@@ -485,6 +638,7 @@ export class Server extends EventEmitter {
           { signal: this.signal, timeout: this.idleTimeout }
         )
         sentAdmission = true
+        phase = 'verification'
         this.emitSafe('verification', {
           ...event,
           fingerprint: fingerprint(owner),
@@ -498,25 +652,7 @@ export class Server extends EventEmitter {
           status: 'succeeded'
         })
         verificationSucceeded = true
-        commitStarted = true
-        await this.commits.commit(verified, {
-          retentionManager: this.retention,
-          signal: this.signal,
-          replaceNames: this.replaceNames,
-          release
-        })
-        this.emitSafe('commit', {
-          ...event,
-          fingerprint: fingerprint(owner),
-          status: 'succeeded'
-        })
-        commitSucceeded = true
-        await this.retireQuietly(b4a.from(metadata.transferId, 'hex'), owner)
-        await writeFinal(
-          socket,
-          { v: 1, status: 'COMMITTED' },
-          { signal: this.signal, timeout: this.idleTimeout }
-        )
+        await finish(verified)
         return
       }
       await writeAdmission(
@@ -532,6 +668,8 @@ export class Server extends EventEmitter {
         { signal: this.signal, timeout: this.idleTimeout }
       )
       sentAdmission = true
+      phase = 'transfer'
+      hookPath = path.join(this.layout!.staging, `${metadata.transferId}.tar.part`)
       this.emitSafe('offer', {
         ...event,
         fingerprint: fingerprint(owner),
@@ -576,6 +714,7 @@ export class Server extends EventEmitter {
       )
       await flush()
       await reader.requireEnd(this.signal, this.idleTimeout)
+      phase = 'verification'
       this.emitSafe('verification', {
         ...event,
         fingerprint: fingerprint(owner),
@@ -589,25 +728,7 @@ export class Server extends EventEmitter {
         status: 'succeeded'
       })
       verificationSucceeded = true
-      commitStarted = true
-      await this.commits.commit(verified, {
-        retentionManager: this.retention,
-        signal: this.signal,
-        replaceNames: this.replaceNames,
-        release
-      })
-      this.emitSafe('commit', {
-        ...event,
-        fingerprint: fingerprint(owner),
-        status: 'succeeded'
-      })
-      commitSucceeded = true
-      await this.retireQuietly(verified.transferId, owner)
-      await writeFinal(
-        socket,
-        { v: 1, status: 'COMMITTED' },
-        { signal: this.signal, timeout: this.idleTimeout }
-      )
+      await finish(verified)
     } catch (error) {
       const reason = codeOf(error)
       this.logger.warn('Direct upload failed', {
@@ -638,7 +759,7 @@ export class Server extends EventEmitter {
             { v: 1, status: 'REJECTED', code: reason },
             { timeout: this.idleTimeout }
           )
-        } else if (!commitSucceeded) {
+        } else if (!finalStarted) {
           await writeFinal(
             socket,
             { v: 1, status: 'FAILED', code: reason },
@@ -649,6 +770,21 @@ export class Server extends EventEmitter {
       try {
         socket.destroy()
       } catch {}
+      this.activeUploads.delete(socket)
+      if (event && artifact && !hooksFinished) {
+        await this.runFailureHook(
+          Object.freeze({
+            artifact,
+            path: hookPath,
+            phase,
+            resumed,
+            alreadyCommitted,
+            error
+          }),
+          owner,
+          event.transfer
+        )
+      }
     } finally {
       this.activeUploads.delete(socket)
       reader.closeReader()
