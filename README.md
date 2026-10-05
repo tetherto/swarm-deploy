@@ -496,10 +496,32 @@ occupies a slot or falls outside a keep set, the limit is best-effort: the
 series can hold more than the configured number until a later upload moves the
 name on.
 
-**Immediate effect.** Rotation also runs right after each commit. An upload that
-is older than the retained window (for example version `1.0.0` when `maxVersions`
-is `2` and `3.x` and `2.x` exist) is committed and may be removed in that same
-run, before `afterCommit` receives its path. Hooks must tolerate a missing file.
+**Immediate effect.** Rotation also runs right after each commit, so an upload
+that is older than the retained window (for example version `1.0.0` when
+`maxVersions` is `2` and `3.x` and `2.x` exist) is committed and then removed in
+that same pass. The exact ordering depends on hooks:
+
+- Without an `afterCommit` hook, the post-commit pass runs immediately after the
+  commit becomes durable, before `COMMITTED` is sent.
+- With an `afterCommit` hook, the post-commit pass is deferred. Order:
+  commit (the pre-commit quota and age checks still run first), `afterCommit`
+  with the final path and sidecar present, and only after the callback
+  succeeds the post-commit pass, then `COMMITTED` (or `ALREADY_COMMITTED`).
+  The path is therefore always readable inside `afterCommit`, even for an
+  out-of-window release. This holds for fresh, resumed, `VERIFIED`, and
+  replacement commits (a replaced artifact's history record is also still
+  present). `beforeCommit`-only and `onFailure`-only servers do not defer.
+- If `afterCommit` throws, no post-commit pass runs. The artifact and its record
+  stay, so an immediate retry is `ALREADY_COMMITTED`, runs `afterCommit` again
+  with the existing path, and runs the pass only after that call succeeds. A
+  failing already-committed `afterCommit` likewise skips the pass.
+- Post-commit retention failures stay non-fatal: they are logged and reported as
+  `retention` events, and never fail the upload.
+
+**Restart caveat.** There is no persistent "hook pending" marker. If
+`afterCommit` failed for an out-of-window artifact, a startup, scheduled, or
+manual retention pass that runs before the client retries can remove it. The
+retry is then a normal fresh upload instead of `ALREADY_COMMITTED`.
 
 `retention` events and results report `ageDeleted`, `countDeleted`,
 `versionDeleted`, and `storageDeleted` next to `expiredSessions` and `scrubbed`.
@@ -577,7 +599,8 @@ seeds, secret keys, TAR bytes, or session material.
   any commit mutation. Its failure aborts the commit.
 - `afterCommit(context)`: after the artifact is durably committed, before the
   terminal success reply. Its failure fails the upload even though the artifact
-  is already stored.
+  is already stored. When it is configured, post-commit rotation is deferred
+  until it succeeds (see "Immediate effect" above).
 - `onFailure(context)`: once per failed connection whose metadata was decoded,
   after the client has been answered.
 

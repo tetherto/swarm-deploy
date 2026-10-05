@@ -1474,3 +1474,304 @@ test('Server close aborts a hung onFailure hook without losing the original fail
   t.is(finalCode(socket), code, 'client response is unchanged by close')
   t.is(calls.length, 1, 'onFailure ran once')
 })
+
+async function readableNow(file: string): Promise<string> {
+  try {
+    return b4a.toString(await fs.promises.readFile(file))
+  } catch (error) {
+    return `unreadable:${code(error)}`
+  }
+}
+
+async function historyFiles(directory: string): Promise<string[]> {
+  return (await fs.promises.readdir(directory)).filter((name) => name.startsWith('history-'))
+}
+
+type RotationFixture = {
+  server: Server
+  node: FakeServerNode
+  log: string[]
+  commitOptions: Array<{ deferPostCommitRetention?: boolean } | undefined>
+}
+
+async function rotationFixture(
+  t: Assert,
+  hooks: ServerHooks,
+  extra: Partial<ConstructorParameters<typeof Server>[0]> = {}
+): Promise<RotationFixture> {
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    hooks,
+    ...extra
+  })
+  const log: string[] = []
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') log.push(`retention:${event.status}`)
+  })
+  const commits = (server as unknown as { commits: CommitStore }).commits
+  const commitOptions: RotationFixture['commitOptions'] = []
+  const commit = commits.commit.bind(commits)
+  commits.commit = (...args: Parameters<CommitStore['commit']>) => {
+    commitOptions.push(args[1])
+    return commit(...args)
+  }
+  return { server, node, log, commitOptions }
+}
+
+test('Server keeps a rotated-out create path readable in afterCommit and rotates only after it succeeds', async (t) => {
+  const inside: string[] = []
+  const fixture = await rotationFixture(t, {
+    async afterCommit({ path: finalPath }) {
+      inside.push(await readableNow(finalPath))
+    }
+  })
+  const newer = await manifest(t, 'app-2.0.0.bin', 'newer release')
+  const older = await manifest(t, 'app-1.0.0.bin', 'older release')
+
+  await uploadAll(fixture.node, newer)
+  inside.length = 0
+  fixture.log.length = 0
+  const socket = await uploadAll(fixture.node, older)
+
+  t.is(statuses(socket).at(-1), 'COMMITTED')
+  t.alike(inside, ['older release'], 'the out-of-window final path exists inside afterCommit')
+  t.alike(
+    fixture.commitOptions.map((options) => options?.deferPostCommitRetention),
+    [true, true]
+  )
+  await t.exception(
+    () => fs.promises.lstat(path.join(fixture.server.storageDir, 'app-1.0.0.bin')),
+    { code: 'ENOENT' },
+    'rotation removes it only after the callback succeeded'
+  )
+  t.ok(
+    (await fs.promises.lstat(path.join(fixture.server.storageDir, 'app-2.0.0.bin'))).isFile(),
+    'the retained window is intact'
+  )
+  t.alike(fixture.log, ['retention:completed'])
+})
+
+test('Server orders afterCommit before post-commit retention', async (t) => {
+  const order: string[] = []
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    hooks: {
+      afterCommit({ artifact }) {
+        order.push(`afterCommit:${artifact.name}`)
+      }
+    }
+  })
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') order.push('retention')
+  })
+  await uploadAll(node, await manifest(t, 'app-2.0.0.bin', 'newer release'))
+  order.length = 0
+  await uploadAll(node, await manifest(t, 'app-1.0.0.bin', 'older release'))
+  t.alike(order, ['afterCommit:app-1.0.0.bin', 'retention'])
+})
+
+test('Server keeps a failed-afterCommit create artifact so a retry reaches ALREADY_COMMITTED before rotating', async (t) => {
+  let failures = 1
+  const inside: string[] = []
+  const order: string[] = []
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    hooks: {
+      async afterCommit({ path: finalPath, alreadyCommitted }) {
+        order.push(`afterCommit:${alreadyCommitted}`)
+        inside.push(await readableNow(finalPath))
+        if (failures-- > 0) throw new Error('deploy step failed')
+      }
+    }
+  })
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') order.push('retention')
+  })
+  const commits = (server as unknown as { commits: CommitStore }).commits
+  await uploadAll(node, await manifest(t, 'app-2.0.0.bin', 'newer release'))
+  order.length = 0
+  inside.length = 0
+  failures = 1
+  const older = await manifest(t, 'app-1.0.0.bin', 'older release')
+  const target = path.join(server.storageDir, 'app-1.0.0.bin')
+
+  const first = await uploadAll(node, older)
+  t.is(finalCode(first), ERRORS.HOOK_FAILED)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.alike(order, ['afterCommit:false'], 'no retention after a failed callback')
+  t.is(await readableNow(target), 'older release', 'the artifact stays')
+  t.ok(
+    (await commits.list()).some((record) => record.name === 'app-1.0.0.bin'),
+    'the record stays'
+  )
+
+  const retry = reconnect(node, older)
+  await waitFor(() => isTerminal(retry))
+  t.alike(statuses(retry), ['ALREADY_COMMITTED'])
+  t.alike(inside, ['older release', 'older release'], 'the retry sees the existing path')
+  t.alike(order, ['afterCommit:false', 'afterCommit:true', 'retention'])
+  await t.exception(() => fs.promises.lstat(target), { code: 'ENOENT' })
+})
+
+test('Server does not rotate after a failing already-committed afterCommit retry', async (t) => {
+  let failures = 2
+  const order: string[] = []
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    hooks: {
+      afterCommit({ alreadyCommitted }) {
+        order.push(`afterCommit:${alreadyCommitted}`)
+        if (failures-- > 0) throw new Error('still failing')
+      }
+    }
+  })
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') order.push('retention')
+  })
+  failures = 0
+  await uploadAll(node, await manifest(t, 'app-2.0.0.bin', 'newer release'))
+  order.length = 0
+  failures = 2
+  const older = await manifest(t, 'app-1.0.0.bin', 'older release')
+  const target = path.join(server.storageDir, 'app-1.0.0.bin')
+
+  await uploadAll(node, older)
+  const retry = reconnect(node, older)
+  await waitFor(() => isTerminal(retry))
+  t.alike(statuses(retry), ['REJECTED'])
+  t.is(finalCode(retry), ERRORS.HOOK_FAILED)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.alike(order, ['afterCommit:false', 'afterCommit:true'], 'no retention after either failure')
+  t.is(await readableNow(target), 'older release')
+
+  const last = reconnect(node, older)
+  await waitFor(() => isTerminal(last))
+  t.alike(statuses(last), ['ALREADY_COMMITTED'])
+  t.alike(order.slice(2), ['afterCommit:true', 'retention'])
+  await t.exception(() => fs.promises.lstat(target), { code: 'ENOENT' })
+})
+
+test('Server defers replacement retention until afterCommit succeeds and keeps it after a failure', async (t) => {
+  let failures = 0
+  const inside: string[][] = []
+  const order: string[] = []
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    replaceNames: ['app-1.0.0.bin'],
+    hooks: {
+      async afterCommit({ alreadyCommitted }) {
+        order.push(`afterCommit:${alreadyCommitted}`)
+        inside.push(await historyFiles(server.storageDir))
+        if (failures-- > 0) throw new Error('deploy step failed')
+      }
+    }
+  })
+  const spy: Array<boolean | undefined> = []
+  const commits = (server as unknown as { commits: CommitStore }).commits
+  const commit = commits.commit.bind(commits)
+  commits.commit = (...args: Parameters<CommitStore['commit']>) => {
+    spy.push(args[1]?.deferPostCommitRetention)
+    return commit(...args)
+  }
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') order.push('retention')
+  })
+  await uploadAll(node, await manifest(t, 'app-2.0.0.bin', 'newer release'))
+  await uploadAll(node, await manifest(t, 'app-1.0.0.bin', 'first content'))
+  order.length = 0
+  inside.length = 0
+  spy.length = 0
+
+  failures = 1
+  const replacement = await manifest(t, 'app-1.0.0.bin', 'second content')
+  const failed = await uploadAll(node, replacement)
+  t.is(finalCode(failed), ERRORS.HOOK_FAILED)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.alike(spy, [true], 'replacement commits defer post-commit retention')
+  t.alike(order, ['afterCommit:false'], 'no retention after a failed callback')
+  t.is(inside[0].length, 1, 'replacement history exists inside afterCommit')
+  t.is(await readableNow(path.join(server.storageDir, 'app-1.0.0.bin')), 'second content')
+  t.is((await historyFiles(server.storageDir)).length, 1, 'history survives the failure')
+
+  const retry = reconnect(node, replacement)
+  await waitFor(() => isTerminal(retry))
+  t.alike(statuses(retry), ['ALREADY_COMMITTED'])
+  t.alike(order, ['afterCommit:false', 'afterCommit:true', 'retention'])
+  t.is(inside[1].length, 1, 'history still exists for the retried callback')
+  t.is(await readableNow(path.join(server.storageDir, 'app-1.0.0.bin')), 'second content')
+  t.is((await historyFiles(server.storageDir)).length, 0, 'rotation removes it afterwards')
+
+  failures = 0
+  order.length = 0
+  const again = await manifest(t, 'app-1.0.0.bin', 'third content')
+  await uploadAll(node, again)
+  t.alike(order, ['afterCommit:false', 'retention'])
+  t.is(inside.at(-1)!.length, 1, 'a successful replacement keeps history inside afterCommit')
+  t.is((await historyFiles(server.storageDir)).length, 0)
+})
+
+test('Server keeps immediate post-commit retention without an afterCommit hook', async (t) => {
+  const configurations: Array<{ name: string; hooks: ServerHooks }> = [
+    { name: 'no hooks', hooks: {} },
+    { name: 'beforeCommit only', hooks: { beforeCommit() {} } },
+    { name: 'onFailure only', hooks: { onFailure() {} } }
+  ]
+  for (const configuration of configurations) {
+    const order: string[] = []
+    const fixture = await rotationFixture(t, configuration.hooks)
+    fixture.server.on('retention', (event) => {
+      if (event.trigger === 'post-commit') order.push('retention')
+    })
+    await uploadAll(fixture.node, await manifest(t, 'app-2.0.0.bin', 'newer release'))
+    order.length = 0
+    fixture.commitOptions.length = 0
+    const socket = await uploadAll(fixture.node, await manifest(t, 'app-1.0.0.bin', 'older'))
+
+    t.is(statuses(socket).at(-1), 'COMMITTED', configuration.name)
+    t.alike(
+      fixture.commitOptions.map((options) => options?.deferPostCommitRetention ?? false),
+      [false],
+      `${configuration.name} does not defer`
+    )
+    t.alike(order, ['retention'], `${configuration.name} rotates once after commit`)
+    await t.exception(
+      () => fs.promises.lstat(path.join(fixture.server.storageDir, 'app-1.0.0.bin')),
+      { code: 'ENOENT' },
+      configuration.name
+    )
+    await fixture.server.close()
+  }
+})
+
+test('Server leaves a failed-afterCommit out-of-window artifact to later scheduled retention', async (t) => {
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    hooks: {
+      afterCommit() {
+        throw new Error('deploy step failed')
+      }
+    }
+  })
+  await uploadAll(node, await manifest(t, 'app-2.0.0.bin', 'newer release'))
+  const failed = await uploadAll(node, await manifest(t, 'app-1.0.0.bin', 'older release'))
+  const target = path.join(server.storageDir, 'app-1.0.0.bin')
+  t.is(finalCode(failed), ERRORS.HOOK_FAILED)
+  t.is(await readableNow(target), 'older release')
+
+  // No persistent hook-pending marker exists, so an ordinary pass removes it.
+  const retention = (server as unknown as { retention: { run(): Promise<unknown> } }).retention
+  await retention.run()
+  await t.exception(() => fs.promises.lstat(target), { code: 'ENOENT' })
+})

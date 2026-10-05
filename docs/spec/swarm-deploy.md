@@ -202,7 +202,19 @@ limit is best-effort when one exceeds it.
 
 Retention runs before a commit's link step and again after the commit becomes
 durable, so rotation may remove an artifact that falls outside the retained
-window immediately after it is committed and before `afterCommit` runs.
+window immediately after it is committed. When an `afterCommit` hook is
+configured the post-commit pass is deferred: the order is commit, `afterCommit`
+(the final path and sidecar still exist, including for out-of-window releases and
+for replacement commits and their history), then the post-commit pass only after
+the callback succeeded. A failing `afterCommit` skips the pass and leaves the
+artifact and record, so an immediate retry is `ALREADY_COMMITTED`, reruns
+`afterCommit`, and then runs the pass; an already-committed offer also runs the
+pass after a successful `afterCommit`. Servers without an `afterCommit` hook
+(including `beforeCommit`-only and `onFailure`-only) run the pass immediately
+after the commit. Pre-commit quota and age checks are never deferred, and
+post-commit retention failures remain non-fatal. Because no persistent
+hook-pending marker exists, a startup, scheduled, or manual pass that runs
+before a retry can remove an out-of-window artifact whose `afterCommit` failed.
 `retention` events and results expose `ageDeleted`, `countDeleted`,
 `versionDeleted`, and `storageDeleted`; deletions log the stable reasons
 `MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and `MAX_STORAGE`.

@@ -9,6 +9,7 @@ All notable changes to this package are documented here.
 - Persist normalized release coordinates in commit records, replacement history, journals, and recovery. Legacy records without coordinates are not count or version rotated.
 - Add count rotation (`maxCount`, `--max-count`) and SemVer major/minor rotation (`maxVersions`, `versionGranularity`, `--max-versions`, `--version-granularity`) running after age and before storage-quota retention, with `countDeleted` and `versionDeleted` retention counters.
 - Add `beforeCommit`, `afterCommit`, and `onFailure` server hooks (`ServerOptions.hooks` and `--hooks <module>` for `.js`, `.mjs`, and `.cjs` modules), the `HOOK_FAILED` error code, and exported hook and release types. Hooks run again on retries and must be idempotent by transfer ID; `afterCommit` can fail after the artifact is durably committed.
+- Defer post-commit rotation until a configured `afterCommit` hook succeeds (new `deferPostCommitRetention` commit option), so out-of-window artifacts stay readable inside `afterCommit` and a failed hook can be retried as `ALREADY_COMMITTED`. Servers without `afterCommit` rotate immediately as before. A restart or scheduled pass after a failed hook may still remove an out-of-window artifact before the retry.
 - Document rollout, retry, path, and compatibility semantics.
 
 ## 0.1.0

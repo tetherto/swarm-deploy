@@ -902,12 +902,19 @@ class CommitStore {
       retentionManager = null,
       signal = null,
       replaceNames,
-      release = null
+      release = null,
+      deferPostCommitRetention = false
     }: {
       retentionManager?: RetentionManager | null
       signal?: AbortSignalLike | null
       replaceNames?: Iterable<string>
       release?: ReleaseCoordinates | null
+      /**
+       * Skips the post-commit retention pass so the caller can run it later
+       * (via the retention manager) once work that needs the committed files
+       * has finished. Pre-commit quota and age checks still run.
+       */
+      deferPostCommitRetention?: boolean
     } = {}
   ): Promise<CommitRecord> {
     try {
@@ -928,7 +935,14 @@ class CommitStore {
       const mutable = validateReplaceNames(replaceNames)
       return withNameLease(this.layout.root, session.name, () =>
         withRootLease(this.layout.root, () =>
-          this._commit(session, retentionManager, signal, mutable, releaseSnapshot)
+          this._commit(
+            session,
+            retentionManager,
+            signal,
+            mutable,
+            releaseSnapshot,
+            deferPostCommitRetention === true
+          )
         )
       )
     } catch (error) {
@@ -941,7 +955,8 @@ class CommitStore {
     retentionManager: RetentionManager | null,
     signal: AbortSignalLike | null,
     mutable: Set<string> = new Set(),
-    release?: CommitRelease
+    release?: CommitRelease,
+    deferPostCommitRetention = false
   ): Promise<CommitRecord> {
     assertNotAborted(signal)
     await this._assertLayout()
@@ -968,7 +983,14 @@ class CommitStore {
         return plan.record
       }
       if (plan.mode === 'replace') {
-        return this._replace(record, stagingDigest.identity, plan, retentionManager, signal)
+        return this._replace(
+          record,
+          stagingDigest.identity,
+          plan,
+          retentionManager,
+          signal,
+          deferPostCommitRetention
+        )
       }
     }
 
@@ -997,7 +1019,9 @@ class CommitStore {
       await this._removeFile(this._tarStagingPath(record.transferId), this.layout.staging)
       assertNotAborted(signal)
       await this._discardJournal(record.transferId, journalAttemptId)
-      if (retentionManager) await retentionManager._afterCommitUnlocked()
+      if (retentionManager && !deferPostCommitRetention) {
+        await retentionManager._afterCommitUnlocked()
+      }
       return record
     } catch (err) {
       if (linearized) {
@@ -1093,7 +1117,8 @@ class CommitStore {
     stagingIdentity: FileIdentity,
     plan: { oldRecord: CommitRecord; finalIdentity: FileIdentity },
     retentionManager: RetentionManager | null,
-    signal: AbortSignalLike | null
+    signal: AbortSignalLike | null,
+    deferPostCommitRetention = false
   ): Promise<CommitRecord> {
     const { oldRecord, finalIdentity } = plan
     const history = historyName(oldRecord.transferId)
@@ -1198,7 +1223,9 @@ class CommitStore {
       await this._removeFile(stagingPath, this.layout.staging)
       await this._removeFile(this._tarStagingPath(newRecord.transferId), this.layout.staging)
       await this._discardJournal(newRecord.transferId, attempt)
-      if (retentionManager) await retentionManager._afterCommitUnlocked()
+      if (retentionManager && !deferPostCommitRetention) {
+        await retentionManager._afterCommitUnlocked()
+      }
       return newRecord
     } catch (err) {
       if (linearized) {

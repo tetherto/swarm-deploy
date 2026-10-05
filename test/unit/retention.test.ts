@@ -708,3 +708,31 @@ test('rotation options are validated', async (t) => {
     )
   }
 })
+
+test('commit defers post-commit retention only when asked and keeps pre-commit checks', async (t) => {
+  for (const defer of [false, true]) {
+    const harness = await createHarness(t)
+    const manager = harness.manager({ maxVersions: 1, versionGranularity: 'major' })
+    await harness.publish('api-2.0.0.bin', b4a.from('newer'), false, {
+      series: 'api',
+      version: '2.0.0'
+    })
+    harness.clock.advance(1)
+    const session = await harness.stage('api-1.0.0.bin', b4a.from('older'))
+    const record = await harness.commits.commit(session, {
+      retentionManager: manager,
+      release: { series: 'api', version: '1.0.0' },
+      deferPostCommitRetention: defer
+    })
+
+    t.is(await exists(path.join(harness.layout.root, 'api-1.0.0.bin')), defer, `defer=${defer}`)
+    if (defer) {
+      t.ok(
+        (await harness.commits.list()).some((entry) => entry.transferId === record.transferId),
+        'record survives until the caller runs retention'
+      )
+      t.is(await manager.afterCommit(), true)
+      t.is(await exists(path.join(harness.layout.root, 'api-1.0.0.bin')), false)
+    }
+  }
+})

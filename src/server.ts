@@ -563,7 +563,8 @@ export class Server extends EventEmitter {
           retentionManager: this.retention,
           signal: this.signal,
           replaceNames: this.replaceNames,
-          release
+          release,
+          deferPostCommitRetention: this.hooks.afterCommit !== undefined
         })
         this.emitSafe('commit', {
           ...event,
@@ -585,6 +586,7 @@ export class Server extends EventEmitter {
           })
         )
         hooksFinished = true
+        await this.runDeferredRetention(owner)
         finalStarted = true
         await writeFinal(
           socket,
@@ -629,6 +631,7 @@ export class Server extends EventEmitter {
           })
         )
         hooksFinished = true
+        await this.runDeferredRetention(owner)
         await writeAdmission(
           socket,
           { v: 1, status: 'ALREADY_COMMITTED' },
@@ -798,6 +801,23 @@ export class Server extends EventEmitter {
     } finally {
       this.activeUploads.delete(socket)
       reader.closeReader()
+    }
+  }
+
+  /**
+   * Runs the post-commit retention pass that a configured `afterCommit` hook
+   * deferred, only after that hook succeeded. The retention manager already
+   * reports its own failures as non-fatal, so nothing here can fail the upload.
+   */
+  private async runDeferredRetention(owner: Uint8Array | null): Promise<void> {
+    if (this.hooks.afterCommit === undefined || !this.retention) return
+    try {
+      await this.retention.afterCommit()
+    } catch (error) {
+      this.logger.warn('Post-commit retention failed', {
+        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        reason: codeOf(error)
+      })
     }
   }
 
