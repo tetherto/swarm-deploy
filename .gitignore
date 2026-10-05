@@ -3,6 +3,7 @@ coverage/
 *.seed
 /.superpowers/
 /docs/superpowers/
+/.worktrees/
 /dist/
 /.test-dist/
 *.tsbuildinfo
