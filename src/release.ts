@@ -1,5 +1,7 @@
 import b4a from 'b4a'
 import { SemVer, compare } from 'semver'
+import { validateBasename } from './files.js'
+import { sodiumSha256 } from './tar-protocol/hash.js'
 
 export type VersionGranularity = 'major' | 'minor'
 
@@ -17,6 +19,20 @@ export const MAX_RELEASE_COMPONENT_BYTES = 100
 const SAFE_ARTIFACT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 /** Immediate source parent: same 100-byte single-component rule; `+` allowed for SemVer build metadata. */
 const SAFE_SOURCE_PARENT = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/
+const FIXED_SERIES_PREFIX = 'fixed-'
+
+/**
+ * The persisted series of a template that captures no `{series}`.
+ *
+ * The template text itself cannot be the key: braces and slashes fail the
+ * commit-record basename rules, so every version-only pattern would reject at
+ * commit time. Hashing gives a safe 70-byte basename that is stable across
+ * restarts and identical on Node and Bare, and distinct templates that happen
+ * to describe the same literals stay distinct releases.
+ */
+export function fixedSeriesKey(template: string): string {
+  return `${FIXED_SERIES_PREFIX}${b4a.toString(sodiumSha256(b4a.from(template)), 'hex')}`
+}
 
 type TemplatePart = { kind: 'literal'; text: string } | { kind: 'series' } | { kind: 'version' }
 
@@ -59,6 +75,14 @@ function assertPlaceholderLayout(template: string): void {
     template.includes(`${PLACEHOLDER_VERSION}${PLACEHOLDER_SERIES}`)
   ) {
     throw new Error('Invalid release template: adjacent placeholder')
+  }
+}
+
+/** Literal text is matched verbatim, so a stray brace is always a typo, not a literal. */
+function assertNoResidualBraces(template: string): void {
+  const literals = template.split(PLACEHOLDER_SERIES).join('').split(PLACEHOLDER_VERSION).join('')
+  if (literals.includes('{') || literals.includes('}')) {
+    throw new Error('Invalid release template: unexpected brace')
   }
 }
 
@@ -177,6 +201,7 @@ function compileParentMatcher(parent: string): ParentMatcher {
 }
 
 function compileTemplate(template: string): CompiledPattern {
+  assertNoResidualBraces(template)
   assertPlaceholderLayout(template)
 
   const seriesCount = placeholderCount(template, PLACEHOLDER_SERIES)
@@ -196,7 +221,14 @@ function compileTemplate(template: string): CompiledPattern {
     throw new Error('Invalid release template: path separator outside parent boundary')
   }
 
-  const fixedSeries = seriesCount === 0 ? template : null
+  const fixedSeries = seriesCount === 0 ? fixedSeriesKey(template) : null
+  if (fixedSeries !== null) {
+    try {
+      validateBasename(fixedSeries)
+    } catch (error) {
+      throw new Error('Invalid release template: unusable fixed series key', { cause: error })
+    }
+  }
   if (segments.length === 1) {
     const basename = compileSegmentPlan(template)
     return {

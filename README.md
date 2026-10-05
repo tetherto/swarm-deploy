@@ -392,11 +392,19 @@ A template is literal text plus the placeholders `{series}` and `{version}`:
 
 - At least one placeholder is required; each may appear at most once.
 - Two placeholders in one path segment must be separated by literal text.
+- `{` and `}` are reserved. A template whose literal text still contains a
+  brace after the exact `{series}` and `{version}` placeholders are removed
+  (`{serie}-{version}.tar.gz`, `{{series}.zip`) is rejected at startup rather
+  than matched literally.
 - A template has one segment (matched against the basename) or two segments
   separated by one `/` (`<source-parent>/<basename>`). Empty segments, further
   `/` characters, and duplicate templates are rejected at startup.
 - `{series}` captures one safe component. A template without `{series}` is a
-  fixed series whose key is the template text itself.
+  fixed series whose key is `fixed-` followed by the lowercase hex SHA-256 of
+  the exact template text. `{version}/payments.tar.gz` therefore has the series
+  `fixed-594ef13d9808171190f7827f7d2fb1dc33f000f531b69d55c1bd485a70ff8c4b`. The
+  key is a 70-character safe basename, so it persists in commit records and
+  stays identical across restarts and between Node.js and Bare.
 - `{version}` must be strict SemVer 2.0.0: no `v` prefix, no leading zeros, no
   padding. The stored version is the normalized `major.minor.patch[-prerelease]`;
   build metadata is accepted in a folder name but dropped, and it never
@@ -407,14 +415,14 @@ A template is literal text plus the placeholders `{series}` and `{version}`:
 
 Examples:
 
-| Template                    | Offer (`sourceParent`, basename)    | Series       | Version      |
-| --------------------------- | ----------------------------------- | ------------ | ------------ |
-| `{series}-{version}.tar.gz` | `payments-2.4.1.tar.gz`             | `payments`   | `2.4.1`      |
-| `{series}-{version}.tar.gz` | `payments-3.0.0-rc.1.tar.gz`        | `payments`   | `3.0.0-rc.1` |
-| `{version}/{series}.tar.gz` | `2.4.1+build.7` / `payments.tar.gz` | `payments`   | `2.4.1`      |
-| `releases/{series}.zip`     | `releases` / `payments.zip`         | `payments`   | none         |
-| `{version}/payments.tar.gz` | `1.8.0` / `payments.tar.gz`         | the template | `1.8.0`      |
-| `{series}.tar.gz`           | `payments.tar.gz`                   | `payments`   | none         |
+| Template                    | Offer (`sourceParent`, basename)    | Series        | Version      |
+| --------------------------- | ----------------------------------- | ------------- | ------------ |
+| `{series}-{version}.tar.gz` | `payments-2.4.1.tar.gz`             | `payments`    | `2.4.1`      |
+| `{series}-{version}.tar.gz` | `payments-3.0.0-rc.1.tar.gz`        | `payments`    | `3.0.0-rc.1` |
+| `{version}/{series}.tar.gz` | `2.4.1+build.7` / `payments.tar.gz` | `payments`    | `2.4.1`      |
+| `releases/{series}.zip`     | `releases` / `payments.zip`         | `payments`    | none         |
+| `{version}/payments.tar.gz` | `1.8.0` / `payments.tar.gz`         | `fixed-594e…` | `1.8.0`      |
+| `{series}.tar.gz`           | `payments.tar.gz`                   | `payments`    | none         |
 
 With a series-first template such as `{series}-{version}.tar.gz`, the split
 chosen is the right-most `-` that yields a valid SemVer, so hyphenated series

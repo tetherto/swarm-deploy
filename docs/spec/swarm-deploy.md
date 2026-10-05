@@ -161,10 +161,13 @@ contains `sourceParent` is invalid.
 A server may be configured with an ordered list of templates made of literal
 text and the placeholders `{series}` and `{version}`. A template has at least
 one placeholder, at most one of each, no adjacent placeholders, one or two
-`/`-separated non-empty segments (`basename` or `parent/basename`), and is
-unique. `{version}` values are strict SemVer 2.0.0 and are normalized without
-build metadata; a template without `{series}` is a fixed series whose key is the
-template text. Matching evaluates templates in declaration order; templates with
+`/`-separated non-empty segments (`basename` or `parent/basename`), no residual
+`{` or `}` in its literal text, and is unique. `{version}` values are strict
+SemVer 2.0.0 and are normalized without build metadata; a template without
+`{series}` is a fixed series whose key is `fixed-` followed by the lowercase hex
+SHA-256 of the exact template text. That key is a 70-byte safe basename, so it
+satisfies commit-record validation and is byte-identical on every runtime and
+across restarts. Matching evaluates templates in declaration order; templates with
 a parent segment are skipped when no `sourceParent` was offered; the first
 template that yields coordinates wins.
 

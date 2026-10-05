@@ -2,7 +2,14 @@
 
 import test from 'brittle'
 import b4a from 'b4a'
-import { ReleaseMatcher, compareReleaseVersions, releaseVersionGroup } from '../../dist/release.js'
+import {
+  ReleaseMatcher,
+  compareReleaseVersions,
+  fixedSeriesKey,
+  releaseVersionGroup
+} from '../../dist/release.js'
+import { validateBasename } from '../../dist/files.js'
+import { assertCommitRelease } from '../../dist/storage/commit-journal.js'
 
 test('release templates match basenames and immediate source parents in order', (t) => {
   const matcher = new ReleaseMatcher([
@@ -157,9 +164,66 @@ test('fixed-series parent-version templates require source parent', (t) => {
   const matcher = new ReleaseMatcher(['{version}/payments.tar.gz'])
   t.is(matcher.match('payments.tar.gz'), null)
   t.alike(matcher.match('payments.tar.gz', '2.4.1'), {
-    series: '{version}/payments.tar.gz',
+    series: fixedSeriesKey('{version}/payments.tar.gz'),
     version: '2.4.1'
   })
+})
+
+test('fixed-series keys are persistable, deterministic, and collision resistant', (t) => {
+  const template = '{version}/payments.tar.gz'
+  const key = fixedSeriesKey(template)
+  t.ok(/^fixed-[0-9a-f]{64}$/.test(key), 'key is a lowercase hashed basename')
+  t.is(key.length, 70)
+  t.is(b4a.from(key).byteLength, 70)
+  t.is(validateBasename(key), key, 'key survives commit-record basename validation')
+  t.execution(() => assertCommitRelease({ series: key, version: '2.4.1' }))
+
+  t.is(fixedSeriesKey(template), key, 'the same template always derives the same key')
+  t.not(fixedSeriesKey('{version}/billing.tar.gz'), key)
+  t.not(fixedSeriesKey('{version}-payments.tar.gz'), key)
+
+  const matcher = new ReleaseMatcher([template])
+  t.is(matcher.match('payments.tar.gz', '2.4.1')!.series, key)
+  t.is(
+    new ReleaseMatcher([template]).match('payments.tar.gz', '9.9.9')!.series,
+    key,
+    'a restarted matcher derives the identical persisted key'
+  )
+})
+
+test('every documented version-only template yields a valid persistable series', (t) => {
+  const templates = [
+    '{version}/payments.tar.gz',
+    'payments-{version}.tar.gz',
+    'releases/payments-{version}.zip',
+    '{version}.bin'
+  ]
+  for (const template of templates) {
+    const matcher = new ReleaseMatcher([template])
+    const matched =
+      matcher.match('payments.tar.gz', '2.4.1') ??
+      matcher.match('payments-2.4.1.tar.gz') ??
+      matcher.match('payments-2.4.1.zip', 'releases') ??
+      matcher.match('2.4.1.bin')
+    t.ok(matched, template)
+    t.is(matched!.series, fixedSeriesKey(template), template)
+    t.is(matched!.version, '2.4.1', template)
+    t.execution(() => assertCommitRelease({ ...matched }), template)
+  }
+})
+
+test('release matcher rejects residual braces outside exact placeholders', (t) => {
+  for (const template of [
+    '{serie}-{version}.tar.gz',
+    '{series}-{version}}.tar.gz',
+    '{{series}.tar.gz',
+    '{series}-{Version}.tar.gz',
+    'a{b}-{series}.tar.gz',
+    '{ series }-{version}.tar.gz',
+    '{version}/payments{.tar.gz'
+  ]) {
+    t.exception(() => new ReleaseMatcher([template]), /brace/i, template)
+  }
 })
 
 test('release matcher rejects non-canonical semver version captures', (t) => {

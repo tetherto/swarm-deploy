@@ -19,6 +19,7 @@ import {
   type ServerScheduler
 } from '../../dist/index.js'
 import { fingerprint } from '../../dist/server.js'
+import { fixedSeriesKey } from '../../dist/release.js'
 import type {
   DirectDhtNode,
   DirectDhtServerHandle,
@@ -762,6 +763,52 @@ test('Server passes normalized release coordinates from filename and parent temp
       .sort((a, b) => (a!.series < b!.series ? -1 : 1)),
     [expected[0], expected[1]].sort((a, b) => (a.series < b.series ? -1 : 1))
   )
+})
+
+test('Server commits and rotates a fixed-series {version}/payments.tar.gz pattern end to end', async (t) => {
+  const template = '{version}/payments.tar.gz'
+  const series = fixedSeriesKey(template)
+  const storageDir = await createTempDir(t)
+  const { server, node } = await createServer(t, {
+    storageDir,
+    artifactPatterns: [template],
+    replaceNames: ['payments.tar.gz'],
+    maxCount: 1
+  })
+  const spy = spyRelease(server)
+  const commits = (server as unknown as { commits: CommitStore }).commits
+
+  const first = await manifestIn(t, '1.0.0', 'payments.tar.gz', 'payments one')
+  t.is(statuses(await uploadAll(node, first)).at(-1), 'COMMITTED')
+  t.alike(spy.committed, [{ series, version: '1.0.0' }])
+  const stored = (await commits.list()).find((record) => record.name === 'payments.tar.gz')!
+  t.alike(stored.release, { series, version: '1.0.0' })
+  const sidecar = JSON.parse(
+    b4a.toString(
+      await fs.promises.readFile(
+        path.join(storageDir, '.swarm-deploy', 'commits', `${stored.transferId}.json`)
+      )
+    )
+  ) as { release: { series: string; version: string } }
+  t.alike(
+    sidecar.release,
+    { series, version: '1.0.0' },
+    'the hashed fixed series is durable on disk'
+  )
+
+  const second = await manifestIn(t, '2.0.0', 'payments.tar.gz', 'payments two')
+  t.is(statuses(await uploadAll(node, second)).at(-1), 'COMMITTED')
+  t.alike(spy.committed.at(-1), { series, version: '2.0.0' })
+  t.is(
+    b4a.toString(await fs.promises.readFile(path.join(storageDir, 'payments.tar.gz'))),
+    'payments two'
+  )
+  t.alike(
+    (await commits.list()).map((record) => record.release),
+    [{ series, version: '2.0.0' }],
+    'count rotation keeps only the newest record of the fixed series'
+  )
+  t.alike(await historyFiles(storageDir), [], 'the rotated-out history artifact is gone')
 })
 
 test('Server passes the matched release when committing an already verified session', async (t) => {
