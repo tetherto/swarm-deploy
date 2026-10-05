@@ -216,8 +216,13 @@ not a lock: a concurrent commit's retention pass, a scheduled pass, or a manual
 pass can remove the file while the callback runs, so a hook needing stable bytes should open or copy
 it promptly. A failing `afterCommit` skips the pass for that connection and
 leaves the artifact and record, so an immediate retry normally is
-`ALREADY_COMMITTED`, reruns `afterCommit`, and then runs the pass; an
-already-committed offer also runs the pass after a successful `afterCommit`.
+`ALREADY_COMMITTED`, reruns `afterCommit`, and then runs the pass. The deferred
+pass is owed per transfer: the server tracks in memory the transfer IDs it
+committed whose `afterCommit` has not yet succeeded, and an already-committed
+offer starts a pass only for one of those. Any other duplicate offer still runs
+`afterCommit` but performs no retention pass, so duplicate offers cannot force
+repeated full scans. The owed set is cleared once a hook succeeds and its pass
+has been attempted, and server close clears it.
 Servers without an `afterCommit` hook (including `beforeCommit`-only and
 `onFailure`-only) run the pass immediately after the commit. Pre-commit quota and
 age checks are never deferred, and post-commit retention failures remain
@@ -256,8 +261,9 @@ Observable order:
 - verified reconnect (`VERIFIED`): re-read of the verified staging file,
   `beforeCommit` with `resumed: true`, commit, `afterCommit`, `COMMITTED`;
 - already committed: `afterCommit` with `alreadyCommitted: true` and
-  `resumed: false`, then `ALREADY_COMMITTED`, with no verification or
-  `beforeCommit`.
+  `resumed: false`, then the deferred retention pass only when this process
+  still owes one for that transfer, then `ALREADY_COMMITTED`, with no
+  verification or `beforeCommit`.
 
 A `beforeCommit` failure prevents commit mutation and leaves the verified
 session resumable. An `afterCommit` failure leaves the artifact durably

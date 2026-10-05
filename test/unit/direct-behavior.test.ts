@@ -1800,6 +1800,103 @@ test('Server keeps immediate post-commit retention without an afterCommit hook',
   }
 })
 
+type RetentionSpy = { passes: number }
+
+function spyRetentionPasses(server: Server): RetentionSpy {
+  const spy: RetentionSpy = { passes: 0 }
+  const retention = (server as unknown as { retention: { afterCommit(): Promise<boolean> } })
+    .retention
+  const original = retention.afterCommit.bind(retention)
+  retention.afterCommit = () => {
+    spy.passes++
+    return original()
+  }
+  return spy
+}
+
+test('Server runs no deferred retention pass for an ordinary duplicate offer', async (t) => {
+  const order: string[] = []
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    hooks: {
+      afterCommit({ alreadyCommitted }) {
+        order.push(`afterCommit:${alreadyCommitted}`)
+      }
+    }
+  })
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') order.push('retention')
+  })
+  const spy = spyRetentionPasses(server)
+  const input = await manifest(t, 'app-2.0.0.bin', 'newer release')
+
+  await uploadAll(node, input)
+  t.alike(order, ['afterCommit:false', 'retention'], 'the committing connection rotates')
+  t.is(spy.passes, 1)
+
+  order.length = 0
+  for (const attempt of ['first', 'second']) {
+    const duplicate = reconnect(node, input)
+    await waitFor(() => isTerminal(duplicate))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    t.alike(statuses(duplicate), ['ALREADY_COMMITTED'], attempt)
+    t.alike(order, ['afterCommit:true'], `${attempt} duplicate invokes afterCommit only`)
+    t.is(spy.passes, 1, `${attempt} duplicate starts no retention pass`)
+    order.length = 0
+  }
+})
+
+test('Server rotates from an already-committed retry only while the hook is pending', async (t) => {
+  let failures = 1
+  const order: string[] = []
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxVersions: 1,
+    versionGranularity: 'major',
+    hooks: {
+      afterCommit({ alreadyCommitted }) {
+        order.push(`afterCommit:${alreadyCommitted}`)
+        if (failures-- > 0) throw new Error('deploy step failed')
+      }
+    }
+  })
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') order.push('retention')
+  })
+  const spy = spyRetentionPasses(server)
+  const pending = (server as unknown as { pendingAfterCommit: Set<string> }).pendingAfterCommit
+  const input = await manifest(t, 'app-1.0.0.bin', 'older release')
+  const transferId = metadataFromManifest(input.manifest).transferId
+
+  const failed = await uploadAll(node, input)
+  t.is(finalCode(failed), ERRORS.HOOK_FAILED)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.alike(order, ['afterCommit:false'])
+  t.is(spy.passes, 0, 'a failed hook starts no pass')
+  t.is(pending.has(transferId), true, 'the transfer stays pending')
+
+  order.length = 0
+  const retry = reconnect(node, input)
+  await waitFor(() => isTerminal(retry))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.alike(statuses(retry), ['ALREADY_COMMITTED'])
+  t.alike(order, ['afterCommit:true', 'retention'], 'the pending retry rotates')
+  t.is(spy.passes, 1)
+  t.is(pending.has(transferId), false, 'success clears the pending transfer')
+
+  order.length = 0
+  const settled = reconnect(node, input)
+  await waitFor(() => isTerminal(settled))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.alike(order, ['afterCommit:true'], 'a later duplicate no longer rotates')
+  t.is(spy.passes, 1)
+
+  await server.close()
+  t.is(pending.size, 0, 'close clears the in-memory pending state')
+})
+
 test('Server leaves a failed-afterCommit out-of-window artifact to later scheduled retention', async (t) => {
   const { server, node } = await createServer(t, {
     artifactPatterns: ['{series}-{version}.bin'],

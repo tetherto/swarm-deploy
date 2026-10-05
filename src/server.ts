@@ -248,6 +248,15 @@ export class Server extends EventEmitter {
   private readonly abort = createAbortController()
   private readonly active = new Map<DirectDhtSocket, Active>()
   private readonly activeUploads = new Set<DirectDhtSocket>()
+  /**
+   * Transfer IDs this process committed but whose deferred post-commit
+   * retention is still owed because `afterCommit` has not yet succeeded. Only
+   * these may start a retention pass from an already-committed retry, so an
+   * ordinary duplicate offer cannot be used to force repeated full passes.
+   * The set is in-memory only; a restart loses it, and the documented fallback
+   * is the next startup, scheduled, or commit-triggered pass.
+   */
+  private readonly pendingAfterCommit = new Set<string>()
   private readonly receives = new Set<Promise<void>>()
   private layout: StorageLayout | null = null
   private sessions: SessionStore | null = null
@@ -575,6 +584,9 @@ export class Server extends EventEmitter {
         hookPath = path.join(this.layout!.root, metadata.name)
         await this.retireQuietly(verified.transferId, owner)
         phase = 'afterCommit'
+        if (this.hooks.afterCommit !== undefined) {
+          this.pendingAfterCommit.add(metadata.transferId)
+        }
         await this.runHook<AfterCommitContext>(
           'afterCommit',
           this.hooks.afterCommit,
@@ -586,7 +598,7 @@ export class Server extends EventEmitter {
           })
         )
         hooksFinished = true
-        await this.runDeferredRetention(owner)
+        await this.settleDeferredRetention(metadata.transferId, owner)
         finalStarted = true
         await writeFinal(
           socket,
@@ -631,7 +643,11 @@ export class Server extends EventEmitter {
           })
         )
         hooksFinished = true
-        await this.runDeferredRetention(owner)
+        // Only a transfer this process committed can still owe a deferred
+        // pass; an ordinary duplicate offer never starts one.
+        if (this.pendingAfterCommit.has(metadata.transferId)) {
+          await this.settleDeferredRetention(metadata.transferId, owner)
+        }
         await writeAdmission(
           socket,
           { v: 1, status: 'ALREADY_COMMITTED' },
@@ -806,18 +822,25 @@ export class Server extends EventEmitter {
 
   /**
    * Runs the post-commit retention pass that a configured `afterCommit` hook
-   * deferred, only after that hook succeeded. The retention manager already
-   * reports its own failures as non-fatal, so nothing here can fail the upload.
+   * deferred, only after that hook succeeded, and then stops owing it. The
+   * retention manager already reports its own failures as non-fatal, so
+   * nothing here can fail the upload; the pass is attempted exactly once per
+   * successful hook, which is why the transfer is cleared either way.
    */
-  private async runDeferredRetention(owner: Uint8Array | null): Promise<void> {
-    if (this.hooks.afterCommit === undefined || !this.retention) return
+  private async settleDeferredRetention(
+    transferId: string,
+    owner: Uint8Array | null
+  ): Promise<void> {
+    if (this.hooks.afterCommit === undefined) return
     try {
-      await this.retention.afterCommit()
+      if (this.retention) await this.retention.afterCommit()
     } catch (error) {
       this.logger.warn('Post-commit retention failed', {
         fingerprint: owner ? fingerprint(owner) : 'invalid',
         reason: codeOf(error)
       })
+    } finally {
+      this.pendingAfterCommit.delete(transferId)
     }
   }
 
@@ -947,6 +970,7 @@ export class Server extends EventEmitter {
     this.transport = null
     await Promise.allSettled([...this.receives])
     this.active.clear()
+    this.pendingAfterCommit.clear()
     await this.retention?.stop().catch(() => {})
     this.retention = null
     await this.sessions?.close().catch(() => {})

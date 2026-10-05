@@ -525,10 +525,21 @@ that same pass. The exact ordering depends on hooks:
   retention pass can remove the file while the callback runs. A hook that needs stable bytes should open or
   copy the file promptly at the start of the callback.
 - If `afterCommit` throws, no post-commit pass runs for that connection. The
-  artifact and its record stay, so an immediate retry normally reaches
+  artifact and its record stay, and the server remembers in memory that this
+  transfer still owes a pass. An immediate retry normally reaches
   `ALREADY_COMMITTED`, runs `afterCommit` again with the existing path, and runs
-  the pass only after that call succeeds. A failing already-committed
-  `afterCommit` likewise skips the pass. See the retry caveat below.
+  the owed pass only after that call succeeds. A failing already-committed
+  `afterCommit` likewise skips the pass and keeps the transfer owed. See the
+  retry caveat below.
+- An ordinary duplicate offer — one whose `afterCommit` already succeeded, or
+  that this process never committed — still calls `afterCommit` with
+  `alreadyCommitted: true`, but starts **no** retention pass. Only a connection
+  that committed in this process, or a retry of a transfer whose hook failed
+  here, can trigger the deferred pass, so repeated duplicate offers cannot be
+  used to force repeated full retention scans.
+- The owed-transfer set lives only in memory. A server restart forgets it, and
+  closing the server clears it; the artifact is then rotated by the next
+  startup, scheduled, or commit-triggered pass instead.
 - Post-commit retention failures stay non-fatal: they are logged and reported as
   `retention` events, and never fail the upload.
 
@@ -663,8 +674,10 @@ after `beforeCommit` returned but before the commit finished.
 Already committed: identical content is detected during offer inspection, so
 there is no transfer, verification, or `beforeCommit`. The server calls
 `afterCommit` with `resumed: false` and `alreadyCommitted: true`, then replies
-`ALREADY_COMMITTED`. This path is reached only while the artifact still exists;
-see the [retry caveat](#artifact-patterns-and-rotation).
+`ALREADY_COMMITTED`. A deferred retention pass follows only when this process
+committed that transfer and its `afterCommit` has not yet succeeded. This path
+is reached only while the artifact still exists; see the
+[retry caveat](#artifact-patterns-and-rotation).
 
 Failure sequences:
 
