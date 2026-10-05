@@ -767,7 +767,12 @@ test('CLI rejects unusable hook modules as startup configuration errors', async 
     'primitive.cjs': `module.exports = '${secret}'\n`,
     'null.cjs': 'module.exports = null\n',
     'array.cjs': `module.exports = [() => {}]\n`,
-    'empty.cjs': 'module.exports = {}\n'
+    'empty.cjs': 'module.exports = {}\n',
+    'function-default-only.mjs': 'export default function () {}\n',
+    'number-default-only.mjs': 'export default 42\n',
+    'compiled-null-default-only.cjs': `Object.defineProperty(exports, '__esModule', { value: true })\nexports.default = null\n`,
+    'non-record-default-bad-named.mjs': `export default 42\nexport const afterCommit = '${secret}'\n`,
+    'function-default-bad-named.cjs': `module.exports = function () {}\nmodule.exports.afterCommit = null\nmodule.exports.beforeCommit = '${secret}'\n`
   }
   for (const [name, source] of Object.entries(modules)) {
     await fs.promises.writeFile(path.join(root, name), source)
@@ -1126,4 +1131,51 @@ test('CLI loads hooks from a .js ES module inside a type=module package', async 
   const result = await runServerCli(root, ['--hooks', 'hooks.js'], { cwd: root })
   t.is(result.code, 0)
   t.alike(Object.keys(result.options?.hooks || {}), ['afterCommit'])
+})
+
+test('CLI ignores a harmless non-object default export next to named hooks', async (t) => {
+  const root = await createTempDir(t)
+  const record = (name: string) => `globalThis.${HOOK_LOG}.push('${name}')`
+  const compiled = (value: string, name: string) =>
+    `Object.defineProperty(exports, '__esModule', { value: true })
+exports.default = ${value}
+exports.${name} = () => { ${record(`compiled:${value}`)} }\n`
+  const files: Record<string, string> = {
+    'function-default.mjs': `export default function () {}
+export function afterCommit () { ${record('function:after')} }\n`,
+    'number-default.mjs': `export default 42
+export function beforeCommit () { ${record('number:before')} }\n`,
+    'null-default.mjs': `export default null
+export function beforeCommit () { ${record('null:before')} }\n`,
+    'array-default.mjs': `export default [() => {}]
+export function afterCommit () { ${record('array:after')} }\n`,
+    'function-default.cjs': `module.exports = function () {}
+module.exports.afterCommit = () => { ${record('cjs-function:after')} }\n`,
+    'compiled-number-default.cjs': compiled('42', 'beforeCommit'),
+    'compiled-null-default.cjs': compiled('null', 'beforeCommit'),
+    'compiled-function-default.cjs': compiled('function () {}', 'afterCommit')
+  }
+  for (const [name, source] of Object.entries(files)) {
+    await fs.promises.writeFile(path.join(root, name), source)
+  }
+  const cases: [string, string[], string[]][] = [
+    ['function-default.mjs', ['afterCommit'], ['function:after']],
+    ['number-default.mjs', ['beforeCommit'], ['number:before']],
+    ['null-default.mjs', ['beforeCommit'], ['null:before']],
+    ['array-default.mjs', ['afterCommit'], ['array:after']],
+    ['function-default.cjs', ['afterCommit'], ['cjs-function:after']],
+    ['compiled-number-default.cjs', ['beforeCommit'], ['compiled:42']],
+    ['compiled-null-default.cjs', ['beforeCommit'], ['compiled:null']],
+    ['compiled-function-default.cjs', ['afterCommit'], ['compiled:function () {}']]
+  ]
+  for (const [file, names, expected] of cases) {
+    const log = hookLog()
+    const result = await runServerCli(root, ['--hooks', file], { cwd: root })
+    t.is(result.code, 0, file)
+    t.is(result.stderr, '', file)
+    const hooks = result.options?.hooks
+    t.alike(Object.keys(hooks || {}), names, `${file} hook names`)
+    await callAll(hooks)
+    t.alike(log, expected, `${file} callbacks`)
+  }
 })

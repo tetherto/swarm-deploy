@@ -41,20 +41,23 @@ function errorCode(error: unknown): string | undefined {
   }
 }
 
-/** Unwraps exactly one explicit `__esModule` interop level (TypeScript-compiled CommonJS). */
+/**
+ * The default export's hook object, or `undefined` when the default is absent or not
+ * a plain object (function, primitive, null, array). Unwraps exactly one explicit
+ * `__esModule` interop level (TypeScript-compiled CommonJS).
+ */
 function defaultHooks(namespace: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!hasOwn(namespace, 'default')) return undefined
   const fallback = namespace.default
   if (fallback === undefined) return undefined
-  if (!isRecord(fallback)) throw new Error('shape')
+  if (!isRecord(fallback)) return undefined
   if (
     hasOwn(fallback, '__esModule') &&
     fallback.__esModule === true &&
     hasOwn(fallback, 'default')
   ) {
     const inner = fallback.default
-    if (!isRecord(inner)) throw new Error('shape')
-    return inner
+    return isRecord(inner) ? inner : undefined
   }
   return fallback
 }
