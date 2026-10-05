@@ -513,8 +513,8 @@ that same pass. The exact ordering depends on hooks:
 - The final path exists when `afterCommit` begins in the sequential server
   flow, including for an out-of-window release, and for replacement commits
   (a replaced artifact's history record is also present). It is not a lock:
-  a concurrent commit's retention pass or a manual retention pass can remove the
-  file while the callback runs. A hook that needs stable bytes should open or
+  a concurrent commit's retention pass, a scheduled retention pass, or a manual
+  retention pass can remove the file while the callback runs. A hook that needs stable bytes should open or
   copy the file promptly at the start of the callback.
 - If `afterCommit` throws, no post-commit pass runs for that connection. The
   artifact and its record stay, so an immediate retry normally reaches

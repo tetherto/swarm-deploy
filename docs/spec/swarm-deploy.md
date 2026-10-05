@@ -209,8 +209,8 @@ then the post-commit pass only after the callback succeeded, then the terminal
 that reply, and a slow retention pass can delay it. When `afterCommit` begins in
 the sequential server flow, the final path and sidecar exist, including for
 out-of-window releases and for replacement commits and their history. This is
-not a lock: a concurrent commit's retention pass or a manual pass can remove the
-file while the callback runs, so a hook needing stable bytes should open or copy
+not a lock: a concurrent commit's retention pass, a scheduled pass, or a manual
+pass can remove the file while the callback runs, so a hook needing stable bytes should open or copy
 it promptly. A failing `afterCommit` skips the pass for that connection and
 leaves the artifact and record, so an immediate retry normally is
 `ALREADY_COMMITTED`, reruns `afterCommit`, and then runs the pass; an

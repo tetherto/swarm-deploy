@@ -7,6 +7,7 @@ import fs from '#fs'
 import path from '#path'
 import { ERRORS } from '../../dist/errors.js'
 import { historyName } from '../../dist/files.js'
+import { ReleaseMatcher } from '../../dist/release.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
@@ -558,6 +559,68 @@ for (const scenario of ROTATION_CASES) {
     t.is(await exists(path.join(harness.layout.root, 'other.bin')), true)
   })
 }
+
+test('count and version rotation each remove records the other would keep', async (t) => {
+  const harness = await createHarness(t)
+  // Commit order: 2.0.0, 2.0.1, 1.0.0. Count(2) alone keeps 2.0.1 + 1.0.0;
+  // version(1 major) alone keeps 2.0.0 + 2.0.1; only both leaves 2.0.1.
+  const records: CommitRecord[] = []
+  for (const version of ['2.0.0', '2.0.1', '1.0.0']) {
+    records.push(
+      await harness.publish(`api-${version}.bin`, b4a.from(version), false, {
+        series: 'api',
+        version
+      })
+    )
+    harness.clock.advance(1)
+  }
+
+  const result = await harness
+    .manager({ maxCount: 2, maxVersions: 1, versionGranularity: 'major' })
+    .run()
+
+  t.is(result.countDeleted, 1)
+  t.is(result.versionDeleted, 1)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId),
+    [records[1].transferId]
+  )
+})
+
+test('build metadata is ignored by identity and equal-precedence releases share a group', async (t) => {
+  const harness = await createHarness(t)
+  const matcher = new ReleaseMatcher(['{version}/{series}.tar.gz'])
+  const kept: CommitRecord[] = []
+  for (const [parent, expectKept] of [
+    ['1.2.3+build.2', true],
+    ['1.2.3+build.1', true],
+    ['1.1.9+build.9', false]
+  ] as const) {
+    const release = matcher.match('api.tar.gz', parent)
+    t.alike(release, {
+      series: 'api',
+      version: parent.split('+', 1)[0]
+    })
+    const record = await harness.publish(
+      `api-${parent.replace('+', '_')}.bin`,
+      b4a.from(parent),
+      false,
+      release as ReleaseCoordinates
+    )
+    t.is(record.release?.version, parent.split('+', 1)[0])
+    if (expectKept) kept.push(record)
+    harness.clock.advance(1)
+  }
+
+  const result = await harness.manager({ maxVersions: 1, versionGranularity: 'minor' }).run()
+
+  t.is(result.versionDeleted, 1)
+  t.is(result.countDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    kept.map((record) => record.transferId).sort()
+  )
+})
 
 test('count rotation applies independently per series', async (t) => {
   const harness = await createHarness(t)
