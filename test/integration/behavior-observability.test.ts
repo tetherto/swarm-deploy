@@ -103,7 +103,11 @@ test('public events and loggers contain failures while forwarding private lifecy
   t.ok(
     serverEvents.some(
       (event) =>
-        event.type === 'retention' && event.trigger === 'startup' && event.status === 'completed'
+        event.type === 'retention' &&
+        event.trigger === 'startup' &&
+        event.status === 'completed' &&
+        event.countDeleted === 0 &&
+        event.versionDeleted === 0
     )
   )
   t.ok(serverEvents.some((event) => event.type === 'progress'))
@@ -176,4 +180,61 @@ test('directory uploads emit per-file nonfinal results and one exact aggregate r
     failed: 0,
     skipped: 1
   })
+})
+
+test('count and version rotation counters reach retention events and rejected offers stay observable', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const storage = await createTempDir(t)
+  const source = await createTempDir(t)
+  const clientKey = keyPairFromSeed(CLIENT_SEED).publicKey
+  const retention: Array<Record<string, unknown>> = []
+  const offers: Array<Record<string, unknown>> = []
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: storage,
+    allowedKeys: [clientKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    dht: testnet.createNode(),
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxCount: 5,
+    maxVersions: 1,
+    versionGranularity: 'major'
+  })
+  server.on('retention', (event) => retention.push({ ...event }))
+  server.on('offer', (event) => offers.push({ ...event }))
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    idleTimeout: 1_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
+  await server.listen()
+
+  for (const name of ['api-1.0.0.bin', 'api-2.0.0.bin']) {
+    const input = path.join(source, name)
+    await fs.promises.writeFile(input, name)
+    t.is((await client.upload(input)).status, 'COMMITTED')
+  }
+  const unmatched = path.join(source, 'unmatched.txt')
+  await fs.promises.writeFile(unmatched, 'unmatched')
+  await t.exception(client.upload(unmatched), { code: ERRORS.INVALID_FILENAME })
+
+  const completed = retention.filter((event) => event.status === 'completed')
+  t.ok(completed.every((event) => event.countDeleted === 0))
+  t.is(
+    completed.reduce((total, event) => total + (event.versionDeleted as number), 0),
+    1
+  )
+  t.ok(completed.some((event) => event.trigger === 'post-commit' && event.versionDeleted === 1))
+  t.ok(
+    offers.some((event) => event.status === 'rejected' && event.reason === ERRORS.INVALID_FILENAME)
+  )
+  t.alike(
+    (await fs.promises.readdir(storage)).filter((name) => name.endsWith('.bin')),
+    ['api-2.0.0.bin']
+  )
 })

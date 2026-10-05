@@ -7,6 +7,7 @@ import { assertSafeDirectory, openSafeRegularFile, withSafeDirectoryIdentity } f
 import { digestMatches, SodiumSha256 } from '../tar-protocol/hash.js'
 import { assertSafeUint } from '../validation.js'
 import { withRootLease } from './root-coordinator.js'
+import { compareReleaseVersions, releaseVersionGroup, type VersionGranularity } from '../release.js'
 import type { CommitRecord } from './commit-journal.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
 
@@ -62,6 +63,8 @@ type RetentionEvent =
       expiredSessions: number
       scrubbed: number
       ageDeleted: number
+      countDeleted: number
+      versionDeleted: number
       storageDeleted: number
     }
   | { type: 'retention'; trigger: string; status: 'failed'; reason: string }
@@ -74,6 +77,8 @@ type RetentionEventPayload =
       expiredSessions: number
       scrubbed: number
       ageDeleted: number
+      countDeleted: number
+      versionDeleted: number
       storageDeleted: number
     }
   | { trigger: string; status: 'failed'; reason: string }
@@ -89,6 +94,9 @@ interface RetentionManagerOptions {
   sessionStore: SessionStore
   commitStore: CommitStore
   maxAge?: number
+  maxCount?: number
+  maxVersions?: number
+  versionGranularity?: VersionGranularity
   maxStorageBytes?: number
   resumeTtl?: number
   cleanupInterval?: number
@@ -134,6 +142,66 @@ function report(
 function compareRecords(left: CommitRecord, right: CommitRecord): number {
   if (left.committedAt !== right.committedAt) return left.committedAt - right.committedAt
   return left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+}
+
+interface RetentionResult {
+  expiredSessions: number
+  scrubbed: number
+  ageDeleted: number
+  countDeleted: number
+  versionDeleted: number
+  storageDeleted: number
+}
+
+/** Newest first: descending commit time, then transfer ID and name for determinism. */
+function compareNewest(left: CommitRecord, right: CommitRecord): number {
+  if (left.committedAt !== right.committedAt) return right.committedAt - left.committedAt
+  if (left.transferId !== right.transferId) return left.transferId < right.transferId ? -1 : 1
+  return left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+}
+
+function bySeries(records: CommitRecord[]): Map<string, CommitRecord[]> {
+  const groups = new Map<string, CommitRecord[]>()
+  for (const record of records) {
+    if (!record.release) continue
+    const group = groups.get(record.release.series)
+    if (group) group.push(record)
+    else groups.set(record.release.series, [record])
+  }
+  return groups
+}
+
+/** Transfer IDs of the newest `maxCount` released records in every series. */
+function countKeepSet(records: CommitRecord[], maxCount: number): Set<string> {
+  const keep = new Set<string>()
+  for (const group of bySeries(records).values()) {
+    for (const record of group.sort(compareNewest).slice(0, maxCount)) keep.add(record.transferId)
+  }
+  return keep
+}
+
+/** Transfer IDs of every versioned record in each series' newest `maxVersions` groups. */
+function versionKeepSet(
+  records: CommitRecord[],
+  maxVersions: number,
+  granularity: VersionGranularity
+): Set<string> {
+  const keep = new Set<string>()
+  for (const group of bySeries(records).values()) {
+    const versioned = group.filter((record) => record.release?.version !== undefined)
+    versioned.sort((left, right) => {
+      const order = compareReleaseVersions(right.release!.version!, left.release!.version!)
+      return order !== 0 ? order : compareNewest(left, right)
+    })
+    const groups = new Set<string>()
+    for (const record of versioned) {
+      const key = releaseVersionGroup(record.release!.version!, granularity)
+      if (!groups.has(key) && groups.size >= maxVersions) continue
+      groups.add(key)
+      keep.add(record.transferId)
+    }
+  }
+  return keep
 }
 
 function identityMatches(left: StorageStat, right: StorageStat): boolean {
@@ -224,6 +292,9 @@ class RetentionManager {
   sessionStore: SessionStore
   commitStore: CommitStore
   maxAge: number | undefined
+  maxCount: number | undefined
+  maxVersions: number | undefined
+  versionGranularity: VersionGranularity | undefined
   maxStorageBytes: number | undefined
   resumeTtl: number
   cleanupInterval: number
@@ -247,6 +318,9 @@ class RetentionManager {
     sessionStore,
     commitStore,
     maxAge,
+    maxCount,
+    maxVersions,
+    versionGranularity,
     maxStorageBytes,
     resumeTtl = DEFAULT_RESUME_TTL,
     cleanupInterval = DEFAULT_CLEANUP_INTERVAL,
@@ -293,6 +367,13 @@ class RetentionManager {
     }
     if (maxAge !== undefined) assertSafeUint(maxAge, 'maxAge')
     if (maxStorageBytes !== undefined) assertSafeUint(maxStorageBytes, 'maxStorageBytes')
+    if (maxCount !== undefined) assertPositiveSafeUint(maxCount, 'maxCount')
+    if (maxVersions !== undefined) assertPositiveSafeUint(maxVersions, 'maxVersions')
+    if (maxVersions === undefined) {
+      if (versionGranularity !== undefined) throw storageError('Invalid versionGranularity')
+    } else if (versionGranularity !== 'major' && versionGranularity !== 'minor') {
+      throw storageError('Invalid versionGranularity')
+    }
     assertPositiveSafeUint(resumeTtl, 'resumeTtl')
     assertPositiveSafeUint(cleanupInterval, 'cleanupInterval')
     if (cleanupInterval > MAX_CLEANUP_INTERVAL) throw storageError('Invalid cleanupInterval')
@@ -301,6 +382,9 @@ class RetentionManager {
     this.sessionStore = sessionStore
     this.commitStore = commitStore
     this.maxAge = maxAge
+    this.maxCount = maxCount
+    this.maxVersions = maxVersions
+    this.versionGranularity = versionGranularity
     this.maxStorageBytes = maxStorageBytes
     this.resumeTtl = resumeTtl
     this.cleanupInterval = cleanupInterval
@@ -403,7 +487,10 @@ class RetentionManager {
     return { records: valid, deleted, unknown: unknown.sort() }
   }
 
-  async _deleteRecord(record: CommitRecord, reason: 'MAX_AGE' | 'MAX_STORAGE'): Promise<void> {
+  async _deleteRecord(
+    record: CommitRecord,
+    reason: 'MAX_AGE' | 'MAX_COUNT' | 'MAX_VERSIONS' | 'MAX_STORAGE'
+  ): Promise<void> {
     try {
       if (!(await this.commitStore.delete(record))) {
         throw storageError('Managed commit record disappeared during retention')
@@ -434,21 +521,11 @@ class RetentionManager {
     return total
   }
 
-  run(options: RetentionRunOptions = {}): Promise<{
-    expiredSessions: number
-    scrubbed: number
-    ageDeleted: number
-    storageDeleted: number
-  }> {
+  run(options: RetentionRunOptions = {}): Promise<RetentionResult> {
     return withRootLease(this.layout.root, () => this._runUnlocked(options))
   }
 
-  async _runUnlocked(options: RetentionRunOptions = {}): Promise<{
-    expiredSessions: number
-    scrubbed: number
-    ageDeleted: number
-    storageDeleted: number
-  }> {
+  async _runUnlocked(options: RetentionRunOptions = {}): Promise<RetentionResult> {
     const trigger = options.trigger || 'manual'
     try {
       const result = await this._run(options)
@@ -462,12 +539,7 @@ class RetentionManager {
     }
   }
 
-  async _run({ incomingBytes = 0 }: RetentionRunOptions = {}): Promise<{
-    expiredSessions: number
-    scrubbed: number
-    ageDeleted: number
-    storageDeleted: number
-  }> {
+  async _run({ incomingBytes = 0 }: RetentionRunOptions = {}): Promise<RetentionResult> {
     assertSafeUint(incomingBytes, 'incomingBytes')
     if (this.maxStorageBytes !== undefined && incomingBytes > this.maxStorageBytes) {
       throw new SwarmDeployError(
@@ -492,6 +564,29 @@ class RetentionManager {
       }
     }
 
+    let countDeleted = 0
+    if (this.maxCount !== undefined) {
+      const keep = countKeepSet(current, this.maxCount)
+      for (const record of current.slice().sort(compareRecords)) {
+        if (!record.release || keep.has(record.transferId) || this._isPinned(record)) continue
+        await this._deleteRecord(record, 'MAX_COUNT')
+        current.splice(current.indexOf(record), 1)
+        countDeleted++
+      }
+    }
+
+    let versionDeleted = 0
+    if (this.maxVersions !== undefined && this.versionGranularity !== undefined) {
+      const keep = versionKeepSet(current, this.maxVersions, this.versionGranularity)
+      for (const record of current.slice().sort(compareRecords)) {
+        if (record.release?.version === undefined) continue
+        if (keep.has(record.transferId) || this._isPinned(record)) continue
+        await this._deleteRecord(record, 'MAX_VERSIONS')
+        current.splice(current.indexOf(record), 1)
+        versionDeleted++
+      }
+    }
+
     let storageDeleted = 0
     if (this.maxStorageBytes !== undefined) {
       const permitted = this.maxStorageBytes - incomingBytes
@@ -505,7 +600,14 @@ class RetentionManager {
       }
       if (total > permitted) throw storageError('Unable to reserve committed storage capacity')
     }
-    return { expiredSessions, scrubbed: scrub.deleted, ageDeleted, storageDeleted }
+    return {
+      expiredSessions,
+      scrubbed: scrub.deleted,
+      ageDeleted,
+      countDeleted,
+      versionDeleted,
+      storageDeleted
+    }
   }
 
   afterCommit(): Promise<boolean> {

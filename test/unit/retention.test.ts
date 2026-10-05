@@ -38,6 +38,13 @@ interface RetentionEvent {
   scrubbed?: number
   ageDeleted?: number
   storageDeleted?: number
+  countDeleted?: number
+  versionDeleted?: number
+}
+
+interface ReleaseCoordinates {
+  series: string
+  version?: string
 }
 
 interface FakeTimer {
@@ -57,7 +64,12 @@ interface Harness {
   commits: CommitStore
   input(name: string, content: Buffer): Promise<{ metadata: MetadataRecord; archive: Buffer }>
   stage(name: string, content: Buffer): Promise<TarSession>
-  publish(name: string, content: Buffer, mutable?: boolean): Promise<CommitRecord>
+  publish(
+    name: string,
+    content: Buffer,
+    mutable?: boolean,
+    release?: ReleaseCoordinates
+  ): Promise<CommitRecord>
   manager(options?: Partial<RetentionOptions>): RetentionManager
 }
 
@@ -136,10 +148,11 @@ async function createHarness(
     commits,
     input,
     stage,
-    async publish(name, content, mutable = false) {
+    async publish(name, content, mutable = false, release) {
       const session = await stage(name, content)
       const record = await commits.commit(session, {
-        ...(mutable ? { replaceNames: [name] } : {})
+        ...(mutable ? { replaceNames: [name] } : {}),
+        ...(release === undefined ? {} : { release })
       })
       await sessions.retireCommitted(session.transferId)
       return record
@@ -215,7 +228,14 @@ test('age deletes at its boundary before quota deletes the oldest remaining reco
 
   const result = await manager.run({ incomingBytes: 2 })
 
-  t.alike(result, { expiredSessions: 0, scrubbed: 0, ageDeleted: 1, storageDeleted: 1 })
+  t.alike(result, {
+    expiredSessions: 0,
+    scrubbed: 0,
+    ageDeleted: 1,
+    countDeleted: 0,
+    versionDeleted: 0,
+    storageDeleted: 1
+  })
   t.is(await exists(path.join(harness.layout.root, expired.name)), false)
   t.is(await exists(path.join(harness.layout.root, alpha.name)), false)
   t.alike(await harness.commits.list(), [bravo])
@@ -394,4 +414,297 @@ test('scrub detects an inode swap while hashing and preserves the replacement pa
   t.alike(result.unknown, [record.name])
   t.alike(await fs.promises.readFile(managedPath), content)
   t.alike(await harness.commits.list(), [])
+})
+
+test('count rotation keeps newest commits per series including history', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish(MUTABLE, b4a.from('1.0.0'), true, {
+    series: 'api',
+    version: '1.0.0'
+  })
+  harness.clock.advance(1)
+  const second = await harness.publish(MUTABLE, b4a.from('1.1.0'), true, {
+    series: 'api',
+    version: '1.1.0'
+  })
+  harness.clock.advance(1)
+  const third = await harness.publish(MUTABLE, b4a.from('1.2.0'), true, {
+    series: 'api',
+    version: '1.2.0'
+  })
+  const result = await harness
+    .manager({
+      maxCount: 2,
+      isPinned: (record) => record.name === MUTABLE
+    })
+    .run()
+
+  t.is(result.countDeleted, 1)
+  t.is(result.versionDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [second.transferId, third.transferId].sort()
+  )
+  t.is(await exists(path.join(harness.layout.root, historyName(first.transferId))), false)
+})
+
+test('version rotation keeps newest distinct SemVer minor groups', async (t) => {
+  const harness = await createHarness(t)
+  const releases = ['1.9.9', '2.0.0-rc.1', '2.0.0', '2.1.0', '2.1.1']
+  for (const [index, version] of releases.entries()) {
+    await harness.publish(`api-${index}.bin`, b4a.from(version), false, {
+      series: 'api',
+      version
+    })
+    harness.clock.advance(1)
+  }
+  const result = await harness
+    .manager({
+      maxVersions: 2,
+      versionGranularity: 'minor'
+    })
+    .run()
+
+  t.is(result.versionDeleted, 1)
+  t.is(result.countDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.release?.version).sort(),
+    ['2.0.0-rc.1', '2.0.0', '2.1.0', '2.1.1'].sort()
+  )
+})
+
+interface RotationCase {
+  name: string
+  versions: string[]
+  maxCount?: number
+  maxVersions?: number
+  tie?: boolean
+  expected: (published: CommitRecord[]) => number[]
+}
+
+const ROTATION_CASES: RotationCase[] = [
+  {
+    name: 'equal-time count ties',
+    versions: ['1.0.0', '1.0.1', '1.0.2'],
+    maxCount: 2,
+    tie: true,
+    expected: (published) => {
+      const ordered = published
+        .map((record, index) => ({ id: record.transferId, index }))
+        .sort((left, right) => (left.id < right.id ? -1 : 1))
+      return ordered.slice(0, 2).map((entry) => entry.index)
+    }
+  },
+  {
+    name: 'major groups',
+    versions: ['1.9.9', '2.0.0-rc.1', '2.1.0', '3.0.0'],
+    maxVersions: 2,
+    expected: () => [1, 2, 3]
+  },
+  {
+    name: 'count and version intersection',
+    versions: ['1.0.0', '2.0.0', '2.0.1'],
+    maxCount: 1,
+    maxVersions: 1,
+    expected: () => [2]
+  }
+]
+
+for (const scenario of ROTATION_CASES) {
+  test(`rotation selection: ${scenario.name}`, async (t) => {
+    const harness = await createHarness(t)
+    const pinned = await harness.publish(MUTABLE, b4a.from('pinned'), true, {
+      series: 'api',
+      version: '0.0.1'
+    })
+    harness.clock.advance(1)
+    const legacy = await harness.publish('legacy.bin', b4a.from('legacy'))
+    const other = await harness.publish('other.bin', b4a.from('other'), false, {
+      series: 'other',
+      version: '9.9.9'
+    })
+    const published: CommitRecord[] = []
+    for (const [index, version] of scenario.versions.entries()) {
+      published.push(
+        await harness.publish(`api-${index}.bin`, b4a.from(version), false, {
+          series: 'api',
+          version
+        })
+      )
+      if (!scenario.tie) harness.clock.advance(1)
+    }
+
+    const result = await harness
+      .manager({
+        ...(scenario.maxCount === undefined ? {} : { maxCount: scenario.maxCount }),
+        ...(scenario.maxVersions === undefined
+          ? {}
+          : { maxVersions: scenario.maxVersions, versionGranularity: 'major' as const }),
+        isPinned: (record) => record.name === MUTABLE
+      })
+      .run()
+
+    const kept = scenario.expected(published).map((index) => published[index].transferId)
+    t.alike(
+      (await harness.commits.list()).map((record) => record.transferId).sort(),
+      [pinned.transferId, legacy.transferId, other.transferId, ...kept].sort()
+    )
+    t.is(
+      (result.countDeleted ?? 0) + (result.versionDeleted ?? 0),
+      scenario.versions.length - kept.length
+    )
+    t.is(await exists(path.join(harness.layout.root, MUTABLE)), true)
+    t.is(await exists(path.join(harness.layout.root, 'legacy.bin')), true)
+    t.is(await exists(path.join(harness.layout.root, 'other.bin')), true)
+  })
+}
+
+test('count rotation applies independently per series', async (t) => {
+  const harness = await createHarness(t)
+  const records: CommitRecord[] = []
+  for (const series of ['api', 'web']) {
+    for (const version of ['1.0.0', '1.0.1']) {
+      records.push(
+        await harness.publish(`${series}-${version}.bin`, b4a.from(`${series}${version}`), false, {
+          series,
+          version
+        })
+      )
+      harness.clock.advance(1)
+    }
+  }
+
+  const result = await harness.manager({ maxCount: 1 }).run()
+
+  t.is(result.countDeleted, 2)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [records[1].transferId, records[3].transferId].sort()
+  )
+})
+
+test('count-only releases without versions are ignored by version rotation', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish('api-a.bin', b4a.from('a'), false, { series: 'api' })
+  harness.clock.advance(1)
+  const second = await harness.publish('api-b.bin', b4a.from('b'), false, { series: 'api' })
+
+  const result = await harness.manager({ maxVersions: 1, versionGranularity: 'major' }).run()
+
+  t.is(result.versionDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [first.transferId, second.transferId].sort()
+  )
+})
+
+test('count and version stages run after age and before quota with stable reasons and events', async (t) => {
+  const harness = await createHarness(t)
+  const reasons: Array<[string, unknown]> = []
+  const events: RetentionEvent[] = []
+  const expired = await harness.publish('old.bin', b4a.from('old'), false, {
+    series: 'api',
+    version: '1.0.0'
+  })
+  harness.clock.advance(10)
+  const countVictim = await harness.publish('api-1.bin', b4a.from('c1'), false, {
+    series: 'api',
+    version: '1.0.1'
+  })
+  harness.clock.advance(1)
+  const webOld = await harness.publish('web-1.bin', b4a.from('w1'), false, {
+    series: 'web',
+    version: '1.0.0'
+  })
+  harness.clock.advance(1)
+  const keep = await harness.publish('web-2.bin', b4a.from('w2'), false, {
+    series: 'web',
+    version: '2.0.0'
+  })
+  harness.clock.advance(1)
+  const survivor = await harness.publish('api-2.bin', b4a.from('c2'), false, {
+    series: 'api',
+    version: '1.0.2'
+  })
+
+  const manager = harness.manager({
+    maxAge: 10,
+    maxCount: 1,
+    maxVersions: 1,
+    versionGranularity: 'major',
+    maxStorageBytes: 100,
+    logger: {
+      info(_message, details) {
+        reasons.push([details.name as string, details.reason])
+      }
+    },
+    onEvent: (event) => events.push(event)
+  })
+
+  const result = await manager.run()
+
+  t.alike(result, {
+    expiredSessions: 0,
+    scrubbed: 0,
+    ageDeleted: 1,
+    countDeleted: 2,
+    versionDeleted: 0,
+    storageDeleted: 0
+  })
+  t.alike(reasons, [
+    [expired.name, 'MAX_AGE'],
+    [countVictim.name, 'MAX_COUNT'],
+    [webOld.name, 'MAX_COUNT']
+  ])
+  t.alike(events.at(-1), { type: 'retention', trigger: 'manual', status: 'completed', ...result })
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [keep.transferId, survivor.transferId].sort()
+  )
+})
+
+test('version stage reports MAX_VERSIONS deletions after count keeps every record', async (t) => {
+  const harness = await createHarness(t)
+  const reasons: Array<[string, unknown]> = []
+  const old = await harness.publish('api-old.bin', b4a.from('old'), false, {
+    series: 'api',
+    version: '1.0.0'
+  })
+  harness.clock.advance(1)
+  await harness.publish('api-new.bin', b4a.from('new'), false, { series: 'api', version: '2.0.0' })
+
+  const result = await harness
+    .manager({
+      maxCount: 5,
+      maxVersions: 1,
+      versionGranularity: 'major',
+      logger: {
+        info(_message, details) {
+          reasons.push([details.name as string, details.reason])
+        }
+      }
+    })
+    .run()
+
+  t.is(result.countDeleted, 0)
+  t.is(result.versionDeleted, 1)
+  t.alike(reasons, [[old.name, 'MAX_VERSIONS']])
+})
+
+test('rotation options are validated', async (t) => {
+  const harness = await createHarness(t)
+  for (const options of [
+    { maxCount: 0 },
+    { maxCount: 1.5 },
+    { maxVersions: 0, versionGranularity: 'major' },
+    { maxVersions: 1 },
+    { versionGranularity: 'major' },
+    { maxVersions: 1, versionGranularity: 'patch' }
+  ]) {
+    await t.exception(
+      () => harness.manager(options as Partial<RetentionOptions>),
+      undefined,
+      JSON.stringify(options)
+    )
+  }
 })

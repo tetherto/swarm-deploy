@@ -12,6 +12,7 @@ import {
 import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
 import { validateReplaceNames } from './files.js'
 import { keyPairFromSeed } from './identity.js'
+import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
 import { acquireStorageLock, initLayout } from './storage/layout.js'
 import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
@@ -68,6 +69,11 @@ export interface ServerOptions {
   minFreeBytes?: number
   maxAge?: number
   maxStorageBytes?: number
+  /** Ordered release templates; when non-empty every new offer must match one. */
+  artifactPatterns?: Iterable<string>
+  maxCount?: number
+  maxVersions?: number
+  versionGranularity?: VersionGranularity
   dht?: DirectDhtNode
   dhtFactory?: DirectDhtFactory
   storage?: StorageAdapter
@@ -116,6 +122,8 @@ export interface RetentionEvent {
   expiredSessions?: number
   scrubbed?: number
   ageDeleted?: number
+  countDeleted?: number
+  versionDeleted?: number
   storageDeleted?: number
 }
 export interface ServerCloseEvent {
@@ -204,6 +212,11 @@ export class Server extends EventEmitter {
   readonly minFreeBytes: number
   readonly maxAge: number | undefined
   readonly maxStorageBytes: number | undefined
+  readonly artifactPatterns: readonly string[]
+  readonly maxCount: number | undefined
+  readonly maxVersions: number | undefined
+  readonly versionGranularity: VersionGranularity | undefined
+  private readonly releaseMatcher: ReleaseMatcher
   private readonly allowedKeySnapshot: readonly Buffer[]
   readonly logger: SafeLogger
   readonly dht: DirectDhtNode | undefined
@@ -275,6 +288,36 @@ export class Server extends EventEmitter {
     }
     this.maxAge = options.maxAge
     this.maxStorageBytes = options.maxStorageBytes
+    const patterns = options.artifactPatterns ?? []
+    if (typeof (patterns as Iterable<unknown>)[Symbol.iterator] !== 'function') {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid artifact patterns')
+    }
+    try {
+      this.artifactPatterns = Object.freeze([...patterns])
+      this.releaseMatcher = new ReleaseMatcher(this.artifactPatterns)
+    } catch (error) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid artifact patterns', error)
+    }
+    if (options.maxCount !== undefined) {
+      positive(options.maxCount, 'maxCount')
+      if (this.releaseMatcher.size === 0) {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'maxCount requires artifact patterns')
+      }
+    }
+    if (options.maxVersions !== undefined) {
+      positive(options.maxVersions, 'maxVersions')
+      if (!this.releaseMatcher.hasVersionPattern) {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'maxVersions requires a {version} artifact pattern')
+      }
+      if (options.versionGranularity !== 'major' && options.versionGranularity !== 'minor') {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid versionGranularity')
+      }
+    } else if (options.versionGranularity !== undefined) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'versionGranularity requires maxVersions')
+    }
+    this.maxCount = options.maxCount
+    this.maxVersions = options.maxVersions
+    this.versionGranularity = options.versionGranularity
     const allow: Buffer[] = []
     if (
       !options.allowedKeys ||
@@ -320,6 +363,25 @@ export class Server extends EventEmitter {
     }
   }
 
+  private async rejectOffer(
+    socket: DirectDhtSocket,
+    event: ReturnType<Server['transfer']>,
+    owner: Uint8Array,
+    reason: ErrorCode
+  ): Promise<void> {
+    await writeAdmission(
+      socket,
+      { v: 1, status: 'REJECTED', code: reason },
+      { signal: this.signal, timeout: this.idleTimeout }
+    )
+    this.emitSafe('offer', {
+      ...event,
+      fingerprint: fingerprint(owner),
+      status: 'rejected',
+      reason
+    })
+  }
+
   private async receive(socket: DirectDhtSocket): Promise<void> {
     const owner = socket.remotePublicKey
     if (this.closed || !this.allowed(owner) || !this.sessions || !this.commits) {
@@ -361,24 +423,23 @@ export class Server extends EventEmitter {
       const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
       assertMetadataTransferId(owner, metadata)
       event = this.transfer(metadata)
+      let release: ReleaseCoordinates | null = null
+      if (this.releaseMatcher.size > 0) {
+        release = this.releaseMatcher.match(metadata.name, metadata.sourceParent)
+        if (release === null) {
+          await this.rejectOffer(socket, event, owner, ERRORS.INVALID_FILENAME)
+          sentAdmission = true
+          return
+        }
+      }
       if (
         metadata.fileSize > this.maxFileBytes ||
         this.activeUploads.size >= this.maxActiveUploads
       ) {
         const reason =
           metadata.fileSize > this.maxFileBytes ? ERRORS.FILE_TOO_LARGE : ERRORS.ACTIVE_UPLOAD_LIMIT
-        await writeAdmission(
-          socket,
-          { v: 1, status: 'REJECTED', code: reason },
-          { signal: this.signal, timeout: this.idleTimeout }
-        )
+        await this.rejectOffer(socket, event, owner, reason)
         sentAdmission = true
-        this.emitSafe('offer', {
-          ...event,
-          fingerprint: fingerprint(owner),
-          status: 'rejected',
-          reason
-        })
         return
       }
       const inspected = await this.commits.inspect(
@@ -387,7 +448,8 @@ export class Server extends EventEmitter {
           name: metadata.name,
           size: metadata.fileSize,
           digest: b4a.from(metadata.fileSha256, 'hex'),
-          transferId: b4a.from(metadata.transferId, 'hex')
+          transferId: b4a.from(metadata.transferId, 'hex'),
+          release
         },
         { replaceNames: this.replaceNames }
       )
@@ -409,18 +471,8 @@ export class Server extends EventEmitter {
         throw fail(ERRORS.FILE_EXISTS, 'Destination already exists')
       }
       if (this.activeUploads.size >= this.maxActiveUploads) {
-        await writeAdmission(
-          socket,
-          { v: 1, status: 'REJECTED', code: ERRORS.ACTIVE_UPLOAD_LIMIT },
-          { signal: this.signal, timeout: this.idleTimeout }
-        )
+        await this.rejectOffer(socket, event, owner, ERRORS.ACTIVE_UPLOAD_LIMIT)
         sentAdmission = true
-        this.emitSafe('offer', {
-          ...event,
-          fingerprint: fingerprint(owner),
-          status: 'rejected',
-          reason: ERRORS.ACTIVE_UPLOAD_LIMIT
-        })
         return
       }
       this.activeUploads.add(socket)
@@ -450,7 +502,8 @@ export class Server extends EventEmitter {
         await this.commits.commit(verified, {
           retentionManager: this.retention,
           signal: this.signal,
-          replaceNames: this.replaceNames
+          replaceNames: this.replaceNames,
+          release
         })
         this.emitSafe('commit', {
           ...event,
@@ -540,7 +593,8 @@ export class Server extends EventEmitter {
       await this.commits.commit(verified, {
         retentionManager: this.retention,
         signal: this.signal,
-        replaceNames: this.replaceNames
+        replaceNames: this.replaceNames,
+        release
       })
       this.emitSafe('commit', {
         ...event,
@@ -670,6 +724,9 @@ export class Server extends EventEmitter {
         sessionStore: this.sessions,
         commitStore: this.commits,
         maxAge: this.maxAge,
+        maxCount: this.maxCount,
+        maxVersions: this.maxVersions,
+        versionGranularity: this.versionGranularity,
         maxStorageBytes: this.maxStorageBytes,
         resumeTtl: this.resumeTtl,
         cleanupInterval: this.cleanupInterval,

@@ -73,6 +73,8 @@ interface CommitOffer {
   size: number
   digest: Uint8Array
   transferId: Uint8Array
+  /** Matched release identity; transfer and release must agree for an idempotent result. */
+  release?: ReleaseCoordinates | null
 }
 
 interface RetentionManager {
@@ -782,15 +784,17 @@ class CommitStore {
     assertSafeUint(offer.size, 'commit offer size')
     assertFixed32(offer.digest, 'commit offer digest')
     assertFixed32(offer.transferId, 'commit offer transfer ID')
+    const release = snapshotRelease(offer.release)
     const mutable = validateReplaceNames(replaceNames)
 
-    return withNameLease(this.layout.root, name, () => this._inspect(name, offer, mutable))
+    return withNameLease(this.layout.root, name, () => this._inspect(name, offer, mutable, release))
   }
 
   async _inspect(
     name: string,
     offer: CommitOffer,
-    mutable: Set<string>
+    mutable: Set<string>,
+    release: CommitRelease | undefined
   ): Promise<
     | { status: 'AVAILABLE' }
     | { status: 'ALREADY_COMMITTED'; record: CommitRecord }
@@ -809,6 +813,7 @@ class CommitStore {
       record.size === offer.size &&
       sameHex32(record.sha256, toHex(offer.digest)) &&
       sameHex32(record.transferId, id) &&
+      releasesEqual(record.release, release) &&
       (await this._matchesRecord(finalPath, this.layout.root, record))
     ) {
       return { status: 'ALREADY_COMMITTED', record }
@@ -819,7 +824,13 @@ class CommitStore {
     if (!current || !identitiesEqual(current.identity, fileIdentity(final))) {
       return { status: 'FILE_EXISTS' }
     }
+    const sameRelease = releasesEqual(current.record.release, release)
+    if (sameHex32(current.record.transferId, id) && !sameRelease) {
+      // One transfer ID names one authenticated upload; its release identity is immutable.
+      throw storageError('Release identity conflicts with the committed transfer')
+    }
     if (
+      sameRelease &&
       current.record.size === offer.size &&
       sameHex32(current.record.sha256, toHex(offer.digest))
     ) {

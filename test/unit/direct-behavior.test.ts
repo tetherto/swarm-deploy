@@ -617,3 +617,205 @@ test('Server recovery reports the number of purged corrupt TAR sessions', async 
   await server.listen()
   t.alike(completed, [1])
 })
+
+async function manifestIn(
+  t: Assert,
+  parent: string,
+  name: string,
+  contents: string = name
+): Promise<{ manifest: TarManifest; tar: Buffer }> {
+  const root = await createTempDir(t)
+  const directory = path.join(root, parent)
+  await fs.promises.mkdir(directory)
+  const file = path.join(directory, name)
+  await fs.promises.writeFile(file, contents)
+  const built = await buildTarManifest(file, CLIENT_KEY)
+  const chunks: Buffer[] = []
+  await regenerateTarSuffix(built, 0, (chunk) => {
+    chunks.push(b4a.from(chunk))
+  })
+  return { manifest: built, tar: b4a.concat(chunks) }
+}
+
+type ReleaseSpy = {
+  inspected: unknown[]
+  committed: unknown[]
+  admitted: number
+}
+
+function spyRelease(server: Server): ReleaseSpy {
+  const spy: ReleaseSpy = { inspected: [], committed: [], admitted: 0 }
+  const internals = server as unknown as { commits: CommitStore; sessions: SessionStore }
+  const inspect = internals.commits.inspect.bind(internals.commits)
+  internals.commits.inspect = (...args: Parameters<CommitStore['inspect']>) => {
+    spy.inspected.push(args[1].release)
+    return inspect(...args)
+  }
+  const commit = internals.commits.commit.bind(internals.commits)
+  internals.commits.commit = (...args: Parameters<CommitStore['commit']>) => {
+    spy.committed.push(args[1]?.release)
+    return commit(...args)
+  }
+  const admit = internals.sessions.admit.bind(internals.sessions)
+  internals.sessions.admit = (...args: Parameters<SessionStore['admit']>) => {
+    spy.admitted++
+    return admit(...args)
+  }
+  return spy
+}
+
+test('Server without artifact patterns accepts unmatched names and passes no release', async (t) => {
+  const { server, node } = await createServer(t)
+  const spy = spyRelease(server)
+  const input = await manifest(t, 'unmatched.txt')
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(metadataFrame(input.manifest))
+  await waitFor(() => statuses(socket).includes('ACCEPT'))
+  socket.feed(input.tar)
+  socket.finishInput()
+  await waitFor(() => statuses(socket).includes('COMMITTED'))
+
+  t.alike(spy.inspected, [null])
+  t.alike(spy.committed, [null])
+})
+
+test('Server rejects unmatched offers before admission when artifact patterns are configured', async (t) => {
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin', 'releases/{series}.bin']
+  })
+  const spy = spyRelease(server)
+  const offers: Array<{ status: string; reason?: string }> = []
+  server.on('offer', (event) => offers.push({ status: event.status, reason: event.reason }))
+  const unsafeParent = await manifestIn(t, 'bad parent', 'app.bin')
+  t.is(unsafeParent.manifest.sourceParent, undefined)
+  const inputs = [
+    await manifest(t, 'plain.txt'),
+    await manifestIn(t, 'staging', 'app.bin'),
+    unsafeParent,
+    await manifest(t, 'app.bin')
+  ]
+
+  for (const input of inputs) {
+    const socket = new FakeSocket(CLIENT_KEY)
+    node.accept(socket)
+    socket.feed(metadataFrame(input.manifest))
+    await waitFor(() => statuses(socket).includes('REJECTED'))
+    const rejected = decodeAdmissionRecord(socket.writes[0].subarray(4))
+    if (rejected.status !== 'REJECTED') throw new Error('Expected rejection')
+    t.is(rejected.code, ERRORS.INVALID_FILENAME)
+    socket.destroy()
+  }
+
+  t.alike(
+    offers,
+    inputs.map(() => ({ status: 'rejected', reason: ERRORS.INVALID_FILENAME }))
+  )
+  t.is(spy.admitted, 0)
+  t.alike(spy.inspected, [])
+  t.alike(spy.committed, [])
+})
+
+test('Server passes normalized release coordinates from filename and parent templates', async (t) => {
+  const { server, node } = await createServer(t, {
+    artifactPatterns: ['{series}-{version}.bin', '{version}/{series}.tar.gz']
+  })
+  const spy = spyRelease(server)
+  const uploads = [
+    await manifest(t, 'payments-2.4.1.bin'),
+    await manifestIn(t, '3.0.0-rc.1', 'web.tar.gz')
+  ]
+  const expected = [
+    { series: 'payments', version: '2.4.1' },
+    { series: 'web', version: '3.0.0-rc.1' }
+  ]
+
+  for (const input of uploads) {
+    const socket = new FakeSocket(CLIENT_KEY)
+    node.accept(socket)
+    socket.feed(metadataFrame(input.manifest))
+    await waitFor(() => statuses(socket).includes('ACCEPT'))
+    socket.feed(input.tar)
+    socket.finishInput()
+    await waitFor(() => statuses(socket).includes('COMMITTED'))
+  }
+
+  t.alike(spy.inspected, expected)
+  t.alike(spy.committed, expected)
+  const commits = (server as unknown as { commits: CommitStore }).commits
+  t.alike(
+    (await commits.list())
+      .map((record) => record.release)
+      .sort((a, b) => (a!.series < b!.series ? -1 : 1)),
+    [expected[0], expected[1]].sort((a, b) => (a.series < b.series ? -1 : 1))
+  )
+})
+
+test('Server passes the matched release when committing an already verified session', async (t) => {
+  const { server, node } = await createServer(t, { artifactPatterns: ['{series}-{version}.bin'] })
+  const spy = spyRelease(server)
+  const input = await manifest(t, 'verified-1.2.3.bin')
+  const metadata = metadataFromManifest(input.manifest)
+  const sessions = (server as unknown as { sessions: SessionStore }).sessions
+  await sessions.admit(CLIENT_KEY, metadata)
+  await sessions.append(CLIENT_KEY, metadata, 0, input.tar)
+  await sessions.verify(CLIENT_KEY, metadata)
+  spy.admitted = 0
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(metadataFrame(input.manifest))
+  await waitFor(() => statuses(socket).includes('COMMITTED'))
+
+  t.alike(spy.committed, [{ series: 'verified', version: '1.2.3' }])
+})
+
+test('Server rejects invalid retention and artifact pattern combinations', async (t) => {
+  const base = {
+    seed: SERVER_SEED,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0
+  }
+  const invalid: Array<Partial<ConstructorParameters<typeof Server>[0]>> = [
+    { maxCount: 1 },
+    { maxCount: 0, artifactPatterns: ['{series}.bin'] },
+    { maxVersions: 1, versionGranularity: 'major' },
+    { maxVersions: 1, versionGranularity: 'major', artifactPatterns: ['{series}.bin'] },
+    { maxVersions: 1, artifactPatterns: ['{series}-{version}.bin'] },
+    { maxVersions: 0, versionGranularity: 'major', artifactPatterns: ['{series}-{version}.bin'] },
+    { versionGranularity: 'major', artifactPatterns: ['{series}-{version}.bin'] },
+    {
+      maxVersions: 1,
+      versionGranularity: 'patch' as 'major',
+      artifactPatterns: ['{series}-{version}.bin']
+    },
+    { artifactPatterns: ['{series}.bin', '{series}.bin'] },
+    { artifactPatterns: ['no-placeholder.bin'] },
+    { artifactPatterns: 7 as unknown as string[] }
+  ]
+  for (const options of invalid) {
+    await t.exception(
+      () => new Server({ ...base, storageDir: '/unused', ...options }),
+      { code: ERRORS.PROTOCOL_INVALID },
+      JSON.stringify(options)
+    )
+  }
+
+  const patterns = ['{series}-{version}.bin']
+  const server = new Server({
+    ...base,
+    storageDir: '/unused',
+    artifactPatterns: patterns,
+    maxCount: 2,
+    maxVersions: 1,
+    versionGranularity: 'minor'
+  })
+  patterns.push('{series}.tar.gz')
+  t.alike([...server.artifactPatterns], ['{series}-{version}.bin'])
+  t.is(server.maxCount, 2)
+  t.is(server.maxVersions, 1)
+  t.is(server.versionGranularity, 'minor')
+})

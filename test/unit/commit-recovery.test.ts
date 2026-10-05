@@ -810,3 +810,130 @@ test('create-only direct-TAR crash boundaries leave only resumable or committed 
     await restarted.close()
   }
 })
+
+function offerFor(
+  session: TarSession,
+  release: ReleaseCoordinates | null | undefined
+): Parameters<CommitStore['inspect']>[1] {
+  return {
+    name: session.name,
+    size: session.size,
+    digest: session.digest,
+    transferId: transferId(session.id),
+    ...(release === undefined ? {} : { release })
+  }
+}
+
+test('inspect reports ALREADY_COMMITTED only when transfer and release identity agree', async (t) => {
+  const other = { series: 'api', version: '9.9.9' }
+  for (const [label, committed] of [
+    ['released', RELEASE],
+    ['legacy', undefined]
+  ] as const) {
+    const harness = await createHarness(t)
+    const name = `${label}.bin`
+    const session = await harness.stage(NEW_BYTES, name, RELEASE.version)
+    const record = await commitRelease(harness.commits, session, { release: committed })
+    await harness.sessions.retireCommitted(session.transferId)
+    const offered = (release: ReleaseCoordinates | null): Promise<{ status: string }> =>
+      harness.commits.inspect(name, offerFor(session, release))
+
+    t.is((await offered(committed ?? null)).status, 'ALREADY_COMMITTED', `${label} agrees`)
+    t.alike(
+      (await harness.commits.inspect(name, offerFor(session, committed ?? null))) as unknown,
+      { status: 'ALREADY_COMMITTED', record },
+      `${label} record`
+    )
+    for (const different of committed ? [null, other, { series: 'api' }] : [RELEASE]) {
+      t.is(
+        (await offered(different)).status,
+        'FILE_EXISTS',
+        `${label} ${JSON.stringify(different)}`
+      )
+    }
+  }
+})
+
+test('inspect fails closed when a mutable transfer is offered with another release identity', async (t) => {
+  const harness = await createHarness(t)
+  const record = await harness.publish(NEW_BYTES, MUTABLE, RELEASE, RELEASE.version)
+  const session = await harness.stage(NEW_BYTES, MUTABLE, RELEASE.version)
+  t.is(session.id, record.transferId)
+
+  t.is(
+    (
+      await harness.commits.inspect(MUTABLE, offerFor(session, RELEASE), {
+        replaceNames: [MUTABLE]
+      })
+    ).status,
+    'ALREADY_COMMITTED'
+  )
+  for (const different of [null, { series: 'api', version: '9.9.9' }]) {
+    await t.exception(
+      harness.commits.inspect(MUTABLE, offerFor(session, different), { replaceNames: [MUTABLE] }),
+      { code: ERRORS.PROTOCOL_INVALID, message: /release identity/i },
+      JSON.stringify(different)
+    )
+  }
+})
+
+test('identical bytes under a different matched release replace a mutable name and keep history', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish(NEW_BYTES, MUTABLE, OLD_RELEASE, OLD_RELEASE.version)
+  const second = await harness.stage(NEW_BYTES, MUTABLE, RELEASE.version)
+  t.not(second.id, first.transferId)
+
+  const inspected = await harness.commits.inspect(MUTABLE, offerFor(second, RELEASE), {
+    replaceNames: [MUTABLE]
+  })
+  t.alike(inspected as unknown, { status: 'REPLACEABLE', record: first })
+
+  const committed = await commitRelease(harness.commits, second, {
+    replaceNames: [MUTABLE],
+    release: RELEASE
+  })
+  await harness.sessions.retireCommitted(second.transferId)
+  t.alike(committed.release, RELEASE)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.release?.version).sort(),
+    [OLD_RELEASE.version, RELEASE.version].sort()
+  )
+  t.alike(
+    await fs.promises.readFile(path.join(harness.layout.root, historyName(first.transferId))),
+    NEW_BYTES
+  )
+})
+
+test('identical bytes with unchanged release stay idempotent for a different transfer', async (t) => {
+  const harness = await createHarness(t)
+  const countOnly = { series: 'api' }
+  const first = await harness.publish(NEW_BYTES, MUTABLE, countOnly, '2.4.0')
+  const second = await harness.stage(NEW_BYTES, MUTABLE, '2.4.1')
+  t.not(second.id, first.transferId)
+
+  t.alike(
+    (await harness.commits.inspect(MUTABLE, offerFor(second, countOnly), {
+      replaceNames: [MUTABLE]
+    })) as unknown,
+    { status: 'ALREADY_COMMITTED', record: first }
+  )
+})
+
+test('legacy current with identical bytes is replaceable by a matched release', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish(NEW_BYTES, MUTABLE, undefined, '2.4.0')
+  const second = await harness.stage(NEW_BYTES, MUTABLE, '2.4.1')
+
+  t.alike(
+    (await harness.commits.inspect(MUTABLE, offerFor(second, RELEASE), {
+      replaceNames: [MUTABLE]
+    })) as unknown,
+    { status: 'REPLACEABLE', record: first }
+  )
+  t.alike(
+    (await harness.commits.inspect(MUTABLE, offerFor(second, null), {
+      replaceNames: [MUTABLE]
+    })) as unknown,
+    { status: 'ALREADY_COMMITTED', record: first }
+  )
+})
