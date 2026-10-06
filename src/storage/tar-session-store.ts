@@ -5,21 +5,32 @@ import path from '#path'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import {
+  type AnyMetadataRecord,
   type MetadataRecord,
-  encodeMetadataRecord,
-  decodeMetadataRecord
+  type TreeMetadataRecord,
+  decodeAnyMetadataRecord,
+  decodeTreeMetadataRecord,
+  encodeAnyMetadataRecord,
+  encodeTreeMetadataRecord,
+  isTreeMetadata
 } from '../tar-protocol/controls.js'
 import { validateAndExtractTar } from '../tar-protocol/extract.js'
+import { validateAndExtractTreeTar } from '../tar-protocol/tree-extract.js'
 import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
+import { assertTreeMetadataTransferId } from '../tar-protocol/tree-manifest.js'
 import { atomicWriteRenamed, MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
 import { readCommitJournal } from './commit-journal.js'
 import { assertSafeFile, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
+import { createTreeStagingTarget } from './tree-staging.js'
+import { digestTree, inspectTreePath, removeTree } from './tree-fs.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout } from './types.js'
-import type { Clock } from '../types.js'
+import type { ArtifactKind, Clock } from '../types.js'
 import { assertSafeUint } from '../validation.js'
 
 const VERSION = 3
 const LEGACY_VERSION = 2
+/** Directory sessions are persisted at a version no file-only server understands. */
+export const TREE_SESSION_VERSION = 4
 const RECEIVING = 'receiving'
 const VERIFIED = 'verified'
 const DELETING = 'deleting'
@@ -31,13 +42,20 @@ export interface TarSession {
   id: string
   transferId: Buffer
   ownerKey: Buffer
+  kind: ArtifactKind
   name: string
   sourceParent?: string
+  /** Payload bytes: the file size, or the aggregate tree payload size. */
   size: number
+  /** The file digest, or the canonical tree digest. */
   digest: Buffer
+  /** Present only for a directory session. */
+  entryCount?: number
   tarSize: number
   tarDigest: Buffer
   tarPath: string
+  /** Present only for a directory session. */
+  treePath?: string
   state: State
   createdAt: number
   updatedAt: number
@@ -57,6 +75,24 @@ interface PersistedTarSession {
   sourceParent?: string
   fileSize: number
   fileSha256: string
+  tarSize: number
+  tarSha256: string
+  partialTar: { path: string; size: number }
+  createdAt: number
+  updatedAt: number
+  state: State
+}
+
+interface PersistedTreeSession {
+  version: typeof TREE_SESSION_VERSION
+  kind: 'directory'
+  transferId: string
+  ownerKey: string
+  name: string
+  sourceParent?: string
+  entryCount: number
+  payloadBytes: number
+  treeSha256: string
   tarSize: number
   tarSha256: string
   partialTar: { path: string; size: number }
@@ -98,15 +134,32 @@ function key(value: Uint8Array, name: string): void {
   if (!b4a.isBuffer(value) || value.byteLength !== 32) throw problem(`Invalid ${name}`)
 }
 
-function sameMetadata(session: TarSession, metadata: MetadataRecord, owner: Uint8Array): boolean {
+function sameMetadata(
+  session: TarSession,
+  metadata: AnyMetadataRecord,
+  owner: Uint8Array
+): boolean {
+  if (
+    !sodium.sodium_memcmp(session.ownerKey, owner) ||
+    session.name !== metadata.name ||
+    session.sourceParent !== metadata.sourceParent ||
+    session.tarSize !== metadata.tarSize ||
+    !sodium.sodium_memcmp(session.tarDigest, b4a.from(metadata.tarSha256, 'hex'))
+  ) {
+    return false
+  }
+  if (isTreeMetadata(metadata)) {
+    return (
+      session.kind === 'directory' &&
+      session.entryCount === metadata.entryCount &&
+      session.size === metadata.payloadBytes &&
+      sodium.sodium_memcmp(session.digest, b4a.from(metadata.treeSha256, 'hex'))
+    )
+  }
   return (
-    sodium.sodium_memcmp(session.ownerKey, owner) &&
-    session.name === metadata.name &&
-    session.sourceParent === metadata.sourceParent &&
+    session.kind === 'file' &&
     session.size === metadata.fileSize &&
-    session.tarSize === metadata.tarSize &&
-    sodium.sodium_memcmp(session.digest, b4a.from(metadata.fileSha256, 'hex')) &&
-    sodium.sodium_memcmp(session.tarDigest, b4a.from(metadata.tarSha256, 'hex'))
+    sodium.sodium_memcmp(session.digest, b4a.from(metadata.fileSha256, 'hex'))
   )
 }
 
@@ -213,6 +266,17 @@ export class TarSessionStore {
     return path.join(this.layout.staging, `${id}.part`)
   }
 
+  private treeStagingPath(id: string): string {
+    return path.join(this.layout.staging, `${id}.tree`)
+  }
+
+  /** Removes a staged tree through the contained primitives; never `storage.rm`. */
+  private removeStagedTree(session: TarSession): Promise<boolean> {
+    return removeTree(this.treeStagingPath(session.id), this.layout.staging, this.storage, {
+      layout: this.layout
+    })
+  }
+
   private journalPath(id: string): string {
     return path.join(this.layout.journals, `${id}.json`)
   }
@@ -227,11 +291,75 @@ export class TarSessionStore {
     }
   }
 
-  private metadata(metadata: MetadataRecord): MetadataRecord {
-    return decodeMetadataRecord(encodeMetadataRecord(metadata))
+  private metadata(input: AnyMetadataRecord): AnyMetadataRecord {
+    return decodeAnyMetadataRecord(encodeAnyMetadataRecord(input))
+  }
+
+  private fileMetadata(input: MetadataRecord): MetadataRecord {
+    const metadata = this.metadata(input)
+    if (isTreeMetadata(metadata)) throw problem('Invalid file session metadata')
+    return metadata
+  }
+
+  private treeFromDisk(id: string, record: Record<string, unknown>): TarSession {
+    const persisted = record as unknown as PersistedTreeSession
+    if (persisted.kind !== 'directory' || persisted.transferId !== id) {
+      throw problem('Invalid tree session')
+    }
+    const ownerKey = bytes(persisted.ownerKey, 'owner key')
+    uint(persisted.entryCount, 'tree entry count')
+    uint(persisted.payloadBytes, 'tree payload size')
+    uint(persisted.tarSize, 'TAR size')
+    uint(persisted.createdAt, 'creation time')
+    uint(persisted.updatedAt, 'update time')
+    if (
+      !persisted.partialTar ||
+      persisted.partialTar.path !== `${id}.tar.part` ||
+      ![RECEIVING, VERIFIED, DELETING].includes(persisted.state)
+    ) {
+      throw problem('Invalid tree session metadata')
+    }
+    uint(persisted.partialTar.size, 'partial TAR size')
+    if (persisted.partialTar.size > persisted.tarSize) throw problem('Oversized partial TAR')
+    const metadata = decodeTreeMetadataRecord(
+      encodeTreeMetadataRecord({
+        v: 1,
+        kind: 'directory',
+        name: persisted.name,
+        ...(persisted.sourceParent === undefined ? {} : { sourceParent: persisted.sourceParent }),
+        entryCount: persisted.entryCount,
+        payloadBytes: persisted.payloadBytes,
+        treeSha256: hex(bytes(persisted.treeSha256, 'tree digest')),
+        tarSize: persisted.tarSize,
+        tarSha256: hex(bytes(persisted.tarSha256, 'TAR digest')),
+        transferId: id,
+        reset: false
+      })
+    )
+    assertTreeMetadataTransferId(ownerKey, metadata)
+    return {
+      id,
+      transferId: b4a.from(id, 'hex'),
+      ownerKey,
+      kind: 'directory',
+      name: metadata.name,
+      sourceParent: metadata.sourceParent,
+      size: metadata.payloadBytes,
+      digest: b4a.from(metadata.treeSha256, 'hex'),
+      entryCount: metadata.entryCount,
+      tarSize: metadata.tarSize,
+      tarDigest: b4a.from(metadata.tarSha256, 'hex'),
+      tarPath: this.tarPath(id),
+      treePath: this.treeStagingPath(id),
+      partialTarSize: persisted.partialTar.size,
+      createdAt: persisted.createdAt,
+      updatedAt: persisted.updatedAt,
+      state: persisted.state
+    }
   }
 
   private fromDisk(id: string, record: Record<string, unknown>): TarSession {
+    if (record.version === TREE_SESSION_VERSION) return this.treeFromDisk(id, record)
     const persisted = record as unknown as PersistedTarSession
     if (
       (persisted.version !== LEGACY_VERSION && persisted.version !== VERSION) ||
@@ -258,7 +386,7 @@ export class TarSessionStore {
     if (persisted.partialTar.size > persisted.tarSize) {
       throw problem('Oversized partial TAR')
     }
-    const metadata = this.metadata({
+    const metadata = this.fileMetadata({
       v: 1,
       name: persisted.name,
       ...(persisted.sourceParent === undefined ? {} : { sourceParent: persisted.sourceParent }),
@@ -274,6 +402,7 @@ export class TarSessionStore {
       id,
       transferId,
       ownerKey,
+      kind: 'file',
       name: metadata.name,
       sourceParent: metadata.sourceParent,
       size: metadata.fileSize,
@@ -294,7 +423,26 @@ export class TarSessionStore {
    * whose record it fully understands; only parent-bearing ones are lost to a
    * downgrade.
    */
-  private serialize(session: TarSession): PersistedTarSession {
+  private serialize(session: TarSession): PersistedTarSession | PersistedTreeSession {
+    if (session.kind === 'directory') {
+      return {
+        version: TREE_SESSION_VERSION,
+        kind: 'directory',
+        transferId: session.id,
+        ownerKey: hex(session.ownerKey),
+        name: session.name,
+        sourceParent: session.sourceParent,
+        entryCount: session.entryCount!,
+        payloadBytes: session.size,
+        treeSha256: hex(session.digest),
+        tarSize: session.tarSize,
+        tarSha256: hex(session.tarDigest),
+        partialTar: { path: `${session.id}.tar.part`, size: session.partialTarSize },
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        state: session.state
+      }
+    }
     return {
       version: session.sourceParent === undefined ? LEGACY_VERSION : VERSION,
       transferId: session.id,
@@ -336,6 +484,17 @@ export class TarSessionStore {
     await withSafeDirectoryIdentity(directory, this.storage, () =>
       syncDirectory(directory, this.storage)
     )
+  }
+
+  /** A verified directory session must still own its staging tree. */
+  private async assertStagedTree(session: TarSession): Promise<void> {
+    const state = await inspectTreePath(
+      this.treeStagingPath(session.id),
+      this.layout.staging,
+      this.storage,
+      { layout: this.layout }
+    )
+    if (state !== 'DIRECTORY') throw problem('Session is not verified')
   }
 
   private async purgeCorruptSession(id: string): Promise<void> {
@@ -467,7 +626,8 @@ export class TarSessionStore {
         }
         if (session.state === DELETING) {
           await this.remove(session.tarPath, this.layout.staging)
-          await this.remove(this.filePath(id), this.layout.staging)
+          if (session.kind === 'directory') await this.removeStagedTree(session)
+          else await this.remove(this.filePath(id), this.layout.staging)
           await this.remove(this.sessionPath(id), this.layout.sessions)
           continue
         }
@@ -477,6 +637,8 @@ export class TarSessionStore {
             session.updatedAt = this.clock.now()
             await this.writeSession(session)
           }
+        } else if (session.kind === 'directory') {
+          await this.assertStagedTree(session)
         } else {
           await assertSafeFile(this.filePath(id), this.storage)
         }
@@ -492,10 +654,27 @@ export class TarSessionStore {
       const expected = new Set<string>()
       for (const session of this.sessions.values()) {
         expected.add(`${session.id}.tar.part`)
-        if (session.state === VERIFIED) expected.add(`${session.id}.part`)
+        if (session.state === VERIFIED) {
+          expected.add(session.kind === 'directory' ? `${session.id}.tree` : `${session.id}.part`)
+        }
       }
       for (const name of await this.storage.readdir(this.layout.staging)) {
         if (expected.has(name)) continue
+        const tree = /^([0-9a-f]{64})\.tree$/.exec(name)
+        if (tree) {
+          // A journal-owned tree belongs to a commit in flight; anything else is residue.
+          if (await readCommitJournal(tree[1], this.layout, this.storage)) continue
+          await removeTree(
+            path.join(this.layout.staging, name),
+            this.layout.staging,
+            this.storage,
+            {
+              layout: this.layout
+            }
+          )
+          this.purgedSessions++
+          continue
+        }
         const staged = /^([0-9a-f]{64})\.(?:part|tar\.part)$/.exec(name)
         if (staged) {
           const journal = await readCommitJournal(staged[1], this.layout, this.storage)
@@ -509,12 +688,13 @@ export class TarSessionStore {
     })
   }
 
-  admit(ownerKey: Uint8Array, input: MetadataRecord): Promise<TarAdmission> {
+  admit(ownerKey: Uint8Array, input: AnyMetadataRecord): Promise<TarAdmission> {
     return this.run(async () => {
       this.assertReady()
       key(ownerKey, 'owner key')
       const metadata = this.metadata(input)
-      assertMetadataTransferId(ownerKey, metadata)
+      if (isTreeMetadata(metadata)) assertTreeMetadataTransferId(ownerKey, metadata)
+      else assertMetadataTransferId(ownerKey, metadata)
       const id = metadata.transferId
       if (this.resumeTtl !== undefined) await this.expireUnlocked(this.resumeTtl)
       let session = this.sessions.get(id)
@@ -553,28 +733,50 @@ export class TarSessionStore {
           throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Destination has an active session')
         }
       }
-      const reservation = metadata.tarSize + metadata.fileSize
+      const reservation =
+        metadata.tarSize + (isTreeMetadata(metadata) ? metadata.payloadBytes : metadata.fileSize)
       if (this.reservedBytes > this.maxStagingBytes - reservation) {
         throw new SwarmDeployError(ERRORS.STAGING_LIMIT, 'Staging capacity exceeded')
       }
       await this.diskReserve(reservation)
       const now = this.clock.now()
-      session = {
-        id,
-        transferId: b4a.from(id, 'hex'),
-        ownerKey: b4a.from(ownerKey),
-        name: metadata.name,
-        sourceParent: metadata.sourceParent,
-        size: metadata.fileSize,
-        digest: b4a.from(metadata.fileSha256, 'hex'),
-        tarSize: metadata.tarSize,
-        tarDigest: b4a.from(metadata.tarSha256, 'hex'),
-        tarPath: this.tarPath(id),
-        partialTarSize: 0,
-        createdAt: now,
-        updatedAt: now,
-        state: RECEIVING
-      }
+      session = isTreeMetadata(metadata)
+        ? {
+            id,
+            transferId: b4a.from(id, 'hex'),
+            ownerKey: b4a.from(ownerKey),
+            kind: 'directory',
+            name: metadata.name,
+            sourceParent: metadata.sourceParent,
+            size: metadata.payloadBytes,
+            digest: b4a.from(metadata.treeSha256, 'hex'),
+            entryCount: metadata.entryCount,
+            tarSize: metadata.tarSize,
+            tarDigest: b4a.from(metadata.tarSha256, 'hex'),
+            tarPath: this.tarPath(id),
+            treePath: this.treeStagingPath(id),
+            partialTarSize: 0,
+            createdAt: now,
+            updatedAt: now,
+            state: RECEIVING
+          }
+        : {
+            id,
+            transferId: b4a.from(id, 'hex'),
+            ownerKey: b4a.from(ownerKey),
+            kind: 'file',
+            name: metadata.name,
+            sourceParent: metadata.sourceParent,
+            size: metadata.fileSize,
+            digest: b4a.from(metadata.fileSha256, 'hex'),
+            tarSize: metadata.tarSize,
+            tarDigest: b4a.from(metadata.tarSha256, 'hex'),
+            tarPath: this.tarPath(id),
+            partialTarSize: 0,
+            createdAt: now,
+            updatedAt: now,
+            state: RECEIVING
+          }
       await withSafeDirectoryIdentity(this.layout.staging, this.storage, async () => {
         const handle = await openSafeRegularFile(session!.tarPath, 'create', this.storage)
         await handle.sync()
@@ -590,7 +792,7 @@ export class TarSessionStore {
 
   append(
     ownerKey: Uint8Array,
-    input: MetadataRecord,
+    input: AnyMetadataRecord,
     offset: number,
     data: Uint8Array
   ): Promise<number> {
@@ -722,7 +924,7 @@ export class TarSessionStore {
     throw failure
   }
 
-  verify(ownerKey: Uint8Array, input: MetadataRecord): Promise<TarSession> {
+  verify(ownerKey: Uint8Array, input: AnyMetadataRecord): Promise<TarSession> {
     const task = (async (): Promise<TarSession> => {
       const prepared = await this.run(() => {
         this.assertReady()
@@ -745,28 +947,32 @@ export class TarSessionStore {
       let file: StorageFileHandle | null = null
       let fileOffset = 0
       try {
-        file = await openSafeRegularFile(this.filePath(session.id), 'create', this.storage)
-        const source = this.readTar(session)
-        await validateAndExtractTar(source, metadata, {
-          writeTar: () => {},
-          writeFile: async (chunk) => {
-            await writeAll(file!, chunk, fileOffset)
-            fileOffset += chunk.byteLength
-          },
-          complete: async () => {
-            await file!.sync()
-          },
-          abort: async () => {
-            await file?.close().catch(() => {})
-            file = null
-            await this.remove(this.filePath(session.id), this.layout.staging).catch(() => {})
-          }
-        })
-        await file.close()
-        file = null
-        await withSafeDirectoryIdentity(this.layout.staging, this.storage, () =>
-          syncDirectory(this.layout.staging, this.storage)
-        )
+        if (session.kind === 'directory') {
+          await this.extractTree(session, metadata as TreeMetadataRecord)
+        } else {
+          file = await openSafeRegularFile(this.filePath(session.id), 'create', this.storage)
+          const source = this.readTar(session)
+          await validateAndExtractTar(source, metadata as MetadataRecord, {
+            writeTar: () => {},
+            writeFile: async (chunk) => {
+              await writeAll(file!, chunk, fileOffset)
+              fileOffset += chunk.byteLength
+            },
+            complete: async () => {
+              await file!.sync()
+            },
+            abort: async () => {
+              await file?.close().catch(() => {})
+              file = null
+              await this.remove(this.filePath(session.id), this.layout.staging).catch(() => {})
+            }
+          })
+          await file.close()
+          file = null
+          await withSafeDirectoryIdentity(this.layout.staging, this.storage, () =>
+            syncDirectory(this.layout.staging, this.storage)
+          )
+        }
         await this.run(async () => {
           if (
             this.sessions.get(session.id) !== session ||
@@ -793,7 +999,8 @@ export class TarSessionStore {
         if (file) await file.close().catch(() => {})
         if (session.state !== VERIFIED) {
           try {
-            await this.remove(this.filePath(session.id), this.layout.staging)
+            if (session.kind === 'directory') await this.removeStagedTree(session)
+            else await this.remove(this.filePath(session.id), this.layout.staging)
           } catch (cleanupCause) {
             await this.quarantineVerificationFailure(session, error, cleanupCause)
           }
@@ -811,6 +1018,31 @@ export class TarSessionStore {
     }
     task.then(settled, settled)
     return task
+  }
+
+  /**
+   * Extracts the complete directory archive into its staging tree, then proves
+   * the tree from the bytes on disk alone: the recomputed canonical digest,
+   * entry count, and payload size must equal the offered values.
+   */
+  private async extractTree(session: TarSession, metadata: TreeMetadataRecord): Promise<void> {
+    const treePath = this.treeStagingPath(session.id)
+    const options = { layout: this.layout }
+    // Residue of an interrupted attempt never survives into a new extraction.
+    await removeTree(treePath, this.layout.staging, this.storage, options)
+    const target = createTreeStagingTarget(treePath, this.layout.staging, this.storage, this.layout)
+    await validateAndExtractTreeTar(this.readTar(session), metadata, target)
+    const staged = await digestTree(treePath, this.storage)
+    if (
+      staged.entryCount !== metadata.entryCount ||
+      staged.payloadBytes !== metadata.payloadBytes ||
+      !sodium.sodium_memcmp(staged.treeSha256, b4a.from(metadata.treeSha256, 'hex'))
+    ) {
+      throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Staged tree digest mismatch')
+    }
+    await withSafeDirectoryIdentity(this.layout.staging, this.storage, () =>
+      syncDirectory(this.layout.staging, this.storage)
+    )
   }
 
   private async *readTar(session: TarSession): AsyncGenerator<Buffer> {
@@ -836,7 +1068,8 @@ export class TarSessionStore {
       key(transferId, 'transfer ID')
       const session = this.sessions.get(hex(transferId))
       if (!session || session.state !== VERIFIED) throw problem('Session is not verified')
-      await assertSafeFile(this.filePath(session.id), this.storage)
+      if (session.kind === 'directory') await this.assertStagedTree(session)
+      else await assertSafeFile(this.filePath(session.id), this.storage)
       return session
     })
   }
@@ -856,7 +1089,8 @@ export class TarSessionStore {
     try {
       await this.writeSession(session)
       await this.remove(session.tarPath, this.layout.staging)
-      await this.remove(this.filePath(session.id), this.layout.staging)
+      if (session.kind === 'directory') await this.removeStagedTree(session)
+      else await this.remove(this.filePath(session.id), this.layout.staging)
       await this.remove(this.sessionPath(session.id), this.layout.sessions)
     } finally {
       if (this.sessions.delete(session.id)) this.reservedBytes -= this.reserve(session)
