@@ -234,6 +234,35 @@ async function guarded<T>(
   return result
 }
 
+/**
+ * Like {@link guarded}, for a leaf call whose own target may legitimately vanish.
+ * Only an ENOENT raised by the call itself is reported as `missing`, and only
+ * after the whole ancestor chain was verified again: if any ancestor, the root,
+ * or the managed parent is gone or replaced, verification throws instead.
+ */
+async function guardedLeaf<T>(
+  anchors: readonly Anchor[],
+  storage: StorageAdapter,
+  code: ErrorCode,
+  message: string,
+  operation: () => Promise<T> | T
+): Promise<{ missing: true } | { missing: false; value: T }> {
+  await verifyAnchors(anchors, storage, code)
+  let value: T
+  try {
+    value = await operation()
+  } catch (error: unknown) {
+    if (isMissing(error)) {
+      await verifyAnchors(anchors, storage, code)
+      return { missing: true }
+    }
+    await verifyAnchors(anchors, storage, code).catch(() => {})
+    throw coded(error, code, message)
+  }
+  await verifyAnchors(anchors, storage, code)
+  return { missing: false, value }
+}
+
 async function syncDirectory(
   directory: string,
   anchors: readonly Anchor[],
@@ -621,8 +650,12 @@ interface RemovalFrame {
  * never calls a recursive remove. A symbolic link inside the tree is unlinked,
  * never traversed. Depth and entry count are bounded by the canonical tree
  * limits; exceeding either, or any failure, throws CLEANUP_FAILED and leaves
- * the remaining tree in place as residue. Members that vanish concurrently are
- * tolerated. Returns `false` when the path was already absent.
+ * the remaining tree in place as residue. Only the leaf entry a call targets may
+ * vanish concurrently (ENOENT), and only after the whole identity chain was
+ * verified again; a missing or moved root, directory, or parent is never a
+ * vanished member and throws CLEANUP_FAILED. Returns `false` only when the path
+ * was already absent; `true` means the original path is gone and the parent
+ * still matches its captured identity.
  *
  * Before and after every mutating call the identity of the parent, the tree
  * root, and every directory above the entry is verified; a replaced directory
@@ -641,7 +674,8 @@ export async function removeTree(
     throw treeError(ERRORS.PROTOCOL_INVALID, 'Refusing to remove an unmanaged tree path')
   }
   const [parentAnchor] = found.anchors
-  const stack: RemovalFrame[] = [{ anchor: found.tree, depth: 0, names: null, index: 0 }]
+  const rootAnchor = found.tree
+  const stack: RemovalFrame[] = [{ anchor: rootAnchor, depth: 0, names: null, index: 0 }]
 
   // A directory holding the private storage directory is a storage root, never a tree.
   try {
@@ -657,19 +691,15 @@ export async function removeTree(
   while (stack.length > 0) {
     const frame = stack[stack.length - 1]
     if (frame.names === null) {
-      try {
-        frame.names = await guarded(
-          chain(),
-          storage,
-          code,
-          'Unable to read tree directory for removal',
-          () => storage.readdir(frame.anchor.path)
-        )
-      } catch (error: unknown) {
-        if (!isMissing(error)) throw coded(error, code, 'Unable to read tree directory')
-        stack.pop()
-        continue
-      }
+      // The directory is part of the verified chain, so a listing that reports
+      // it missing is never a vanished member: it fails the removal.
+      frame.names = await guarded(
+        chain(),
+        storage,
+        code,
+        'Unable to read tree directory for removal',
+        () => storage.readdir(frame.anchor.path)
+      )
       frame.names.sort()
     }
 
@@ -679,15 +709,16 @@ export async function removeTree(
       if (visited > MAX_TREE_ENTRIES) {
         throw treeError(code, 'Tree has too many entries to remove')
       }
-      let stat: StorageStats
-      try {
-        stat = await guarded(chain(), storage, code, 'Unable to inspect tree entry', () =>
-          storage.lstat(child)
-        )
-      } catch (error: unknown) {
-        if (isMissing(error)) continue
-        throw coded(error, code, 'Unable to inspect tree entry')
-      }
+      // Only the leaf's own target may vanish, and only while the chain still matches.
+      const inspected = await guardedLeaf(
+        chain(),
+        storage,
+        code,
+        'Unable to inspect tree entry',
+        () => storage.lstat(child)
+      )
+      if (inspected.missing) continue
+      const stat = inspected.value
       if (!stat.isSymbolicLink() && stat.isDirectory()) {
         if (frame.depth + 1 > MAX_TREE_DEPTH) throw treeError(code, 'Tree is too deep to remove')
         stack.push({
@@ -698,30 +729,33 @@ export async function removeTree(
         })
         continue
       }
-      try {
-        await guarded(chain(), storage, code, 'Unable to remove tree entry', () =>
-          storage.unlink(child)
-        )
-      } catch (error: unknown) {
-        if (!isMissing(error)) throw coded(error, code, 'Unable to remove tree entry')
-      }
+      await guardedLeaf(chain(), storage, code, 'Unable to remove tree entry', () =>
+        storage.unlink(child)
+      )
       continue
     }
 
     // The directory itself disappears with the call, so only its ancestors can
-    // be verified afterwards; the directory is verified immediately before.
+    // be verified afterwards; the directory is verified immediately before. A
+    // directory that is already missing here was moved, not removed.
     const ancestors = chain().slice(0, -1)
-    try {
-      await verifyAnchors([...ancestors, frame.anchor], storage, code)
-      await guarded(ancestors, storage, code, 'Unable to remove tree directory', () =>
-        storage.rmdir(frame.anchor.path)
-      )
-    } catch (error: unknown) {
-      if (!isMissing(error)) throw coded(error, code, 'Unable to remove tree directory')
-    }
+    await verifyAnchors([...ancestors, frame.anchor], storage, code)
+    await guarded(ancestors, storage, code, 'Unable to remove tree directory', () =>
+      storage.rmdir(frame.anchor.path)
+    )
     stack.pop()
   }
 
+  // `true` is only returned once the original path is observably gone while the
+  // managed parent still matches its captured identity.
+  const remaining = await guardedLeaf(
+    [parentAnchor],
+    storage,
+    code,
+    'Unable to confirm tree removal',
+    () => storage.lstat(rootAnchor.path)
+  )
+  if (!remaining.missing) throw treeError(code, 'Tree path still exists after removal')
   await syncDirectory(parentAnchor.path, [parentAnchor], storage, code)
   return true
 }

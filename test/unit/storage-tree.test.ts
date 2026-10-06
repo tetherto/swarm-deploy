@@ -705,3 +705,133 @@ test('digesting fails with FILE_BUSY when the tree changes while it is hashed', 
     await t.exception(() => digestTree(root, storage), { code: ERRORS.FILE_BUSY }, label)
   }
 })
+
+test('removal never treats a moved root, directory, or parent as a vanished member', async (t) => {
+  // `move` is renamed to `move + '.moved'` right before the matching operation.
+  const scenarios: Array<{
+    label: string
+    operation: string
+    on: string[]
+    move: string[]
+    residue: string[]
+  }> = [
+    {
+      label: 'the root moves before it is listed',
+      operation: 'readdir',
+      on: ['p', 't.tree'],
+      move: ['p', 't.tree'],
+      residue: ['a', 'b.bin']
+    },
+    {
+      label: 'the root moves before a leaf is unlinked',
+      operation: 'unlink',
+      on: ['p', 't.tree', 'a', 'b.bin'],
+      move: ['p', 't.tree'],
+      residue: ['a', 'b.bin']
+    },
+    {
+      label: 'the root moves before a leaf is inspected',
+      operation: 'lstat',
+      on: ['p', 't.tree', 'a', 'b.bin'],
+      move: ['p', 't.tree'],
+      residue: ['a', 'b.bin']
+    },
+    {
+      label: 'the root moves before its final rmdir',
+      operation: 'rmdir',
+      on: ['p', 't.tree'],
+      move: ['p', 't.tree'],
+      residue: []
+    },
+    {
+      label: 'a nested directory moves before a child is inspected',
+      operation: 'lstat',
+      on: ['p', 't.tree', 'a', 'b.bin'],
+      move: ['p', 't.tree', 'a'],
+      residue: ['b.bin']
+    },
+    {
+      label: 'a nested directory moves before it is listed',
+      operation: 'readdir',
+      on: ['p', 't.tree', 'a'],
+      move: ['p', 't.tree', 'a'],
+      residue: ['b.bin']
+    },
+    {
+      label: 'a nested directory moves before a leaf is unlinked',
+      operation: 'unlink',
+      on: ['p', 't.tree', 'a', 'b.bin'],
+      move: ['p', 't.tree', 'a'],
+      residue: ['b.bin']
+    },
+    {
+      label: 'a nested directory moves before its rmdir',
+      operation: 'rmdir',
+      on: ['p', 't.tree', 'a'],
+      move: ['p', 't.tree', 'a'],
+      residue: []
+    },
+    {
+      label: 'the managed parent moves before a leaf is unlinked',
+      operation: 'unlink',
+      on: ['p', 't.tree', 'a', 'b.bin'],
+      move: ['p'],
+      residue: ['t.tree', 'a', 'b.bin']
+    }
+  ]
+
+  for (const scenario of scenarios) {
+    const base = await createTempDir(t)
+    const parent = path.join(base, 'p')
+    const treePath = path.join(parent, 't.tree')
+    await fs.promises.mkdir(parent)
+    await writeTree(treePath, { 'a/b.bin': 'x' })
+    const trigger = path.join(base, ...scenario.on)
+    const mover = path.join(base, ...scenario.move)
+    let fired = false
+    const storage = createStorage({
+      beforeOperation: async (name, target) => {
+        if (!fired && name === scenario.operation && target === trigger) {
+          fired = true
+          await fs.promises.rename(mover, `${mover}.moved`)
+        }
+      }
+    })
+    let returned: boolean | null = null
+    let error: unknown = null
+    try {
+      returned = await removeTree(treePath, parent, storage)
+    } catch (thrown: unknown) {
+      error = thrown
+    }
+    t.ok(fired, `${scenario.label}: the race was injected`)
+    t.is(returned, null, `${scenario.label}: never reports success`)
+    t.ok(error instanceof SwarmDeployError, `${scenario.label}: fails with a stable error`)
+    t.is((error as SwarmDeployError | null)?.code, ERRORS.CLEANUP_FAILED, scenario.label)
+    t.ok(await exists(`${mover}.moved`), `${scenario.label}: the moved path is preserved`)
+    t.ok(
+      await exists(path.join(`${mover}.moved`, ...scenario.residue)),
+      `${scenario.label}: residue is preserved`
+    )
+  }
+})
+
+test('removal returns true only when the original tree path is gone and the parent is intact', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const tree = path.join(layout.trash, 'done.tree')
+  await writeTree(tree, { 'a/b.bin': 'x', 'c.bin': 'y' })
+  t.is(await removeTree(tree, layout.trash, createStorage()), true)
+  t.absent(await exists(tree))
+  t.ok((await fs.promises.lstat(layout.trash)).isDirectory())
+
+  // Something recreates the path while removal finishes: success must not be reported.
+  const again = path.join(layout.trash, 'again.tree')
+  await writeTree(again, { 'a.bin': 'x' })
+  const storage = createStorage({
+    afterOperation: async (name, target) => {
+      if (name === 'rmdir' && target === again) await fs.promises.mkdir(again)
+    }
+  })
+  const error = await rejection(() => removeTree(again, layout.trash, storage))
+  t.is(error.code, ERRORS.CLEANUP_FAILED)
+})
