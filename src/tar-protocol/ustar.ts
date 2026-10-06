@@ -11,6 +11,7 @@ const TAR_END_BYTES = 2 * TAR_BLOCK_BYTES
  * changing one changes every transfer ID.
  */
 export const TAR_MODE = 0o644
+export const TAR_DIRECTORY_MODE = 0o755
 export const TAR_UID = 0
 export const TAR_GID = 0
 export const TAR_MTIME_MS = 0
@@ -79,4 +80,67 @@ export function canonicalUstarHeader(name: string, fileSize: number): Buffer {
   for (let index = 156; index < TAR_BLOCK_BYTES; index++) checksum += header[index]
   set(148, octal(checksum, 6))
   return header
+}
+
+/**
+ * Builds the canonical USTAR header block for one tree entry.
+ *
+ * `storedName` is the exact TAR name field: the relative path for a file and
+ * the relative path plus `/` for a directory. For a one-component file name
+ * this returns exactly `canonicalUstarHeader(storedName, size)`.
+ */
+export function canonicalUstarTreeHeader(
+  storedName: string,
+  kind: 'file' | 'directory',
+  size: number
+): Buffer {
+  if (kind !== 'file' && kind !== 'directory') {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR entry kind')
+  }
+  if (kind === 'directory' && size !== 0) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR directory size')
+  }
+  assertUstarFileSize(size)
+  const encoded = b4a.from(storedName)
+  if (encoded.byteLength === 0 || encoded.byteLength > 100) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Canonical TAR name overflow')
+  }
+  const header = b4a.alloc(TAR_BLOCK_BYTES)
+  const set = (offset: number, value: Uint8Array): void => {
+    header.set(value, offset)
+  }
+  set(0, encoded)
+  set(100, octal(kind === 'directory' ? TAR_DIRECTORY_MODE : TAR_MODE, 6))
+  set(108, octal(TAR_UID, 6))
+  set(116, octal(TAR_GID, 6))
+  set(124, octal(size, 11))
+  set(136, octal(TAR_MTIME_MS / 1000, 11))
+  header[156] = kind === 'directory' ? 53 : 48
+  set(257, b4a.from([0x75, 0x73, 0x74, 0x61, 0x72, 0]))
+  set(263, b4a.from('00'))
+  if (TAR_UNAME) set(265, b4a.from(TAR_UNAME))
+  if (TAR_GNAME) set(297, b4a.from(TAR_GNAME))
+  set(329, octal(0, 6))
+  set(337, octal(0, 6))
+
+  let checksum = 8 * 32
+  for (let index = 0; index < 148; index++) checksum += header[index]
+  for (let index = 156; index < TAR_BLOCK_BYTES; index++) checksum += header[index]
+  set(148, octal(checksum, 6))
+  return header
+}
+
+/** The exact deterministic archive length for an ordered canonical entry list. */
+export function deterministicTreeTarSize(
+  entries: readonly { kind: 'file' | 'directory'; size: number }[]
+): number {
+  let total = TAR_END_BYTES
+  for (const entry of entries) {
+    assertUstarFileSize(entry.size)
+    const payload = entry.kind === 'directory' ? 0 : entry.size
+    const padding = (TAR_BLOCK_BYTES - (payload % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES
+    total += TAR_BLOCK_BYTES + payload + padding
+    if (!Number.isSafeInteger(total)) throw invalidSize()
+  }
+  return total
 }

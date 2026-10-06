@@ -6,6 +6,9 @@ import type { ErrorCode } from './errors.js'
  */
 export type Binary = Buffer
 
+/** Whether a managed artifact is one regular file or one recursive directory. */
+export type ArtifactKind = 'file' | 'directory'
+
 /** Byte input accepted by APIs that normalize values to a b4a/Node Buffer. */
 export type BinaryInput = Uint8Array
 

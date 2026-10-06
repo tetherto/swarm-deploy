@@ -5,6 +5,7 @@ declare module 'b4a' {
     concat(values: Uint8Array[], total?: number): Buffer
     from(value: string | Uint8Array | ArrayLike<number>, encoding?: BufferEncoding): Buffer
     isBuffer(value: unknown): value is Buffer
+    compare(a: Uint8Array, b: Uint8Array): number
     equals(a: Uint8Array, b: Uint8Array): boolean
     toString(value: Uint8Array, encoding?: BufferEncoding): string
   }

@@ -1,5 +1,6 @@
 /// <reference path="./types/brittle.d.ts" />
 
+require('./unit/tree-canonical.test.js')
 require('./unit/release.test.js')
 require('./unit/tar-protocol.test.js')
 require('./unit/tar-session-store.test.js')
