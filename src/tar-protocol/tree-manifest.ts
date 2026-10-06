@@ -214,10 +214,10 @@ export async function buildTreeManifest(
   { signal = null, includeSourceParent = true }: TreeManifestOptions = {}
 ): Promise<TreeManifest> {
   assertClientKey(clientPublicKey)
-  const name = canonicalName(directoryPath)
-  const sourceParent =
-    includeSourceParent === false ? undefined : deriveSourceParent(path.resolve(directoryPath))
-  const snapshot = await snapshotTree(directoryPath, { signal })
+  const resolved = path.resolve(directoryPath)
+  const name = canonicalName(resolved)
+  const sourceParent = includeSourceParent === false ? undefined : deriveSourceParent(resolved)
+  const snapshot = await snapshotTree(resolved, { signal })
   assertCanonicalTreeEntries(snapshot.entries)
   const digests: TreeDigestEntry[] = []
   const tarHash = new SodiumSha256()
@@ -243,7 +243,7 @@ export async function buildTreeManifest(
   })
   return {
     kind: 'directory',
-    path: directoryPath,
+    path: resolved,
     name,
     ...(sourceParent === undefined ? {} : { sourceParent }),
     entryCount: snapshot.entryCount,

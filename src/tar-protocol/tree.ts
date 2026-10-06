@@ -5,7 +5,7 @@ import { throwIfAborted, type AbortSignalLike } from '../abort.js'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import type { ArtifactKind } from '../types.js'
 import { SodiumSha256 } from './hash.js'
-import { assertTreeEntryPath, compareTreePaths } from './tree-path.js'
+import { assertTreeEntryPath, compareTreePaths, MAX_TREE_ENTRIES } from './tree-path.js'
 import { MAX_USTAR_FILE_BYTES } from './ustar.js'
 
 export {
@@ -13,12 +13,12 @@ export {
   assertTreeStoredName,
   compareTreePaths,
   MAX_TREE_DEPTH,
+  MAX_TREE_ENTRIES,
   MAX_TREE_NAME_BYTES,
   tarEntryName
 } from './tree-path.js'
 
 export const TREE_DIGEST_DOMAIN = 'swarm-deploy/tree/v1'
-export const MAX_TREE_ENTRIES = 10_000
 
 export interface TreeEntry {
   kind: ArtifactKind

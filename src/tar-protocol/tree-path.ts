@@ -4,6 +4,7 @@ import { isReservedHistoryName, validateBasename } from '../files.js'
 import type { ArtifactKind } from '../types.js'
 
 export const MAX_TREE_DEPTH = 32
+export const MAX_TREE_ENTRIES = 10_000
 export const MAX_TREE_NAME_BYTES = 100
 
 function unsafeName(message: string): SwarmDeployError {

@@ -1,7 +1,7 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError, type ErrorCode } from '../errors.js'
-import { MAX_TREE_ENTRIES } from './tree.js'
-import { deterministicTarSize, TAR_BLOCK_BYTES } from './ustar.js'
+import { MAX_TREE_ENTRIES } from './tree-path.js'
+import { deterministicTarSize, MAX_USTAR_FILE_BYTES, TAR_BLOCK_BYTES } from './ustar.js'
 
 export const CONTROL_VERSION = 1
 export const MAX_CONTROL_RECORD_BYTES = 4 * 1024
@@ -171,6 +171,28 @@ function validateMetadata(value: unknown): MetadataRecord {
 
 const TAR_END_BLOCKS = 2 * TAR_BLOCK_BYTES
 
+/**
+ * The exact set of TAR sizes a canonical generator can produce for these counts.
+ *
+ * Every entry owns one header block and the archive ends with two zero blocks. Only files carry
+ * payload, and each non-empty file pads to a block boundary with at most 511 bytes. At least one
+ * file exists when there is any payload, so the unpadded total is `minimum`, and at most
+ * `min(entryCount, payloadBytes)` files can each hold a padded tail. Real archives are whole blocks,
+ * so the window is the whole-block sizes from `minimum` rounded up to `maximum` rounded down.
+ */
+function assertTreeTarSize(entryCount: number, payloadBytes: number, tarSize: number): void {
+  if (payloadBytes > entryCount * MAX_USTAR_FILE_BYTES) throw invalid('Invalid tree payload size')
+  if (payloadBytes > 0 && entryCount === 0) throw invalid('Invalid tree payload size')
+  const base = TAR_END_BLOCKS + TAR_BLOCK_BYTES * entryCount
+  const minimum = base + payloadBytes
+  const maximum = minimum + (TAR_BLOCK_BYTES - 1) * Math.min(entryCount, payloadBytes)
+  const lowest = Math.ceil(minimum / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES
+  const highest = Math.floor(maximum / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES
+  if (tarSize % TAR_BLOCK_BYTES !== 0 || tarSize < lowest || tarSize > highest) {
+    throw invalid('Noncanonical TAR size')
+  }
+}
+
 function validateTreeMetadata(value: unknown): TreeMetadataRecord {
   if (!isRecord(value)) throw invalid('Metadata record must be an object')
   const expected = [
@@ -201,13 +223,7 @@ function validateTreeMetadata(value: unknown): TreeMetadataRecord {
   assertHex32(value.tarSha256, 'TAR digest')
   assertHex32(value.transferId, 'transfer ID')
   if (typeof value.reset !== 'boolean') throw invalid('Invalid reset flag')
-  // Every entry owns one header block; each file pads its payload to a block boundary.
-  const headers = TAR_BLOCK_BYTES * value.entryCount
-  const minimum = TAR_END_BLOCKS + headers + value.payloadBytes
-  const maximum = minimum + (TAR_BLOCK_BYTES - 1) * value.entryCount
-  if (value.tarSize % TAR_BLOCK_BYTES !== 0 || value.tarSize < minimum || value.tarSize > maximum) {
-    throw invalid('Noncanonical TAR size')
-  }
+  assertTreeTarSize(value.entryCount, value.payloadBytes, value.tarSize)
   return value as unknown as TreeMetadataRecord
 }
 

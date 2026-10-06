@@ -4,6 +4,7 @@ import test from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
+import process from '#process'
 import { ERRORS } from '../../dist/errors.js'
 import {
   CONTROL_VERSION,
@@ -37,7 +38,7 @@ import {
   TAR_TRANSFER_DOMAIN
 } from '../../dist/tar-protocol/manifest.js'
 import { MAX_TREE_ENTRIES } from '../../dist/tar-protocol/tree.js'
-import { deterministicTreeTarSize } from '../../dist/tar-protocol/ustar.js'
+import { deterministicTreeTarSize, MAX_USTAR_FILE_BYTES } from '../../dist/tar-protocol/ustar.js'
 import { createTempDir } from '../helpers/files.js'
 import { writeTree } from '../helpers/trees.js'
 
@@ -329,18 +330,138 @@ test('directory metadata validation bounds every field', (t) => {
   }
 })
 
-test('directory metadata TAR size window is exactly the canonical bound', (t) => {
-  // Three entries carrying 100 payload bytes: one padded file (3072) up to three padded files (4096).
-  const entryCount = 3
-  const payloadBytes = 100
+/** Every byte-granular TAR size a directory record would accept for these counts. */
+function acceptedTarSizes(entryCount: number, payloadBytes: number, limit: number): number[] {
   const accepted: number[] = []
-  for (let size = 0; size <= 8192; size++) {
+  for (let size = 0; size <= limit; size++) {
     try {
       encodeTreeMetadataRecord(treeRecord({ entryCount, payloadBytes, tarSize: size }))
       accepted.push(size)
     } catch {}
   }
-  t.alike(accepted, [3072, 3584, 4096])
+  return accepted
+}
+
+test('directory metadata TAR size window is a whole-block range for 3 entries and 100 bytes', (t) => {
+  // One padded file (3072) up to three padded files (4096): only whole-block sizes in between.
+  t.alike(acceptedTarSizes(3, 100, 8192), [3072, 3584, 4096])
+})
+
+test('directory metadata with no payload accepts exactly one TAR size', (t) => {
+  // 1024 end bytes plus one header block per entry and nothing else.
+  t.alike(acceptedTarSizes(3, 0, 8192), [2560])
+  t.alike(acceptedTarSizes(0, 0, 8192), [1024])
+})
+
+test('directory metadata with one payload byte accepts exactly one TAR size', (t) => {
+  // One file of one byte pads to a full block no matter how many directories surround it.
+  t.alike(acceptedTarSizes(3, 1, 8192), [3072])
+  t.alike(acceptedTarSizes(1, 1, 8192), [2048])
+})
+
+test('directory metadata padding is bounded by the smaller of entries and payload bytes', (t) => {
+  const base = 1024 + 512 * 5
+  // Two payload bytes can pad at most two files even though five entries exist.
+  t.alike(acceptedTarSizes(5, 2, 8192), [base + 512, base + 1024])
+  // Only one file can hold one byte.
+  t.alike(acceptedTarSizes(5, 1, 8192), [base + 512])
+  // Two files carrying 513 bytes pad to exactly two blocks each at most.
+  t.alike(acceptedTarSizes(2, 513, 8192), [3072])
+})
+
+test('directory metadata rejects payload with no entry and fewer payload bytes than entries', (t) => {
+  // Payload bytes with no entry to carry them, even though the size is block aligned.
+  t.exception(
+    () => encodeTreeMetadataRecord(treeRecord({ entryCount: 0, payloadBytes: 512, tarSize: 1536 })),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  // payloadBytes < entryCount: only the sizes between one and payloadBytes padded files fit.
+  t.alike(acceptedTarSizes(4, 2, 8192), [1024 + 512 * 4 + 512, 1024 + 512 * 4 + 1024])
+  for (const tarSize of [1024 + 512 * 4, 1024 + 512 * 4 + 1536]) {
+    t.exception(
+      () => encodeTreeMetadataRecord(treeRecord({ entryCount: 4, payloadBytes: 2, tarSize })),
+      { code: ERRORS.PROTOCOL_INVALID }
+    )
+  }
+})
+
+test('directory metadata rejects a payload over the per-file USTAR cap times the entries', (t) => {
+  const sizeFor = (entryCount: number, payloadBytes: number): number =>
+    1024 + 512 * entryCount + Math.ceil(payloadBytes / 512) * 512
+  const atCap = 2 * MAX_USTAR_FILE_BYTES
+  const accepted = treeRecord({ entryCount: 2, payloadBytes: atCap, tarSize: sizeFor(2, atCap) })
+  t.alike(decodeAnyMetadataRecord(encodeTreeMetadataRecord(accepted)), accepted)
+  for (const [entryCount, payloadBytes] of [
+    [2, atCap + 1],
+    [1, MAX_USTAR_FILE_BYTES + 1]
+  ] as const) {
+    t.exception(
+      () =>
+        encodeTreeMetadataRecord(
+          treeRecord({ entryCount, payloadBytes, tarSize: sizeFor(entryCount, payloadBytes) })
+        ),
+      { code: ERRORS.PROTOCOL_INVALID }
+    )
+  }
+})
+
+test('every accepted window size is reachable by a real layout', (t) => {
+  // Brute force: every split of a small payload over three files is a real TAR layout.
+  for (const payloadBytes of [1, 2, 3, 511, 512, 513, 1023, 1025]) {
+    const reachable = new Set<number>()
+    for (let a = 0; a <= payloadBytes; a++) {
+      for (let b = 0; a + b <= payloadBytes; b++) {
+        reachable.add(
+          deterministicTreeTarSize([
+            { kind: 'file', size: a },
+            { kind: 'file', size: b },
+            { kind: 'file', size: payloadBytes - a - b }
+          ])
+        )
+      }
+    }
+    t.alike(
+      acceptedTarSizes(3, payloadBytes, 16384),
+      [...reachable].sort((left, right) => left - right),
+      `window for 3 entries and ${payloadBytes} bytes matches every reachable layout`
+    )
+  }
+})
+
+test('real generated archives from random trees land inside the strict window', async (t) => {
+  let seed = 0x2c1b3a7
+  const next = (): number => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+    return seed >>> 8
+  }
+  for (let iteration = 0; iteration < 12; iteration++) {
+    const root = await createTempDir(t)
+    const source = path.join(root, 'artifact')
+    const spec: Record<string, string> = {}
+    const files = 1 + (next() % 7)
+    for (let index = 0; index < files; index++) {
+      const depth = 1 + (next() % 3)
+      const segments = Array.from({ length: depth }, (_value, level) => `d${level}${next() % 3}`)
+      spec[`${segments.join('/')}/f${index}.bin`] = 'x'.repeat(next() % 2000)
+    }
+    spec[`empty${next() % 3}/`] = ''
+    await writeTree(source, spec)
+    const manifest = await buildTreeManifest(source, OWNER)
+    const generated = await collect(manifest)
+    t.is(generated.byteLength, manifest.tarSize)
+    const record = treeMetadataFromManifest(manifest)
+    t.alike(decodeAnyMetadataRecord(encodeTreeMetadataRecord(record)), record)
+    const window = acceptedTarSizes(
+      manifest.entryCount,
+      manifest.payloadBytes,
+      manifest.tarSize + 4096
+    )
+    t.ok(window.includes(generated.byteLength), 'a generated archive is inside the strict window')
+    t.ok(
+      window.every((size) => size % 512 === 0),
+      'the window only holds whole blocks'
+    )
+  }
 })
 
 test('a tree transfer ID commits to every directory metadata field', (t) => {
@@ -886,4 +1007,61 @@ test('directory offers cross the direct wire framed and decoded by the any-decod
     code: ERRORS.PROTOCOL_INVALID
   })
   t.is(writes.length, 2, 'an invalid record never reaches the socket')
+})
+
+test('a file larger than one read chunk generates and resumes across 64 KiB boundaries', async (t) => {
+  const root = await createTempDir(t)
+  const source = path.join(root, 'big')
+  await fs.promises.mkdir(source)
+  // Position-dependent bytes: a repeated, dropped, or misaligned chunk changes the archive.
+  const payload = b4a.alloc(3 * 64 * 1024 + 1234)
+  for (let index = 0; index < payload.byteLength; index++) {
+    payload[index] = (index * 31 + (index >>> 8) * 7 + (index >>> 16)) & 0xff
+  }
+  await fs.promises.writeFile(path.join(source, 'big.bin'), payload)
+  await fs.promises.writeFile(path.join(source, 'tail.bin'), 'tail')
+
+  const manifest = await buildTreeManifest(source, OWNER)
+  t.is(manifest.payloadBytes, payload.byteLength + 4)
+  const whole = await collect(manifest)
+  t.is(whole.byteLength, manifest.tarSize)
+  t.alike(sodiumSha256(whole), manifest.tarSha256)
+  // The first header block precedes the payload of the first (sorted) file.
+  t.alike(whole.subarray(512, 512 + payload.byteLength), payload)
+
+  const headerBlock = 512
+  const chunk = 64 * 1024
+  const offsets = [
+    chunk,
+    headerBlock + chunk - 1,
+    headerBlock + chunk,
+    headerBlock + chunk + 1,
+    headerBlock + chunk + 777,
+    headerBlock + 2 * chunk,
+    headerBlock + payload.byteLength,
+    manifest.tarSize - 1024
+  ]
+  for (const offset of offsets) {
+    const suffix = await collect(manifest, offset, {
+      expectedPrefixSha256: sodiumSha256(whole.subarray(0, offset))
+    })
+    t.alike(suffix, whole.subarray(offset), `exact suffix at ${offset}`)
+    const reset = await regenerateTreeTarSuffix(manifest, offset, () => {}, {
+      expectedPrefixSha256: sodiumSha256(whole.subarray(0, offset + 1))
+    })
+    t.is(reset.status, 'RESET_REQUIRED', `a wrong prefix resets at ${offset}`)
+  }
+})
+
+test('the manifest path is absolute even when built from a relative path', async (t) => {
+  const root = await createTempDir(t)
+  const source = path.join(root, 'rel', '0.18.1')
+  await writeTree(source, { 'a.bin': 'a' })
+  const relative = path.relative(process.cwd(), source)
+  t.absent(path.isAbsolute(relative), 'the probe path is genuinely relative')
+  const manifest = await buildTreeManifest(relative, OWNER)
+  t.ok(path.isAbsolute(manifest.path))
+  t.is(manifest.path, path.resolve(relative))
+  t.is(manifest.name, '0.18.1')
+  t.alike(await collect(manifest), await collect(await buildTreeManifest(source, OWNER)))
 })

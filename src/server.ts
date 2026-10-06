@@ -37,13 +37,8 @@ import {
 import { SessionStore } from './storage/session-store.js'
 import type { TarSession } from './storage/tar-session-store.js'
 import type { StorageAdapter, StorageLayout } from './storage/types.js'
-import { isTreeMetadata, type MetadataRecord } from './tar-protocol/controls.js'
-import {
-  decodeDirectMetadata,
-  DirectWireReader,
-  writeAdmission,
-  writeFinal
-} from './tar-protocol/direct-wire.js'
+import { decodeMetadataRecord } from './tar-protocol/controls.js'
+import { DirectWireReader, writeAdmission, writeFinal } from './tar-protocol/direct-wire.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 import { assertMetadataTransferId } from './tar-protocol/manifest.js'
 import type {
@@ -182,15 +177,11 @@ function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDep
 }
 
 /**
- * The wire decoder also accepts directory offers, but this server only serves file offers
- * until the tree transfer path exists, so a directory offer stays a protocol violation exactly
- * as it was before the record existed.
+ * Until the server serves trees it decodes only the exact file record. Any directory-shaped offer,
+ * well formed or not, fails the exact-key check as an unknown record, so it keeps the
+ * PROTOCOL_INVALID outcome it had before the directory record existed.
  */
-function decodeFileOffer(bytes: Uint8Array): MetadataRecord {
-  const metadata = decodeDirectMetadata(bytes)
-  if (isTreeMetadata(metadata)) throw fail(ERRORS.PROTOCOL_INVALID, 'Unsupported artifact kind')
-  return metadata
-}
+const decodeFileOffer = decodeMetadataRecord
 function codeOf(error: unknown): ErrorCode {
   return error instanceof SwarmDeployError &&
     Object.values(ERRORS).includes(error.code as ErrorCode)

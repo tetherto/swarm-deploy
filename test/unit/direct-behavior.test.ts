@@ -1700,31 +1700,36 @@ test('Server reports a noncanonical transfer ID to onFailure once and keeps PROT
   }
 })
 
-test('Server treats a directory offer as a protocol violation until trees are served', async (t) => {
+test('Server treats every directory-shaped offer as a protocol violation until trees are served', async (t) => {
   const calls: HookCall[] = []
   const ref: { current: FakeSocket | null } = { current: null }
   const { server, node } = await createServer(t, { hooks: recordingHooks(calls, ref) })
   const rejections: string[] = []
   server.on('failure', (event) => rejections.push(event.reason))
-  const directory = encodeControlFrame(
-    encodeTreeMetadataRecord({
-      v: 1,
-      kind: 'directory',
-      name: '0.18.1',
-      entryCount: 1,
-      payloadBytes: 0,
-      treeSha256: 'a'.repeat(64),
-      tarSize: 1536,
-      tarSha256: 'b'.repeat(64),
-      transferId: 'c'.repeat(64),
-      reset: false
-    })
-  )
-  const legacyUnknown = encodeControlFrame(
-    Buffer.from(JSON.stringify({ v: 1, kind: 'directory', name: '0.18.1' }))
-  )
+  const wellFormed = {
+    v: 1,
+    kind: 'directory',
+    name: '0.18.1',
+    entryCount: 1,
+    payloadBytes: 0,
+    treeSha256: 'a'.repeat(64),
+    tarSize: 1536,
+    tarSha256: 'b'.repeat(64),
+    transferId: 'c'.repeat(64),
+    reset: false
+  }
+  const raw = (record: unknown): Buffer => encodeControlFrame(Buffer.from(JSON.stringify(record)))
+  const directory = encodeControlFrame(encodeTreeMetadataRecord(wellFormed as never))
+  // Frames a tree-aware decoder would reject with INVALID_FILENAME must keep their old code.
+  const frames: Array<[string, Buffer]> = [
+    ['unknown record', raw({ v: 1, foo: 1 })],
+    ['well-formed directory offer', directory],
+    ['directory offer with a reserved name', raw({ ...wellFormed, name: 'history-aa' })],
+    ['directory offer with an unsafe name', raw({ ...wellFormed, name: 'a/b' })],
+    ['directory offer with an unsafe sourceParent', raw({ ...wellFormed, sourceParent: '../x' })]
+  ]
   const outcomes: Array<{ statuses: string[]; code: string | undefined; hooks: string[] }> = []
-  for (const frame of [directory, legacyUnknown]) {
+  for (const [label, frame] of frames) {
     calls.length = 0
     const socket = new FakeSocket(CLIENT_KEY)
     ref.current = socket
@@ -1732,15 +1737,25 @@ test('Server treats a directory offer as a protocol violation until trees are se
     socket.feed(frame)
     await waitFor(() => isTerminal(socket))
     await new Promise((resolve) => setTimeout(resolve, 20))
-    outcomes.push({
+    const outcome = {
       statuses: statuses(socket),
       code: finalCode(socket),
       hooks: calls.map((call) => call.hook)
-    })
+    }
+    outcomes.push(outcome)
+    t.is(outcome.code, ERRORS.PROTOCOL_INVALID, `${label} is PROTOCOL_INVALID`)
+    t.absent(
+      outcome.hooks.includes('beforeCommit') || outcome.hooks.includes('afterCommit'),
+      `${label} never reaches commit`
+    )
   }
-  t.alike(outcomes[0], outcomes[1], 'a directory offer is rejected exactly like an unknown record')
-  t.is(outcomes[0].code, ERRORS.PROTOCOL_INVALID)
-  t.absent(outcomes[0].hooks.includes('beforeCommit') || outcomes[0].hooks.includes('afterCommit'))
+  for (const outcome of outcomes.slice(1)) {
+    t.alike(
+      outcome,
+      outcomes[0],
+      'a directory-shaped offer is rejected exactly like an unknown record'
+    )
+  }
 })
 
 test('Server reports a VERIFIED reconnect read failure with the extracted .part path', async (t) => {
