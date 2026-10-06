@@ -69,13 +69,11 @@ function isTreeFileDigest(value: unknown): value is Buffer {
   return value.constructor.name === 'Buffer'
 }
 
-function isEnoent(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as NodeJS.ErrnoException).code === 'ENOENT'
-  )
+const REVALIDATE_BUSY_MESSAGE = 'Tree changed during TAR generation'
+
+function finishRevalidate(error: unknown): never {
+  if (error instanceof SwarmDeployError && error.code === ERRORS.ABORTED) throw error
+  throw fileBusy(REVALIDATE_BUSY_MESSAGE)
 }
 
 /** The exact TAR name field for an entry: directories carry a trailing `/`. */
@@ -199,7 +197,12 @@ export async function snapshotTree(
   let payloadBytes = 0
 
   const walk = async (absolute: string, prefix: string): Promise<void> => {
-    const names = await fs.promises.readdir(absolute)
+    let names: string[]
+    try {
+      names = await fs.promises.readdir(absolute)
+    } catch {
+      throw invalid('Unable to read tree directory')
+    }
     names.sort((left, right) => compareTreePaths(left, right))
     for (const name of names) {
       throwIfAborted(signal)
@@ -267,67 +270,46 @@ export function assertSameTreeIdentity(
   }
 }
 
-/** Reproves every snapshotted identity before a resume regenerates the archive. */
-function classifyForRevalidate(stat: fs.Stats): ArtifactKind {
-  try {
-    return classify(stat)
-  } catch (error) {
-    if (error instanceof SwarmDeployError && error.code === ERRORS.INVALID_FILENAME) {
-      throw fileBusy('Tree entry changed during TAR generation')
-    }
-    throw error
-  }
-}
-
+/**
+ * Reproves every snapshotted identity and re-walks the source tree before a resume
+ * regenerates the archive. Any mutation, disappearance, unreadable path, collision,
+ * limit breach, or newly unsafe member becomes FILE_BUSY; ABORTED is preserved.
+ */
 export async function revalidateTreeSnapshot(
   snapshot: TreeSnapshot,
   { signal = null }: TreeSnapshotOptions = {}
 ): Promise<void> {
   throwIfAborted(signal)
-  let rootStat: fs.Stats
   try {
-    rootStat = await fs.promises.lstat(snapshot.rootPath)
-  } catch (error) {
-    if (isEnoent(error)) throw fileBusy('Tree root changed during TAR generation')
-    throw error
-  }
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw fileBusy('Tree root changed during TAR generation')
-  }
-  if (rootStat.dev !== snapshot.root.dev || rootStat.ino !== snapshot.root.ino) {
-    throw fileBusy('Tree root changed during TAR generation')
-  }
-  for (const entry of snapshot.entries) {
-    throwIfAborted(signal)
-    let stat: fs.Stats
-    try {
-      stat = await fs.promises.lstat(entry.absolutePath)
-    } catch (error) {
-      if (isEnoent(error)) throw fileBusy('Tree entry changed during TAR generation')
-      throw error
+    const rootStat = await fs.promises.lstat(snapshot.rootPath)
+    if (classify(rootStat) !== 'directory') throw unsafeName('Tree root must be a directory')
+    if (rootStat.dev !== snapshot.root.dev || rootStat.ino !== snapshot.root.ino) {
+      throw fileBusy(REVALIDATE_BUSY_MESSAGE)
     }
-    const kind = classifyForRevalidate(stat)
-    if (kind !== entry.kind) {
-      throw fileBusy('Tree entry kind changed during TAR generation')
-    }
-    if (entry.kind === 'directory') {
-      if (stat.dev !== entry.identity.dev || stat.ino !== entry.identity.ino) {
-        throw fileBusy('Tree directory changed during TAR generation')
+    for (const entry of snapshot.entries) {
+      throwIfAborted(signal)
+      const stat = await fs.promises.lstat(entry.absolutePath)
+      const kind = classify(stat)
+      if (kind !== entry.kind) throw fileBusy(REVALIDATE_BUSY_MESSAGE)
+      if (entry.kind === 'directory') {
+        if (stat.dev !== entry.identity.dev || stat.ino !== entry.identity.ino) {
+          throw fileBusy(REVALIDATE_BUSY_MESSAGE)
+        }
+        continue
       }
-      continue
+      assertSameTreeIdentity(entry.identity, stat, REVALIDATE_BUSY_MESSAGE)
     }
-    assertSameTreeIdentity(entry.identity, stat, 'Tree entry changed during TAR generation')
-  }
-  const refreshed = await snapshotTree(snapshot.rootPath, { signal })
-  if (refreshed.entryCount !== snapshot.entryCount) {
-    throw fileBusy('Tree listing changed during TAR generation')
-  }
-  for (let index = 0; index < refreshed.entries.length; index++) {
-    if (
-      refreshed.entries[index].path !== snapshot.entries[index].path ||
-      refreshed.entries[index].kind !== snapshot.entries[index].kind
-    ) {
-      throw fileBusy('Tree listing changed during TAR generation')
+    const refreshed = await snapshotTree(snapshot.rootPath, { signal })
+    if (refreshed.entryCount !== snapshot.entryCount) throw fileBusy(REVALIDATE_BUSY_MESSAGE)
+    for (let index = 0; index < refreshed.entries.length; index++) {
+      if (
+        refreshed.entries[index].path !== snapshot.entries[index].path ||
+        refreshed.entries[index].kind !== snapshot.entries[index].kind
+      ) {
+        throw fileBusy(REVALIDATE_BUSY_MESSAGE)
+      }
     }
+  } catch (error) {
+    finishRevalidate(error)
   }
 }

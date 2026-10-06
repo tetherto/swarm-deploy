@@ -1,5 +1,6 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { validateBasename } from '../files.js'
 
 export const TAR_BLOCK_BYTES = 512
 export const MAX_USTAR_FILE_BYTES = 0o77777777777
@@ -48,6 +49,26 @@ function assertCanonicalTreeStoredName(storedName: string, kind: 'file' | 'direc
   const encoded = b4a.from(storedName)
   if (encoded.byteLength === 0 || encoded.byteLength > 100) {
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Canonical TAR name overflow')
+  }
+  if (
+    storedName.startsWith('/') ||
+    storedName.includes('\\') ||
+    storedName.includes('..') ||
+    storedName.includes('/./') ||
+    storedName.includes('\u0000')
+  ) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR name')
+  }
+  const logical = kind === 'directory' ? storedName.slice(0, -1) : storedName
+  for (const component of logical.split('/')) {
+    if (component.length === 0) {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR name')
+    }
+    try {
+      validateBasename(component)
+    } catch {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR name')
+    }
   }
   if (kind === 'directory') {
     if (!storedName.endsWith('/')) {
