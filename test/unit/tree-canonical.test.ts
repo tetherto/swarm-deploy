@@ -15,9 +15,12 @@ import {
   assertTreeEntryPath,
   compareTreePaths,
   hashField,
+  classifyTreeEntry,
+  normalizeRevalidateFailure,
   revalidateTreeSnapshot,
   snapshotTree,
   tarEntryName,
+  treeDirectoryReadError,
   treeDigest,
   type TreeEntry
 } from '../../dist/tar-protocol/tree.js'
@@ -30,13 +33,42 @@ import {
 import { SodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createAbortController } from '../../dist/abort.js'
 import { createTempDir } from '../helpers/files.js'
-import { installFifoTreeMember } from '../helpers/create-named-fifo.js'
 import { writeTree } from '../helpers/trees.js'
+import process from '#process'
 
 const FILE_DIGEST = b4a.alloc(32, 7)
 
 function entry(kind: 'file' | 'directory', treePath: string, size = 0): TreeEntry {
   return { kind, path: treePath, size }
+}
+
+async function directoryIsCaseInsensitive(root: string): Promise<boolean> {
+  const marker = `ci-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const lowerPath = path.join(root, `${marker}.probe`)
+  const upperPath = path.join(root, `${marker}.PROBE`)
+  await fs.promises.writeFile(lowerPath, 'probe', { flag: 'wx' })
+  try {
+    await fs.promises.access(upperPath)
+    return true
+  } catch {
+    return false
+  } finally {
+    await fs.promises.unlink(lowerPath).catch(() => {})
+  }
+}
+
+function syntheticSpecialEntryStat(): {
+  isSymbolicLink: () => boolean
+  isDirectory: () => boolean
+  isFile: () => boolean
+  nlink: number
+} {
+  return {
+    isSymbolicLink: () => false,
+    isDirectory: () => false,
+    isFile: () => false,
+    nlink: 1
+  }
 }
 
 test('tree entry paths reject traversal, absolute, reserved, and overlong components', (t) => {
@@ -303,30 +335,50 @@ test('a canonical tree file header is byte-identical to the single-file header',
   t.exception(() => canonicalUstarTreeHeader('a\u0000b', 'file', 0), {
     code: ERRORS.PROTOCOL_INVALID
   })
-  for (const storedName of ['../escape', '.hidden/x', 'a\\b', 'a/../b']) {
+  t.alike(canonicalUstarTreeHeader('v1..2.txt', 'file', 0), canonicalUstarHeader('v1..2.txt', 0))
+  for (const storedName of [
+    '../escape',
+    '.hidden/x',
+    'a\\b',
+    'a/../b',
+    'a/.',
+    'a/..',
+    '/abs.bin'
+  ]) {
     t.exception(() => canonicalUstarTreeHeader(storedName, 'file', 0), {
       code: ERRORS.PROTOCOL_INVALID
     })
   }
+  t.exception(() => canonicalUstarTreeHeader('bad/', 'file', 0), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => canonicalUstarTreeHeader('dir', 'directory', 0), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
 })
 
 test('a canonical tree directory header matches tar-stream USTAR framing', async (t) => {
-  const output = pack()
-  output.entry({
-    name: 'nested/',
-    type: 'directory',
-    size: 0,
-    mode: 0o755,
-    uid: 0,
-    gid: 0,
-    mtime: new Date(0),
-    uname: '',
-    gname: ''
-  })
-  output.finalize()
-  const chunks: Buffer[] = []
-  for await (const chunk of output as AsyncIterable<Uint8Array>) chunks.push(b4a.from(chunk))
-  t.alike(b4a.concat(chunks).subarray(0, 512), canonicalUstarTreeHeader('nested/', 'directory', 0))
+  for (const storedName of ['nested/', 'd..x/']) {
+    const output = pack()
+    output.entry({
+      name: storedName,
+      type: 'directory',
+      size: 0,
+      mode: 0o755,
+      uid: 0,
+      gid: 0,
+      mtime: new Date(0),
+      uname: '',
+      gname: ''
+    })
+    output.finalize()
+    const chunks: Buffer[] = []
+    for await (const chunk of output as AsyncIterable<Uint8Array>) chunks.push(b4a.from(chunk))
+    t.alike(
+      b4a.concat(chunks).subarray(0, 512),
+      canonicalUstarTreeHeader(storedName, 'directory', 0)
+    )
+  }
 })
 
 test('deterministic tree TAR size accounts for every header, payload, and pad block', (t) => {
@@ -364,11 +416,29 @@ test('snapshotTree rejects invalid roots, symlinks, and non-regular members', as
   await writeTree(cycleRoot, { 'sub/': '' })
   await fs.promises.symlink(cycleRoot, path.join(cycleRoot, 'sub', 'loop'))
   await t.exception(() => snapshotTree(cycleRoot), { code: ERRORS.INVALID_FILENAME })
+})
 
-  const fifoRoot = await createTempDir(t)
-  const hasFifo = await installFifoTreeMember(fifoRoot)
-  t.ok(hasFifo, 'FIFO member creation requires Node mkfifo or SWARM_DEPLOY_TEST_FIFO on Bare')
-  await t.exception(() => snapshotTree(fifoRoot), { code: ERRORS.INVALID_FILENAME })
+test('classifyTreeEntry rejects synthetic special-file stats', (t) => {
+  t.exception(() => classifyTreeEntry(syntheticSpecialEntryStat()), {
+    code: ERRORS.INVALID_FILENAME
+  })
+  t.is(
+    classifyTreeEntry({
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+      isFile: () => false
+    }),
+    'directory'
+  )
+  t.is(
+    classifyTreeEntry({
+      isSymbolicLink: () => false,
+      isDirectory: () => false,
+      isFile: () => true,
+      nlink: 1
+    }),
+    'file'
+  )
 })
 
 test('tree snapshots are canonical, keep empty directories, and reject unsafe entries', async (t) => {
@@ -472,15 +542,6 @@ test('revalidateTreeSnapshot detects source changes as FILE_BUSY', async (t) => 
   await fs.promises.unlink(removedSnap.entries[0].absolutePath)
   await t.exception(() => revalidateTreeSnapshot(removedSnap), { code: ERRORS.FILE_BUSY })
 
-  const abortRoot = await createTempDir(t)
-  await writeTree(abortRoot, { 'wait.bin': 'w' })
-  const abortSnap = await snapshotTree(abortRoot)
-  const controller = createAbortController()
-  controller.abort()
-  await t.exception(() => revalidateTreeSnapshot(abortSnap, { signal: controller.signal }), {
-    code: ERRORS.ABORTED
-  })
-
   const rootSwap = await createTempDir(t)
   await writeTree(rootSwap, { 'only.bin': 'o' })
   const rootSnap = await snapshotTree(rootSwap)
@@ -520,15 +581,13 @@ test('revalidateTreeSnapshot maps snapshot re-walk failures to FILE_BUSY only', 
   }
 
   const foldRoot = await createTempDir(t)
-  await writeTree(foldRoot, { 'a.bin': 'a' })
+  await fs.promises.writeFile(path.join(foldRoot, 'a.bin'), 'a', { flag: 'wx' })
   const foldSnap = await snapshotTree(foldRoot)
-  try {
-    await fs.promises.writeFile(path.join(foldRoot, 'A.bin'), 'A')
+  if (await directoryIsCaseInsensitive(foldRoot)) {
+    t.pass('case-insensitive filesystem cannot host a case-fold collision')
+  } else {
+    await fs.promises.writeFile(path.join(foldRoot, 'A.bin'), 'A', { flag: 'wx' })
     await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(foldSnap))
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code !== 'EEXIST') throw error
-    t.pass('case-insensitive filesystem prevented case-fold collision setup')
   }
 
   const vanishRoot = await createTempDir(t)
@@ -538,15 +597,54 @@ test('revalidateTreeSnapshot maps snapshot re-walk failures to FILE_BUSY only', 
   await fs.promises.rm(vanishDir.absolutePath, { recursive: true, force: true })
   await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(vanishSnap))
 
-  const unreadableRoot = await createTempDir(t)
-  await writeTree(unreadableRoot, { 'locked/': '', 'locked/x.bin': 'x' })
-  const unreadableSnap = await snapshotTree(unreadableRoot)
-  await fs.promises.chmod(unreadableRoot, 0)
-  try {
-    await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(unreadableSnap))
-  } finally {
-    await fs.promises.chmod(unreadableRoot, 0o755).catch(() => {})
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null
+  if (uid !== 0) {
+    const unreadableRoot = await createTempDir(t)
+    await writeTree(unreadableRoot, { 'locked/': '', 'locked/x.bin': 'x' })
+    const unreadableSnap = await snapshotTree(unreadableRoot)
+    await fs.promises.chmod(unreadableRoot, 0)
+    try {
+      await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(unreadableSnap))
+    } finally {
+      await fs.promises.chmod(unreadableRoot, 0o755).catch(() => {})
+    }
+  } else {
+    t.pass('root-owned trees skip unreadable-root chmod integration')
   }
+})
+
+test('revalidate preserves ABORTED after the initial abort check', async (t) => {
+  const root = await createTempDir(t)
+  await writeTree(root, { 'solo.bin': 'solo' })
+  const snap = await snapshotTree(root)
+  const controller = createAbortController()
+  const soloPath = snap.entries[0].absolutePath
+  const originalLstat = fs.promises.lstat
+  fs.promises.lstat = (async (target, opts) => {
+    const stat = await originalLstat(target, opts as never)
+    if (String(target) === soloPath) controller.abort()
+    return stat
+  }) as typeof fs.promises.lstat
+  try {
+    await t.exception(() => revalidateTreeSnapshot(snap, { signal: controller.signal }), {
+      code: ERRORS.ABORTED
+    })
+  } finally {
+    fs.promises.lstat = originalLstat
+  }
+})
+
+test('tree walk and revalidation error normalization boundaries', (t) => {
+  t.is(treeDirectoryReadError().code, ERRORS.PROTOCOL_INVALID)
+  t.exception(() => normalizeRevalidateFailure(treeDirectoryReadError()), {
+    code: ERRORS.FILE_BUSY
+  })
+  t.exception(
+    () => normalizeRevalidateFailure(new SwarmDeployError(ERRORS.ABORTED, 'Operation aborted')),
+    {
+      code: ERRORS.ABORTED
+    }
+  )
 })
 
 test('revalidateTreeSnapshot never leaks snapshot validation error codes', async (t) => {

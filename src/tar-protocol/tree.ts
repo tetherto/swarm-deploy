@@ -170,7 +170,15 @@ function identityOf(stat: fs.Stats): TreeIdentity {
   return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs }
 }
 
-function classify(stat: fs.Stats): ArtifactKind {
+/** Minimal stat surface used to classify one tree member. */
+export interface TreeEntryStatLike {
+  isSymbolicLink(): boolean
+  isDirectory(): boolean
+  isFile(): boolean
+  nlink?: number
+}
+
+export function classifyTreeEntry(stat: TreeEntryStatLike): ArtifactKind {
   if (stat.isSymbolicLink()) throw unsafeName('Tree entries cannot be symbolic links')
   if (stat.isDirectory()) return 'directory'
   if (!stat.isFile()) throw unsafeName('Tree entries must be regular files or directories')
@@ -178,6 +186,38 @@ function classify(stat: fs.Stats): ArtifactKind {
     throw unsafeName('Tree entries cannot be hard links')
   }
   return 'file'
+}
+
+function classify(stat: fs.Stats): ArtifactKind {
+  return classifyTreeEntry(stat)
+}
+
+/** Normalizes a canonical TAR stored name to a tree entry path and validates components. */
+export function assertTreeStoredName(storedName: string, kind: ArtifactKind): string {
+  if (typeof storedName !== 'string') throw unsafeName('Invalid tree entry path')
+  if (storedName.includes('\u0000') || storedName.includes('\\') || storedName.startsWith('/')) {
+    throw unsafeName('Invalid tree entry path')
+  }
+  const encoded = b4a.from(storedName)
+  if (encoded.byteLength === 0 || encoded.byteLength > MAX_TREE_NAME_BYTES) {
+    throw unsafeName('Tree entry path is too long')
+  }
+  if (kind === 'directory') {
+    if (!storedName.endsWith('/')) throw unsafeName('Invalid tree entry path')
+    return assertTreeEntryPath(storedName.slice(0, -1), 'directory')
+  }
+  if (storedName.endsWith('/')) throw unsafeName('Invalid tree entry path')
+  return assertTreeEntryPath(storedName, 'file')
+}
+
+/** Stable error for unreadable directory listings during snapshot walks. */
+export function treeDirectoryReadError(): SwarmDeployError {
+  return invalid('Unable to read tree directory')
+}
+
+/** Maps revalidation failures to FILE_BUSY while preserving ABORTED. */
+export function normalizeRevalidateFailure(error: unknown): never {
+  finishRevalidate(error)
 }
 
 /**
@@ -201,7 +241,7 @@ export async function snapshotTree(
     try {
       names = await fs.promises.readdir(absolute)
     } catch {
-      throw invalid('Unable to read tree directory')
+      throw treeDirectoryReadError()
     }
     names.sort((left, right) => compareTreePaths(left, right))
     for (const name of names) {
