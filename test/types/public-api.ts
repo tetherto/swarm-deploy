@@ -15,6 +15,8 @@ import {
   type RetentionEvent,
   type ServerHooks,
   type ServerOptions,
+  type StorageAdapter,
+  type SymlinkCapableStorage,
   type UploadResult,
   type VersionGranularity
 } from '../../dist/index.js'
@@ -212,3 +214,11 @@ void artifactPath
 // @ts-expect-error The failure context error is unknown, not an Error.
 const failureMessage: string = ({} as HookFailureContext).error.message
 void failureMessage
+
+declare const symlinkStorage: SymlinkCapableStorage
+const storageAdapter: StorageAdapter = symlinkStorage
+const linkTarget: Promise<string> = symlinkStorage.readlink('link')
+const linked: Promise<void> = symlinkStorage.symlink('target', 'link')
+void storageAdapter
+void linkTarget
+void linked

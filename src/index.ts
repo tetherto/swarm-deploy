@@ -70,5 +70,6 @@ export type {
   StorageRmOptions,
   StorageStatFs,
   StorageStats,
-  StorageWriteResult
+  StorageWriteResult,
+  SymlinkCapableStorage
 } from './storage/types.js'

@@ -2,6 +2,10 @@ export interface StorageStats {
   dev: number | bigint
   ino: number | bigint
   size: number
+  /** Hard-link count; tree primitives reject any file reporting more than one. */
+  nlink?: number
+  /** Modification time, compared across hashing when the adapter reports it. */
+  mtimeMs?: number
   isSymbolicLink(): boolean
   isDirectory(): boolean
   isFile(): boolean
