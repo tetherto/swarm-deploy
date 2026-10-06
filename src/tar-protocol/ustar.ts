@@ -41,6 +41,25 @@ export function deterministicTarSize(fileSize: number): number {
   return total
 }
 
+function assertCanonicalTreeStoredName(storedName: string, kind: 'file' | 'directory'): void {
+  if (storedName.includes('\u0000')) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Canonical TAR name overflow')
+  }
+  const encoded = b4a.from(storedName)
+  if (encoded.byteLength === 0 || encoded.byteLength > 100) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Canonical TAR name overflow')
+  }
+  if (kind === 'directory') {
+    if (!storedName.endsWith('/')) {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR directory name')
+    }
+    return
+  }
+  if (storedName.endsWith('/')) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR file name')
+  }
+}
+
 function octal(value: number, digits: number): Buffer {
   const encoded = value.toString(8)
   if (encoded.length > digits) {
@@ -101,21 +120,21 @@ export function canonicalUstarTreeHeader(
     throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR directory size')
   }
   assertUstarFileSize(size)
+  assertCanonicalTreeStoredName(storedName, kind)
+  if (kind === 'file') return canonicalUstarHeader(storedName, size)
+
   const encoded = b4a.from(storedName)
-  if (encoded.byteLength === 0 || encoded.byteLength > 100) {
-    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Canonical TAR name overflow')
-  }
   const header = b4a.alloc(TAR_BLOCK_BYTES)
   const set = (offset: number, value: Uint8Array): void => {
     header.set(value, offset)
   }
   set(0, encoded)
-  set(100, octal(kind === 'directory' ? TAR_DIRECTORY_MODE : TAR_MODE, 6))
+  set(100, octal(TAR_DIRECTORY_MODE, 6))
   set(108, octal(TAR_UID, 6))
   set(116, octal(TAR_GID, 6))
   set(124, octal(size, 11))
   set(136, octal(TAR_MTIME_MS / 1000, 11))
-  header[156] = kind === 'directory' ? 53 : 48
+  header[156] = 53
   set(257, b4a.from([0x75, 0x73, 0x74, 0x61, 0x72, 0]))
   set(263, b4a.from('00'))
   if (TAR_UNAME) set(265, b4a.from(TAR_UNAME))
@@ -136,6 +155,12 @@ export function deterministicTreeTarSize(
 ): number {
   let total = TAR_END_BYTES
   for (const entry of entries) {
+    if (entry.kind !== 'file' && entry.kind !== 'directory') {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR entry kind')
+    }
+    if (entry.kind === 'directory' && entry.size !== 0) {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid canonical TAR directory size')
+    }
     assertUstarFileSize(entry.size)
     const payload = entry.kind === 'directory' ? 0 : entry.size
     const padding = (TAR_BLOCK_BYTES - (payload % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES

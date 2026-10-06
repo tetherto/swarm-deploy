@@ -6,6 +6,7 @@ import { ERRORS, SwarmDeployError } from '../errors.js'
 import { isReservedHistoryName, validateBasename } from '../files.js'
 import type { ArtifactKind } from '../types.js'
 import { SodiumSha256 } from './hash.js'
+import { MAX_USTAR_FILE_BYTES } from './ustar.js'
 
 export const TREE_DIGEST_DOMAIN = 'swarm-deploy/tree/v1'
 export const MAX_TREE_DEPTH = 32
@@ -58,6 +59,25 @@ function unsafeName(message: string): SwarmDeployError {
   return new SwarmDeployError(ERRORS.INVALID_FILENAME, message)
 }
 
+function fileBusy(message: string): SwarmDeployError {
+  return new SwarmDeployError(ERRORS.FILE_BUSY, message)
+}
+
+function isTreeFileDigest(value: unknown): value is Buffer {
+  if (!b4a.isBuffer(value) || value.byteLength !== 32) return false
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) return true
+  return value.constructor.name === 'Buffer'
+}
+
+function isEnoent(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as NodeJS.ErrnoException).code === 'ENOENT'
+  )
+}
+
 /** The exact TAR name field for an entry: directories carry a trailing `/`. */
 export function tarEntryName(entry: Pick<TreeEntry, 'kind' | 'path'>): string {
   return entry.kind === 'directory' ? `${entry.path}/` : entry.path
@@ -96,6 +116,9 @@ export function assertCanonicalTreeEntries(entries: readonly TreeEntry[]): void 
     if (entry.kind === 'directory' && entry.size !== 0) throw invalid('Invalid tree directory size')
     if (typeof entry.size !== 'number' || !Number.isSafeInteger(entry.size) || entry.size < 0) {
       throw invalid('Invalid tree entry size')
+    }
+    if (entry.kind === 'file' && entry.size > MAX_USTAR_FILE_BYTES) {
+      throw invalid('Tree file exceeds canonical USTAR capacity')
     }
     assertTreeEntryPath(entry.path, entry.kind)
     if (previous !== null && compareTreePaths(previous, entry.path) >= 0) {
@@ -139,7 +162,7 @@ export function treeDigest(entries: readonly TreeDigestEntry[]): Buffer {
       if (sha256 !== undefined) throw invalid('Unexpected tree directory digest')
       continue
     }
-    if (!b4a.isBuffer(sha256) || sha256.byteLength !== 32) throw invalid('Invalid tree file digest')
+    if (!isTreeFileDigest(sha256)) throw invalid('Invalid tree file digest')
     hashField(hash, 'sha256', sha256)
   }
   return hash.digest()
@@ -175,8 +198,7 @@ export async function snapshotTree(
   const entries: TreeSnapshotEntry[] = []
   let payloadBytes = 0
 
-  const walk = async (absolute: string, prefix: string, depth: number): Promise<void> => {
-    if (depth > MAX_TREE_DEPTH) throw unsafeName('Tree entry path is too deep')
+  const walk = async (absolute: string, prefix: string): Promise<void> => {
     const names = await fs.promises.readdir(absolute)
     names.sort((left, right) => compareTreePaths(left, right))
     for (const name of names) {
@@ -198,8 +220,11 @@ export async function snapshotTree(
           absolutePath: entryAbsolute,
           identity: identityOf(stat)
         })
-        await walk(entryAbsolute, entryPath, depth + 1)
+        await walk(entryAbsolute, entryPath)
         continue
+      }
+      if (stat.size > MAX_USTAR_FILE_BYTES) {
+        throw invalid('Tree file exceeds canonical USTAR capacity')
       }
       if (payloadBytes > Number.MAX_SAFE_INTEGER - stat.size) {
         throw invalid('Tree payload exceeds safe integer range')
@@ -215,7 +240,8 @@ export async function snapshotTree(
     }
   }
 
-  await walk(rootPath, '', 1)
+  await walk(rootPath, '')
+  entries.sort((left, right) => compareTreePaths(left.path, right.path))
   assertCanonicalTreeEntries(entries)
   return {
     rootPath,
@@ -242,25 +268,51 @@ export function assertSameTreeIdentity(
 }
 
 /** Reproves every snapshotted identity before a resume regenerates the archive. */
+function classifyForRevalidate(stat: fs.Stats): ArtifactKind {
+  try {
+    return classify(stat)
+  } catch (error) {
+    if (error instanceof SwarmDeployError && error.code === ERRORS.INVALID_FILENAME) {
+      throw fileBusy('Tree entry changed during TAR generation')
+    }
+    throw error
+  }
+}
+
 export async function revalidateTreeSnapshot(
   snapshot: TreeSnapshot,
   { signal = null }: TreeSnapshotOptions = {}
 ): Promise<void> {
   throwIfAborted(signal)
-  const rootStat = await fs.promises.lstat(snapshot.rootPath)
-  if (classify(rootStat) !== 'directory') throw unsafeName('Tree root must be a directory')
+  let rootStat: fs.Stats
+  try {
+    rootStat = await fs.promises.lstat(snapshot.rootPath)
+  } catch (error) {
+    if (isEnoent(error)) throw fileBusy('Tree root changed during TAR generation')
+    throw error
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw fileBusy('Tree root changed during TAR generation')
+  }
   if (rootStat.dev !== snapshot.root.dev || rootStat.ino !== snapshot.root.ino) {
-    throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Tree root changed during TAR generation')
+    throw fileBusy('Tree root changed during TAR generation')
   }
   for (const entry of snapshot.entries) {
     throwIfAborted(signal)
-    const stat = await fs.promises.lstat(entry.absolutePath)
-    if (classify(stat) !== entry.kind) {
-      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Tree entry kind changed during TAR generation')
+    let stat: fs.Stats
+    try {
+      stat = await fs.promises.lstat(entry.absolutePath)
+    } catch (error) {
+      if (isEnoent(error)) throw fileBusy('Tree entry changed during TAR generation')
+      throw error
+    }
+    const kind = classifyForRevalidate(stat)
+    if (kind !== entry.kind) {
+      throw fileBusy('Tree entry kind changed during TAR generation')
     }
     if (entry.kind === 'directory') {
       if (stat.dev !== entry.identity.dev || stat.ino !== entry.identity.ino) {
-        throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Tree directory changed during TAR generation')
+        throw fileBusy('Tree directory changed during TAR generation')
       }
       continue
     }
@@ -268,14 +320,14 @@ export async function revalidateTreeSnapshot(
   }
   const refreshed = await snapshotTree(snapshot.rootPath, { signal })
   if (refreshed.entryCount !== snapshot.entryCount) {
-    throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Tree listing changed during TAR generation')
+    throw fileBusy('Tree listing changed during TAR generation')
   }
   for (let index = 0; index < refreshed.entries.length; index++) {
     if (
       refreshed.entries[index].path !== snapshot.entries[index].path ||
       refreshed.entries[index].kind !== snapshot.entries[index].kind
     ) {
-      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Tree listing changed during TAR generation')
+      throw fileBusy('Tree listing changed during TAR generation')
     }
   }
 }

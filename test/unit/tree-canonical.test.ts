@@ -10,19 +10,25 @@ import { ERRORS } from '../../dist/errors.js'
 import {
   MAX_TREE_DEPTH,
   MAX_TREE_ENTRIES,
+  TREE_DIGEST_DOMAIN,
   assertCanonicalTreeEntries,
   assertTreeEntryPath,
   compareTreePaths,
+  hashField,
+  revalidateTreeSnapshot,
   snapshotTree,
   tarEntryName,
   treeDigest,
   type TreeEntry
 } from '../../dist/tar-protocol/tree.js'
 import {
+  MAX_USTAR_FILE_BYTES,
   canonicalUstarHeader,
   canonicalUstarTreeHeader,
   deterministicTreeTarSize
 } from '../../dist/tar-protocol/ustar.js'
+import { SodiumSha256 } from '../../dist/tar-protocol/hash.js'
+import { createAbortController } from '../../dist/abort.js'
 import { createTempDir } from '../helpers/files.js'
 import { writeTree } from '../helpers/trees.js'
 
@@ -69,6 +75,7 @@ test('tree ordering is bytewise with parents before children', (t) => {
   assertCanonicalTreeEntries([
     entry('directory', 'a'),
     entry('file', 'a-b.bin', 1),
+    entry('file', 'a.json', 1),
     entry('file', 'a/b.bin', 2),
     entry('directory', 'a/c'),
     entry('file', 'a/c/d.bin', 3)
@@ -85,7 +92,52 @@ test('tree ordering is bytewise with parents before children', (t) => {
   }
 })
 
-test('tree digest is order sensitive and ignores nothing', (t) => {
+test('tree snapshots interleave directory children with sibling paths in compareTreePaths order', async (t) => {
+  const root = await createTempDir(t)
+  await writeTree(root, {
+    'a/': '',
+    'a-b.bin': '1',
+    'a.json': '2',
+    'a/b.bin': '3'
+  })
+  const snapshot = await snapshotTree(root)
+  t.alike(
+    snapshot.entries.map((value) => `${value.kind}:${value.path}`),
+    ['directory:a', 'file:a-b.bin', 'file:a.json', 'file:a/b.bin']
+  )
+})
+
+test('tree digest golden vector pins domain framing and file payload', (t) => {
+  const sha256 = b4a.alloc(32, 7)
+  const expected = b4a.from(
+    'bd5aa376418cdd15c25f3b4cdfc9f04b7f7e95e2d250764e10367d9c19425461',
+    'hex'
+  )
+  t.alike(
+    treeDigest([
+      { entry: entry('directory', 'a') },
+      { entry: entry('file', 'a/b.bin', 3), sha256 }
+    ]),
+    expected
+  )
+  const independent = new SodiumSha256()
+  hashField(independent, 'domain', TREE_DIGEST_DOMAIN)
+  hashField(independent, 'entryCount', 2)
+  hashField(independent, 'kind', 'directory')
+  hashField(independent, 'path', 'a')
+  hashField(independent, 'size', 0)
+  hashField(independent, 'kind', 'file')
+  hashField(independent, 'path', 'a/b.bin')
+  hashField(independent, 'size', 3)
+  hashField(independent, 'sha256', sha256)
+  t.alike(independent.digest(), expected)
+  t.alike(
+    treeDigest([]),
+    b4a.from('1e6ce64486eeac9c74187ddb7464a1e91df2483ece429e58bece32f176c0ea16', 'hex')
+  )
+})
+
+test('tree digest is order sensitive and rejects invalid file digests', (t) => {
   const base = treeDigest([
     { entry: entry('directory', 'a') },
     { entry: entry('file', 'a/b.bin', 3), sha256: FILE_DIGEST }
@@ -117,6 +169,107 @@ test('tree digest is order sensitive and ignores nothing', (t) => {
     )
   )
   t.absent(b4a.equals(base, treeDigest([{ entry: entry('directory', 'a') }])))
+  t.exception(
+    () =>
+      treeDigest([
+        { entry: entry('file', 'a/b.bin', 3), sha256: FILE_DIGEST },
+        { entry: entry('directory', 'a') }
+      ]),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  t.absent(
+    b4a.equals(
+      base,
+      treeDigest([
+        { entry: entry('directory', 'a') },
+        { entry: entry('file', 'a/b.bin', 3), sha256: FILE_DIGEST },
+        { entry: entry('file', 'a/c.bin', 1), sha256: FILE_DIGEST }
+      ])
+    )
+  )
+  t.exception(
+    () =>
+      treeDigest([
+        { entry: entry('directory', 'a'), sha256: FILE_DIGEST },
+        { entry: entry('file', 'a/b.bin', 3), sha256: FILE_DIGEST }
+      ]),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  t.exception(() => treeDigest([{ entry: entry('file', 'solo.bin', 1) }]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => treeDigest([{ entry: entry('file', 'solo.bin', 1), sha256: b4a.alloc(31) }]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(
+    () => treeDigest([{ entry: entry('file', 'solo.bin', 1), sha256: new Uint8Array(32) }]),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+})
+
+test('canonical tree model rejects direct boundary violations', (t) => {
+  const depth32 = Array.from({ length: MAX_TREE_DEPTH }, () => 'a').join('/')
+  t.is(assertTreeEntryPath(depth32, 'directory'), depth32)
+  t.exception(() => assertTreeEntryPath(`${depth32}/extra`, 'file'), {
+    code: ERRORS.INVALID_FILENAME
+  })
+
+  const maxEntries: TreeEntry[] = []
+  for (let index = 0; index < MAX_TREE_ENTRIES; index++) {
+    maxEntries.push(entry('file', `e${String(index).padStart(5, '0')}.bin`, 0))
+  }
+  assertCanonicalTreeEntries(maxEntries)
+  t.exception(() => assertCanonicalTreeEntries([...maxEntries, entry('file', 'one-more.bin', 0)]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => assertCanonicalTreeEntries(null as unknown as TreeEntry[]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => assertCanonicalTreeEntries([entry('directory', 'a', 1)]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => assertCanonicalTreeEntries([entry('link' as 'file', 'a.bin', 0)]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(
+    () => assertCanonicalTreeEntries([entry('file', 'big.bin', MAX_USTAR_FILE_BYTES + 1)]),
+    {
+      code: ERRORS.PROTOCOL_INVALID
+    }
+  )
+  assertCanonicalTreeEntries([entry('file', 'max.bin', MAX_USTAR_FILE_BYTES)])
+
+  const maxFile = MAX_USTAR_FILE_BYTES
+  const maxPadding = (512 - (maxFile % 512)) % 512
+  t.is(
+    deterministicTreeTarSize([entry('file', 'max.bin', maxFile)]),
+    512 + maxFile + maxPadding + 1024
+  )
+  t.exception(
+    () => deterministicTreeTarSize([entry('file', 'big.bin', MAX_USTAR_FILE_BYTES + 1)]),
+    {
+      code: ERRORS.PROTOCOL_INVALID
+    }
+  )
+  t.exception(() => deterministicTreeTarSize([{ kind: 'directory', size: 1 }]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => deterministicTreeTarSize([{ kind: 'symlink' as 'file', size: 0 }]), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(
+    () =>
+      deterministicTreeTarSize(
+        Array(1_048_576).fill({ kind: 'file' as const, size: MAX_USTAR_FILE_BYTES })
+      ),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+
+  const name100 = 'n'.repeat(100)
+  t.alike(canonicalUstarTreeHeader(name100, 'file', 0), canonicalUstarHeader(name100, 0))
+  t.exception(() => canonicalUstarTreeHeader(`${name100}x`, 'file', 0), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
 })
 
 test('a canonical tree file header is byte-identical to the single-file header', (t) => {
@@ -127,6 +280,15 @@ test('a canonical tree file header is byte-identical to the single-file header',
   t.is(tarEntryName(entry('directory', 'nested')), 'nested/')
   t.is(tarEntryName(entry('file', 'nested/x.bin', 1)), 'nested/x.bin')
   t.exception(() => canonicalUstarTreeHeader('nested/', 'directory', 1), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => canonicalUstarTreeHeader('nested', 'directory', 0), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => canonicalUstarTreeHeader('nested/', 'file', 0), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => canonicalUstarTreeHeader('a\u0000b', 'file', 0), {
     code: ERRORS.PROTOCOL_INVALID
   })
 })
@@ -195,6 +357,93 @@ test('tree snapshots are canonical, keep empty directories, and reject unsafe en
   const named = await createTempDir(t)
   await writeTree(named, { '-invalid': 'x' })
   await t.exception(() => snapshotTree(named), { code: ERRORS.INVALID_FILENAME })
+})
+
+test('tree snapshots reject files larger than canonical USTAR capacity', async (t) => {
+  const root = await createTempDir(t)
+  const target = path.join(root, 'too-big.bin')
+  await fs.promises.writeFile(target, b4a.alloc(1))
+  await fs.promises.truncate(target, MAX_USTAR_FILE_BYTES + 1)
+  await t.exception(() => snapshotTree(root), { code: ERRORS.PROTOCOL_INVALID })
+})
+
+test('depth-32 empty directories snapshot and validate', async (t) => {
+  const root = await createTempDir(t)
+  const nested = `${Array.from({ length: MAX_TREE_DEPTH - 1 }, () => 'a').join('/')}/leaf/`
+  await writeTree(root, { [nested]: '' })
+  const snapshot = await snapshotTree(root)
+  const leaf = snapshot.entries.find(
+    (value) => value.kind === 'directory' && value.path.endsWith('leaf')
+  )
+  t.ok(leaf)
+  t.is(leaf!.path.split('/').length, MAX_TREE_DEPTH)
+})
+
+test('revalidateTreeSnapshot detects source changes as FILE_BUSY', async (t) => {
+  const mtimeRoot = await createTempDir(t)
+  await writeTree(mtimeRoot, { 'dir/': '', 'dir/x.bin': 'x' })
+  const mtimeSnap = await snapshotTree(mtimeRoot)
+  const fileEntry = mtimeSnap.entries.find((value) => value.path === 'dir/x.bin')!
+  await fs.promises.utimes(fileEntry.absolutePath, new Date(), new Date(Date.now() + 60_000))
+  await t.exception(() => revalidateTreeSnapshot(mtimeSnap), { code: ERRORS.FILE_BUSY })
+
+  const truncateRoot = await createTempDir(t)
+  await writeTree(truncateRoot, { 'solo.bin': 'solo' })
+  const truncateSnap = await snapshotTree(truncateRoot)
+  await fs.promises.truncate(truncateSnap.entries[0].absolutePath, 0)
+  await t.exception(() => revalidateTreeSnapshot(truncateSnap), { code: ERRORS.FILE_BUSY })
+
+  const inodeRoot = await createTempDir(t)
+  await writeTree(inodeRoot, { 'dir/': '' })
+  const inodeSnap = await snapshotTree(inodeRoot)
+  const dirEntry = inodeSnap.entries[0]
+  await fs.promises.rm(dirEntry.absolutePath, { recursive: true })
+  await fs.promises.mkdir(dirEntry.absolutePath)
+  await t.exception(() => revalidateTreeSnapshot(inodeSnap), { code: ERRORS.FILE_BUSY })
+
+  const symlinkRoot = await createTempDir(t)
+  await writeTree(symlinkRoot, { 'target.bin': 't', 'link.bin': 'l' })
+  const symlinkSnap = await snapshotTree(symlinkRoot)
+  const linkEntry = symlinkSnap.entries.find((value) => value.path === 'link.bin')!
+  await fs.promises.unlink(linkEntry.absolutePath)
+  await fs.promises.symlink(path.join(symlinkRoot, 'target.bin'), linkEntry.absolutePath)
+  await t.exception(() => revalidateTreeSnapshot(symlinkSnap), { code: ERRORS.FILE_BUSY })
+
+  const addedRoot = await createTempDir(t)
+  await writeTree(addedRoot, { 'keep.bin': 'k' })
+  const addedSnap = await snapshotTree(addedRoot)
+  await fs.promises.writeFile(path.join(addedRoot, 'added.bin'), 'n')
+  await t.exception(() => revalidateTreeSnapshot(addedSnap), { code: ERRORS.FILE_BUSY })
+
+  const removedRoot = await createTempDir(t)
+  await writeTree(removedRoot, { 'gone.bin': 'g' })
+  const removedSnap = await snapshotTree(removedRoot)
+  await fs.promises.unlink(removedSnap.entries[0].absolutePath)
+  await t.exception(() => revalidateTreeSnapshot(removedSnap), { code: ERRORS.FILE_BUSY })
+
+  const abortRoot = await createTempDir(t)
+  await writeTree(abortRoot, { 'wait.bin': 'w' })
+  const abortSnap = await snapshotTree(abortRoot)
+  const controller = createAbortController()
+  controller.abort()
+  await t.exception(() => revalidateTreeSnapshot(abortSnap, { signal: controller.signal }), {
+    code: ERRORS.ABORTED
+  })
+
+  const rootSwap = await createTempDir(t)
+  await writeTree(rootSwap, { 'only.bin': 'o' })
+  const rootSnap = await snapshotTree(rootSwap)
+  await fs.promises.rm(rootSwap, { recursive: true, force: true })
+  await fs.promises.symlink('/tmp', rootSwap)
+  await t.exception(() => revalidateTreeSnapshot(rootSnap), { code: ERRORS.FILE_BUSY })
+
+  const dirSymlinkRoot = await createTempDir(t)
+  await writeTree(dirSymlinkRoot, { 'inner/': '', 'inner/a.bin': 'a' })
+  const dirSymlinkSnap = await snapshotTree(dirSymlinkRoot)
+  const innerDir = dirSymlinkSnap.entries.find((value) => value.path === 'inner')!
+  await fs.promises.rm(innerDir.absolutePath, { recursive: true })
+  await fs.promises.symlink('/tmp', innerDir.absolutePath)
+  await t.exception(() => revalidateTreeSnapshot(dirSymlinkSnap), { code: ERRORS.FILE_BUSY })
 })
 
 test('tree snapshots reject an over-count tree without reading every file', async (t) => {
