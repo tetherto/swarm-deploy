@@ -6,14 +6,17 @@ import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { historyName, isReservedHistoryName, validateBasename } from '../files.js'
 import { assertSafeUint } from '../validation.js'
+import { MAX_TREE_ENTRIES } from '../tar-protocol/tree.js'
 import { MetadataFormatError, readJson } from './atomic-file.js'
 import { assertSafeFile } from './layout.js'
 import type { StorageAdapter, StorageLayout, StorageStat } from './types.js'
 
 const COMMIT_VERSION = 1
 const REPLACEMENT_COMMIT_VERSION = 2
+const DIRECTORY_COMMIT_VERSION = 3
 const JOURNAL_VERSION = 1
 const REPLACEMENT_JOURNAL_VERSION = 2
+const DIRECTORY_JOURNAL_VERSION = 3
 const MAX_COMMIT_METADATA_BYTES = 16 * 1024
 
 function sameTransferId(left: string, right: string): boolean {
@@ -95,14 +98,31 @@ export interface CommitRelease {
 
 export interface CommitRecord {
   version: number
+  /** Present only on a version 3 directory record. */
+  kind?: 'directory'
   name: string
+  /** Payload bytes: the file size, or the aggregate tree payload size. */
   size: number
+  /** The file digest, or the canonical tree digest. */
   sha256: string
+  /** Present only on a version 3 directory record. */
+  entryCount?: number
   committedAt: number
   uploaderFingerprint: string
   transferId: string
   release?: CommitRelease
   replaces?: CommitReplacement
+}
+
+/** Newest first: descending commit time, then transfer ID and name for determinism. */
+export function compareCommitOrder(left: CommitRecord, right: CommitRecord): number {
+  if (left.committedAt !== right.committedAt) return right.committedAt - left.committedAt
+  if (left.transferId !== right.transferId) return left.transferId < right.transferId ? -1 : 1
+  return left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+}
+
+export function commitRecordKind(record: CommitRecord): 'file' | 'directory' {
+  return record.kind === 'directory' ? 'directory' : 'file'
 }
 
 function isRecordLike(value: unknown): value is Record<string, unknown> {
@@ -154,7 +174,11 @@ export function assertCommitRelease(value: unknown): asserts value is CommitRele
 function assertCommitRecordShape(record: unknown): asserts record is CommitRecord {
   if (!isRecordLike(record)) throw storageError('Invalid commit record')
   const candidate = record
-  if (candidate.version !== COMMIT_VERSION && candidate.version !== REPLACEMENT_COMMIT_VERSION) {
+  if (
+    candidate.version !== COMMIT_VERSION &&
+    candidate.version !== REPLACEMENT_COMMIT_VERSION &&
+    candidate.version !== DIRECTORY_COMMIT_VERSION
+  ) {
     throw storageError('Invalid commit record version')
   }
   validateBasename(typeof candidate.name === 'string' ? candidate.name : '')
@@ -164,6 +188,20 @@ function assertCommitRecordShape(record: unknown): asserts record is CommitRecor
   if (!isHex(candidate.uploaderFingerprint)) throw storageError('Invalid uploader fingerprint')
   if (!isHex(candidate.transferId)) throw storageError('Invalid commit transfer ID')
   if (candidate.release !== undefined) assertCommitRelease(candidate.release)
+  if (candidate.version === DIRECTORY_COMMIT_VERSION) {
+    if (candidate.kind !== 'directory') throw storageError('Invalid commit artifact kind')
+    assertSafeUint(candidate.entryCount, 'commit entry count')
+    if ((candidate.entryCount as number) > MAX_TREE_ENTRIES) {
+      throw storageError('Invalid commit entry count')
+    }
+    if (isReservedHistoryName(candidate.name)) throw storageError('Reserved directory name')
+    if (candidate.replaces !== undefined) {
+      throw storageError('Unexpected commit replacement metadata')
+    }
+    return
+  }
+  if (candidate.kind !== undefined) throw storageError('Unexpected commit artifact kind')
+  if (candidate.entryCount !== undefined) throw storageError('Unexpected commit entry count')
   if (candidate.version === REPLACEMENT_COMMIT_VERSION) {
     assertReplacement(candidate.replaces)
   } else if (candidate.replaces !== undefined) {
@@ -214,7 +252,34 @@ export interface ReplacementJournal {
   record: CommitRecord
 }
 
-export type AnyCommitJournal = CommitJournal | ReplacementJournal
+export const DIRECTORY_PHASES = ['journaled', 'renamed', 'sidecar', 'cleanup'] as const
+export type DirectoryPhase = (typeof DIRECTORY_PHASES)[number]
+
+/**
+ * The create-only directory transaction. A directory is published by renaming
+ * its verified staging tree, so the journal names the staging tree and its
+ * inode identity instead of a hardlink source.
+ */
+export interface DirectoryCommitJournal {
+  version: 3
+  intent: 'create-directory'
+  state: 'committing' | 'aborting'
+  phase: DirectoryPhase
+  transferId: string
+  attemptId: string
+  name: string
+  stagingTreeName: string
+  stagingTreeIdentity: FileIdentity
+  record: CommitRecord
+}
+
+export type AnyCommitJournal = CommitJournal | ReplacementJournal | DirectoryCommitJournal
+
+export function isDirectoryJournal(
+  journal: AnyCommitJournal | null
+): journal is DirectoryCommitJournal {
+  return journal !== null && journal.version === DIRECTORY_JOURNAL_VERSION
+}
 
 export function isReplacementJournal(
   journal: AnyCommitJournal | null
@@ -301,8 +366,69 @@ function parseReplacementJournal(id: string, journal: Record<string, unknown>): 
   }
 }
 
+function isDirectoryPhase(value: unknown): value is DirectoryPhase {
+  return typeof value === 'string' && (DIRECTORY_PHASES as readonly string[]).includes(value)
+}
+
+function parseDirectoryJournal(
+  id: string,
+  journal: Record<string, unknown>
+): DirectoryCommitJournal {
+  if (
+    journal.intent !== 'create-directory' ||
+    (journal.state !== 'committing' && journal.state !== 'aborting') ||
+    !isDirectoryPhase(journal.phase) ||
+    !sameTransferId(journal.transferId as string, id) ||
+    !isHex(journal.attemptId) ||
+    typeof journal.name !== 'string' ||
+    journal.stagingTreeName !== `${id}.tree`
+  ) {
+    throw new CorruptJournalError('Invalid directory journal')
+  }
+  let name: string
+  try {
+    name = validateBasename(journal.name)
+    if (isReservedHistoryName(name)) throw storageError('Reserved directory name')
+  } catch (error: unknown) {
+    throw new CorruptJournalError('Invalid directory journal name', error)
+  }
+  const record = parseRecord(journal.record)
+  if (!sameTransferId(record.transferId, id)) {
+    throw new CorruptJournalError('Commit journal ID mismatch')
+  }
+  if (record.version !== DIRECTORY_COMMIT_VERSION || record.name !== name) {
+    throw new CorruptJournalError('Directory journal record mismatch')
+  }
+  return {
+    version: DIRECTORY_JOURNAL_VERSION,
+    intent: 'create-directory',
+    state: journal.state,
+    phase: journal.phase,
+    transferId: id,
+    attemptId: journal.attemptId,
+    name,
+    stagingTreeName: journal.stagingTreeName,
+    stagingTreeIdentity: parseIdentity(journal.stagingTreeIdentity),
+    record
+  }
+}
+
 /** The exact durable shape of a journal, for creation and phase transitions. */
 export function serializeJournal(journal: AnyCommitJournal): Record<string, unknown> {
+  if (journal.version === DIRECTORY_JOURNAL_VERSION) {
+    return {
+      version: DIRECTORY_JOURNAL_VERSION,
+      intent: journal.intent,
+      state: journal.state,
+      phase: journal.phase,
+      transferId: journal.transferId,
+      attemptId: journal.attemptId,
+      name: journal.name,
+      stagingTreeName: journal.stagingTreeName,
+      stagingTreeIdentity: journal.stagingTreeIdentity,
+      record: journal.record
+    }
+  }
   if (journal.version === REPLACEMENT_JOURNAL_VERSION) {
     return {
       version: REPLACEMENT_JOURNAL_VERSION,
@@ -349,6 +475,7 @@ export async function readCommitJournal(
       throw err
     }
     journal = await readJson(journalPath, storage, MAX_COMMIT_METADATA_BYTES)
+    if (journal.version === DIRECTORY_JOURNAL_VERSION) return parseDirectoryJournal(id, journal)
     if (journal.version === REPLACEMENT_JOURNAL_VERSION) {
       return parseReplacementJournal(id, journal)
     }
@@ -384,7 +511,9 @@ export async function readCommitJournal(
 export {
   COMMIT_VERSION,
   REPLACEMENT_COMMIT_VERSION,
+  DIRECTORY_COMMIT_VERSION,
   JOURNAL_VERSION,
   REPLACEMENT_JOURNAL_VERSION,
+  DIRECTORY_JOURNAL_VERSION,
   MAX_COMMIT_METADATA_BYTES
 }

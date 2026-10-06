@@ -31,6 +31,7 @@ import {
   MAX_COMMIT_METADATA_BYTES,
   assertCommitRelease,
   assertCommitRecord as assertRecord,
+  isDirectoryJournal,
   isReplacementJournal,
   readCommitJournal,
   serializeJournal,
@@ -1481,6 +1482,8 @@ class CommitStore {
     }
     const journal = await this._readJournal(id)
     if (!journal) return { status: 'MISSING' }
+    // Directory transactions are recovered by their own store; fail closed here.
+    if (isDirectoryJournal(journal)) throw storageError('Unsupported directory journal')
     if (isReplacementJournal(journal)) {
       return withNameLease(this.layout.root, journal.name, () =>
         this._recoverReplacementJournal(id, journal, sessionStore, isAuthorized)

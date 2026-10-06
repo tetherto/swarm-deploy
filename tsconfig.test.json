@@ -29,6 +29,7 @@
     "test/unit/tar-property.test.ts",
     "test/unit/tar-protocol.test.ts",
     "test/unit/tar-session-store.test.ts",
+    "test/unit/commit-journal.test.ts",
     "test/unit/commit-recovery.test.ts",
     "test/integration/direct-upload.test.ts",
     "test/integration/source-parent-optout.test.ts",
