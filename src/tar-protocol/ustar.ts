@@ -1,6 +1,6 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError } from '../errors.js'
-import { assertTreeStoredName } from './tree.js'
+import { assertTreeStoredName } from './tree-path.js'
 
 export const TAR_BLOCK_BYTES = 512
 export const MAX_USTAR_FILE_BYTES = 0o77777777777
