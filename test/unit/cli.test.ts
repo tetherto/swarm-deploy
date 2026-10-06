@@ -1303,3 +1303,95 @@ module.exports.afterCommit = () => { ${record('cjs-function:after')} }\n`,
     t.alike(log, expected, `${file} callbacks`)
   }
 })
+
+test('--symlink is a repeatable two-value option passed through as rules', async (t) => {
+  const run = await runServerCli(await createTempDir(t), [
+    '--symlink',
+    '/^\\d+\\.\\d+\\.\\d+$/',
+    'latest',
+    '--symlink',
+    'release.tar.gz',
+    'current.tar.gz'
+  ])
+  t.is(run.code, 0)
+  t.alike(
+    [...((run.options as ServerOptions).symlinks as Iterable<unknown>)],
+    [
+      { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
+      { selector: 'release.tar.gz', name: 'current.tar.gz' }
+    ]
+  )
+})
+
+test('a server without --symlink passes no symlinks option', async (t) => {
+  const run = await runServerCli(await createTempDir(t), [])
+  t.is(run.code, 0)
+  t.absent('symlinks' in (run.options as ServerOptions))
+})
+
+test('--symlink rejects a missing second value and an invalid rule with exit code 2', async (t) => {
+  const root = await createTempDir(t)
+  for (const extra of [
+    ['--symlink', 'release.tar.gz'],
+    ['--symlink'],
+    ['--symlink', 'release.tar.gz', '--hooks', './hooks.mjs'],
+    ['--symlink', 'release.tar.gz', 'release.tar.gz'],
+    ['--symlink', '/[unclosed/', 'latest'],
+    ['--symlink', 'one.bin', 'latest', '--symlink', 'two.bin', 'latest'],
+    ['--symlink', 'release.tar.gz', 'history-latest'],
+    ['--symlink', 'release.tar.gz', '../escape']
+  ]) {
+    const run = await runServerCli(root, extra)
+    t.is(run.code, 2, extra.join(' '))
+    t.is(run.constructed, 0, extra.join(' '))
+  }
+})
+
+test('the usage text documents the repeatable two-value symlink option', async (t) => {
+  const stdout = output()
+  t.is(await main(['--help'], {}, { stdout: stdout.stream }), 0)
+  t.ok(stdout.text().includes('[--symlink <selector> <link-name>]...'))
+})
+
+test('upload output names the artifact kind', async (t) => {
+  const artifact = path.join(await createTempDir(t), 'payload.bin')
+  await fs.promises.writeFile(artifact, 'payload')
+  class Client {
+    constructor(_options: ClientOptions) {}
+    upload() {
+      return Promise.resolve({
+        status: 'COMMITTED' as const,
+        kind: 'file' as const,
+        name: 'payload.bin',
+        size: 7,
+        digest: b4a.alloc(32, 1),
+        transferId: b4a.alloc(32, 2)
+      })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  t.is(
+    await main(
+      [
+        'upload',
+        '--seed',
+        b4a.toString(CLIENT_SEED, 'hex'),
+        '--server-key',
+        b4a.toString(SERVER_KEY, 'hex'),
+        artifact
+      ],
+      {},
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: stdout.stream
+      }
+    ),
+    0
+  )
+  t.is(stdout.text(), 'payload.bin file COMMITTED\n')
+})

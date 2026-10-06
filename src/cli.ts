@@ -8,6 +8,7 @@ import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS } from './errors.js'
 import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './identity.js'
 import { validateReplaceNames } from './files.js'
+import { compileSymlinkRules } from './symlinks.js'
 import { loadHooksModule } from './hooks-module.js'
 import type { ServerHooks } from './hooks.js'
 import { Server, type ServerLogger, type ServerOptions } from './server.js'
@@ -45,7 +46,7 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--hooks <module>]',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> <link-name>]... [--hooks <module>]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] <file-or-directory>',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
@@ -304,10 +305,12 @@ function parseOptions(
   allowed: ReadonlySet<string>,
   repeatable: ReadonlySet<string> = new Set(),
   keyValues: ReadonlySet<string> = new Set(),
-  flags: ReadonlySet<string> = new Set()
+  flags: ReadonlySet<string> = new Set(),
+  pairs: ReadonlySet<string> = new Set()
 ): {
   options: Record<string, string | undefined>
   repeatedOptions: Record<string, string[] | undefined>
+  pairOptions: Record<string, Array<[string, string]> | undefined>
   flagOptions: Record<string, true | undefined>
   positionals: string[]
 } {
@@ -319,6 +322,9 @@ function parseOptions(
     string,
     string[] | undefined
   >
+  const pairOptions: Record<string, Array<[string, string]> | undefined> = Object.create(
+    null
+  ) as Record<string, Array<[string, string]> | undefined>
   const flagOptions: Record<string, true | undefined> = Object.create(null) as Record<
     string,
     true | undefined
@@ -333,6 +339,7 @@ function parseOptions(
       if (arg.includes('=') || !allowed.has(arg)) throw usageError('Unknown option')
       if (
         !repeatable.has(arg) &&
+        !pairs.has(arg) &&
         (Object.prototype.hasOwnProperty.call(options, arg) ||
           Object.prototype.hasOwnProperty.call(repeatedOptions, arg) ||
           Object.prototype.hasOwnProperty.call(flagOptions, arg))
@@ -342,6 +349,24 @@ function parseOptions(
       // A flag takes no value, so the next argument keeps its own meaning.
       if (flags.has(arg)) {
         flagOptions[arg] = true
+        continue
+      }
+      if (pairs.has(arg)) {
+        const first = args[i + 1]
+        const second = args[i + 2]
+        if (
+          first === undefined ||
+          first.startsWith('-') ||
+          second === undefined ||
+          second.startsWith('-')
+        ) {
+          throw usageError('Missing option value')
+        }
+        if (isCanonicalHexToken(second) && !keyValues.has(arg)) rejectUnexpectedSeed()
+        const values = pairOptions[arg] || []
+        values.push([first, second])
+        pairOptions[arg] = values
+        i += 2
         continue
       }
       const value = args[i + 1]
@@ -361,7 +386,7 @@ function parseOptions(
     }
     positionals.push(arg)
   }
-  return { options, repeatedOptions, flagOptions, positionals }
+  return { options, repeatedOptions, pairOptions, flagOptions, positionals }
 }
 
 function requireOption(options: Record<string, string | undefined>, name: string): string {
@@ -530,7 +555,7 @@ async function runPublicKey(args: string[]): Promise<string> {
 }
 
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, repeatedOptions, positionals } = parseOptions(
+  const { options, repeatedOptions, pairOptions, positionals } = parseOptions(
     args,
     new Set([
       '--seed-file',
@@ -546,10 +571,13 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--max-count',
       '--max-versions',
       '--version-granularity',
+      '--symlink',
       '--hooks'
     ]),
-    new Set(['--replace-name', '--allow-key', '--artifact-pattern']),
-    new Set(['--allow-key', '--seed'])
+    new Set(['--replace-name', '--allow-key', '--artifact-pattern', '--symlink']),
+    new Set(['--allow-key', '--seed']),
+    new Set(),
+    new Set(['--symlink'])
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
@@ -618,6 +646,14 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     }
   }
 
+  const symlinkPairs = pairOptions['--symlink'] || []
+  const symlinks = symlinkPairs.map(([selector, name]) => ({ selector, name }))
+  try {
+    compileSymlinkRules(symlinks)
+  } catch {
+    throw usageError('Invalid --symlink')
+  }
+
   const ServerImpl = io.Server || Server
   let server: Server
   try {
@@ -634,6 +670,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       maxCount,
       maxVersions,
       versionGranularity: granularity,
+      ...(symlinks.length > 0 ? { symlinks } : {}),
       hooks,
       dht: io.dht,
       logger: createLogger(io)

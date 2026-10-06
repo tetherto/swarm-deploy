@@ -1065,7 +1065,13 @@ class CommitStore {
       throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
     }
     if (session.kind === 'directory') {
-      return this._commitDirectory(record, retentionManager, signal, mutable)
+      return this._commitDirectory(
+        record,
+        retentionManager,
+        signal,
+        mutable,
+        deferPostCommitRetention
+      )
     }
     const stagingPath = this._stagingPath(record.transferId)
     const finalPath = this._finalPath(record.name)
@@ -1172,7 +1178,8 @@ class CommitStore {
     record: CommitRecord,
     retentionManager: RetentionManager | null,
     signal: AbortSignalLike | null,
-    mutable: Set<string>
+    mutable: Set<string>,
+    deferPostCommitRetention = false
   ): Promise<CommitRecord> {
     if (mutable.has(record.name)) {
       throw existsError('Directory artifacts cannot be replaced')
@@ -1243,6 +1250,9 @@ class CommitStore {
       await this._removeFile(this._sessionPath(record.transferId), this.layout.sessions)
       await this._removeFile(this._tarStagingPath(record.transferId), this.layout.staging)
       await this._discardJournal(record.transferId, attempt)
+      if (retentionManager && !deferPostCommitRetention) {
+        await retentionManager._afterCommitUnlocked()
+      }
       return record
     } catch (err) {
       if (linearized) {

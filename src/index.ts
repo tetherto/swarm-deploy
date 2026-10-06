@@ -31,6 +31,7 @@ export { fixedSeriesKey, type ReleaseCoordinates, type VersionGranularity } from
 export { parseAllowlist } from './allowlist.js'
 export type { ArtifactKind } from './types.js'
 export type { UploadTarget } from './files.js'
+export type { SymlinkRule } from './symlinks.js'
 export {
   Server,
   type AllowlistKey,

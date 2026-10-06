@@ -27,7 +27,9 @@ import {
 import { keyPairFromSeed } from './identity.js'
 import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
+import { LinkStore } from './storage/link-store.js'
 import { acquireStorageLock, initLayout } from './storage/layout.js'
+import { withRootLease } from './storage/root-coordinator.js'
 import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
 import {
   RetentionManager,
@@ -36,12 +38,26 @@ import {
 } from './storage/retention.js'
 import { SessionStore } from './storage/session-store.js'
 import type { TarSession } from './storage/tar-session-store.js'
-import type { StorageAdapter, StorageLayout } from './storage/types.js'
-import { decodeMetadataRecord } from './tar-protocol/controls.js'
+import type { StorageAdapter, StorageLayout, SymlinkCapableStorage } from './storage/types.js'
+import { assertSymlinkCapable } from './storage/tree-fs.js'
+import {
+  decodeAnyMetadataRecord,
+  isTreeMetadata,
+  type AnyMetadataRecord
+} from './tar-protocol/controls.js'
 import { DirectWireReader, writeAdmission, writeFinal } from './tar-protocol/direct-wire.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 import { assertMetadataTransferId } from './tar-protocol/manifest.js'
+import { assertTreeMetadataTransferId } from './tar-protocol/tree-manifest.js'
+import {
+  compileSymlinkRules,
+  selectDesiredLinks,
+  symlinkRuleNames,
+  type CompiledSymlinkRule,
+  type SymlinkRule
+} from './symlinks.js'
 import type {
+  ArtifactKind,
   AuthenticationEvent,
   FingerprintEvent,
   Logger,
@@ -52,6 +68,7 @@ import type {
   TransferEvent,
   TransferLifecycleEvent
 } from './types.js'
+import type { CommitRecord } from './storage/commit-journal.js'
 
 const EventEmitter = events.EventEmitter
 const DEFAULT_MAX_CONNECTIONS = 64
@@ -102,6 +119,8 @@ export interface ServerOptions {
   replaceNames?: Iterable<string>
   /** Optional deployment lifecycle callbacks; snapshotted at construction. */
   hooks?: ServerHooks | null
+  /** Repeatable managed-symlink rules; snapshotted and validated at construction. */
+  symlinks?: Iterable<SymlinkRule>
 }
 
 export interface ServerConnectionEvent extends FingerprintEvent {
@@ -176,12 +195,6 @@ function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDep
   return new SwarmDeployError(code, message, cause)
 }
 
-/**
- * Until the server serves trees it decodes only the exact file record. Any directory-shaped offer,
- * well formed or not, fails the exact-key check as an unknown record, so it keeps the
- * PROTOCOL_INVALID outcome it had before the directory record existed.
- */
-const decodeFileOffer = decodeMetadataRecord
 function codeOf(error: unknown): ErrorCode {
   return error instanceof SwarmDeployError &&
     Object.values(ERRORS).includes(error.code as ErrorCode)
@@ -254,6 +267,9 @@ export class Server extends EventEmitter {
   readonly scheduler: ServerScheduler
   readonly replaceNames: ReadonlySet<string>
   readonly hooks: Readonly<ServerHooks>
+  readonly symlinks: readonly CompiledSymlinkRule[]
+  readonly linkNames: ReadonlySet<string>
+  private links: LinkStore | null = null
   listening = false
   closed = false
   private readonly keyPair
@@ -387,8 +403,23 @@ export class Server extends EventEmitter {
     this.scheduler = options.scheduler || { setTimeout, clearTimeout, setInterval, clearInterval }
     this.replaceNames = validateReplaceNames(options.replaceNames)
     this.hooks = snapshotHooks(options.hooks)
+    this.symlinks = compileSymlinkRules(options.symlinks)
+    this.linkNames = symlinkRuleNames(this.symlinks)
+    if (this.symlinks.length > 0) assertSymlinkCapable(this.storage)
     this.logger = safeLogger(options.logger)
     this.signal = this.abort.signal
+  }
+
+  private artifactKind(metadata: AnyMetadataRecord): ArtifactKind {
+    return isTreeMetadata(metadata) ? 'directory' : 'file'
+  }
+
+  private payloadBytes(metadata: AnyMetadataRecord): number {
+    return isTreeMetadata(metadata) ? metadata.payloadBytes : metadata.fileSize
+  }
+
+  private payloadDigest(metadata: AnyMetadataRecord): string {
+    return isTreeMetadata(metadata) ? metadata.treeSha256 : metadata.fileSha256
   }
 
   private emitSafe(type: string, payload: Record<string, unknown>): void {
@@ -404,11 +435,12 @@ export class Server extends EventEmitter {
     }
     return accepted
   }
-  private transfer(metadata: { transferId: string; name: string; fileSize: number }) {
+  private transfer(metadata: AnyMetadataRecord) {
     return {
       transfer: fingerprint(b4a.from(metadata.transferId, 'hex')),
       name: metadata.name,
-      size: metadata.fileSize
+      kind: this.artifactKind(metadata),
+      size: this.payloadBytes(metadata)
     }
   }
 
@@ -432,20 +464,16 @@ export class Server extends EventEmitter {
   }
 
   private hookArtifact(
-    metadata: {
-      name: string
-      fileSize: number
-      fileSha256: string
-      transferId: string
-      sourceParent?: string
-    },
+    metadata: AnyMetadataRecord,
     release: ReleaseCoordinates | null
   ): HookArtifact {
     return Object.freeze({
       name: metadata.name,
-      size: metadata.fileSize,
-      sha256: metadata.fileSha256,
+      kind: this.artifactKind(metadata),
+      size: this.payloadBytes(metadata),
+      sha256: this.payloadDigest(metadata),
       transferId: metadata.transferId,
+      ...(isTreeMetadata(metadata) ? { entryCount: metadata.entryCount } : {}),
       ...(metadata.sourceParent === undefined ? {} : { sourceParent: metadata.sourceParent }),
       ...(release === null
         ? {}
@@ -456,6 +484,30 @@ export class Server extends EventEmitter {
             })
           })
     })
+  }
+
+  /**
+   * Computes and converges the desired links from durable commit records.
+   * Called with the root lease already held.
+   */
+  private async reconcileLinksUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
+    if (this.symlinks.length === 0 || !this.links) return new Set()
+    const desired = selectDesiredLinks(this.symlinks, records)
+    await this.links.reconcile(desired, this.linkNames)
+    return new Set(desired.map((link) => link.transferId))
+  }
+
+  /** Reconciles after a durable commit; this is the only caller that leases the root. */
+  private async reconcileAfterCommit(): Promise<void> {
+    if (this.symlinks.length === 0 || !this.links || !this.commits) return
+    try {
+      await withRootLease(this.layout!.root, async () =>
+        this.reconcileLinksUnlocked(await this.commits!.list())
+      )
+    } catch (error) {
+      if (error instanceof SwarmDeployError && error.code === ERRORS.LINK_CONFLICT) throw error
+      throw new SwarmDeployError(ERRORS.LINK_FAILED, 'Unable to reconcile managed symlinks', error)
+    }
   }
 
   /** Runs a gating callback; only callback exceptions become HOOK_FAILED. */
@@ -571,12 +623,13 @@ export class Server extends EventEmitter {
       await reportFailure(fail(reason, message))
     }
     try {
-      const metadata = await reader.control(decodeFileOffer, this.signal, this.idleTimeout)
+      const metadata = await reader.control(decodeAnyMetadataRecord, this.signal, this.idleTimeout)
       // The decoded record is shape-validated but not yet authenticated; the
       // artifact context carries only its non-secret descriptive fields.
       event = this.transfer(metadata)
       artifact = this.hookArtifact(metadata, null)
-      assertMetadataTransferId(owner, metadata)
+      if (isTreeMetadata(metadata)) assertTreeMetadataTransferId(owner, metadata)
+      else assertMetadataTransferId(owner, metadata)
       // The transfer ID is authenticated from here on, so it is safe to key
       // the single-owner guard on it.
       if (this.activeTransfers.has(metadata.transferId)) {
@@ -597,10 +650,17 @@ export class Server extends EventEmitter {
         }
         artifact = this.hookArtifact(metadata, release)
       }
+      if (this.linkNames.has(metadata.name)) {
+        await rejectEarly(ERRORS.INVALID_FILENAME, 'Artifact name is a configured symlink name')
+        return
+      }
       const hookArtifact = artifact
+      const stagingHookPath = isTreeMetadata(metadata)
+        ? path.join(this.layout!.staging, `${metadata.transferId}.tree`)
+        : path.join(this.layout!.staging, `${metadata.transferId}.part`)
       const finish = async (verified: TarSession): Promise<void> => {
         phase = 'beforeCommit'
-        hookPath = path.join(this.layout!.staging, `${metadata.transferId}.part`)
+        hookPath = stagingHookPath
         await this.runHook<BeforeCommitContext>(
           'beforeCommit',
           this.hooks.beforeCommit,
@@ -628,6 +688,7 @@ export class Server extends EventEmitter {
         commitSucceeded = true
         hookPath = path.join(this.layout!.root, metadata.name)
         await this.retireQuietly(verified.transferId, owner)
+        await this.reconcileAfterCommit()
         phase = 'afterCommit'
         if (this.hooks.afterCommit !== undefined) {
           this.owePostCommitRetention(metadata.transferId)
@@ -651,11 +712,9 @@ export class Server extends EventEmitter {
           { signal: this.signal, timeout: this.idleTimeout }
         )
       }
-      if (
-        metadata.fileSize > this.maxFileBytes ||
-        this.activeUploads.size >= this.maxActiveUploads
-      ) {
-        if (metadata.fileSize > this.maxFileBytes) {
+      const payloadBytes = this.payloadBytes(metadata)
+      if (payloadBytes > this.maxFileBytes || this.activeUploads.size >= this.maxActiveUploads) {
+        if (payloadBytes > this.maxFileBytes) {
           await rejectEarly(ERRORS.FILE_TOO_LARGE, 'File exceeds the maximum size')
         } else {
           await rejectEarly(ERRORS.ACTIVE_UPLOAD_LIMIT, 'Active upload capacity exceeded')
@@ -666,8 +725,10 @@ export class Server extends EventEmitter {
         metadata.name,
         {
           name: metadata.name,
-          size: metadata.fileSize,
-          digest: b4a.from(metadata.fileSha256, 'hex'),
+          kind: this.artifactKind(metadata),
+          size: payloadBytes,
+          digest: b4a.from(this.payloadDigest(metadata), 'hex'),
+          ...(isTreeMetadata(metadata) ? { entryCount: metadata.entryCount } : {}),
           transferId: b4a.from(metadata.transferId, 'hex'),
           release
         },
@@ -676,6 +737,7 @@ export class Server extends EventEmitter {
       if (inspected.status === 'ALREADY_COMMITTED') {
         alreadyCommitted = true
         hookPath = path.join(this.layout!.root, metadata.name)
+        await this.reconcileAfterCommit()
         phase = 'afterCommit'
         await this.runHook<AfterCommitContext>(
           'afterCommit',
@@ -707,7 +769,8 @@ export class Server extends EventEmitter {
         return
       }
       if (inspected.status === 'FILE_EXISTS') {
-        throw fail(ERRORS.FILE_EXISTS, 'Destination already exists')
+        await rejectEarly(ERRORS.FILE_EXISTS, 'Destination already exists')
+        return
       }
       if (this.activeUploads.size >= this.maxActiveUploads) {
         await rejectEarly(ERRORS.ACTIVE_UPLOAD_LIMIT, 'Active upload capacity exceeded')
@@ -725,7 +788,7 @@ export class Server extends EventEmitter {
         )
         sentAdmission = true
         phase = 'verification'
-        hookPath = path.join(this.layout!.staging, `${metadata.transferId}.part`)
+        hookPath = stagingHookPath
         this.emitSafe('verification', {
           ...event,
           fingerprint: fingerprint(owner),
@@ -947,6 +1010,12 @@ export class Server extends EventEmitter {
         storage: this.storage,
         logger: this.logger
       })
+      if (this.symlinks.length > 0) {
+        this.links = new LinkStore({
+          layout: this.layout,
+          storage: this.storage as SymlinkCapableStorage
+        })
+      }
       this.emitSafe('recovery', { status: 'started' })
       await prepareStorageRecovery({
         layout: this.layout,
@@ -991,6 +1060,8 @@ export class Server extends EventEmitter {
           ),
         hasActiveUploads: () => this.activeUploads.size > 0,
         isPinned: (record) => this.replaceNames.has(record.name),
+        managedLinkNames: () => this.linkNames,
+        reconcileLinks: (records) => this.reconcileLinksUnlocked(records),
         logger: this.logger,
         onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
@@ -1038,6 +1109,7 @@ export class Server extends EventEmitter {
     this.pendingAfterCommit.clear()
     await this.retention?.stop().catch(() => {})
     this.retention = null
+    this.links = null
     await this.sessions?.close().catch(() => {})
     this.sessions = null
     if (this.releaseLock) await this.releaseLock().catch(() => {})

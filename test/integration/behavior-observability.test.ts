@@ -181,3 +181,85 @@ test('count and version rotation counters reach retention events and rejected of
     ['api-2.0.0.bin']
   )
 })
+
+test('a directory upload commits one recursive artifact and one final result', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const storage = await createTempDir(t)
+  const source = path.join(await createTempDir(t), '0.18.1')
+  await fs.promises.mkdir(path.join(source, 'nested'), { recursive: true })
+  await fs.promises.writeFile(path.join(source, 'b.txt'), 'b')
+  await fs.promises.writeFile(path.join(source, 'nested', 'a.txt'), 'a')
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(CLIENT_SEED).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 16 * 1024,
+    minFreeBytes: 0,
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  const clientResults: Array<Record<string, unknown>> = []
+  const serverCommits: Array<Record<string, unknown>> = []
+  client.on('result', (event) => clientResults.push(event as unknown as Record<string, unknown>))
+  server.on('commit', (event) => serverCommits.push(event as unknown as Record<string, unknown>))
+  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
+
+  await server.listen()
+  const result = await client.upload(source)
+  t.is(result.status, 'COMMITTED')
+  t.is(result.kind, 'directory')
+  t.is(result.name, '0.18.1')
+  t.is(result.entryCount, 3)
+  t.is(result.size, 2)
+  t.is(clientResults.length, 1)
+  t.alike(clientResults[0], {
+    name: '0.18.1',
+    kind: 'directory',
+    status: 'COMMITTED',
+    final: true
+  })
+  t.ok(serverCommits.every((event) => event.kind === 'directory'))
+  t.alike((await fs.promises.readdir(path.join(storage, '0.18.1'))).sort(), ['b.txt', 'nested'])
+  t.alike(await fs.promises.readdir(path.join(storage, '0.18.1', 'nested')), ['a.txt'])
+  t.ok((await fs.promises.lstat(path.join(storage, '0.18.1'))).isDirectory())
+  t.is(await fs.promises.readFile(path.join(storage, '0.18.1', 'nested', 'a.txt'), 'utf8'), 'a')
+})
+
+test('a configured symlink follows the newest committed directory end to end', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const storage = await createTempDir(t)
+  const sourceRoot = await createTempDir(t)
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(CLIENT_SEED).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 16 * 1024,
+    minFreeBytes: 0,
+    dht: testnet.createNode(),
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }]
+  })
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
+  await server.listen()
+
+  for (const version of ['0.18.0', '0.18.1']) {
+    const source = path.join(sourceRoot, version)
+    await fs.promises.mkdir(source)
+    await fs.promises.writeFile(path.join(source, 'a.bin'), version)
+    t.is((await client.upload(source)).status, 'COMMITTED')
+    t.is(await fs.promises.readlink(path.join(storage, 'latest')), version)
+  }
+  t.is(await fs.promises.readFile(path.join(storage, 'latest', 'a.bin'), 'utf8'), '0.18.1')
+})

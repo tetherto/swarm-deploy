@@ -1,6 +1,7 @@
 import { onAbort, type AbortSignalLike } from './abort.js'
 import { ERRORS, SwarmDeployError } from './errors.js'
 import type { ReleaseCoordinates } from './release.js'
+import type { ArtifactKind } from './types.js'
 
 export type HookFailurePhase =
   'offer' | 'transfer' | 'verification' | 'beforeCommit' | 'commit' | 'afterCommit'
@@ -8,9 +9,13 @@ export type HookFailurePhase =
 /** Immutable, secret-free description of the artifact a hook is observing. */
 export interface HookArtifact {
   name: string
+  kind: ArtifactKind
   size: number
+  /** The file digest, or the canonical tree digest. */
   sha256: string
   transferId: string
+  /** Present only for a directory artifact. */
+  entryCount?: number
   sourceParent?: string
   release?: ReleaseCoordinates
 }

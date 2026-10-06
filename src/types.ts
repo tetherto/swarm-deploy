@@ -64,6 +64,7 @@ export interface TransferEvent {
   /** A 12-character SHA-256 fingerprint of the transfer ID. */
   transfer: string
   name: string
+  kind: ArtifactKind
   size: number
 }
 

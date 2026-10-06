@@ -38,8 +38,11 @@ import {
 } from '../../dist/tar-protocol/controls.js'
 import {
   buildTreeManifest,
-  regenerateTreeTarSuffix
+  regenerateTreeTarSuffix,
+  treeMetadataFromManifest,
+  type TreeManifest
 } from '../../dist/tar-protocol/tree-manifest.js'
+import { writeTree } from '../helpers/trees.js'
 import {
   buildTarManifest,
   metadataFromManifest,
@@ -999,6 +1002,7 @@ test('Server runs beforeCommit and afterCommit around a fresh durable commit', a
   ]
   t.alike(before.artifact, {
     name: 'fresh-hook.txt',
+    kind: 'file',
     size: metadata.fileSize,
     sha256: metadata.fileSha256,
     transferId: metadata.transferId,
@@ -1703,64 +1707,18 @@ test('Server reports a noncanonical transfer ID to onFailure once and keeps PROT
   t.is((context.error as SwarmDeployError).code, ERRORS.PROTOCOL_INVALID)
   t.is(context.artifact.transferId, forged.transferId)
   for (const key of Object.keys(context.artifact)) {
-    t.ok(['name', 'size', 'sha256', 'transferId', 'sourceParent', 'release'].includes(key), key)
-  }
-})
-
-test('Server treats every directory-shaped offer as a protocol violation until trees are served', async (t) => {
-  const calls: HookCall[] = []
-  const ref: { current: FakeSocket | null } = { current: null }
-  const { server, node } = await createServer(t, { hooks: recordingHooks(calls, ref) })
-  const rejections: string[] = []
-  server.on('failure', (event) => rejections.push(event.reason))
-  const wellFormed = {
-    v: 1,
-    kind: 'directory',
-    name: '0.18.1',
-    entryCount: 1,
-    payloadBytes: 0,
-    treeSha256: 'a'.repeat(64),
-    tarSize: 1536,
-    tarSha256: 'b'.repeat(64),
-    transferId: 'c'.repeat(64),
-    reset: false
-  }
-  const raw = (record: unknown): Buffer => encodeControlFrame(Buffer.from(JSON.stringify(record)))
-  const directory = encodeControlFrame(encodeTreeMetadataRecord(wellFormed as never))
-  // Frames a tree-aware decoder would reject with INVALID_FILENAME must keep their old code.
-  const frames: Array<[string, Buffer]> = [
-    ['unknown record', raw({ v: 1, foo: 1 })],
-    ['well-formed directory offer', directory],
-    ['directory offer with a reserved name', raw({ ...wellFormed, name: 'history-aa' })],
-    ['directory offer with an unsafe name', raw({ ...wellFormed, name: 'a/b' })],
-    ['directory offer with an unsafe sourceParent', raw({ ...wellFormed, sourceParent: '../x' })]
-  ]
-  const outcomes: Array<{ statuses: string[]; code: string | undefined; hooks: string[] }> = []
-  for (const [label, frame] of frames) {
-    calls.length = 0
-    const socket = new FakeSocket(CLIENT_KEY)
-    ref.current = socket
-    node.accept(socket)
-    socket.feed(frame)
-    await waitFor(() => isTerminal(socket))
-    await new Promise((resolve) => setTimeout(resolve, 20))
-    const outcome = {
-      statuses: statuses(socket),
-      code: finalCode(socket),
-      hooks: calls.map((call) => call.hook)
-    }
-    outcomes.push(outcome)
-    t.is(outcome.code, ERRORS.PROTOCOL_INVALID, `${label} is PROTOCOL_INVALID`)
-    t.absent(
-      outcome.hooks.includes('beforeCommit') || outcome.hooks.includes('afterCommit'),
-      `${label} never reaches commit`
-    )
-  }
-  for (const outcome of outcomes.slice(1)) {
-    t.alike(
-      outcome,
-      outcomes[0],
-      'a directory-shaped offer is rejected exactly like an unknown record'
+    t.ok(
+      [
+        'name',
+        'kind',
+        'size',
+        'sha256',
+        'transferId',
+        'sourceParent',
+        'release',
+        'entryCount'
+      ].includes(key),
+      key
     )
   }
 })
@@ -2350,4 +2308,201 @@ test('Client reports a single-file upload as kind file with no entry count', asy
   t.is(result.name, 'artifact.txt')
   t.is(result.entryCount, undefined)
   t.is(decodeMetadataRecord(socket.writes[0].subarray(4)).name, 'artifact.txt')
+})
+
+async function treeManifest(
+  t: Assert,
+  name: string,
+  spec: Record<string, string>
+): Promise<{ manifest: TreeManifest; tar: Buffer }> {
+  const source = path.join(await createTempDir(t), name)
+  await writeTree(source, spec)
+  const built = await buildTreeManifest(source, CLIENT_KEY)
+  const chunks: Buffer[] = []
+  await regenerateTreeTarSuffix(built, 0, (chunk) => {
+    chunks.push(b4a.from(chunk))
+  })
+  return { manifest: built, tar: b4a.concat(chunks) }
+}
+
+function treeMetadataFrame(value: TreeManifest, reset = false): Buffer {
+  return encodeControlFrame(encodeTreeMetadataRecord(treeMetadataFromManifest(value, reset)))
+}
+
+test('a directory upload commits, reconciles its link, and reports kind to hooks', async (t) => {
+  const contexts: Array<{ phase: string; kind: string; path: string; entryCount?: number }> = []
+  const hooks: ServerHooks = {
+    beforeCommit: (context) =>
+      void contexts.push({
+        phase: 'beforeCommit',
+        kind: context.artifact.kind,
+        path: context.path,
+        entryCount: context.artifact.entryCount
+      }),
+    afterCommit: (context) =>
+      void contexts.push({
+        phase: 'afterCommit',
+        kind: context.artifact.kind,
+        path: context.path,
+        entryCount: context.artifact.entryCount
+      })
+  }
+  const { server, node } = await createServer(t, {
+    hooks,
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }]
+  })
+  const built = await treeManifest(t, '0.18.1', { 'a/b.bin': 'bb', 'a/empty/': '', 'z.bin': 'z' })
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(treeMetadataFrame(built.manifest))
+  socket.feed(built.tar)
+  socket.finishInput()
+  await waitFor(() => statuses(socket).includes('COMMITTED'))
+
+  const root = server.storageDir
+  t.ok((await fs.promises.lstat(path.join(root, '0.18.1'))).isDirectory())
+  t.alike((await fs.promises.readdir(path.join(root, '0.18.1'))).sort(), ['a', 'z.bin'])
+  t.is(await fs.promises.readlink(path.join(root, 'latest')), '0.18.1')
+  t.alike(
+    contexts.map((context) => `${context.phase}:${context.kind}:${context.entryCount}`),
+    ['beforeCommit:directory:4', 'afterCommit:directory:4']
+  )
+  t.ok(contexts[0].path.endsWith(`${built.manifest.transferId.toString('hex')}.tree`))
+  t.is(contexts[1].path, path.join(root, '0.18.1'))
+})
+
+test('a configured link name cannot be uploaded as an artifact', async (t) => {
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }]
+  })
+  const built = await manifest(t, 'latest', 'payload')
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(metadataFrame(built.manifest))
+  await waitFor(() => statuses(socket).includes('REJECTED'))
+  const rejection = JSON.parse(b4a.toString(socket.writes[0].subarray(4))) as { code: string }
+  t.is(rejection.code, ERRORS.INVALID_FILENAME)
+  await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'latest')))
+})
+
+test('a link is repointed to the newest match before the old target is rotated', async (t) => {
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }],
+    artifactPatterns: ['{version}'],
+    maxCount: 1
+  })
+  for (const name of ['0.18.0', '0.18.1']) {
+    const built = await treeManifest(t, name, { 'a.bin': name })
+    const socket = new FakeSocket(CLIENT_KEY)
+    node.accept(socket)
+    socket.feed(treeMetadataFrame(built.manifest))
+    socket.feed(built.tar)
+    socket.finishInput()
+    await waitFor(() => statuses(socket).includes('COMMITTED'))
+  }
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'latest')), '0.18.1')
+  t.ok((await fs.promises.lstat(path.join(server.storageDir, '0.18.1'))).isDirectory())
+  await t.exception(() => fs.promises.lstat(path.join(server.storageDir, '0.18.0')))
+})
+
+test('an unrecorded directory and an operator file leave a rule dormant at startup', async (t) => {
+  const storageDir = await createTempDir(t)
+  await fs.promises.mkdir(path.join(storageDir, '0.18.1'))
+  await fs.promises.writeFile(path.join(storageDir, 'latest'), 'operator file')
+  const node = new FakeServerNode()
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    dht: node,
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }]
+  })
+  t.teardown(() => server.close())
+  await server.listen()
+  t.is(await fs.promises.readFile(path.join(storageDir, 'latest'), 'utf8'), 'operator file')
+  t.ok((await fs.promises.lstat(path.join(storageDir, '0.18.1'))).isDirectory())
+})
+
+test('an unmanaged path at a configured link name fails the link closed', async (t) => {
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }]
+  })
+  await fs.promises.writeFile(path.join(server.storageDir, 'latest'), 'operator file')
+  const built = await treeManifest(t, '0.18.1', { 'a.bin': 'a' })
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(treeMetadataFrame(built.manifest))
+  socket.feed(built.tar)
+  socket.finishInput()
+  await waitFor(() => statuses(socket).includes('FAILED'))
+  const failure = JSON.parse(b4a.toString(socket.writes[socket.writes.length - 1].subarray(4))) as {
+    code: string
+  }
+  t.is(failure.code, ERRORS.LINK_CONFLICT)
+  t.ok((await fs.promises.lstat(path.join(server.storageDir, '0.18.1'))).isDirectory())
+  t.is(await fs.promises.readFile(path.join(server.storageDir, 'latest'), 'utf8'), 'operator file')
+})
+
+test('configuring symlinks requires a symlink-capable storage adapter', async (t) => {
+  const { createStorage } =
+    require('../helpers/storage.js') as typeof import('../helpers/storage.js')
+  const incapable = { ...createStorage(), symlink: undefined, readlink: undefined }
+  t.exception(
+    () =>
+      new Server({
+        seed: SERVER_SEED,
+        storageDir: '/srv/swarm-deploy',
+        allowedKeys: [CLIENT_KEY],
+        maxFileBytes: 1024,
+        maxStagingBytes: 4096,
+        storage: incapable,
+        symlinks: [{ selector: 'release.tar.gz', name: 'current.tar.gz' }]
+      }),
+    { code: ERRORS.UNSUPPORTED_STORAGE }
+  )
+  t.execution(
+    () =>
+      new Server({
+        seed: SERVER_SEED,
+        storageDir: '/srv/swarm-deploy',
+        allowedKeys: [CLIENT_KEY],
+        maxFileBytes: 1024,
+        maxStagingBytes: 4096,
+        storage: createStorage()
+      })
+  )
+})
+
+test('a link reconciliation failure after a durable commit is retried as already committed', async (t) => {
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }]
+  })
+  const links = (server as unknown as { links: { reconcile: unknown } }).links
+  const original = links.reconcile
+  let reconcilesWithTargets = 0
+  ;(links as { reconcile: unknown }).reconcile = async (...args: unknown[]) => {
+    const desired = args[0] as unknown[]
+    if (desired.length > 0 && ++reconcilesWithTargets === 2) {
+      throw new Error('injected link failure')
+    }
+    return (original as (...rest: unknown[]) => unknown).apply(links, args)
+  }
+  const built = await treeManifest(t, '0.18.1', { 'a.bin': 'a' })
+  const first = new FakeSocket(CLIENT_KEY)
+  node.accept(first)
+  first.feed(treeMetadataFrame(built.manifest))
+  first.feed(built.tar)
+  first.finishInput()
+  await waitFor(() => statuses(first).includes('FAILED'))
+  t.ok((await fs.promises.lstat(path.join(server.storageDir, '0.18.1'))).isDirectory())
+
+  const retry = new FakeSocket(CLIENT_KEY)
+  node.accept(retry)
+  retry.feed(treeMetadataFrame(built.manifest))
+  retry.finishInput()
+  await waitFor(() => statuses(retry).includes('ALREADY_COMMITTED'))
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'latest')), '0.18.1')
 })
