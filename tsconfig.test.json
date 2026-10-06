@@ -18,6 +18,7 @@
     "test/unit/tree-module-graph.test.ts",
     "test/unit/storage-tree.test.ts",
     "test/unit/tree-manifest.test.ts",
+    "test/unit/tree-extract.test.ts",
     "test/unit/cli.test.ts",
     "test/unit/direct-behavior.test.ts",
     "test/unit/direct-dht.test.ts",
