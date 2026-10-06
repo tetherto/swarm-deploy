@@ -64,6 +64,7 @@ test('CLI passes --server-key only to the direct client', async (t) => {
     upload() {
       return Promise.resolve({
         status: 'COMMITTED' as const,
+        kind: 'file' as const,
         name: 'artifact.txt',
         size: 19,
         digest: b4a.alloc(32),
@@ -103,7 +104,7 @@ test('CLI passes --server-key only to the direct client', async (t) => {
   t.alike(clientOptions.serverPublicKey, SERVER_KEY)
   t.is(clientOptions.idleTimeout, 4321)
   t.absent('topic' in clientOptions)
-  t.is(stdout.text(), 'artifact.txt COMMITTED\n')
+  t.is(stdout.text(), 'artifact.txt file COMMITTED\n')
   t.is(stderr.text(), '')
 })
 
@@ -193,6 +194,7 @@ test('CLI accepts canonical --seed strings and rejects competing seed sources', 
     upload() {
       return Promise.resolve({
         status: 'COMMITTED' as const,
+        kind: 'file' as const,
         name: 'string-seed.txt',
         size: 18,
         digest: b4a.alloc(32),
@@ -307,6 +309,7 @@ test('CLI accepts role-specific environment seeds, rejects file conflicts, and h
     upload() {
       return Promise.resolve({
         status: 'COMMITTED' as const,
+        kind: 'file' as const,
         name: 'artifact.txt',
         size: 23,
         digest: b4a.alloc(32),
@@ -477,6 +480,7 @@ test('upload --no-source-parent takes no value and leaves other options intact',
     upload() {
       return Promise.resolve({
         status: 'COMMITTED' as const,
+        kind: 'file' as const,
         name: 'artifact.txt',
         size: 19,
         digest: b4a.alloc(32),

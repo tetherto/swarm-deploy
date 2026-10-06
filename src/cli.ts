@@ -678,18 +678,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
 }
 
 function printUploadResult(result: ClientUploadResult, io: CliIo): number {
-  if ('results' in result) {
-    for (const skipped of result.skipped || []) {
-      writeLine(io.stdout, `${skipped.name} skipped ${skipped.reason}`)
-    }
-    let failed = false
-    for (const entry of result.results) {
-      writeLine(io.stdout, `${entry.name} ${entry.status}`)
-      if (entry.status !== 'COMMITTED' && entry.status !== 'ALREADY_COMMITTED') failed = true
-    }
-    return failed ? 1 : 0
-  }
-  writeLine(io.stdout, `${result.name} ${result.status}`)
+  writeLine(io.stdout, `${result.name} ${result.kind} ${result.status}`)
   return result.status === 'COMMITTED' || result.status === 'ALREADY_COMMITTED' ? 0 : 1
 }
 

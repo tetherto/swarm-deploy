@@ -49,7 +49,6 @@ test('a client that opts out of the source parent keeps the legacy transfer iden
   await server.listen()
   const result = await client.upload(input)
   t.is(result.status, 'COMMITTED')
-  if (!('transferId' in result)) throw new Error('Expected single upload result')
   t.alike(
     result.transferId,
     (

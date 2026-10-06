@@ -5,13 +5,7 @@ import test from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import {
-  Client,
-  ERRORS,
-  keyPairFromSeed,
-  Server,
-  type ClientResultEvent
-} from '../../dist/index.js'
+import { Client, ERRORS, keyPairFromSeed, Server } from '../../dist/index.js'
 import { DirectDhtClient } from '../../dist/direct-dht.js'
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
@@ -129,57 +123,6 @@ test('public events and loggers contain failures while forwarding private lifecy
   for (const event of [...serverEvents, ...clientEvents]) {
     if (typeof event.fingerprint === 'string') t.ok(/^[0-9a-f]{12}$/.test(event.fingerprint))
   }
-})
-
-test('directory uploads emit per-file nonfinal results and one exact aggregate result', async (t) => {
-  const testnet = await createLocalTestnet(t)
-  const storage = await createTempDir(t)
-  const source = await createTempDir(t)
-  await fs.promises.writeFile(path.join(source, 'b.txt'), 'b')
-  await fs.promises.writeFile(path.join(source, 'a.txt'), 'a')
-  await fs.promises.mkdir(path.join(source, 'ignored'))
-  const server = new Server({
-    seed: SERVER_SEED,
-    storageDir: storage,
-    allowedKeys: [keyPairFromSeed(CLIENT_SEED).publicKey],
-    maxFileBytes: 1024,
-    maxStagingBytes: 4096,
-    minFreeBytes: 0,
-    dht: testnet.createNode()
-  })
-  const client = new Client({
-    seed: CLIENT_SEED,
-    serverPublicKey: server.publicKey,
-    connectTimeout: 5_000,
-    dht: testnet.createNode()
-  })
-  const events: ClientResultEvent[] = []
-  client.on('result', (event) => events.push(event))
-  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
-
-  await server.listen()
-  const result = await client.upload(source)
-  if (!('results' in result)) throw new Error('Expected directory result')
-  t.is(result.status, 'COMMITTED')
-  t.alike(
-    result.results.map((entry) => entry.name),
-    ['a.txt', 'b.txt']
-  )
-  t.is(result.skipped.length, 1)
-
-  const perFile = events.filter((event) => event.name !== undefined)
-  const aggregate = events.filter((event) => event.name === undefined)
-  t.is(perFile.length, 2)
-  t.ok(perFile.every((event) => event.final === false))
-  t.is(aggregate.length, 1)
-  t.alike(aggregate[0], {
-    status: 'COMMITTED',
-    final: true,
-    files: 2,
-    committed: 2,
-    failed: 0,
-    skipped: 1
-  })
 })
 
 test('count and version rotation counters reach retention events and rejected offers stay observable', async (t) => {

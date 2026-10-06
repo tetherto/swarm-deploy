@@ -28,11 +28,18 @@ import type {
 import {
   decodeAdmissionRecord,
   decodeFinalRecord,
+  decodeMetadataRecord,
+  decodeTreeMetadataRecord,
   encodeAdmissionRecord,
   encodeControlFrame,
+  encodeFinalRecord,
   encodeMetadataRecord,
   encodeTreeMetadataRecord
 } from '../../dist/tar-protocol/controls.js'
+import {
+  buildTreeManifest,
+  regenerateTreeTarSuffix
+} from '../../dist/tar-protocol/tree-manifest.js'
 import {
   buildTarManifest,
   metadataFromManifest,
@@ -2239,4 +2246,108 @@ test('Server leaves a failed-afterCommit out-of-window artifact to later schedul
   const retention = (server as unknown as { retention: { run(): Promise<unknown> } }).retention
   await retention.run()
   await t.exception(() => fs.promises.lstat(target), { code: 'ENOENT' })
+})
+
+function committingSocket(): FakeSocket {
+  const socket = new FakeSocket(keyPairFromSeed(SERVER_SEED).publicKey)
+  socket.onWrite = (_bytes, index) => {
+    if (index === 0) {
+      queueMicrotask(() =>
+        socket.feed(
+          encodeControlFrame(encodeAdmissionRecord({ v: 1, status: 'ACCEPT', offset: 0 }))
+        )
+      )
+    }
+    return true
+  }
+  socket.onEnd = () =>
+    socket.feed(encodeControlFrame(encodeFinalRecord({ v: 1, status: 'COMMITTED' })))
+  return socket
+}
+
+test('Client uploads a directory as one directory offer and one canonical tree archive', async (t) => {
+  const source = path.join(await createTempDir(t), '0.18.1')
+  await fs.promises.mkdir(path.join(source, 'nested'), { recursive: true })
+  await fs.promises.writeFile(path.join(source, 'b.txt'), 'b')
+  await fs.promises.writeFile(path.join(source, 'nested', 'a.txt'), 'a')
+
+  const socket = committingSocket()
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    idleTimeout: 5_000,
+    dht: fakeClientNode(socket)
+  })
+  const events: Array<{ name: string; kind: string; status: string; final: boolean }> = []
+  client.on('result', (event) => events.push(event))
+  t.teardown(() => client.close())
+
+  const result = await client.upload(source)
+  t.is(result.status, 'COMMITTED')
+  t.is(result.kind, 'directory')
+  t.is(result.name, '0.18.1')
+  t.is(result.entryCount, 3)
+  t.is(result.size, 2)
+  t.alike(events, [{ name: '0.18.1', kind: 'directory', status: 'COMMITTED', final: true }])
+
+  // Exactly one offer frame, and it is a directory offer, not a batch of children.
+  const offer = decodeTreeMetadataRecord(socket.writes[0].subarray(4))
+  t.is(offer.kind, 'directory')
+  t.is(offer.name, '0.18.1')
+  t.is(offer.entryCount, 3)
+  t.is(offer.payloadBytes, 2)
+  t.is(offer.sourceParent, path.basename(path.dirname(source)))
+
+  // The payload is byte-identical to the canonical archive the manifest describes.
+  const manifest = await buildTreeManifest(source, keyPairFromSeed(CLIENT_SEED).publicKey)
+  const expected: Buffer[] = []
+  await regenerateTreeTarSuffix(manifest, 0, (chunk) => {
+    expected.push(b4a.from(chunk))
+  })
+  t.ok(b4a.equals(b4a.concat(socket.writes.slice(1)), b4a.concat(expected)))
+  t.is(offer.tarSize, manifest.tarSize)
+  t.is(b4a.toString(result.digest, 'hex'), offer.treeSha256)
+  t.is(b4a.toString(result.transferId, 'hex'), offer.transferId)
+})
+
+test('Client rejects a directory containing a symlink before any connection write', async (t) => {
+  const root = await createTempDir(t)
+  const source = path.join(root, '0.18.1')
+  await fs.promises.mkdir(source)
+  await fs.promises.writeFile(path.join(root, 'outside.txt'), 'outside')
+  await fs.promises.symlink(path.join(root, 'outside.txt'), path.join(source, 'link.txt'))
+
+  const socket = committingSocket()
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    idleTimeout: 5_000,
+    dht: fakeClientNode(socket)
+  })
+  const failures: string[] = []
+  client.on('failure', (event) => failures.push(event.reason))
+  t.teardown(() => client.close())
+
+  await t.exception(client.upload(source), { code: ERRORS.INVALID_FILENAME })
+  t.is(socket.writes.length, 0)
+  t.alike(failures, [ERRORS.INVALID_FILENAME])
+})
+
+test('Client reports a single-file upload as kind file with no entry count', async (t) => {
+  const input = path.join(await createTempDir(t), 'artifact.txt')
+  await fs.promises.writeFile(input, 'payload')
+  const socket = committingSocket()
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+    idleTimeout: 5_000,
+    dht: fakeClientNode(socket)
+  })
+  t.teardown(() => client.close())
+
+  const result = await client.upload(input)
+  t.is(result.kind, 'file')
+  t.is(result.name, 'artifact.txt')
+  t.is(result.entryCount, undefined)
+  t.is(decodeMetadataRecord(socket.writes[0].subarray(4)).name, 'artifact.txt')
 })

@@ -1,9 +1,9 @@
 import b4a from 'b4a'
-import { errorCode } from './error-code.js'
 import fs from '#fs'
 import path from '#path'
 import { throwIfAborted } from './abort.js'
 import { ERRORS, SwarmDeployError } from './errors.js'
+import type { ArtifactKind } from './types.js'
 
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
 const TRANSFER_ID_HEX = /^[0-9a-f]{64}$/
@@ -11,12 +11,19 @@ const TRANSFER_ID_HEX = /^[0-9a-f]{64}$/
 /** Reserved top-level namespace for server-managed historical artifacts. */
 export const HISTORY_NAME_PREFIX = 'history-'
 
-export interface SelectUploadPathsOptions {
+export interface SelectUploadTargetOptions {
   signal?: {
     readonly aborted: boolean
     addEventListener(event: 'abort', callback: () => void, options?: { once?: boolean }): void
     removeEventListener(event: 'abort', callback: () => void): void
   } | null
+}
+
+export interface UploadTarget {
+  kind: ArtifactKind
+  /** The managed artifact basename. */
+  name: string
+  path: string
 }
 
 export function validateBasename(name: string): string {
@@ -68,137 +75,26 @@ export function validateReplaceNames(values?: Iterable<string>): Set<string> {
   return names
 }
 
-type SelectedEntry = { kind: 'selected'; name: string }
-type SkippedEntry = { kind: 'skipped'; reason: SkippedUploadReason }
-type ClassifiedEntry = SelectedEntry | SkippedEntry
-
-function classifyEntry(entryPath: string, stat: fs.Stats): ClassifiedEntry {
-  if (stat.isSymbolicLink()) {
-    return { kind: 'skipped', reason: 'symlink' }
-  }
-  if (stat.isDirectory()) {
-    return { kind: 'skipped', reason: 'directory' }
-  }
-  if (!stat.isFile()) {
-    return { kind: 'skipped', reason: 'not-regular-file' }
-  }
-
-  const name = path.basename(entryPath)
-  try {
-    validateBasename(name)
-  } catch {
-    return { kind: 'skipped', reason: 'invalid-filename' }
-  }
-  if (isReservedHistoryName(name)) {
-    return { kind: 'skipped', reason: 'reserved-history' }
-  }
-
-  return { kind: 'selected', name }
-}
-
-export type SkippedUploadReason =
-  'symlink' | 'directory' | 'not-regular-file' | 'invalid-filename' | 'reserved-history'
-
-export interface SelectedUploadPath {
-  kind: 'selected'
-  name: string
-  path: string
-}
-
-export interface SkippedUploadPath {
-  kind: 'skipped'
-  name: string
-  path: string
-  reason: SkippedUploadReason
-}
-
-export interface FailedUploadPath {
-  kind: 'failed'
-  name: string
-  path: string
-  reason: 'unreadable'
-  code: string | null
-}
-
-export type UploadPathEntry = SelectedUploadPath | SkippedUploadPath | FailedUploadPath
-
-export interface UploadPathSelection {
-  paths: string[]
-  skipped: Array<Omit<SkippedUploadPath, 'kind'>>
-  failed: Array<Omit<FailedUploadPath, 'kind'>>
-  entries: UploadPathEntry[]
-}
-
-export async function selectUploadPaths(
+/**
+ * Classifies one upload input. A directory becomes exactly one recursive
+ * directory artifact; children are never uploaded independently.
+ */
+export async function selectUploadTarget(
   inputPath: string,
-  { signal = null }: SelectUploadPathsOptions = {}
-): Promise<UploadPathSelection> {
+  { signal = null }: SelectUploadTargetOptions = {}
+): Promise<UploadTarget> {
   throwIfAborted(signal)
-  const rootStat = await fs.promises.lstat(inputPath)
+  const stat = await fs.promises.lstat(inputPath)
   throwIfAborted(signal)
-
-  if (rootStat.isSymbolicLink()) {
+  if (stat.isSymbolicLink()) {
     throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Symlinks are not supported')
   }
-
-  if (rootStat.isFile()) {
-    const name = validateBasename(path.basename(inputPath))
-    if (isReservedHistoryName(name)) {
-      throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
-    }
-    return {
-      paths: [inputPath],
-      skipped: [],
-      failed: [],
-      entries: [{ kind: 'selected', name, path: inputPath }]
-    }
-  }
-
-  if (!rootStat.isDirectory()) {
+  if (!stat.isFile() && !stat.isDirectory()) {
     throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Path must be a regular file or directory')
   }
-
-  const names = await fs.promises.readdir(inputPath)
-  names.sort()
-
-  const paths: string[] = []
-  const skipped: Array<Omit<SkippedUploadPath, 'kind'>> = []
-  const failed: Array<Omit<FailedUploadPath, 'kind'>> = []
-  const entries: UploadPathEntry[] = []
-
-  for (const name of names) {
-    throwIfAborted(signal)
-    const entryPath = path.join(inputPath, name)
-    let entryStat
-    try {
-      entryStat = await fs.promises.lstat(entryPath)
-    } catch (err: unknown) {
-      throwIfAborted(signal)
-      const entry: Omit<FailedUploadPath, 'kind'> = {
-        name,
-        path: entryPath,
-        reason: 'unreadable',
-        code: errorCode(err)
-      }
-      failed.push(entry)
-      entries.push({ kind: 'failed', ...entry })
-      continue
-    }
-    const classified = classifyEntry(entryPath, entryStat)
-
-    if (classified.kind === 'selected') {
-      paths.push(entryPath)
-      entries.push({ kind: 'selected', name, path: entryPath })
-      continue
-    }
-
-    skipped.push({
-      name,
-      path: entryPath,
-      reason: classified.reason
-    })
-    entries.push({ kind: 'skipped', name, path: entryPath, reason: classified.reason })
+  const name = validateBasename(path.basename(path.resolve(inputPath)))
+  if (isReservedHistoryName(name)) {
+    throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
   }
-
-  return { paths, skipped, failed, entries }
+  return { kind: stat.isDirectory() ? 'directory' : 'file', name, path: inputPath }
 }
