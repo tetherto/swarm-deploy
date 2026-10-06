@@ -11,6 +11,7 @@ import { initLayout } from '../../dist/storage/layout.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import {
+  DIRECTORY_JOURNAL_VERSION,
   readCommitJournal,
   serializeJournal,
   type AnyCommitJournal,
@@ -25,8 +26,19 @@ import {
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
 import type { MetadataRecord } from '../../dist/tar-protocol/controls.js'
+import {
+  buildTreeManifest,
+  regenerateTreeTarSuffix,
+  treeMetadataFromManifest
+} from '../../dist/tar-protocol/tree-manifest.js'
 import { createTempDir } from '../helpers/files.js'
-import { createStorage, type TestStorage } from '../helpers/storage.js'
+import {
+  createStorage,
+  type StorageOperationHook,
+  type StorageOperationName,
+  type TestStorage
+} from '../helpers/storage.js'
+import { writeTree } from '../helpers/trees.js'
 
 const OWNER = b4a.alloc(32, 7)
 const MUTABLE = 'release.tar.gz'
@@ -63,6 +75,7 @@ interface Harness {
   sessions: TarSessionStore
   commits: CommitStore
   stage(content: Buffer, name?: string, sourceParent?: string): Promise<TarSession>
+  stageTree(name: string, spec: Record<string, string>): Promise<TarSession>
   publish(
     content: Buffer,
     name?: string,
@@ -150,11 +163,26 @@ async function createHarness(t: Assert, storage: TestStorage = createStorage()):
     return sessions.verify(OWNER, input.metadata)
   }
 
+  async function stageTree(name: string, spec: Record<string, string>): Promise<TarSession> {
+    const sourceRoot = await createTempDir(t)
+    await writeTree(path.join(sourceRoot, name), spec)
+    const manifest = await buildTreeManifest(path.join(sourceRoot, name), OWNER)
+    const metadata = treeMetadataFromManifest(manifest)
+    const chunks: Buffer[] = []
+    await regenerateTreeTarSuffix(manifest, 0, (chunk) => {
+      chunks.push(b4a.from(chunk))
+    })
+    await sessions.admit(OWNER, metadata)
+    await sessions.append(OWNER, metadata, 0, b4a.concat(chunks))
+    return sessions.verify(OWNER, metadata)
+  }
+
   return {
     layout,
     sessions,
     commits,
     stage,
+    stageTree,
     async publish(
       content: Buffer,
       name = MUTABLE,
@@ -936,4 +964,179 @@ test('legacy current with identical bytes is replaceable by a matched release', 
     })) as unknown,
     { status: 'ALREADY_COMMITTED', record: first }
   )
+})
+
+function crashStorage(
+  when: 'before' | 'after',
+  hit: (name: StorageOperationName, target: string, destination?: unknown) => boolean
+): TestStorage {
+  let crashed = false
+  const trip: StorageOperationHook = (name, target, ...rest) => {
+    if (crashed || !hit(name, target, rest[0])) return
+    crashed = true
+    throw new Error(`crash at ${name} ${target}`)
+  }
+  const noop: StorageOperationHook = () => {}
+  return createStorage({
+    beforeOperation: when === 'before' ? trip : noop,
+    afterOperation: when === 'after' ? trip : noop
+  })
+}
+
+test('a directory commit publishes by rename and persists a version 3 record', async (t) => {
+  const harness = await createHarness(t)
+  const session = await harness.stageTree('0.18.1', {
+    'a/b.bin': 'bb',
+    'a/empty/': '',
+    'z.bin': 'z'
+  })
+  const record = await harness.commits.commit(session)
+  t.is(record.version, 3)
+  t.is(record.kind, 'directory')
+  t.is(record.name, '0.18.1')
+  t.is(record.entryCount, 4)
+  t.is(record.size, 3)
+  t.is(record.replaces, undefined)
+  const finalPath = path.join(harness.layout.root, '0.18.1')
+  t.ok((await fs.promises.lstat(finalPath)).isDirectory())
+  t.alike((await fs.promises.readdir(finalPath)).sort(), ['a', 'z.bin'])
+  await t.exception(() =>
+    fs.promises.lstat(path.join(harness.layout.staging, `${record.transferId}.tree`))
+  )
+  t.alike(await fs.promises.readdir(harness.layout.journals), [])
+  t.alike(
+    (await harness.commits.list()).map((value) => value.name),
+    ['0.18.1']
+  )
+})
+
+test('a directory artifact is create-only and never changes kind', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+  await harness.commits.commit(first)
+  await harness.sessions.retireCommitted(first.transferId)
+
+  const second = await harness.stageTree('0.18.1', { 'a.bin': 'b' })
+  await t.exception(() => harness.commits.commit(second), { code: ERRORS.FILE_EXISTS })
+  await harness.sessions.retireCommitted(second.transferId)
+  const replaceAttempt = await harness.stageTree('0.18.1', { 'a.bin': 'c' })
+  await t.exception(() => harness.commits.commit(replaceAttempt, { replaceNames: ['0.18.1'] }), {
+    code: ERRORS.FILE_EXISTS
+  })
+  await harness.sessions.retireCommitted(replaceAttempt.transferId)
+
+  const asFile = await harness.stage(b4a.from('file'), '0.18.1')
+  await t.exception(() => harness.commits.commit(asFile), { code: ERRORS.FILE_EXISTS })
+  await harness.sessions.retireCommitted(asFile.transferId)
+
+  const fileFirst = await harness.stage(b4a.from('file'), 'plain.bin')
+  await harness.commits.commit(fileFirst)
+  await harness.sessions.retireCommitted(fileFirst.transferId)
+  const dirSecond = await harness.stageTree('plain.bin', { 'a.bin': 'a' })
+  await t.exception(() => harness.commits.commit(dirSecond), { code: ERRORS.FILE_EXISTS })
+})
+
+test('an unchanged directory offer is already committed and a mutated one is not', async (t) => {
+  const harness = await createHarness(t)
+  const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+  const record = await harness.commits.commit(session)
+  const offer = {
+    name: record.name,
+    kind: 'directory' as const,
+    size: record.size,
+    entryCount: record.entryCount,
+    digest: b4a.from(record.sha256, 'hex'),
+    transferId: b4a.from(record.transferId, 'hex')
+  }
+  t.alike(await harness.commits.inspect(record.name, offer), {
+    status: 'ALREADY_COMMITTED',
+    record
+  })
+  await fs.promises.writeFile(path.join(harness.layout.root, '0.18.1', 'a.bin'), 'mutated')
+  t.alike(await harness.commits.inspect(record.name, offer), { status: 'FILE_EXISTS' })
+})
+
+test('directory recovery converges from every crash boundary', async (t) => {
+  const beforeRename = await createHarness(
+    t,
+    crashStorage('after', (name, target) => name === 'sync' && target.endsWith('journals'))
+  )
+  const session = await beforeRename.stageTree('0.18.1', { 'a.bin': 'a' })
+  await t.exception(() => beforeRename.commits.commit(session))
+  t.alike(await fs.promises.readdir(beforeRename.layout.root).then((names) => names.sort()), [
+    '.swarm-deploy'
+  ])
+  t.is(
+    (await beforeRename.commits.recoverJournal(session.id, beforeRename.sessions)).status,
+    'RESUMABLE'
+  )
+  t.alike(await fs.promises.readdir(beforeRename.layout.journals), [])
+
+  const beforeSidecar = await createHarness(t)
+  const renamed = await beforeSidecar.stageTree('0.18.1', { 'a.bin': 'a' })
+  const renamedRecord = await beforeSidecar.commits.commit(renamed)
+  await fs.promises.unlink(
+    path.join(beforeSidecar.layout.commits, `${renamedRecord.transferId}.json`)
+  )
+  await fs.promises.writeFile(
+    path.join(beforeSidecar.layout.journals, `${renamedRecord.transferId}.json`),
+    JSON.stringify(
+      serializeJournal({
+        version: DIRECTORY_JOURNAL_VERSION,
+        intent: 'create-directory',
+        state: 'committing',
+        phase: 'renamed',
+        transferId: renamedRecord.transferId,
+        attemptId: 'b'.repeat(64),
+        name: renamedRecord.name,
+        stagingTreeName: `${renamedRecord.transferId}.tree`,
+        stagingTreeIdentity: { dev: '0', ino: '0' },
+        record: renamedRecord
+      })
+    )
+  )
+  const recovered = await beforeSidecar.commits.recoverJournal(renamed.id, beforeSidecar.sessions)
+  t.is(recovered.status, 'COMMITTED')
+  t.is(recovered.record?.kind, 'directory')
+  t.ok((await fs.promises.lstat(path.join(beforeSidecar.layout.root, '0.18.1'))).isDirectory())
+  t.alike(await fs.promises.readdir(beforeSidecar.layout.journals), [])
+
+  const afterSidecar = await createHarness(t)
+  const cleaned = await afterSidecar.stageTree('0.18.1', { 'a.bin': 'a' })
+  const record = await afterSidecar.commits.commit(cleaned)
+  t.is(
+    (await afterSidecar.commits.recoverJournal(record.transferId, afterSidecar.sessions)).status,
+    'MISSING'
+  )
+})
+
+test('a directory recovery refuses an unmanaged path at the artifact name', async (t) => {
+  const harness = await createHarness(t)
+  const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+  const record = await harness.commits.commit(session)
+  await fs.promises.unlink(path.join(harness.layout.commits, `${record.transferId}.json`))
+  const attemptId = 'a'.repeat(64)
+  await fs.promises.writeFile(
+    path.join(harness.layout.journals, `${record.transferId}.json`),
+    JSON.stringify(
+      serializeJournal({
+        version: DIRECTORY_JOURNAL_VERSION,
+        intent: 'create-directory',
+        state: 'committing',
+        phase: 'renamed',
+        transferId: record.transferId,
+        attemptId,
+        name: record.name,
+        stagingTreeName: `${record.transferId}.tree`,
+        stagingTreeIdentity: { dev: '0', ino: '0' },
+        record
+      })
+    )
+  )
+  await fs.promises.rm(path.join(harness.layout.root, '0.18.1'), { recursive: true })
+  await fs.promises.writeFile(path.join(harness.layout.root, '0.18.1'), 'foreign')
+  await t.exception(() => harness.commits.recoverJournal(session.id, harness.sessions), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.is(await fs.promises.readFile(path.join(harness.layout.root, '0.18.1'), 'utf8'), 'foreign')
 })

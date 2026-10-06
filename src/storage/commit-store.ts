@@ -13,6 +13,7 @@ import {
 } from '../files.js'
 import { digestMatches, SodiumSha256, sodiumSha256 } from '../tar-protocol/hash.js'
 import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
+import { assertTreeMetadataTransferId } from '../tar-protocol/tree-manifest.js'
 import { assertFixed32, assertSafeUint } from '../validation.js'
 import {
   assertSafeDirectory,
@@ -26,6 +27,8 @@ import {
   CorruptJournalError,
   JOURNAL_VERSION,
   COMMIT_VERSION,
+  DIRECTORY_COMMIT_VERSION,
+  DIRECTORY_JOURNAL_VERSION,
   REPLACEMENT_COMMIT_VERSION,
   REPLACEMENT_JOURNAL_VERSION,
   MAX_COMMIT_METADATA_BYTES,
@@ -46,9 +49,12 @@ import type {
   CommitRecord,
   CommitRelease,
   FileIdentity,
+  DirectoryCommitJournal,
+  DirectoryPhase,
   ReplacementJournal,
   ReplacementPhase
 } from './commit-journal.js'
+import { digestTree, inspectTreePath, type TreePathState } from './tree-fs.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
 
 interface AbortSignalLike {
@@ -59,10 +65,12 @@ interface CommitSession {
   id: string
   transferId: Uint8Array
   ownerKey: Uint8Array
+  kind?: 'file' | 'directory'
   name: string
   sourceParent?: string
   size: number
   digest: Uint8Array
+  entryCount?: number
   /** Direct-TAR sessions carry these immutable archive fields. */
   tarSize: number
   tarDigest: Uint8Array
@@ -71,8 +79,10 @@ interface CommitSession {
 
 interface CommitOffer {
   name: string
+  kind?: 'file' | 'directory'
   size: number
   digest: Uint8Array
+  entryCount?: number
   transferId: Uint8Array
   /** Matched release identity; transfer and release must agree for an idempotent result. */
   release?: ReleaseCoordinates | null
@@ -178,8 +188,10 @@ function releasesEqual(left: CommitRecord['release'], right: CommitRecord['relea
 function recordsEqual(left: CommitRecord, right: CommitRecord): boolean {
   return (
     left.version === right.version &&
+    left.kind === right.kind &&
     left.name === right.name &&
     left.size === right.size &&
+    left.entryCount === right.entryCount &&
     sameHex32(left.sha256, right.sha256) &&
     left.committedAt === right.committedAt &&
     left.uploaderFingerprint === right.uploaderFingerprint &&
@@ -227,6 +239,28 @@ function assertSession(session: unknown): asserts session is CommitSession {
 
   assertSafeUint(candidate.tarSize, 'session TAR size')
   assertFixed32(candidate.tarDigest, 'session TAR digest')
+  if (candidate.kind === 'directory') {
+    assertSafeUint(candidate.entryCount, 'session entry count')
+    assertTreeMetadataTransferId(candidate.ownerKey as Uint8Array, {
+      v: 1,
+      kind: 'directory',
+      name: candidate.name as string,
+      ...(candidate.sourceParent === undefined
+        ? {}
+        : { sourceParent: candidate.sourceParent as string }),
+      entryCount: candidate.entryCount as number,
+      payloadBytes: candidate.size as number,
+      treeSha256: toHex(candidate.digest as Uint8Array),
+      tarSize: candidate.tarSize as number,
+      tarSha256: toHex(candidate.tarDigest as Uint8Array),
+      transferId: candidate.id,
+      reset: false
+    })
+    return
+  }
+  if (candidate.kind !== 'file' && candidate.kind !== undefined) {
+    throw storageError('Invalid session artifact kind')
+  }
   assertMetadataTransferId(candidate.ownerKey as Uint8Array, {
     v: 1,
     name: candidate.name as string,
@@ -344,6 +378,15 @@ class CommitStore {
 
   _tarStagingPath(id: string): string {
     return path.join(this.layout.staging, `${id}.tar.part`)
+  }
+
+  _treeStagingPath(id: string): string {
+    return path.join(this.layout.staging, `${id}.tree`)
+  }
+
+  /** The visible state of one top-level directory path, without following links. */
+  _rootTreeState(name: string): Promise<TreePathState> {
+    return inspectTreePath(this._finalPath(name), this.layout.root, this.storage)
   }
 
   _sessionPath(id: string): string {
@@ -553,8 +596,8 @@ class CommitStore {
     return id
   }
 
-  /** A replacement always starts a fresh attempt; leftovers belong to recovery. */
-  async _writeReplacementJournal(journal: ReplacementJournal): Promise<void> {
+  /** A replacement or directory commit always starts a fresh attempt; leftovers belong to recovery. */
+  async _writeFreshJournal(journal: ReplacementJournal | DirectoryCommitJournal): Promise<void> {
     const id = journal.transferId
     if (await this._safeFileOrAbsent(this._journalPath(id), this.layout.journals)) {
       let existing: AnyCommitJournal | null = null
@@ -752,8 +795,7 @@ class CommitStore {
 
   _recordFromSession(session: CommitSession, release?: CommitRelease): CommitRecord {
     assertSession(session)
-    const record = {
-      version: COMMIT_VERSION,
+    const base = {
       name: session.name,
       size: session.size,
       sha256: toHex(session.digest),
@@ -762,7 +804,16 @@ class CommitStore {
       transferId: session.id,
       ...(release === undefined ? {} : { release })
     }
-    return assertRecord(record)
+    return assertRecord(
+      session.kind === 'directory'
+        ? {
+            version: DIRECTORY_COMMIT_VERSION,
+            kind: 'directory' as const,
+            entryCount: session.entryCount,
+            ...base
+          }
+        : { version: COMMIT_VERSION, ...base }
+    )
   }
 
   async inspect(
@@ -785,6 +836,10 @@ class CommitStore {
     assertSafeUint(offer.size, 'commit offer size')
     assertFixed32(offer.digest, 'commit offer digest')
     assertFixed32(offer.transferId, 'commit offer transfer ID')
+    if (offer.kind !== undefined && offer.kind !== 'file' && offer.kind !== 'directory') {
+      throw storageError('Invalid commit offer kind')
+    }
+    if (offer.kind === 'directory') assertSafeUint(offer.entryCount, 'commit offer entry count')
     const release = snapshotRelease(offer.release)
     const mutable = validateReplaceNames(replaceNames)
 
@@ -802,6 +857,8 @@ class CommitStore {
     | { status: 'REPLACEABLE'; record: CommitRecord }
     | { status: 'FILE_EXISTS' }
   > {
+    if (offer.kind === 'directory') return this._inspectDirectory(name, offer)
+
     const finalPath = this._finalPath(name)
     const final = await this._safeFileOrAbsent(finalPath, this.layout.root)
     if (!final) return { status: 'AVAILABLE' }
@@ -840,6 +897,42 @@ class CommitStore {
     return { status: 'REPLACEABLE', record: current.record }
   }
 
+  async _inspectDirectory(
+    name: string,
+    offer: CommitOffer
+  ): Promise<
+    | { status: 'AVAILABLE' }
+    | { status: 'ALREADY_COMMITTED'; record: CommitRecord }
+    | { status: 'FILE_EXISTS' }
+  > {
+    if ((await this._rootTreeState(name)) === 'MISSING') {
+      const occupied = await this._safeFileOrAbsent(this._finalPath(name), this.layout.root)
+      return occupied ? { status: 'FILE_EXISTS' } : { status: 'AVAILABLE' }
+    }
+    const id = toHex(offer.transferId)
+    const record = await this._readRecordOrAbsent(this._recordPath(id))
+    if (
+      !record ||
+      record.kind !== 'directory' ||
+      record.name !== name ||
+      record.size !== offer.size ||
+      record.entryCount !== offer.entryCount ||
+      !sameHex32(record.sha256, toHex(offer.digest)) ||
+      !sameHex32(record.transferId, id)
+    ) {
+      return { status: 'FILE_EXISTS' }
+    }
+    const digested = await digestTree(this._finalPath(name), this.storage)
+    if (
+      digested.entryCount !== record.entryCount ||
+      digested.payloadBytes !== record.size ||
+      !digestMatches(digested.treeSha256, b4a.from(record.sha256, 'hex'))
+    ) {
+      return { status: 'FILE_EXISTS' }
+    }
+    return { status: 'ALREADY_COMMITTED', record }
+  }
+
   /** The managed record whose verified content currently owns a visible name. */
   async _managedCurrent(
     name: string
@@ -860,7 +953,9 @@ class CommitStore {
       session.name !== record.name ||
       session.size !== record.size ||
       toHex(session.digest) !== record.sha256 ||
-      fingerprint(session.ownerKey) !== record.uploaderFingerprint
+      fingerprint(session.ownerKey) !== record.uploaderFingerprint ||
+      (record.kind === 'directory' &&
+        (session.kind !== 'directory' || session.entryCount !== record.entryCount))
     ) {
       throw new CorruptJournalError(message)
     }
@@ -965,6 +1060,9 @@ class CommitStore {
     if (isReservedHistoryName(record.name)) {
       throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Reserved artifact name')
     }
+    if (session.kind === 'directory') {
+      return this._commitDirectory(record, retentionManager, signal, mutable)
+    }
     const stagingPath = this._stagingPath(record.transferId)
     const finalPath = this._finalPath(record.name)
 
@@ -1062,11 +1160,146 @@ class CommitStore {
   }
 
   /**
+   * Publishes one verified staging tree by rename. Directory artifacts are
+   * create-only: a configured mutable name, an occupied destination, and a
+   * kind change are all existing-name conflicts.
+   */
+  async _commitDirectory(
+    record: CommitRecord,
+    retentionManager: RetentionManager | null,
+    signal: AbortSignalLike | null,
+    mutable: Set<string>
+  ): Promise<CommitRecord> {
+    if (mutable.has(record.name)) {
+      throw existsError('Directory artifacts cannot be replaced')
+    }
+    const treePath = this._treeStagingPath(record.transferId)
+    const finalPath = this._finalPath(record.name)
+    if ((await inspectTreePath(treePath, this.layout.staging, this.storage)) !== 'DIRECTORY') {
+      throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Verified staging tree is missing')
+    }
+    const digested = await digestTree(treePath, this.storage)
+    if (
+      digested.entryCount !== record.entryCount ||
+      digested.payloadBytes !== record.size ||
+      !digestMatches(digested.treeSha256, b4a.from(record.sha256, 'hex'))
+    ) {
+      throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Staging tree checksum mismatch')
+    }
+    const stagingTreeIdentity = fileIdentity(
+      await withSafeDirectoryIdentity(this.layout.staging, this.storage, () =>
+        this.storage.lstat(treePath)
+      )
+    )
+    for (const existing of await this._scanRecords()) {
+      if (existing.name === record.name) throw existsError('Destination already exists')
+    }
+    if ((await this._rootTreeState(record.name)) !== 'MISSING') {
+      throw existsError('Destination already exists')
+    }
+    if (retentionManager) {
+      await retentionManager._runUnlocked({ incomingBytes: record.size, trigger: 'commit' })
+    }
+    assertNotAborted(signal)
+
+    const attempt = attemptId()
+    let journal: DirectoryCommitJournal = {
+      version: DIRECTORY_JOURNAL_VERSION,
+      intent: 'create-directory',
+      state: 'committing',
+      phase: 'journaled',
+      transferId: record.transferId,
+      attemptId: attempt,
+      name: record.name,
+      stagingTreeName: `${record.transferId}.tree`,
+      stagingTreeIdentity,
+      record
+    }
+    await this._writeFreshJournal(journal)
+
+    let linearized = false
+    try {
+      assertNotAborted(signal)
+      if ((await this._rootTreeState(record.name)) !== 'MISSING') {
+        throw existsError('Destination already exists')
+      }
+      await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
+        withSafeDirectoryIdentity(this.layout.staging, this.storage, () =>
+          this.storage.rename(treePath, finalPath)
+        )
+      )
+      await this._syncRoot()
+      journal = await this._setDirectoryPhase(journal, 'renamed')
+
+      assertNotAborted(signal)
+      await this._writeRecord(record)
+      linearized = true
+      journal = await this._setDirectoryPhase(journal, 'sidecar')
+
+      await this._removeFile(this._sessionPath(record.transferId), this.layout.sessions)
+      await this._removeFile(this._tarStagingPath(record.transferId), this.layout.staging)
+      await this._discardJournal(record.transferId, attempt)
+      return record
+    } catch (err) {
+      if (linearized) {
+        this._reportCleanupPending(record, err)
+        return record
+      }
+      try {
+        await this._rollbackDirectory(journal)
+      } catch (cleanupError) {
+        throw new AggregateError([err, cleanupError], 'Unable to roll back directory commit')
+      }
+      throw err
+    }
+  }
+
+  async _setDirectoryPhase(
+    journal: DirectoryCommitJournal,
+    phase: DirectoryPhase
+  ): Promise<DirectoryCommitJournal> {
+    const next: DirectoryCommitJournal = { ...journal, phase }
+    await writeAtomic(
+      this._journalPath(journal.transferId),
+      b4a.from(JSON.stringify(serializeJournal(next))),
+      this.storage
+    )
+    return next
+  }
+
+  /** Returns a proven renamed tree to staging; a foreign destination is preserved. */
+  async _rollbackDirectory(journal: DirectoryCommitJournal): Promise<void> {
+    const finalPath = this._finalPath(journal.name)
+    const treePath = this._treeStagingPath(journal.transferId)
+    if ((await this._rootTreeState(journal.name)) !== 'DIRECTORY') return
+    const visible = fileIdentity(
+      await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
+        this.storage.lstat(finalPath)
+      )
+    )
+    if (!identitiesEqual(visible, journal.stagingTreeIdentity)) {
+      throw storageError('Foreign artifact at directory destination')
+    }
+    if ((await inspectTreePath(treePath, this.layout.staging, this.storage)) !== 'MISSING') {
+      throw storageError('Directory staging tree already exists')
+    }
+    await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
+      withSafeDirectoryIdentity(this.layout.staging, this.storage, () =>
+        this.storage.rename(finalPath, treePath)
+      )
+    )
+    await this._syncRoot()
+  }
+
+  /**
    * Classifies a configured mutable name. Only an exact managed current record
    * whose verified content owns the visible path may be replaced; every other
    * occupied path is an existing-name conflict.
    */
   async _planReplacement(record: CommitRecord): Promise<ReplacementPlan> {
+    if ((await this._rootTreeState(record.name)) === 'DIRECTORY') {
+      throw existsError('Destination already exists')
+    }
     const state = await this._rootPathState(record.name)
     if (!state.present) return { mode: 'create' }
     if (!state.stat) throw existsError('Destination already exists')
@@ -1170,7 +1403,7 @@ class CommitStore {
       record: newRecord
     }
     const publicationPath = this._publicationPath(journal.publicationName)
-    await this._writeReplacementJournal(journal)
+    await this._writeFreshJournal(journal)
 
     let linearized = false
     try {
@@ -1446,6 +1679,59 @@ class CommitStore {
   }
 
   /** Proves the verified session and staging an aborted attempt must retain. */
+  /**
+   * Converges one directory attempt. The durable sidecar is the linearization
+   * point: before it a proven renamed tree returns to staging, after it the
+   * published tree is kept and only residue is removed. A destination that
+   * cannot be proven is preserved and fails closed.
+   */
+  async _recoverDirectoryJournal(
+    id: string,
+    journal: DirectoryCommitJournal,
+    sessionStore: SessionStore
+  ): Promise<{ status: 'COMMITTED' | 'RESUMABLE'; record: CommitRecord }> {
+    const { record, name, attemptId: attempt } = journal
+    const sidecar = await this._readRecordOrAbsent(this._recordPath(id))
+    if (sidecar && !recordsEqual(sidecar, record)) {
+      throw storageError('Commit sidecar does not match journal')
+    }
+    const state = await this._rootTreeState(name)
+    if (state === 'UNMANAGED') throw storageError('Foreign artifact at directory destination')
+
+    if (state === 'DIRECTORY') {
+      const digested = await digestTree(this._finalPath(name), this.storage)
+      if (
+        digested.entryCount !== record.entryCount ||
+        digested.payloadBytes !== record.size ||
+        !digestMatches(digested.treeSha256, b4a.from(record.sha256, 'hex'))
+      ) {
+        throw storageError('Published directory does not match its journal')
+      }
+      if (!sidecar) await this._writeRecord(record)
+      await this._removeFile(this._sessionPath(id), this.layout.sessions)
+      await this._removeFile(this._tarStagingPath(id), this.layout.staging)
+      await this._discardJournal(id, attempt)
+      return { status: 'COMMITTED', record }
+    }
+
+    if (sidecar) await this._removeFile(this._recordPath(id), this.layout.commits)
+    if (!sessionStore || typeof sessionStore.readVerified !== 'function') {
+      throw storageError('Session store cannot validate recovery state')
+    }
+    const session = await sessionStore.readVerified(b4a.from(id, 'hex'))
+    this._assertSessionMatchesRecord(
+      session,
+      record,
+      'Directory journal does not match verified session'
+    )
+    const treePath = this._treeStagingPath(id)
+    if ((await inspectTreePath(treePath, this.layout.staging, this.storage)) !== 'DIRECTORY') {
+      throw new CorruptJournalError('Directory journal does not own verified staging')
+    }
+    await this._discardJournal(id, attempt)
+    return { status: 'RESUMABLE', record }
+  }
+
   async _assertReplacementRetryable(
     id: string,
     journal: ReplacementJournal,
@@ -1482,8 +1768,11 @@ class CommitStore {
     }
     const journal = await this._readJournal(id)
     if (!journal) return { status: 'MISSING' }
-    // Directory transactions are recovered by their own store; fail closed here.
-    if (isDirectoryJournal(journal)) throw storageError('Unsupported directory journal')
+    if (isDirectoryJournal(journal)) {
+      return withNameLease(this.layout.root, journal.name, () =>
+        this._recoverDirectoryJournal(id, journal, sessionStore)
+      )
+    }
     if (isReplacementJournal(journal)) {
       return withNameLease(this.layout.root, journal.name, () =>
         this._recoverReplacementJournal(id, journal, sessionStore, isAuthorized)
