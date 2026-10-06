@@ -13,6 +13,7 @@ import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import type { CommitRecord } from '../../dist/storage/commit-journal.js'
 import { RetentionManager } from '../../dist/storage/retention.js'
+import { recoverStorage } from '../../dist/storage/recovery.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import {
   buildTarManifest,
@@ -20,6 +21,12 @@ import {
   regenerateTarSuffix,
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
+import {
+  buildTreeManifest,
+  regenerateTreeTarSuffix,
+  treeMetadataFromManifest
+} from '../../dist/tar-protocol/tree-manifest.js'
+import { writeTree } from '../helpers/trees.js'
 import type { MetadataRecord } from '../../dist/tar-protocol/controls.js'
 import { createClock, type TestClock } from '../helpers/clock.js'
 import { createTempDir } from '../helpers/files.js'
@@ -69,6 +76,11 @@ interface Harness {
     name: string,
     content: Buffer,
     mutable?: boolean,
+    release?: ReleaseCoordinates
+  ): Promise<CommitRecord>
+  publishTree(
+    name: string,
+    spec: Record<string, string>,
     release?: ReleaseCoordinates
   ): Promise<CommitRecord>
   manager(options?: Partial<RetentionOptions>): RetentionManager
@@ -142,6 +154,20 @@ async function createHarness(
     return sessions.verify(OWNER, tar.metadata)
   }
 
+  async function stageTree(name: string, spec: Record<string, string>): Promise<TarSession> {
+    const sourceRoot = await createTempDir(t)
+    await writeTree(path.join(sourceRoot, name), spec)
+    const manifest = await buildTreeManifest(path.join(sourceRoot, name), OWNER)
+    const metadata = treeMetadataFromManifest(manifest)
+    const chunks: Buffer[] = []
+    await regenerateTreeTarSuffix(manifest, 0, (chunk) => {
+      chunks.push(b4a.from(chunk))
+    })
+    await sessions.admit(OWNER, metadata)
+    await sessions.append(OWNER, metadata, 0, b4a.concat(chunks))
+    return sessions.verify(OWNER, metadata)
+  }
+
   return {
     layout,
     clock,
@@ -155,6 +181,12 @@ async function createHarness(
         ...(mutable ? { replaceNames: [name] } : {}),
         ...(release === undefined ? {} : { release })
       })
+      await sessions.retireCommitted(session.transferId)
+      return record
+    },
+    async publishTree(name, spec, release) {
+      const session = await stageTree(name, spec)
+      const record = await commits.commit(session, release === undefined ? {} : { release })
       await sessions.retireCommitted(session.transferId)
       return record
     },
@@ -797,6 +829,139 @@ test('replacement reclaims space in its own pre-commit pass, not the deferred on
     'the replacement ran a pre-commit retention pass'
   )
   t.is(await fs.promises.readFile(path.join(harness.layout.root, MUTABLE), 'utf8'), 'new')
+})
+
+test('deleting a directory artifact renames it into private trash first', async (t) => {
+  const renames: Array<[string, string]> = []
+  const storage = createStorage({
+    afterOperation: (name, target, ...rest) => {
+      if (name === 'rename') renames.push([target, String(rest[0])])
+    }
+  })
+  const harness = await createHarness(t, { storage })
+  const record = await harness.publishTree('0.18.1', { 'a/b.bin': 'bb' })
+  const finalPath = path.join(harness.layout.root, '0.18.1')
+  t.ok((await fs.promises.lstat(finalPath)).isDirectory())
+
+  t.is(await harness.commits.delete(record), true)
+  t.is(await exists(finalPath), false)
+  t.is(await exists(path.join(harness.layout.trash, `${record.transferId}.tree`)), false)
+  t.ok(
+    renames.some(
+      ([from, to]) => from === finalPath && to.includes(path.join('.swarm-deploy', 'trash'))
+    )
+  )
+  t.alike(await harness.commits.list(), [])
+})
+
+test('trash sweeping removes proven residue and ignores foreign entries', async (t) => {
+  const harness = await createHarness(t)
+  const stray = path.join(harness.layout.trash, `${'b'.repeat(64)}.tree`)
+  await fs.promises.mkdir(path.join(stray, 'nested'), { recursive: true })
+  await fs.promises.writeFile(path.join(stray, 'nested', 'x.bin'), 'x')
+  const foreign = path.join(harness.layout.trash, 'operator-notes.txt')
+  await fs.promises.writeFile(foreign, 'keep me')
+  t.is(await harness.commits.sweepTrash(), 1)
+  t.is(await exists(stray), false)
+  t.is(await fs.promises.readFile(foreign, 'utf8'), 'keep me')
+  t.is(await harness.commits.sweepTrash(), 0)
+})
+
+test('storage recovery sweeps trash residue and reports it once', async (t) => {
+  const harness = await createHarness(t)
+  const stray = path.join(harness.layout.trash, `${'c'.repeat(64)}.tree`)
+  await fs.promises.mkdir(stray, { recursive: true })
+  await fs.promises.writeFile(path.join(stray, 'x.bin'), 'x')
+  const events: Array<Record<string, unknown>> = []
+  await recoverStorage({
+    layout: harness.layout,
+    commitStore: harness.commits,
+    sessionStore: harness.sessions,
+    onEvent: (event) => events.push(event as unknown as Record<string, unknown>)
+  })
+  t.is(await exists(stray), false)
+  t.alike(
+    events.filter((event) => event.type === 'cleanup'),
+    [{ type: 'cleanup', transfer: 'trash', name: null, reason: 'trash-residue' }]
+  )
+})
+
+test('scrub validates a directory artifact by type cheaply and by digest at startup', async (t) => {
+  const harness = await createHarness(t)
+  const record = await harness.publishTree('0.18.1', { 'a.bin': 'aaa' })
+  const manager = harness.manager()
+  t.is((await manager.scrubCommitted({ hash: false })).records.length, 1)
+  t.is((await manager.scrubCommitted({ hash: true })).records.length, 1)
+
+  await fs.promises.writeFile(path.join(harness.layout.root, '0.18.1', 'a.bin'), 'mutated')
+  const cheap = await manager.scrubCommitted({ hash: false })
+  t.is(cheap.records.length, 1)
+  const hashed = await manager.scrubCommitted({ hash: true })
+  t.is(hashed.records.length, 0)
+  t.is(hashed.deleted, 1)
+  t.ok(hashed.unknown.includes('0.18.1'))
+  t.ok((await fs.promises.lstat(path.join(harness.layout.root, '0.18.1'))).isDirectory())
+  t.is(await exists(path.join(harness.layout.commits, `${record.transferId}.json`)), false)
+})
+
+test('age, count, version, and quota retention delete directory artifacts', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publishTree(
+    'api-1.0.0',
+    { 'a.bin': 'a' },
+    { series: 'api', version: '1.0.0' }
+  )
+  harness.clock.advance(10)
+  const second = await harness.publishTree(
+    'api-2.0.0',
+    { 'a.bin': 'bb' },
+    { series: 'api', version: '2.0.0' }
+  )
+  const result = await harness.manager({ maxCount: 1 }).run()
+  t.is(result.countDeleted, 1)
+  t.alike(
+    (await harness.commits.list()).map((value) => value.transferId),
+    [second.transferId]
+  )
+  t.is(await exists(path.join(harness.layout.root, 'api-1.0.0')), false)
+  t.is(first.kind, 'directory')
+})
+
+test('link reconciliation runs before deletion and pins every selected target', async (t) => {
+  const harness = await createHarness(t)
+  const old = await harness.publishTree('0.18.0', { 'a.bin': 'a' })
+  harness.clock.advance(10)
+  const fresh = await harness.publishTree('0.18.1', { 'a.bin': 'b' })
+  const seen: string[][] = []
+  const manager = harness.manager({
+    maxCount: undefined,
+    maxAge: 1,
+    reconcileLinks: (records) => {
+      seen.push(records.map((record) => record.name).sort())
+      return Promise.resolve(new Set([fresh.transferId]))
+    }
+  })
+  harness.clock.advance(100)
+  const result = await manager.run()
+  t.alike(seen, [['0.18.0', '0.18.1']])
+  t.is(result.ageDeleted, 1)
+  t.alike(
+    (await harness.commits.list()).map((value) => value.transferId),
+    [fresh.transferId]
+  )
+  t.is(await exists(path.join(harness.layout.root, '0.18.0')), false)
+  t.is(old.name, '0.18.0')
+})
+
+test('scrub ignores a configured managed link name instead of reporting it unknown', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publishTree('0.18.1', { 'a.bin': 'a' })
+  await fs.promises.symlink('0.18.1', path.join(harness.layout.root, 'latest'))
+  const scrub = await harness
+    .manager({ managedLinkNames: () => new Set(['latest']) })
+    .scrubCommitted({ hash: false })
+  t.alike(scrub.unknown, [])
+  t.is(scrub.records.length, 1)
 })
 
 test('commit defers post-commit retention only when asked and keeps pre-commit checks', async (t) => {

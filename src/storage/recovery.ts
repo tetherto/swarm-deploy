@@ -53,6 +53,7 @@ interface CommitStore {
     record: CommitRecord,
     options?: { preservePath?: boolean }
   ): Promise<false | { purged: true; preservedPath: boolean }>
+  sweepTrash(): Promise<number>
 }
 
 type RecoveryEvent =
@@ -69,7 +70,12 @@ type RecoveryEvent =
       status: 'MISSING' | 'FILE_EXISTS' | 'COMMITTED' | 'ABORTED' | 'RESUMABLE' | 'CORRUPT'
       transfer: string
     }
-  | { type: 'cleanup'; transfer: string; name: null; reason: 'corrupt-journal' }
+  | {
+      type: 'cleanup'
+      transfer: string
+      name: null
+      reason: 'corrupt-journal' | 'trash-residue'
+    }
   | { type: 'scrub'; status: 'started' }
   | { type: 'scrub'; status: 'completed'; deleted: number; unknownCount: number }
   | { type: 'scrub'; status: 'failed'; reason: string }
@@ -137,7 +143,9 @@ async function assertRecoveryLayout(layout: StorageLayout, storage: StorageAdapt
     layout.staging,
     layout.sessions,
     layout.commits,
-    layout.journals
+    layout.journals,
+    layout.links,
+    layout.trash
   ]) {
     await assertSafeDirectory(directory, storage)
   }
@@ -316,6 +324,11 @@ async function recoverStorage({
     ) {
       await sessionStore.delete(b4a.from(id, 'hex'))
     }
+  }
+  const sweptTrash = await commitStore.sweepTrash()
+  if (sweptTrash > 0) {
+    report(logger, 'warn', 'Swept managed directory trash residue', { trees: sweptTrash })
+    emit(onEvent, { type: 'cleanup', transfer: 'trash', name: null, reason: 'trash-residue' })
   }
   const retention = new RetentionManager({
     layout,

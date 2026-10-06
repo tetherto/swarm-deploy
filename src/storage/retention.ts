@@ -8,7 +8,8 @@ import { digestMatches, SodiumSha256 } from '../tar-protocol/hash.js'
 import { assertSafeUint } from '../validation.js'
 import { withRootLease } from './root-coordinator.js'
 import { compareReleaseVersions, releaseVersionGroup, type VersionGranularity } from '../release.js'
-import type { CommitRecord } from './commit-journal.js'
+import { commitRecordKind, compareCommitOrder, type CommitRecord } from './commit-journal.js'
+import { digestTree } from './tree-fs.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
 
 const DEFAULT_RESUME_TTL = 7 * 24 * 60 * 60 * 1000
@@ -105,6 +106,14 @@ interface RetentionManagerOptions {
   isSessionActive: (session: Session) => boolean
   hasActiveUploads?: () => boolean
   isPinned?: (record: CommitRecord) => boolean
+  /**
+   * Reconciles managed symlinks and returns the transfer IDs pinned by a rule.
+   * Called once per pass with the scrubbed record set, with the root lease
+   * already held; it must not acquire the root lease itself.
+   */
+  reconcileLinks?: (records: CommitRecord[]) => Promise<ReadonlySet<string>>
+  /** Names in the storage root that are server-managed symlinks, not artifacts. */
+  managedLinkNames?: () => ReadonlySet<string>
   logger?: Logger | null
   scheduler?: Scheduler
   onEvent?: ((event: RetentionEvent) => void) | null
@@ -153,13 +162,6 @@ interface RetentionResult {
   storageDeleted: number
 }
 
-/** Newest first: descending commit time, then transfer ID and name for determinism. */
-function compareNewest(left: CommitRecord, right: CommitRecord): number {
-  if (left.committedAt !== right.committedAt) return right.committedAt - left.committedAt
-  if (left.transferId !== right.transferId) return left.transferId < right.transferId ? -1 : 1
-  return left.name < right.name ? -1 : left.name > right.name ? 1 : 0
-}
-
 function bySeries(records: CommitRecord[]): Map<string, CommitRecord[]> {
   const groups = new Map<string, CommitRecord[]>()
   for (const record of records) {
@@ -175,7 +177,9 @@ function bySeries(records: CommitRecord[]): Map<string, CommitRecord[]> {
 function countKeepSet(records: CommitRecord[], maxCount: number): Set<string> {
   const keep = new Set<string>()
   for (const group of bySeries(records).values()) {
-    for (const record of group.sort(compareNewest).slice(0, maxCount)) keep.add(record.transferId)
+    for (const record of group.sort(compareCommitOrder).slice(0, maxCount)) {
+      keep.add(record.transferId)
+    }
   }
   return keep
 }
@@ -191,7 +195,7 @@ function versionKeepSet(
     const versioned = group.filter((record) => record.release?.version !== undefined)
     versioned.sort((left, right) => {
       const order = compareReleaseVersions(right.release!.version!, left.release!.version!)
-      return order !== 0 ? order : compareNewest(left, right)
+      return order !== 0 ? order : compareCommitOrder(left, right)
     })
     const groups = new Set<string>()
     for (const record of versioned) {
@@ -246,6 +250,22 @@ function inspectManagedFinal(
       throw err
     }
     if (initial.isSymbolicLink()) return 'SYMLINK'
+    if (commitRecordKind(record) === 'directory') {
+      if (initial.isSymbolicLink() || !initial.isDirectory()) return 'NON_REGULAR'
+      if (!hash) return 'VALID'
+      let digested
+      try {
+        digested = await digestTree(finalPath, storage)
+      } catch {
+        return 'DIGEST_INVALID'
+      }
+      if (digested.entryCount !== record.entryCount || digested.payloadBytes !== record.size) {
+        return 'WRONG_SIZE'
+      }
+      return digestMatches(digested.treeSha256, b4a.from(record.sha256, 'hex'))
+        ? 'VALID'
+        : 'DIGEST_INVALID'
+    }
     if (!initial.isFile()) return 'NON_REGULAR'
     if (initial.size !== record.size) return 'WRONG_SIZE'
     if (!hash) return 'VALID'
@@ -303,6 +323,8 @@ class RetentionManager {
   isSessionActive: (session: Session) => boolean
   hasActiveUploads: () => boolean
   isPinned: (record: CommitRecord) => boolean
+  reconcileLinks: ((records: CommitRecord[]) => Promise<ReadonlySet<string>>) | undefined
+  managedLinkNames: (() => ReadonlySet<string>) | undefined
   logger: Logger | null
   timer: unknown | null
   cleanupFailure: unknown | null
@@ -329,6 +351,8 @@ class RetentionManager {
     isSessionActive,
     hasActiveUploads = () => false,
     isPinned = () => false,
+    reconcileLinks,
+    managedLinkNames,
     logger = null,
     scheduler = { setInterval, clearInterval },
     onEvent = null
@@ -362,6 +386,12 @@ class RetentionManager {
       throw storageError('Invalid active upload predicate')
     }
     if (typeof isPinned !== 'function') throw storageError('Invalid retention pin predicate')
+    if (reconcileLinks !== undefined && typeof reconcileLinks !== 'function') {
+      throw storageError('Invalid link reconciliation callback')
+    }
+    if (managedLinkNames !== undefined && typeof managedLinkNames !== 'function') {
+      throw storageError('Invalid managed link name callback')
+    }
     if (onEvent !== null && typeof onEvent !== 'function') {
       throw storageError('Invalid retention event callback')
     }
@@ -393,6 +423,8 @@ class RetentionManager {
     this.isSessionActive = isSessionActive
     this.hasActiveUploads = hasActiveUploads
     this.isPinned = isPinned
+    this.reconcileLinks = reconcileLinks
+    this.managedLinkNames = managedLinkNames
     this.logger = logger
     this.timer = null
     this.cleanupFailure = null
@@ -444,8 +476,9 @@ class RetentionManager {
     const rootNames = await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
       this.storage.readdir(this.layout.root)
     )
+    const linkNames = this.managedLinkNames ? this.managedLinkNames() : new Set<string>()
     const unknown = rootNames
-      .filter((name) => name !== '.swarm-deploy' && !knownNames.has(name))
+      .filter((name) => name !== '.swarm-deploy' && !knownNames.has(name) && !linkNames.has(name))
       .sort()
     for (const name of unknown) {
       report(this.logger, 'warn', 'Ignoring unknown committed path', { name })
@@ -465,7 +498,9 @@ class RetentionManager {
       }
       let purged
       try {
-        purged = await this.commitStore.purge(record, { preservePath: status === 'CHANGED' })
+        purged = await this.commitStore.purge(record, {
+          preservePath: status === 'CHANGED' || commitRecordKind(record) === 'directory'
+        })
         if (!purged) {
           throw storageError('Managed commit record disappeared during scrub')
         }
@@ -551,12 +586,17 @@ class RetentionManager {
     const expiredSessions = await this.expireSessions()
     const scrub = await this.scrubCommitted({ hash: false })
     const current = scrub.records.slice()
+    const linkPinned = this.reconcileLinks
+      ? await this.reconcileLinks(current.slice())
+      : new Set<string>()
+    const pinned = (record: CommitRecord): boolean =>
+      this._isPinned(record) || linkPinned.has(record.transferId)
     let ageDeleted = 0
     if (this.maxAge !== undefined) {
       const now = this.clock.now()
       assertSafeUint(now, 'current timestamp')
       for (const record of current.slice().sort(compareRecords)) {
-        if (this._isPinned(record)) continue
+        if (pinned(record)) continue
         if (now < record.committedAt || now - record.committedAt < this.maxAge) continue
         await this._deleteRecord(record, 'MAX_AGE')
         current.splice(current.indexOf(record), 1)
@@ -568,7 +608,7 @@ class RetentionManager {
     if (this.maxCount !== undefined) {
       const keep = countKeepSet(current, this.maxCount)
       for (const record of current.slice().sort(compareRecords)) {
-        if (!record.release || keep.has(record.transferId) || this._isPinned(record)) continue
+        if (!record.release || keep.has(record.transferId) || pinned(record)) continue
         await this._deleteRecord(record, 'MAX_COUNT')
         current.splice(current.indexOf(record), 1)
         countDeleted++
@@ -580,7 +620,7 @@ class RetentionManager {
       const keep = versionKeepSet(current, this.maxVersions, this.versionGranularity)
       for (const record of current.slice().sort(compareRecords)) {
         if (record.release?.version === undefined) continue
-        if (keep.has(record.transferId) || this._isPinned(record)) continue
+        if (keep.has(record.transferId) || pinned(record)) continue
         await this._deleteRecord(record, 'MAX_VERSIONS')
         current.splice(current.indexOf(record), 1)
         versionDeleted++
@@ -593,7 +633,7 @@ class RetentionManager {
       let total = this._totalSize(current)
       for (const record of current.slice().sort(compareRecords)) {
         if (total <= permitted) break
-        if (this._isPinned(record)) continue
+        if (pinned(record)) continue
         await this._deleteRecord(record, 'MAX_STORAGE')
         total -= record.size
         storageDeleted++

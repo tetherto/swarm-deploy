@@ -54,7 +54,7 @@ import type {
   ReplacementJournal,
   ReplacementPhase
 } from './commit-journal.js'
-import { digestTree, inspectTreePath, type TreePathState } from './tree-fs.js'
+import { digestTree, inspectTreePath, removeTree, type TreePathState } from './tree-fs.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
 
 interface AbortSignalLike {
@@ -382,6 +382,10 @@ class CommitStore {
 
   _treeStagingPath(id: string): string {
     return path.join(this.layout.staging, `${id}.tree`)
+  }
+
+  _trashTreePath(id: string): string {
+    return path.join(this.layout.trash, `${id}.tree`)
   }
 
   /** The visible state of one top-level directory path, without following links. */
@@ -2004,10 +2008,68 @@ class CommitStore {
     throw storageError('Commit record changed before deletion')
   }
 
+  /**
+   * Removes proven private trash trees left by an interrupted deletion. Only a
+   * `<64-hex>.tree` entry is ours; anything else in the directory is left alone.
+   */
+  async sweepTrash(): Promise<number> {
+    await this._assertLayout()
+    const names = await withSafeDirectoryIdentity(this.layout.trash, this.storage, () =>
+      this.storage.readdir(this.layout.trash)
+    )
+    let removed = 0
+    for (const name of names.sort()) {
+      if (!/^[0-9a-f]{64}\.tree$/.test(name)) continue
+      if (await removeTree(path.join(this.layout.trash, name), this.layout.trash, this.storage)) {
+        removed++
+      }
+    }
+    return removed
+  }
+
+  /**
+   * Removes a managed directory by renaming it into the private trash first, so
+   * the visible name disappears atomically, and only then removing the sidecar
+   * and recursively deleting the trash tree.
+   */
+  async _removeManagedTree(
+    record: CommitRecord
+  ): Promise<{ removed: boolean; preservedPath: boolean }> {
+    const finalPath = this._finalPath(record.name)
+    const trashPath = this._trashTreePath(record.transferId)
+    const state = await this._rootTreeState(record.name)
+    if (state === 'MISSING') return { removed: false, preservedPath: false }
+    if (state === 'UNMANAGED') return { removed: false, preservedPath: true }
+    if ((await inspectTreePath(trashPath, this.layout.trash, this.storage)) !== 'MISSING') {
+      await removeTree(trashPath, this.layout.trash, this.storage)
+    }
+    await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
+      withSafeDirectoryIdentity(this.layout.trash, this.storage, () =>
+        this.storage.rename(finalPath, trashPath)
+      )
+    )
+    await this._syncRoot()
+    await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
+    await removeTree(trashPath, this.layout.trash, this.storage)
+    return { removed: true, preservedPath: false }
+  }
+
   async delete(record: CommitRecord): Promise<boolean> {
     await this._assertLayout()
     assertRecord(record)
     if (!(await this._storedRecordFor(record))) return false
+
+    if (record.kind === 'directory') {
+      const removed = await this._removeManagedTree(record)
+      if (removed.preservedPath) {
+        await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
+        return true
+      }
+      if (!removed.removed) {
+        await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
+      }
+      return true
+    }
 
     const finalPath = this._finalPath(record.name)
     const final = await this._safeFileOrAbsent(finalPath, this.layout.root)
@@ -2023,6 +2085,16 @@ class CommitStore {
     await this._assertLayout()
     assertRecord(record)
     if (!(await this._storedRecordFor(record))) return false
+
+    if (record.kind === 'directory') {
+      if (preservePath) {
+        await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
+        return { purged: true, preservedPath: true }
+      }
+      const removed = await this._removeManagedTree(record)
+      await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
+      return { purged: true, preservedPath: removed.preservedPath }
+    }
 
     let final
     if (preservePath) {
