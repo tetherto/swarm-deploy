@@ -2,6 +2,7 @@
 
 require('./unit/tree-canonical.test.js')
 require('./unit/tree-module-graph.test.js')
+require('./unit/storage-tree.test.js')
 require('./unit/release.test.js')
 require('./unit/tar-protocol.test.js')
 require('./unit/tar-session-store.test.js')

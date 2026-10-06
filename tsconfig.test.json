@@ -16,6 +16,7 @@
     "test/run.ts",
     "test/unit/tree-canonical.test.ts",
     "test/unit/tree-module-graph.test.ts",
+    "test/unit/storage-tree.test.ts",
     "test/unit/cli.test.ts",
     "test/unit/direct-behavior.test.ts",
     "test/unit/direct-dht.test.ts",

@@ -62,6 +62,14 @@ export interface StorageAdapter {
   rmdir(path: string): Promise<void>
   readdir(path: string): Promise<string[]>
   statfs?(path: string): Promise<StorageStatFs>
+  /** Required only when symlink rules are configured. */
+  symlink?(target: string, path: string): Promise<void>
+  readlink?(path: string): Promise<string>
+}
+
+export type SymlinkCapableStorage = StorageAdapter & {
+  symlink(target: string, path: string): Promise<void>
+  readlink(path: string): Promise<string>
 }
 
 export interface StorageLayout {
@@ -73,6 +81,10 @@ export interface StorageLayout {
   journals: string
   /** Private destinations for replacement publications before they are visible. */
   publications: string
+  /** Private managed-symlink ownership records. */
+  links: string
+  /** Private destination a managed directory is renamed into before deletion. */
+  trash: string
   lock: string
 }
 
