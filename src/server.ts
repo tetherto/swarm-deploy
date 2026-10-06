@@ -37,6 +37,7 @@ import {
 import { SessionStore } from './storage/session-store.js'
 import type { TarSession } from './storage/tar-session-store.js'
 import type { StorageAdapter, StorageLayout } from './storage/types.js'
+import { isTreeMetadata, type MetadataRecord } from './tar-protocol/controls.js'
 import {
   decodeDirectMetadata,
   DirectWireReader,
@@ -178,6 +179,17 @@ type Active = { owner: Buffer; transfer: string | null }
 
 function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(code, message, cause)
+}
+
+/**
+ * The wire decoder also accepts directory offers, but this server only serves file offers
+ * until the tree transfer path exists, so a directory offer stays a protocol violation exactly
+ * as it was before the record existed.
+ */
+function decodeFileOffer(bytes: Uint8Array): MetadataRecord {
+  const metadata = decodeDirectMetadata(bytes)
+  if (isTreeMetadata(metadata)) throw fail(ERRORS.PROTOCOL_INVALID, 'Unsupported artifact kind')
+  return metadata
 }
 function codeOf(error: unknown): ErrorCode {
   return error instanceof SwarmDeployError &&
@@ -568,7 +580,7 @@ export class Server extends EventEmitter {
       await reportFailure(fail(reason, message))
     }
     try {
-      const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
+      const metadata = await reader.control(decodeFileOffer, this.signal, this.idleTimeout)
       // The decoded record is shape-validated but not yet authenticated; the
       // artifact context carries only its non-secret descriptive fields.
       event = this.transfer(metadata)

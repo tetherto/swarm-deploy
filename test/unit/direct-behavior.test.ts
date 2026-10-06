@@ -30,7 +30,8 @@ import {
   decodeFinalRecord,
   encodeAdmissionRecord,
   encodeControlFrame,
-  encodeMetadataRecord
+  encodeMetadataRecord,
+  encodeTreeMetadataRecord
 } from '../../dist/tar-protocol/controls.js'
 import {
   buildTarManifest,
@@ -1697,6 +1698,49 @@ test('Server reports a noncanonical transfer ID to onFailure once and keeps PROT
   for (const key of Object.keys(context.artifact)) {
     t.ok(['name', 'size', 'sha256', 'transferId', 'sourceParent', 'release'].includes(key), key)
   }
+})
+
+test('Server treats a directory offer as a protocol violation until trees are served', async (t) => {
+  const calls: HookCall[] = []
+  const ref: { current: FakeSocket | null } = { current: null }
+  const { server, node } = await createServer(t, { hooks: recordingHooks(calls, ref) })
+  const rejections: string[] = []
+  server.on('failure', (event) => rejections.push(event.reason))
+  const directory = encodeControlFrame(
+    encodeTreeMetadataRecord({
+      v: 1,
+      kind: 'directory',
+      name: '0.18.1',
+      entryCount: 1,
+      payloadBytes: 0,
+      treeSha256: 'a'.repeat(64),
+      tarSize: 1536,
+      tarSha256: 'b'.repeat(64),
+      transferId: 'c'.repeat(64),
+      reset: false
+    })
+  )
+  const legacyUnknown = encodeControlFrame(
+    Buffer.from(JSON.stringify({ v: 1, kind: 'directory', name: '0.18.1' }))
+  )
+  const outcomes: Array<{ statuses: string[]; code: string | undefined; hooks: string[] }> = []
+  for (const frame of [directory, legacyUnknown]) {
+    calls.length = 0
+    const socket = new FakeSocket(CLIENT_KEY)
+    ref.current = socket
+    node.accept(socket)
+    socket.feed(frame)
+    await waitFor(() => isTerminal(socket))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    outcomes.push({
+      statuses: statuses(socket),
+      code: finalCode(socket),
+      hooks: calls.map((call) => call.hook)
+    })
+  }
+  t.alike(outcomes[0], outcomes[1], 'a directory offer is rejected exactly like an unknown record')
+  t.is(outcomes[0].code, ERRORS.PROTOCOL_INVALID)
+  t.absent(outcomes[0].hooks.includes('beforeCommit') || outcomes[0].hooks.includes('afterCommit'))
 })
 
 test('Server reports a VERIFIED reconnect read failure with the extracted .part path', async (t) => {
