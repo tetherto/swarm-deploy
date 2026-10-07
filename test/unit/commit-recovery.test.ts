@@ -1110,6 +1110,184 @@ test('directory recovery converges from every crash boundary', async (t) => {
   )
 })
 
+type DirectoryBoundary = 'tree-renamed' | 'renamed-phase' | 'sidecar-phase'
+
+interface DirectoryCrash {
+  layout: StorageLayout
+  session: TarSession
+  id: string
+  final: string
+  journal: string
+  record: string
+  stagingTree: string
+}
+
+async function crashDirectory(t: Assert, boundary: DirectoryBoundary): Promise<DirectoryCrash> {
+  let armed = false
+  let crashed = false
+  let final = ''
+  let journal = ''
+  let record = ''
+  let treeRenamed = false
+  const storage = createStorage({
+    beforeOperation(name) {
+      if (crashed && MUTATIONS.has(name)) throw new Error('process stopped at crash boundary')
+    },
+    afterOperation(name, source, destination) {
+      if (!armed || crashed) return
+      if (name === 'rename' && destination === final) treeRenamed = true
+      const hit =
+        (boundary === 'tree-renamed' && name === 'rename' && destination === final) ||
+        (boundary === 'renamed-phase' &&
+          treeRenamed &&
+          name === 'sync' &&
+          source === path.dirname(journal)) ||
+        (boundary === 'sidecar-phase' && name === 'sync' && source === path.dirname(record))
+      if (!hit) return
+      crashed = true
+      throw new Error(`crash at ${boundary}`)
+    }
+  })
+  const harness = await createHarness(t, storage)
+  const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+  final = path.join(harness.layout.root, session.name)
+  journal = path.join(harness.layout.journals, `${session.id}.json`)
+  record = path.join(harness.layout.commits, `${session.id}.json`)
+  const stagingTree = path.join(harness.layout.staging, `${session.id}.tree`)
+  armed = true
+  await harness.commits.commit(session).then(
+    () => undefined,
+    () => undefined
+  )
+  t.ok(crashed, `${boundary} reached`)
+  await harness.sessions.close()
+  return {
+    layout: harness.layout,
+    session,
+    id: session.id,
+    final,
+    journal,
+    record,
+    stagingTree
+  }
+}
+
+async function restartDirectoryCrash(crash: DirectoryCrash) {
+  const sessions = await restart(crash.layout)
+  const commits = new CommitStore({ layout: crash.layout })
+  return {
+    sessions,
+    commits,
+    recover: () =>
+      recoverStorage({
+        layout: crash.layout,
+        sessionStore: sessions,
+        commitStore: commits,
+        logger: { warn() {} }
+      })
+  }
+}
+
+test('directory restart survives a missing staging tree while a commit journal is open', async (t) => {
+  for (const boundary of ['tree-renamed', 'renamed-phase', 'sidecar-phase'] as const) {
+    const crash = await crashDirectory(t, boundary)
+    const { sessions, commits, recover } = await restartDirectoryCrash(crash)
+    const results = await recover()
+    t.is(results.length, 1, boundary)
+    t.is(results[0].status, 'COMMITTED', boundary)
+    t.ok((await fs.promises.lstat(crash.final)).isDirectory(), `${boundary} final tree`)
+    t.ok(await exists(crash.record), `${boundary} sidecar`)
+    t.is(await exists(crash.journal), false, `${boundary} journal`)
+    t.is(await exists(crash.stagingTree), false, `${boundary} staging tree`)
+    t.is(await exists(path.join(crash.layout.sessions, `${crash.id}.json`)), false, boundary)
+    t.alike(
+      (await commits.list()).map((entry) => entry.name),
+      ['0.18.1'],
+      boundary
+    )
+    await sessions.close()
+  }
+})
+
+test('directory recovery rolls back an unauthorized rename before the sidecar exists', async (t) => {
+  const crash = await crashDirectory(t, 'renamed-phase')
+  const sessions = await restart(crash.layout)
+  const commits = new CommitStore({ layout: crash.layout })
+  const results = await recoverStorage({
+    layout: crash.layout,
+    sessionStore: sessions,
+    commitStore: commits,
+    isAuthorized: () => false,
+    logger: { warn() {} }
+  })
+  t.is(results[0].status, 'RESUMABLE')
+  t.is(await exists(crash.final), false)
+  t.ok((await fs.promises.lstat(crash.stagingTree)).isDirectory())
+  t.is(await exists(crash.record), false)
+  await sessions.close()
+})
+
+test('directory recovery stays committed after the sidecar is durable even when unauthorized', async (t) => {
+  const crash = await crashDirectory(t, 'sidecar-phase')
+  const sessions = await restart(crash.layout)
+  const commits = new CommitStore({ layout: crash.layout })
+  const results = await recoverStorage({
+    layout: crash.layout,
+    sessionStore: sessions,
+    commitStore: commits,
+    isAuthorized: () => false,
+    logger: { warn() {} }
+  })
+  t.is(results[0].status, 'COMMITTED')
+  t.ok((await fs.promises.lstat(crash.final)).isDirectory())
+  t.ok(await exists(crash.record))
+  await sessions.close()
+})
+
+test('a directory commit can retry after abort once the journal is written', async (t) => {
+  let journalSeen = false
+  const controller = { aborted: false }
+  const signal = {
+    get aborted() {
+      return controller.aborted
+    },
+    addEventListener() {},
+    removeEventListener() {}
+  }
+  const storage = createStorage({
+    afterOperation(name, source) {
+      if (name === 'sync' && source.endsWith('journals')) journalSeen = true
+    },
+    beforeOperation(name) {
+      if (journalSeen && name === 'rename') controller.aborted = true
+    }
+  })
+  const harness = await createHarness(t, storage)
+  const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+  await t.exception(() => harness.commits.commit(session, { signal }), { code: ERRORS.ABORTED })
+  t.is(await exists(path.join(harness.layout.journals, `${session.id}.json`)), false)
+  const retried = await harness.commits.commit(session)
+  t.is(retried.name, '0.18.1')
+  t.alike(await fs.promises.readdir(harness.layout.journals), [])
+})
+
+test('a directory tree with a forbidden entry is reported as FILE_EXISTS on re-offer', async (t) => {
+  const harness = await createHarness(t)
+  const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+  const record = await harness.commits.commit(session)
+  await harness.sessions.retireCommitted(session.transferId)
+  await fs.promises.writeFile(path.join(harness.layout.root, '0.18.1', '.cache'), 'x')
+  const offer = {
+    name: record.name,
+    kind: 'directory' as const,
+    size: record.size,
+    entryCount: record.entryCount,
+    digest: b4a.from(record.sha256, 'hex'),
+    transferId: b4a.from(record.transferId, 'hex')
+  }
+  t.alike(await harness.commits.inspect(record.name, offer), { status: 'FILE_EXISTS' })
+})
+
 test('a directory recovery refuses an unmanaged path at the artifact name', async (t) => {
   const harness = await createHarness(t)
   const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })

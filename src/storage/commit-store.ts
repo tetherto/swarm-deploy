@@ -926,7 +926,18 @@ class CommitStore {
     ) {
       return { status: 'FILE_EXISTS' }
     }
-    const digested = await digestTree(this._finalPath(name), this.storage)
+    let digested
+    try {
+      digested = await digestTree(this._finalPath(name), this.storage)
+    } catch (error: unknown) {
+      if (
+        error instanceof SwarmDeployError &&
+        (error.code === ERRORS.INVALID_FILENAME || error.code === ERRORS.PROTOCOL_INVALID)
+      ) {
+        return { status: 'FILE_EXISTS' }
+      }
+      throw error
+    }
     if (
       digested.entryCount !== record.entryCount ||
       digested.payloadBytes !== record.size ||
@@ -1285,7 +1296,12 @@ class CommitStore {
   async _rollbackDirectory(journal: DirectoryCommitJournal): Promise<void> {
     const finalPath = this._finalPath(journal.name)
     const treePath = this._treeStagingPath(journal.transferId)
-    if ((await this._rootTreeState(journal.name)) !== 'DIRECTORY') return
+    if ((await this._rootTreeState(journal.name)) !== 'DIRECTORY') {
+      if ((await inspectTreePath(treePath, this.layout.staging, this.storage)) === 'DIRECTORY') {
+        await this._discardJournal(journal.transferId, journal.attemptId)
+      }
+      return
+    }
     const visible = fileIdentity(
       await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
         this.storage.lstat(finalPath)
@@ -1303,6 +1319,7 @@ class CommitStore {
       )
     )
     await this._syncRoot()
+    await this._discardJournal(journal.transferId, journal.attemptId)
   }
 
   /**
@@ -1702,7 +1719,8 @@ class CommitStore {
   async _recoverDirectoryJournal(
     id: string,
     journal: DirectoryCommitJournal,
-    sessionStore: SessionStore
+    sessionStore: SessionStore,
+    isAuthorized: ((ownerKey: Uint8Array) => boolean) | null = null
   ): Promise<{ status: 'COMMITTED' | 'RESUMABLE'; record: CommitRecord }> {
     const { record, name, attemptId: attempt } = journal
     const sidecar = await this._readRecordOrAbsent(this._recordPath(id))
@@ -1720,6 +1738,16 @@ class CommitStore {
         !digestMatches(digested.treeSha256, b4a.from(record.sha256, 'hex'))
       ) {
         throw storageError('Published directory does not match its journal')
+      }
+      if (!sidecar && isAuthorized) {
+        if (!sessionStore || typeof sessionStore.readVerified !== 'function') {
+          throw storageError('Session store cannot validate recovery state')
+        }
+        const session = await sessionStore.readVerified(b4a.from(id, 'hex'))
+        if (!isAuthorized(session.ownerKey)) {
+          await this._rollbackDirectory(journal)
+          return { status: 'RESUMABLE', record }
+        }
       }
       if (!sidecar) await this._writeRecord(record)
       await this._removeFile(this._sessionPath(id), this.layout.sessions)
@@ -1784,7 +1812,7 @@ class CommitStore {
     if (!journal) return { status: 'MISSING' }
     if (isDirectoryJournal(journal)) {
       return withNameLease(this.layout.root, journal.name, () =>
-        this._recoverDirectoryJournal(id, journal, sessionStore)
+        this._recoverDirectoryJournal(id, journal, sessionStore, isAuthorized)
       )
     }
     if (isReplacementJournal(journal)) {

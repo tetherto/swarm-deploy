@@ -19,7 +19,7 @@ import { validateAndExtractTreeTar } from '../tar-protocol/tree-extract.js'
 import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
 import { assertTreeMetadataTransferId } from '../tar-protocol/tree-manifest.js'
 import { atomicWriteRenamed, MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
-import { readCommitJournal } from './commit-journal.js'
+import { isDirectoryJournal, readCommitJournal } from './commit-journal.js'
 import { assertSafeFile, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
 import { createTreeStagingTarget } from './tree-staging.js'
 import { digestTree, inspectTreePath, removeTree } from './tree-fs.js'
@@ -497,6 +497,22 @@ export class TarSessionStore {
     if (state !== 'DIRECTORY') throw problem('Session is not verified')
   }
 
+  /** Verified directory sessions mid-commit may only have a durable journal tree. */
+  private async assertVerifiedDirectorySession(session: TarSession): Promise<void> {
+    const treeState = await inspectTreePath(
+      this.treeStagingPath(session.id),
+      this.layout.staging,
+      this.storage,
+      { layout: this.layout }
+    )
+    if (treeState === 'DIRECTORY') {
+      await this.assertStagedTree(session)
+      return
+    }
+    const journal = await readCommitJournal(session.id, this.layout, this.storage)
+    if (!journal || !isDirectoryJournal(journal)) throw problem('Session is not verified')
+  }
+
   private async purgeCorruptSession(id: string): Promise<void> {
     await this.remove(this.tarPath(id), this.layout.staging)
     await this.remove(this.sessionPath(id), this.layout.sessions)
@@ -638,7 +654,26 @@ export class TarSessionStore {
             await this.writeSession(session)
           }
         } else if (session.kind === 'directory') {
-          await this.assertStagedTree(session)
+          const treeState = await inspectTreePath(
+            this.treeStagingPath(id),
+            this.layout.staging,
+            this.storage,
+            { layout: this.layout }
+          )
+          if (treeState !== 'DIRECTORY') {
+            const journal = await readCommitJournal(id, this.layout, this.storage)
+            if (!journal || !isDirectoryJournal(journal)) {
+              await this.purgeCorruptSession(id)
+              if (treeState !== 'MISSING') {
+                await removeTree(this.treeStagingPath(id), this.layout.staging, this.storage, {
+                  layout: this.layout
+                }).catch(() => {})
+              }
+              continue
+            }
+          } else {
+            await this.assertVerifiedDirectorySession(session)
+          }
         } else {
           await assertSafeFile(this.filePath(id), this.storage)
         }
@@ -1068,7 +1103,7 @@ export class TarSessionStore {
       key(transferId, 'transfer ID')
       const session = this.sessions.get(hex(transferId))
       if (!session || session.state !== VERIFIED) throw problem('Session is not verified')
-      if (session.kind === 'directory') await this.assertStagedTree(session)
+      if (session.kind === 'directory') await this.assertVerifiedDirectorySession(session)
       else await assertSafeFile(this.filePath(session.id), this.storage)
       return session
     })
