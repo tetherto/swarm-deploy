@@ -2,9 +2,8 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest published release. This repository
-is preparing its initial `0.1.0` release; unreleased commits are not a supported
-production distribution.
+Security fixes are provided for the latest published release. Unreleased commits
+are not a supported production distribution.
 
 ## Report a vulnerability
 

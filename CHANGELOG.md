@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented here.
 
-## Unreleased
+## 0.2.0
 
 - **Behavior change.** A directory upload now commits exactly one recursive managed directory artifact instead of a batch of immediate-child file uploads. `BatchUploadResult`, `BatchUploadFailure`, `SkippedUploadEntry`, `SkippedUploadReason`, and the client `skipped` event are removed, `ClientUploadResult` is now `UploadResult`, and `UploadResult` gains `kind` and, for a directory, `entryCount`. Direct file upload stays byte-compatible. Automation that relied on per-child results must now treat the directory as one artifact.
 - Add recursive directory artifacts: a canonical deterministic multi-entry USTAR archive with normalized file mode `0644`, directory mode `0755`, fixed uid, gid, mtime, uname, and gname; bytewise entry ordering with parents before children; empty directories preserved; and symlinks, hardlinks, devices, sockets, FIFOs, cycles, traversal, duplicate, and case-fold-colliding paths rejected. Limits are 100 UTF-8 bytes per component, 100 UTF-8 bytes per stored TAR name, depth 32, 10,000 entries, `maxFileBytes` aggregate payload, and `maxStagingBytes` aggregate staging.
