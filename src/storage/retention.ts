@@ -112,6 +112,11 @@ interface RetentionManagerOptions {
    * already held; it must not acquire the root lease itself.
    */
   reconcileLinks?: (records: CommitRecord[]) => Promise<ReadonlySet<string>>
+  /**
+   * When link reconciliation fails, returns transfer IDs that must stay pinned
+   * from desired links and durable ownership records.
+   */
+  linkPinsFallback?: (records: CommitRecord[]) => Promise<ReadonlySet<string>>
   /** Names in the storage root that are server-managed symlinks, not artifacts. */
   managedLinkNames?: () => ReadonlySet<string>
   logger?: Logger | null
@@ -324,6 +329,7 @@ class RetentionManager {
   hasActiveUploads: () => boolean
   isPinned: (record: CommitRecord) => boolean
   reconcileLinks: ((records: CommitRecord[]) => Promise<ReadonlySet<string>>) | undefined
+  linkPinsFallback: ((records: CommitRecord[]) => Promise<ReadonlySet<string>>) | undefined
   managedLinkNames: (() => ReadonlySet<string>) | undefined
   logger: Logger | null
   timer: unknown | null
@@ -352,6 +358,7 @@ class RetentionManager {
     hasActiveUploads = () => false,
     isPinned = () => false,
     reconcileLinks,
+    linkPinsFallback,
     managedLinkNames,
     logger = null,
     scheduler = { setInterval, clearInterval },
@@ -389,6 +396,9 @@ class RetentionManager {
     if (reconcileLinks !== undefined && typeof reconcileLinks !== 'function') {
       throw storageError('Invalid link reconciliation callback')
     }
+    if (linkPinsFallback !== undefined && typeof linkPinsFallback !== 'function') {
+      throw storageError('Invalid link pin fallback callback')
+    }
     if (managedLinkNames !== undefined && typeof managedLinkNames !== 'function') {
       throw storageError('Invalid managed link name callback')
     }
@@ -424,6 +434,7 @@ class RetentionManager {
     this.hasActiveUploads = hasActiveUploads
     this.isPinned = isPinned
     this.reconcileLinks = reconcileLinks
+    this.linkPinsFallback = linkPinsFallback
     this.managedLinkNames = managedLinkNames
     this.logger = logger
     this.timer = null
@@ -564,7 +575,7 @@ class RetentionManager {
     const trigger = options.trigger || 'manual'
     try {
       const result = await this._run(options)
-      this.cleanupFailure = null
+      if (!this.cleanupFailure) this.cleanupFailure = null
       this._emit({ trigger, status: 'completed', ...result })
       return result
     } catch (err) {
@@ -574,7 +585,10 @@ class RetentionManager {
     }
   }
 
-  async _run({ incomingBytes = 0 }: RetentionRunOptions = {}): Promise<RetentionResult> {
+  async _run({
+    incomingBytes = 0,
+    trigger = 'manual'
+  }: RetentionRunOptions = {}): Promise<RetentionResult> {
     assertSafeUint(incomingBytes, 'incomingBytes')
     if (this.maxStorageBytes !== undefined && incomingBytes > this.maxStorageBytes) {
       throw new SwarmDeployError(
@@ -586,9 +600,21 @@ class RetentionManager {
     const expiredSessions = await this.expireSessions()
     const scrub = await this.scrubCommitted({ hash: false })
     const current = scrub.records.slice()
-    const linkPinned = this.reconcileLinks
-      ? await this.reconcileLinks(current.slice())
-      : new Set<string>()
+    let linkPinned = new Set<string>()
+    let linkReconcileError: unknown = null
+    if (this.reconcileLinks) {
+      try {
+        linkPinned = new Set(await this.reconcileLinks(current.slice()))
+      } catch (err) {
+        linkReconcileError = err
+        if (this.linkPinsFallback) {
+          linkPinned = new Set(await this.linkPinsFallback(current.slice()))
+        }
+        report(this.logger, 'warn', 'Managed link reconciliation failed during retention', {
+          reason: errorMessage(err)
+        })
+      }
+    }
     const pinned = (record: CommitRecord): boolean =>
       this._isPinned(record) || linkPinned.has(record.transferId)
     let ageDeleted = 0
@@ -639,6 +665,10 @@ class RetentionManager {
         storageDeleted++
       }
       if (total > permitted) throw storageError('Unable to reserve committed storage capacity')
+    }
+    if (linkReconcileError) {
+      this.cleanupFailure = linkReconcileError
+      if (trigger !== 'commit') throw linkReconcileError
     }
     return {
       expiredSessions,

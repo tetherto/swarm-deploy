@@ -493,8 +493,22 @@ export class Server extends EventEmitter {
   private async reconcileLinksUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
     if (this.symlinks.length === 0 || !this.links) return new Set()
     const desired = selectDesiredLinks(this.symlinks, records)
-    await this.links.reconcile(desired, this.linkNames)
+    await this.links.reconcile(desired, this.linkNames, {
+      managedArtifactNames: new Set(records.map((record) => record.name))
+    })
     return new Set(desired.map((link) => link.transferId))
+  }
+
+  /** Pins link targets when reconciliation fails but retention must continue. */
+  private async linkPinsFallbackUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
+    const pins = new Set(selectDesiredLinks(this.symlinks, records).map((link) => link.transferId))
+    if (!this.links) return pins
+    for (const ledger of await this.links.list()) {
+      pins.add(ledger.transferId)
+      const target = records.find((record) => record.name === ledger.target)
+      if (target) pins.add(target.transferId)
+    }
+    return pins
   }
 
   /** Reconciles after a durable commit; this is the only caller that leases the root. */
@@ -1062,6 +1076,7 @@ export class Server extends EventEmitter {
         isPinned: (record) => this.replaceNames.has(record.name),
         managedLinkNames: () => this.linkNames,
         reconcileLinks: (records) => this.reconcileLinksUnlocked(records),
+        linkPinsFallback: (records) => this.linkPinsFallbackUnlocked(records),
         logger: this.logger,
         onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })

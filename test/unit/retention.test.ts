@@ -13,6 +13,8 @@ import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import type { CommitRecord } from '../../dist/storage/commit-journal.js'
 import { RetentionManager } from '../../dist/storage/retention.js'
+import { LinkStore } from '../../dist/storage/link-store.js'
+import { compileSymlinkRules, selectDesiredLinks } from '../../dist/symlinks.js'
 import { recoverStorage } from '../../dist/storage/recovery.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import {
@@ -72,6 +74,7 @@ interface Harness {
   commits: CommitStore
   input(name: string, content: Buffer): Promise<{ metadata: MetadataRecord; archive: Buffer }>
   stage(name: string, content: Buffer): Promise<TarSession>
+  stageTree(name: string, spec: Record<string, string>): Promise<TarSession>
   publish(
     name: string,
     content: Buffer,
@@ -175,6 +178,7 @@ async function createHarness(
     commits,
     input,
     stage,
+    stageTree,
     async publish(name, content, mutable = false, release) {
       const session = await stage(name, content)
       const record = await commits.commit(session, {
@@ -962,6 +966,81 @@ test('scrub ignores a configured managed link name instead of reporting it unkno
     .scrubCommitted({ hash: false })
   t.alike(scrub.unknown, [])
   t.is(scrub.records.length, 1)
+})
+
+test('a dormant managed link is removed before retention deletes its old target', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publishTree('0.18.0', { 'a.bin': 'a' })
+  harness.clock.advance(10)
+  await harness.publishTree('0.18.1', { 'a.bin': 'b' })
+  const links = new LinkStore({ layout: harness.layout })
+  const rules = compileSymlinkRules([{ selector: '/^0\\.18\\.0$/', name: 'latest' }])
+  await links.reconcile(
+    selectDesiredLinks(rules, await harness.commits.list()),
+    new Set(['latest'])
+  )
+  const rulesV2 = compileSymlinkRules([{ selector: '/^0\\.18\\.1$/', name: 'latest' }])
+  const manager = harness.manager({
+    maxAge: 1,
+    reconcileLinks: async (records) => {
+      await links.reconcile(selectDesiredLinks(rulesV2, records), new Set(['latest']), {
+        managedArtifactNames: new Set(records.map((record) => record.name))
+      })
+      return new Set(selectDesiredLinks(rulesV2, records).map((link) => link.transferId))
+    }
+  })
+  harness.clock.advance(100)
+  await manager.run()
+  t.is((await links.read('latest'))?.target, '0.18.1')
+  t.is(await exists(path.join(harness.layout.root, '0.18.0')), false)
+  t.ok(await exists(path.join(harness.layout.root, '0.18.1')))
+})
+
+test('retention still evicts over quota when link reconciliation conflicts', async (t) => {
+  const harness = await createHarness(t)
+  const old = await harness.publishTree('0.18.0', { 'a.bin': 'aa' })
+  harness.clock.advance(10)
+  const kept = await harness.publishTree('0.18.1', { 'a.bin': 'bb' })
+  const links = new LinkStore({ layout: harness.layout })
+  await links.reconcile(
+    [{ name: 'latest', target: '0.18.1', transferId: kept.transferId, targetKind: 'directory' }],
+    new Set(['latest'])
+  )
+  await fs.promises.unlink(path.join(harness.layout.root, 'latest'))
+  await fs.promises.writeFile(path.join(harness.layout.root, 'latest'), 'operator')
+  const rules = compileSymlinkRules([{ selector: '/^0\\.18\\.1$/', name: 'latest' }])
+  const manager = harness.manager({
+    maxStorageBytes: 3,
+    reconcileLinks: async (records) => {
+      await links.reconcile(selectDesiredLinks(rules, records), new Set(['latest']), {
+        managedArtifactNames: new Set(records.map((record) => record.name))
+      })
+      return new Set()
+    },
+    linkPinsFallback: async (records) => {
+      const pins = new Set<string>()
+      for (const ledger of await links.list()) {
+        pins.add(ledger.transferId)
+        const target = records.find((record) => record.name === ledger.target)
+        if (target) pins.add(target.transferId)
+      }
+      return pins
+    }
+  })
+  await t.exception(() => manager.run(), { code: ERRORS.LINK_CONFLICT })
+  t.is(manager.cleanupFailure !== null, true)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId),
+    [kept.transferId]
+  )
+  t.is(await exists(path.join(harness.layout.root, '0.18.0')), false)
+  t.is(await exists(path.join(harness.layout.root, '0.18.1')), true)
+  t.is(await fs.promises.readFile(path.join(harness.layout.root, 'latest'), 'utf8'), 'operator')
+
+  const session = await harness.stageTree('0.18.2', { 'a.bin': 'c' })
+  await harness.commits.commit(session, { retentionManager: manager })
+  await harness.sessions.retireCommitted(session.transferId)
+  t.ok(await exists(path.join(harness.layout.root, '0.18.2')))
 })
 
 test('commit defers post-commit retention only when asked and keeps pre-commit checks', async (t) => {
