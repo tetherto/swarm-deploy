@@ -518,8 +518,10 @@ test('revalidateTreeSnapshot detects source changes as FILE_BUSY', async (t) => 
   await writeTree(inodeRoot, { 'dir/': '' })
   const inodeSnap = await snapshotTree(inodeRoot)
   const dirEntry = inodeSnap.entries[0]
-  await fs.promises.rm(dirEntry.absolutePath, { recursive: true })
+  // Keep the old directory alive so Linux cannot hand its inode to the replacement.
+  await fs.promises.rename(dirEntry.absolutePath, path.join(inodeRoot, 'held'))
   await fs.promises.mkdir(dirEntry.absolutePath)
+  await fs.promises.rm(path.join(inodeRoot, 'held'), { recursive: true })
   await t.exception(() => revalidateTreeSnapshot(inodeSnap), { code: ERRORS.FILE_BUSY })
 
   const symlinkRoot = await createTempDir(t)
