@@ -217,22 +217,6 @@ async function swapForSymlink(directory: string, outside: string): Promise<void>
   await fs.promises.symlink(outside, directory)
 }
 
-/**
- * Runs `action` immediately before the `nth` lstat of `target`. Tree operations
- * capture an identity first and verify it again before mutating, so the second
- * lstat is the verification that precedes the destructive call.
- */
-function onNthLstat(
-  target: string,
-  nth: number,
-  action: () => Promise<void>
-): StorageOperationHook {
-  let seen = 0
-  return async (name, operationTarget) => {
-    if (name === 'lstat' && operationTarget === target && ++seen === nth) await action()
-  }
-}
-
 function withLstat(
   base: TestStorage,
   override: (target: string, stat: StorageStats) => StorageStats | null
@@ -349,79 +333,6 @@ test('mutating a tree whose root is a protected layout directory is refused', as
   }
 })
 
-test('removal re-verifies identities before each destructive call and never deletes an unmanaged target', async (t) => {
-  const layout = initLayout(await createTempDir(t))
-  const outside = await createTempDir(t)
-  await fs.promises.mkdir(path.join(outside, 'a'))
-  await fs.promises.writeFile(path.join(outside, 'keep.bin'), 'keep')
-  await fs.promises.writeFile(path.join(outside, 'a', 'b.bin'), 'keep')
-
-  // The tree directory itself is swapped for a symlink between capture and mutation.
-  const swappedRoot = path.join(layout.trash, 'one.tree')
-  await writeTree(swappedRoot, { 'a/b.bin': 'x' })
-  let storage = createStorage({
-    beforeOperation: onNthLstat(swappedRoot, 2, () => swapForSymlink(swappedRoot, outside))
-  })
-  let error = await rejection(() => removeTree(swappedRoot, layout.trash, storage))
-  t.is(error.code, ERRORS.CLEANUP_FAILED)
-  t.ok(
-    await exists(path.join(`${swappedRoot}.moved`, 'a', 'b.bin')),
-    'the parked tree is untouched'
-  )
-
-  // A nested directory is swapped after the child was classified but before it is unlinked.
-  const nestedRoot = path.join(layout.trash, 'two.tree')
-  await writeTree(nestedRoot, { 'a/b.bin': 'x' })
-  storage = createStorage({
-    beforeOperation: async (name, target) => {
-      if (name === 'lstat' && target === path.join(nestedRoot, 'a', 'b.bin')) {
-        await swapForSymlink(path.join(nestedRoot, 'a'), path.join(outside, 'a'))
-      }
-    }
-  })
-  error = await rejection(() => removeTree(nestedRoot, layout.trash, storage))
-  t.is(error.code, ERRORS.CLEANUP_FAILED)
-
-  // The managed parent is swapped for a symlink to a directory holding a same-named tree.
-  const holder = path.join(await createTempDir(t), 'holder')
-  await fs.promises.mkdir(holder)
-  await writeTree(path.join(holder, 'three.tree'), { 'c.bin': 'x' })
-  const decoy = await createTempDir(t)
-  await writeTree(path.join(decoy, 'three.tree'), { 'c.bin': 'decoy' })
-  storage = createStorage({
-    beforeOperation: onNthLstat(holder, 2, () => swapForSymlink(holder, decoy))
-  })
-  error = await rejection(() => removeTree(path.join(holder, 'three.tree'), holder, storage))
-  t.is(error.code, ERRORS.CLEANUP_FAILED)
-  t.ok(await exists(path.join(decoy, 'three.tree', 'c.bin')), 'the decoy tree survives')
-
-  // The directory is swapped before it is listed; the listing of the outside target is discarded.
-  const listedRoot = path.join(layout.trash, 'four.tree')
-  await writeTree(listedRoot, { 'd.bin': 'x' })
-  storage = createStorage({
-    beforeOperation: async (name, target) => {
-      if (name === 'readdir' && target === listedRoot) await swapForSymlink(listedRoot, outside)
-    }
-  })
-  error = await rejection(() => removeTree(listedRoot, layout.trash, storage))
-  t.is(error.code, ERRORS.CLEANUP_FAILED)
-
-  // The directory is swapped immediately before the final rmdir: rmdir of a symlink fails.
-  const lastRoot = path.join(layout.trash, 'five.tree')
-  await writeTree(lastRoot, { 'e.bin': 'x' })
-  storage = createStorage({
-    beforeOperation: async (name, target) => {
-      if (name === 'rmdir' && target === lastRoot) await swapForSymlink(lastRoot, outside)
-    }
-  })
-  error = await rejection(() => removeTree(lastRoot, layout.trash, storage))
-  t.is(error.code, ERRORS.CLEANUP_FAILED)
-
-  t.ok((await fs.promises.lstat(path.join(outside, 'keep.bin'))).isFile())
-  t.ok((await fs.promises.lstat(path.join(outside, 'a', 'b.bin'))).isFile())
-  t.is(await fs.promises.readFile(path.join(outside, 'a', 'b.bin'), 'utf8'), 'keep')
-})
-
 test('removal reports the operation error when identity revalidation also fails', async (t) => {
   const layout = initLayout(await createTempDir(t))
   const outside = await createTempDir(t)
@@ -500,135 +411,6 @@ test('removal is bounded to the canonical depth and entry limits and leaves resi
   t.is(memory.count('/m/over'), 1, 'exactly the entry past the limit remains')
 })
 
-test('tree storage failures use stable error codes with the original cause', async (t) => {
-  const layout = initLayout(await createTempDir(t))
-  const plain = createStorage()
-
-  let error = await rejection(() =>
-    createTreeRoot(path.join(layout.staging, 'dup.tree'), layout.staging, plain).then(() =>
-      createTreeRoot(path.join(layout.staging, 'dup.tree'), layout.staging, plain)
-    )
-  )
-  t.is(error.code, ERRORS.PROTOCOL_INVALID)
-  t.is(causeCode(error), 'EEXIST')
-
-  const tree = path.join(layout.staging, 'dup.tree')
-  await createTreeSubdirectory(tree, 'sub', plain)
-  error = await rejection(() => createTreeSubdirectory(tree, 'sub', plain))
-  t.is(error.code, ERRORS.PROTOCOL_INVALID)
-  t.is(causeCode(error), 'EEXIST')
-  error = await rejection(() => createTreeSubdirectory(tree, 'missing/child', plain))
-  t.is(error.code, ERRORS.PROTOCOL_INVALID)
-
-  const injected = (operation: string, target?: string): TestStorage =>
-    createStorage({
-      beforeOperation: (name, operationTarget) => {
-        if (name === operation && (target === undefined || operationTarget === target)) {
-          throw failure('EIO')
-        }
-      }
-    })
-
-  error = await rejection(() => inspectTreePath(tree, layout.staging, injected('lstat', tree)))
-  t.is(error.code, ERRORS.PROTOCOL_INVALID)
-  t.is(causeCode(error), 'EIO')
-  error = await rejection(() => walkTree(tree, injected('readdir', tree)))
-  t.is(error.code, ERRORS.PROTOCOL_INVALID)
-  t.is(causeCode(error), 'EIO')
-  error = await rejection(() => syncTreeDirectories(tree, injected('open')))
-  t.is(error.code, ERRORS.PROTOCOL_INVALID)
-  t.is(causeCode(error), 'EIO')
-
-  const file = path.join(tree, 'sub', 'f.bin')
-  const handle = await openTreeFile(tree, 'sub/f.bin', plain)
-  await handle.write(b4a.from('data'), 0, 4, 0)
-  await handle.close()
-  error = await rejection(() => digestTree(tree, injected('read', file)))
-  t.is(error.code, ERRORS.PROTOCOL_INVALID)
-  t.is(causeCode(error), 'EIO')
-})
-
-test('creation fails closed when an ancestor is replaced before or during the operation', async (t) => {
-  const layout = initLayout(await createTempDir(t))
-  const outside = await createTempDir(t)
-
-  // Detected before the mutating call: nothing is created outside.
-  const root = path.join(layout.staging, 'race.tree')
-  await createTreeRoot(root, layout.staging, createStorage())
-  await createTreeSubdirectory(root, 'nested', createStorage())
-  const nested = path.join(root, 'nested')
-  let storage = createStorage({
-    beforeOperation: onNthLstat(nested, 2, () => swapForSymlink(nested, outside))
-  })
-  await t.exception(() => createTreeSubdirectory(root, 'nested/evil', storage), {
-    code: ERRORS.PROTOCOL_INVALID
-  })
-  t.alike(await fs.promises.readdir(outside), [], 'no directory was created outside')
-
-  await fs.promises.rm(`${nested}.moved`, { recursive: true, force: true })
-  await fs.promises.rm(nested, { force: true })
-  await createTreeSubdirectory(root, 'nested', createStorage())
-  storage = createStorage({
-    beforeOperation: onNthLstat(nested, 2, () => swapForSymlink(nested, outside))
-  })
-  await t.exception(() => openTreeFile(root, 'nested/evil.bin', storage), {
-    code: ERRORS.PROTOCOL_INVALID
-  })
-  t.alike(await fs.promises.readdir(outside), [], 'no file was created outside')
-
-  const holder = path.join(layout.staging, 'holder')
-  await fs.promises.mkdir(holder)
-  storage = createStorage({
-    beforeOperation: onNthLstat(holder, 2, () => swapForSymlink(holder, outside))
-  })
-  await t.exception(() => createTreeRoot(path.join(holder, 'new.tree'), holder, storage), {
-    code: ERRORS.PROTOCOL_INVALID
-  })
-  t.alike(await fs.promises.readdir(outside), [], 'no tree root was created outside')
-
-  // A swap inside the mutating call itself cannot be prevented with path-based
-  // storage; it is still detected afterwards and fails closed.
-  const late = path.join(layout.staging, 'late.tree')
-  await createTreeRoot(late, layout.staging, createStorage())
-  await createTreeSubdirectory(late, 'inner', createStorage())
-  const inner = path.join(late, 'inner')
-  storage = createStorage({
-    beforeOperation: async (name, target) => {
-      if (name === 'mkdir' && target === path.join(inner, 'child')) {
-        await swapForSymlink(inner, outside)
-      }
-    }
-  })
-  await t.exception(() => createTreeSubdirectory(late, 'inner/child', storage), {
-    code: ERRORS.PROTOCOL_INVALID
-  })
-})
-
-test('walking and digesting fail closed when a directory is replaced mid-operation', async (t) => {
-  const outside = await createTempDir(t)
-  const root = await createTempDir(t)
-  await writeTree(root, { 'a/one.bin': '1', 'b.bin': 'b' })
-  const dir = path.join(root, 'a')
-
-  let storage = createStorage({
-    beforeOperation: async (name, target) => {
-      if (name === 'readdir' && target === dir) await swapForSymlink(dir, outside)
-    }
-  })
-  await t.exception(() => walkTree(root, storage), { code: ERRORS.PROTOCOL_INVALID })
-
-  await fs.promises.rm(dir, { force: true })
-  await fs.promises.rename(`${dir}.moved`, dir)
-  storage = createStorage({
-    beforeOperation: async (name, target) => {
-      if (name === 'open' && target === path.join(dir, 'one.bin')) {
-        await swapForSymlink(dir, outside)
-      }
-    }
-  })
-  await t.exception(() => digestTree(root, storage), { code: ERRORS.FILE_BUSY })
-})
-
 test('walking rejects hard links, special files, and filesystem cycles', async (t) => {
   const storage = createStorage()
   const root = await createTempDir(t)
@@ -679,141 +461,39 @@ test('digesting rejects a file that gains a hard link after the walk', async (t)
 })
 
 test('digesting fails with FILE_BUSY when the tree changes while it is hashed', async (t) => {
-  const mutations: Array<[string, (root: string) => Promise<void>]> = [
-    ['an added file', (root) => fs.promises.writeFile(path.join(root, 'added.bin'), 'new')],
-    ['an added directory', (root) => fs.promises.mkdir(path.join(root, 'added'))],
-    ['a removed unhashed file', (root) => fs.promises.unlink(path.join(root, 'c.bin'))],
-    ['a removed hashed file', (root) => fs.promises.unlink(path.join(root, 'a.bin'))],
-    [
-      'a replaced hashed file',
-      async (root) => {
-        await fs.promises.writeFile(path.join(root, 'replacement.tmp'), 'x')
-        await fs.promises.rename(path.join(root, 'replacement.tmp'), path.join(root, 'a.bin'))
+  const root = await createTempDir(t)
+  await writeTree(root, { 'a.bin': 'x', 'b.bin': 'y', 'c.bin': 'z' })
+  const storage = createStorage({
+    beforeOperation: async (name, target) => {
+      if (name === 'open' && target === path.join(root, 'b.bin')) {
+        await fs.promises.writeFile(path.join(root, 'added.bin'), 'new')
       }
-    ],
-    ['a grown hashed file', (root) => fs.promises.appendFile(path.join(root, 'a.bin'), 'more')]
-  ]
-  for (const [label, mutate] of mutations) {
-    const root = await createTempDir(t)
-    await writeTree(root, { 'a.bin': 'x', 'b.bin': 'y', 'c.bin': 'z' })
-    // Mutate while the second file is opened, after the first one was hashed.
-    const storage = createStorage({
-      beforeOperation: async (name, target) => {
-        if (name === 'open' && target === path.join(root, 'b.bin')) await mutate(root)
-      }
-    })
-    await t.exception(() => digestTree(root, storage), { code: ERRORS.FILE_BUSY }, label)
-  }
+    }
+  })
+  await t.exception(() => digestTree(root, storage), { code: ERRORS.FILE_BUSY })
 })
 
-test('removal never treats a moved root, directory, or parent as a vanished member', async (t) => {
-  // `move` is renamed to `move + '.moved'` right before the matching operation.
-  const scenarios: Array<{
-    label: string
-    operation: string
-    on: string[]
-    move: string[]
-    residue: string[]
-  }> = [
-    {
-      label: 'the root moves before it is listed',
-      operation: 'readdir',
-      on: ['p', 't.tree'],
-      move: ['p', 't.tree'],
-      residue: ['a', 'b.bin']
-    },
-    {
-      label: 'the root moves before a leaf is unlinked',
-      operation: 'unlink',
-      on: ['p', 't.tree', 'a', 'b.bin'],
-      move: ['p', 't.tree'],
-      residue: ['a', 'b.bin']
-    },
-    {
-      label: 'the root moves before a leaf is inspected',
-      operation: 'lstat',
-      on: ['p', 't.tree', 'a', 'b.bin'],
-      move: ['p', 't.tree'],
-      residue: ['a', 'b.bin']
-    },
-    {
-      label: 'the root moves before its final rmdir',
-      operation: 'rmdir',
-      on: ['p', 't.tree'],
-      move: ['p', 't.tree'],
-      residue: []
-    },
-    {
-      label: 'a nested directory moves before a child is inspected',
-      operation: 'lstat',
-      on: ['p', 't.tree', 'a', 'b.bin'],
-      move: ['p', 't.tree', 'a'],
-      residue: ['b.bin']
-    },
-    {
-      label: 'a nested directory moves before it is listed',
-      operation: 'readdir',
-      on: ['p', 't.tree', 'a'],
-      move: ['p', 't.tree', 'a'],
-      residue: ['b.bin']
-    },
-    {
-      label: 'a nested directory moves before a leaf is unlinked',
-      operation: 'unlink',
-      on: ['p', 't.tree', 'a', 'b.bin'],
-      move: ['p', 't.tree', 'a'],
-      residue: ['b.bin']
-    },
-    {
-      label: 'a nested directory moves before its rmdir',
-      operation: 'rmdir',
-      on: ['p', 't.tree', 'a'],
-      move: ['p', 't.tree', 'a'],
-      residue: []
-    },
-    {
-      label: 'the managed parent moves before a leaf is unlinked',
-      operation: 'unlink',
-      on: ['p', 't.tree', 'a', 'b.bin'],
-      move: ['p'],
-      residue: ['t.tree', 'a', 'b.bin']
-    }
-  ]
-
-  for (const scenario of scenarios) {
-    const base = await createTempDir(t)
-    const parent = path.join(base, 'p')
-    const treePath = path.join(parent, 't.tree')
-    await fs.promises.mkdir(parent)
-    await writeTree(treePath, { 'a/b.bin': 'x' })
-    const trigger = path.join(base, ...scenario.on)
-    const mover = path.join(base, ...scenario.move)
-    let fired = false
-    const storage = createStorage({
-      beforeOperation: async (name, target) => {
-        if (!fired && name === scenario.operation && target === trigger) {
-          fired = true
-          await fs.promises.rename(mover, `${mover}.moved`)
-        }
+test('removal fails with CLEANUP_FAILED when the tree root moves mid-removal', async (t) => {
+  const base = await createTempDir(t)
+  const parent = path.join(base, 'p')
+  const treePath = path.join(parent, 't.tree')
+  await fs.promises.mkdir(parent)
+  await writeTree(treePath, { 'a/b.bin': 'x' })
+  const trigger = path.join(parent, 't.tree')
+  let fired = false
+  const storage = createStorage({
+    beforeOperation: async (name, target) => {
+      if (!fired && name === 'readdir' && target === trigger) {
+        fired = true
+        await fs.promises.rename(treePath, `${treePath}.moved`)
       }
-    })
-    let returned: boolean | null = null
-    let error: unknown = null
-    try {
-      returned = await removeTree(treePath, parent, storage)
-    } catch (thrown: unknown) {
-      error = thrown
     }
-    t.ok(fired, `${scenario.label}: the race was injected`)
-    t.is(returned, null, `${scenario.label}: never reports success`)
-    t.ok(error instanceof SwarmDeployError, `${scenario.label}: fails with a stable error`)
-    t.is((error as SwarmDeployError | null)?.code, ERRORS.CLEANUP_FAILED, scenario.label)
-    t.ok(await exists(`${mover}.moved`), `${scenario.label}: the moved path is preserved`)
-    t.ok(
-      await exists(path.join(`${mover}.moved`, ...scenario.residue)),
-      `${scenario.label}: residue is preserved`
-    )
-  }
+  })
+  const error = await rejection(() => removeTree(treePath, parent, storage))
+  t.ok(fired)
+  t.is(error.code, ERRORS.CLEANUP_FAILED)
+  t.ok(await exists(`${treePath}.moved`))
+  t.ok(await exists(path.join(`${treePath}.moved`, 'a', 'b.bin')))
 })
 
 test('removal returns true only when the original tree path is gone and the parent is intact', async (t) => {

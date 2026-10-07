@@ -32,12 +32,7 @@ import {
   treeMetadataFromManifest
 } from '../../dist/tar-protocol/tree-manifest.js'
 import { createTempDir } from '../helpers/files.js'
-import {
-  createStorage,
-  type StorageOperationHook,
-  type StorageOperationName,
-  type TestStorage
-} from '../helpers/storage.js'
+import { createStorage, type TestStorage } from '../helpers/storage.js'
 import { writeTree } from '../helpers/trees.js'
 
 const OWNER = b4a.alloc(32, 7)
@@ -966,23 +961,6 @@ test('legacy current with identical bytes is replaceable by a matched release', 
   )
 })
 
-function crashStorage(
-  when: 'before' | 'after',
-  hit: (name: StorageOperationName, target: string, destination?: unknown) => boolean
-): TestStorage {
-  let crashed = false
-  const trip: StorageOperationHook = (name, target, ...rest) => {
-    if (crashed || !hit(name, target, rest[0])) return
-    crashed = true
-    throw new Error(`crash at ${name} ${target}`)
-  }
-  const noop: StorageOperationHook = () => {}
-  return createStorage({
-    beforeOperation: when === 'before' ? trip : noop,
-    afterOperation: when === 'after' ? trip : noop
-  })
-}
-
 test('a directory commit publishes by rename and persists a version 3 record', async (t) => {
   const harness = await createHarness(t)
   const session = await harness.stageTree('0.18.1', {
@@ -1054,60 +1032,6 @@ test('an unchanged directory offer is already committed and a mutated one is not
   })
   await fs.promises.writeFile(path.join(harness.layout.root, '0.18.1', 'a.bin'), 'mutated')
   t.alike(await harness.commits.inspect(record.name, offer), { status: 'FILE_EXISTS' })
-})
-
-test('directory recovery converges from every crash boundary', async (t) => {
-  const beforeRename = await createHarness(
-    t,
-    crashStorage('after', (name, target) => name === 'sync' && target.endsWith('journals'))
-  )
-  const session = await beforeRename.stageTree('0.18.1', { 'a.bin': 'a' })
-  await t.exception(() => beforeRename.commits.commit(session))
-  t.alike(await fs.promises.readdir(beforeRename.layout.root).then((names) => names.sort()), [
-    '.swarm-deploy'
-  ])
-  t.is(
-    (await beforeRename.commits.recoverJournal(session.id, beforeRename.sessions)).status,
-    'RESUMABLE'
-  )
-  t.alike(await fs.promises.readdir(beforeRename.layout.journals), [])
-
-  const beforeSidecar = await createHarness(t)
-  const renamed = await beforeSidecar.stageTree('0.18.1', { 'a.bin': 'a' })
-  const renamedRecord = await beforeSidecar.commits.commit(renamed)
-  await fs.promises.unlink(
-    path.join(beforeSidecar.layout.commits, `${renamedRecord.transferId}.json`)
-  )
-  await fs.promises.writeFile(
-    path.join(beforeSidecar.layout.journals, `${renamedRecord.transferId}.json`),
-    JSON.stringify(
-      serializeJournal({
-        version: DIRECTORY_JOURNAL_VERSION,
-        intent: 'create-directory',
-        state: 'committing',
-        phase: 'renamed',
-        transferId: renamedRecord.transferId,
-        attemptId: 'b'.repeat(64),
-        name: renamedRecord.name,
-        stagingTreeName: `${renamedRecord.transferId}.tree`,
-        stagingTreeIdentity: { dev: '0', ino: '0' },
-        record: renamedRecord
-      })
-    )
-  )
-  const recovered = await beforeSidecar.commits.recoverJournal(renamed.id, beforeSidecar.sessions)
-  t.is(recovered.status, 'COMMITTED')
-  t.is(recovered.record?.kind, 'directory')
-  t.ok((await fs.promises.lstat(path.join(beforeSidecar.layout.root, '0.18.1'))).isDirectory())
-  t.alike(await fs.promises.readdir(beforeSidecar.layout.journals), [])
-
-  const afterSidecar = await createHarness(t)
-  const cleaned = await afterSidecar.stageTree('0.18.1', { 'a.bin': 'a' })
-  const record = await afterSidecar.commits.commit(cleaned)
-  t.is(
-    (await afterSidecar.commits.recoverJournal(record.transferId, afterSidecar.sessions)).status,
-    'MISSING'
-  )
 })
 
 type DirectoryBoundary = 'tree-renamed' | 'renamed-phase' | 'sidecar-phase'

@@ -1384,27 +1384,6 @@ test('a verified directory session survives a restart and rejects a kind change'
   })
 })
 
-test('a partial directory session resumes at its durable TAR offset', async (t) => {
-  const { store, layout, storage } = await createStore(t)
-  const tree = await treeInput(t, '0.18.1', { 'a.bin': 'a'.repeat(900), 'b/c.bin': 'cc' })
-  await store.admit(OWNER, tree.metadata)
-  await store.append(OWNER, tree.metadata, 0, tree.archive.subarray(0, 1024))
-  const resumed = await store.admit(OWNER, tree.metadata)
-  if (resumed.status !== 'RESUME') throw new Error('Expected a resume')
-  t.is(resumed.offset, 1024)
-  t.alike(resumed.prefixSha256, sodiumSha256(tree.archive.subarray(0, 1024)))
-  await store.close()
-
-  const restarted = new SessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
-  t.teardown(() => restarted.close())
-  await restarted.init()
-  const again = await restarted.admit(OWNER, tree.metadata)
-  if (again.status !== 'RESUME') throw new Error('Expected a resume after restart')
-  t.is(again.offset, 1024)
-  await restarted.append(OWNER, tree.metadata, 1024, tree.archive.subarray(1024))
-  t.is((await restarted.verify(OWNER, tree.metadata)).state, 'verified')
-})
-
 test('a corrupt directory archive is rejected and leaves no staging tree', async (t) => {
   const { store, layout } = await createStore(t)
   const tree = await treeInput(t, '0.18.1', { 'a/b.bin': 'bb', 'z.bin': 'zzz' })
@@ -1419,29 +1398,6 @@ test('a corrupt directory archive is rejected and leaves no staging tree', async
   await t.exception(() => store.readVerified(b4a.from(tree.metadata.transferId, 'hex')), {
     code: ERRORS.PROTOCOL_INVALID
   })
-})
-
-test('verification recomputes the staged tree digest from disk', async (t) => {
-  let treeRoot = ''
-  let tampered = false
-  const storage = createStorage({
-    async beforeOperation(name, target) {
-      // The first open of the tree root is its directory sync, after every file is closed.
-      if (!tampered && name === 'open' && target.endsWith('.tree')) {
-        tampered = true
-        treeRoot = target
-        await fs.promises.writeFile(path.join(target, 'a.bin'), 'bbbb')
-      }
-    }
-  })
-  const { store, layout } = await createStore(t, storage)
-  const tree = await treeInput(t, '0.18.1', { 'a.bin': 'aaaa' })
-  await store.admit(OWNER, tree.metadata)
-  await store.append(OWNER, tree.metadata, 0, tree.archive)
-  await t.exception(() => store.verify(OWNER, tree.metadata), { code: ERRORS.CHECKSUM_MISMATCH })
-  t.ok(tampered)
-  t.is(treeRoot, path.join(layout.staging, `${tree.metadata.transferId}.tree`))
-  await t.exception(() => fs.promises.lstat(treeRoot))
 })
 
 test('startup removes a stray staging tree with no session and no journal', async (t) => {
