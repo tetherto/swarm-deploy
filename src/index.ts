@@ -19,8 +19,19 @@ export {
   keyPairFromSeed,
   publicKeyFromSeed
 } from './identity.js'
+export type {
+  AfterCommitContext,
+  BeforeCommitContext,
+  HookArtifact,
+  HookFailureContext,
+  HookFailurePhase,
+  ServerHooks
+} from './hooks.js'
+export { fixedSeriesKey, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 export { parseAllowlist } from './allowlist.js'
-export type { SkippedUploadReason } from './files.js'
+export type { ArtifactKind } from './types.js'
+export type { UploadTarget } from './files.js'
+export type { SymlinkRule } from './symlinks.js'
 export {
   Server,
   type AllowlistKey,
@@ -39,8 +50,6 @@ export {
 } from './server.js'
 export {
   Client,
-  type BatchUploadFailure,
-  type BatchUploadResult,
   type ClientEvent,
   type ClientEventMap,
   type ClientEventName,
@@ -49,7 +58,6 @@ export {
   type ClientProgressEvent,
   type ClientResultEvent,
   type ClientUploadResult,
-  type SkippedUploadEntry,
   type UploadResult,
   type UploadStatus
 } from './client.js'
@@ -61,5 +69,6 @@ export type {
   StorageRmOptions,
   StorageStatFs,
   StorageStats,
-  StorageWriteResult
+  StorageWriteResult,
+  SymlinkCapableStorage
 } from './storage/types.js'

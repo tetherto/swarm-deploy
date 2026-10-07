@@ -1,8 +1,9 @@
 import b4a from 'b4a'
 import events from '#events'
 import fs from '#fs'
+import path from '#path'
 import sodium from 'sodium-native'
-import { createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
+import { abortError, createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
 import {
   DirectDhtServer,
   type DirectDhtFactory,
@@ -11,9 +12,24 @@ import {
 } from './direct-dht.js'
 import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
 import { validateReplaceNames } from './files.js'
+import {
+  callbackError,
+  hookError,
+  invokeHook,
+  snapshotHooks,
+  type AfterCommitContext,
+  type BeforeCommitContext,
+  type HookArtifact,
+  type HookFailureContext,
+  type HookFailurePhase,
+  type ServerHooks
+} from './hooks.js'
 import { keyPairFromSeed } from './identity.js'
+import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
+import { LinkStore } from './storage/link-store.js'
 import { acquireStorageLock, initLayout } from './storage/layout.js'
+import { withRootLease } from './storage/root-coordinator.js'
 import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
 import {
   RetentionManager,
@@ -21,16 +37,27 @@ import {
   DEFAULT_RESUME_TTL
 } from './storage/retention.js'
 import { SessionStore } from './storage/session-store.js'
-import type { StorageAdapter, StorageLayout } from './storage/types.js'
+import type { TarSession } from './storage/tar-session-store.js'
+import type { StorageAdapter, StorageLayout, SymlinkCapableStorage } from './storage/types.js'
+import { assertSymlinkCapable } from './storage/tree-fs.js'
 import {
-  decodeDirectMetadata,
-  DirectWireReader,
-  writeAdmission,
-  writeFinal
-} from './tar-protocol/direct-wire.js'
+  decodeAnyMetadataRecord,
+  isTreeMetadata,
+  type AnyMetadataRecord
+} from './tar-protocol/controls.js'
+import { DirectWireReader, writeAdmission, writeFinal } from './tar-protocol/direct-wire.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 import { assertMetadataTransferId } from './tar-protocol/manifest.js'
+import { assertTreeMetadataTransferId } from './tar-protocol/tree-manifest.js'
+import {
+  compileSymlinkRules,
+  selectDesiredLinks,
+  symlinkRuleNames,
+  type CompiledSymlinkRule,
+  type SymlinkRule
+} from './symlinks.js'
 import type {
+  ArtifactKind,
   AuthenticationEvent,
   FingerprintEvent,
   Logger,
@@ -41,6 +68,7 @@ import type {
   TransferEvent,
   TransferLifecycleEvent
 } from './types.js'
+import type { CommitRecord } from './storage/commit-journal.js'
 
 const EventEmitter = events.EventEmitter
 const DEFAULT_MAX_CONNECTIONS = 64
@@ -50,6 +78,16 @@ const MAX_CONNECTIONS = 1024
 const MAX_ACTIVE_UPLOADS = 1024
 const FINGERPRINT_LENGTH = 12
 const TAR_DURABILITY_BATCH_BYTES = 1024 * 1024
+
+/**
+ * How many transfers may owe a deferred post-commit retention pass at once.
+ *
+ * The set grows only when an `afterCommit` hook fails after a durable commit,
+ * and entries are removed as soon as a retry succeeds, so reaching the bound
+ * means a persistently failing hook. Capping it at the connection ceiling
+ * keeps a broken deployment step from growing server memory without limit.
+ */
+export const MAX_OWED_POST_COMMIT_RETENTION = MAX_CONNECTIONS
 
 export type ServerLogger = Logger
 export type AllowlistKey = PublicKeyInput | string
@@ -68,12 +106,21 @@ export interface ServerOptions {
   minFreeBytes?: number
   maxAge?: number
   maxStorageBytes?: number
+  /** Ordered release templates; when non-empty every new offer must match one. */
+  artifactPatterns?: Iterable<string>
+  maxCount?: number
+  maxVersions?: number
+  versionGranularity?: VersionGranularity
   dht?: DirectDhtNode
   dhtFactory?: DirectDhtFactory
   storage?: StorageAdapter
   scheduler?: ServerScheduler
   logger?: Logger | null
   replaceNames?: Iterable<string>
+  /** Optional deployment lifecycle callbacks; snapshotted at construction. */
+  hooks?: ServerHooks | null
+  /** Repeatable managed-symlink rules; snapshotted and validated at construction. */
+  symlinks?: Iterable<SymlinkRule>
 }
 
 export interface ServerConnectionEvent extends FingerprintEvent {
@@ -116,6 +163,8 @@ export interface RetentionEvent {
   expiredSessions?: number
   scrubbed?: number
   ageDeleted?: number
+  countDeleted?: number
+  versionDeleted?: number
   storageDeleted?: number
 }
 export interface ServerCloseEvent {
@@ -145,6 +194,7 @@ type Active = { owner: Buffer; transfer: string | null }
 function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(code, message, cause)
 }
+
 function codeOf(error: unknown): ErrorCode {
   return error instanceof SwarmDeployError &&
     Object.values(ERRORS).includes(error.code as ErrorCode)
@@ -204,6 +254,11 @@ export class Server extends EventEmitter {
   readonly minFreeBytes: number
   readonly maxAge: number | undefined
   readonly maxStorageBytes: number | undefined
+  readonly artifactPatterns: readonly string[]
+  readonly maxCount: number | undefined
+  readonly maxVersions: number | undefined
+  readonly versionGranularity: VersionGranularity | undefined
+  private readonly releaseMatcher: ReleaseMatcher
   private readonly allowedKeySnapshot: readonly Buffer[]
   readonly logger: SafeLogger
   readonly dht: DirectDhtNode | undefined
@@ -211,6 +266,10 @@ export class Server extends EventEmitter {
   readonly storage: StorageAdapter
   readonly scheduler: ServerScheduler
   readonly replaceNames: ReadonlySet<string>
+  readonly hooks: Readonly<ServerHooks>
+  readonly symlinks: readonly CompiledSymlinkRule[]
+  readonly linkNames: ReadonlySet<string>
+  private links: LinkStore | null = null
   listening = false
   closed = false
   private readonly keyPair
@@ -218,6 +277,24 @@ export class Server extends EventEmitter {
   private readonly abort = createAbortController()
   private readonly active = new Map<DirectDhtSocket, Active>()
   private readonly activeUploads = new Set<DirectDhtSocket>()
+  /**
+   * Transfer IDs this process committed but whose deferred post-commit
+   * retention is still owed because `afterCommit` has not yet succeeded. Only
+   * these may start a retention pass from an already-committed retry, so an
+   * ordinary duplicate offer cannot be used to force repeated full passes.
+   * The set is in-memory only and bounded by `MAX_OWED_POST_COMMIT_RETENTION`;
+   * a restart or an eviction loses an entry, and the documented fallback is the
+   * next startup, scheduled, or commit-triggered pass.
+   */
+  private readonly pendingAfterCommit = new Set<string>()
+  /**
+   * Authenticated transfer IDs a connection currently owns. One connection
+   * holds at most one entry and releases it in a `finally`, so the set is
+   * bounded by `maxConnections`. A second connection offering the same
+   * transfer is rejected with `FILE_BUSY` rather than running the lifecycle
+   * and its hooks concurrently against one staging and commit identity.
+   */
+  private readonly activeTransfers = new Set<string>()
   private readonly receives = new Set<Promise<void>>()
   private layout: StorageLayout | null = null
   private sessions: SessionStore | null = null
@@ -275,6 +352,36 @@ export class Server extends EventEmitter {
     }
     this.maxAge = options.maxAge
     this.maxStorageBytes = options.maxStorageBytes
+    const patterns = options.artifactPatterns ?? []
+    if (typeof (patterns as Iterable<unknown>)[Symbol.iterator] !== 'function') {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid artifact patterns')
+    }
+    try {
+      this.artifactPatterns = Object.freeze([...patterns])
+      this.releaseMatcher = new ReleaseMatcher(this.artifactPatterns)
+    } catch (error) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid artifact patterns', error)
+    }
+    if (options.maxCount !== undefined) {
+      positive(options.maxCount, 'maxCount')
+      if (this.releaseMatcher.size === 0) {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'maxCount requires artifact patterns')
+      }
+    }
+    if (options.maxVersions !== undefined) {
+      positive(options.maxVersions, 'maxVersions')
+      if (!this.releaseMatcher.hasVersionPattern) {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'maxVersions requires a {version} artifact pattern')
+      }
+      if (options.versionGranularity !== 'major' && options.versionGranularity !== 'minor') {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid versionGranularity')
+      }
+    } else if (options.versionGranularity !== undefined) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'versionGranularity requires maxVersions')
+    }
+    this.maxCount = options.maxCount
+    this.maxVersions = options.maxVersions
+    this.versionGranularity = options.versionGranularity
     const allow: Buffer[] = []
     if (
       !options.allowedKeys ||
@@ -295,8 +402,24 @@ export class Server extends EventEmitter {
     this.storage = options.storage || fs.promises
     this.scheduler = options.scheduler || { setTimeout, clearTimeout, setInterval, clearInterval }
     this.replaceNames = validateReplaceNames(options.replaceNames)
+    this.hooks = snapshotHooks(options.hooks)
+    this.symlinks = compileSymlinkRules(options.symlinks)
+    this.linkNames = symlinkRuleNames(this.symlinks)
+    if (this.symlinks.length > 0) assertSymlinkCapable(this.storage)
     this.logger = safeLogger(options.logger)
     this.signal = this.abort.signal
+  }
+
+  private artifactKind(metadata: AnyMetadataRecord): ArtifactKind {
+    return isTreeMetadata(metadata) ? 'directory' : 'file'
+  }
+
+  private payloadBytes(metadata: AnyMetadataRecord): number {
+    return isTreeMetadata(metadata) ? metadata.payloadBytes : metadata.fileSize
+  }
+
+  private payloadDigest(metadata: AnyMetadataRecord): string {
+    return isTreeMetadata(metadata) ? metadata.treeSha256 : metadata.fileSha256
   }
 
   private emitSafe(type: string, payload: Record<string, unknown>): void {
@@ -312,11 +435,129 @@ export class Server extends EventEmitter {
     }
     return accepted
   }
-  private transfer(metadata: { transferId: string; name: string; fileSize: number }) {
+  private transfer(metadata: AnyMetadataRecord) {
     return {
       transfer: fingerprint(b4a.from(metadata.transferId, 'hex')),
       name: metadata.name,
-      size: metadata.fileSize
+      kind: this.artifactKind(metadata),
+      size: this.payloadBytes(metadata)
+    }
+  }
+
+  private async rejectOffer(
+    socket: DirectDhtSocket,
+    event: ReturnType<Server['transfer']>,
+    owner: Uint8Array,
+    reason: ErrorCode
+  ): Promise<void> {
+    await writeAdmission(
+      socket,
+      { v: 1, status: 'REJECTED', code: reason },
+      { signal: this.signal, timeout: this.idleTimeout }
+    )
+    this.emitSafe('offer', {
+      ...event,
+      fingerprint: fingerprint(owner),
+      status: 'rejected',
+      reason
+    })
+  }
+
+  private hookArtifact(
+    metadata: AnyMetadataRecord,
+    release: ReleaseCoordinates | null
+  ): HookArtifact {
+    return Object.freeze({
+      name: metadata.name,
+      kind: this.artifactKind(metadata),
+      size: this.payloadBytes(metadata),
+      sha256: this.payloadDigest(metadata),
+      transferId: metadata.transferId,
+      ...(isTreeMetadata(metadata) ? { entryCount: metadata.entryCount } : {}),
+      ...(metadata.sourceParent === undefined ? {} : { sourceParent: metadata.sourceParent }),
+      ...(release === null
+        ? {}
+        : {
+            release: Object.freeze({
+              series: release.series,
+              ...(release.version === undefined ? {} : { version: release.version })
+            })
+          })
+    })
+  }
+
+  /**
+   * Computes and converges the desired links from durable commit records.
+   * Called with the root lease already held.
+   */
+  private async reconcileLinksUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
+    if (this.symlinks.length === 0 || !this.links) return new Set()
+    const desired = selectDesiredLinks(this.symlinks, records)
+    await this.links.reconcile(desired, this.linkNames, {
+      managedArtifactNames: new Set(records.map((record) => record.name))
+    })
+    return new Set(desired.map((link) => link.transferId))
+  }
+
+  /** Pins link targets when reconciliation fails but retention must continue. */
+  private async linkPinsFallbackUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
+    const pins = new Set(selectDesiredLinks(this.symlinks, records).map((link) => link.transferId))
+    if (!this.links) return pins
+    for (const ledger of await this.links.list()) {
+      pins.add(ledger.transferId)
+      const target = records.find((record) => record.name === ledger.target)
+      if (target) pins.add(target.transferId)
+    }
+    return pins
+  }
+
+  /** Reconciles after a durable commit; this is the only caller that leases the root. */
+  private async reconcileAfterCommit(): Promise<void> {
+    if (this.symlinks.length === 0 || !this.links || !this.commits) return
+    try {
+      await withRootLease(this.layout!.root, async () =>
+        this.reconcileLinksUnlocked(await this.commits!.list())
+      )
+    } catch (error) {
+      if (error instanceof SwarmDeployError && error.code === ERRORS.LINK_CONFLICT) throw error
+      throw new SwarmDeployError(ERRORS.LINK_FAILED, 'Unable to reconcile managed symlinks', error)
+    }
+  }
+
+  /** Runs a gating callback; only callback exceptions become HOOK_FAILED. */
+  private async runHook<Context>(
+    phase: 'beforeCommit' | 'afterCommit',
+    hook: ((context: Context) => void | Promise<void>) | undefined,
+    context: Context
+  ): Promise<void> {
+    if (hook === undefined) return
+    throwIfAborted(this.signal)
+    let outcome: 'completed' | 'aborted'
+    try {
+      outcome = await invokeHook(hook, context, this.signal)
+    } catch (cause) {
+      throw hookError(phase, cause)
+    }
+    if (outcome === 'aborted') throw abortError()
+  }
+
+  /** Runs onFailure once; its own failure is logged and never replaces the original. */
+  private async runFailureHook(
+    context: HookFailureContext,
+    owner: Uint8Array | null,
+    transfer: string
+  ): Promise<void> {
+    const hook = this.hooks.onFailure
+    if (hook === undefined) return
+    try {
+      await invokeHook(hook, context, this.signal)
+    } catch {
+      this.logger.warn('Failure hook failed', {
+        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        transfer,
+        phase: context.phase,
+        reason: ERRORS.HOOK_FAILED
+      })
     }
   }
 
@@ -357,41 +598,177 @@ export class Server extends EventEmitter {
     let verificationSucceeded = false
     let commitStarted = false
     let commitSucceeded = false
+    let artifact: HookArtifact | null = null
+    let phase: HookFailurePhase = 'offer'
+    let hookPath: string | null = null
+    let resumed = false
+    let alreadyCommitted = false
+    let hooksFinished = false
+    let finalStarted = false
+    let failureReported = false
+    let guardedTransfer: string | null = null
+    /**
+     * Hands the transfer back before this connection's last await. Clearing
+     * `guardedTransfer` makes the `finally` a no-op, so a late release can
+     * never take ownership away from the connection that acquired it next.
+     */
+    const releaseTransfer = (): void => {
+      if (guardedTransfer === null) return
+      this.activeTransfers.delete(guardedTransfer)
+      guardedTransfer = null
+    }
+    // Runs onFailure at most once per connection, after the client was answered.
+    const reportFailure = async (error: unknown): Promise<void> => {
+      if (failureReported || !event || !artifact) return
+      failureReported = true
+      // The guard serializes the commit lifecycle, and this connection has
+      // finished its own. `onFailure` only observes, so holding the transfer
+      // across a slow callback would reject the client's legitimate retry.
+      releaseTransfer()
+      await this.runFailureHook(
+        Object.freeze({ artifact, path: hookPath, phase, resumed, alreadyCommitted, error }),
+        owner,
+        event.transfer
+      )
+    }
+    const rejectEarly = async (reason: ErrorCode, message: string): Promise<void> => {
+      await this.rejectOffer(socket, event!, owner, reason)
+      sentAdmission = true
+      await reportFailure(fail(reason, message))
+    }
     try {
-      const metadata = await reader.control(decodeDirectMetadata, this.signal, this.idleTimeout)
-      assertMetadataTransferId(owner, metadata)
+      const metadata = await reader.control(decodeAnyMetadataRecord, this.signal, this.idleTimeout)
+      // The decoded record is shape-validated but not yet authenticated; the
+      // artifact context carries only its non-secret descriptive fields.
       event = this.transfer(metadata)
-      if (
-        metadata.fileSize > this.maxFileBytes ||
-        this.activeUploads.size >= this.maxActiveUploads
-      ) {
-        const reason =
-          metadata.fileSize > this.maxFileBytes ? ERRORS.FILE_TOO_LARGE : ERRORS.ACTIVE_UPLOAD_LIMIT
-        await writeAdmission(
-          socket,
-          { v: 1, status: 'REJECTED', code: reason },
-          { signal: this.signal, timeout: this.idleTimeout }
+      artifact = this.hookArtifact(metadata, null)
+      if (isTreeMetadata(metadata)) assertTreeMetadataTransferId(owner, metadata)
+      else assertMetadataTransferId(owner, metadata)
+      // The transfer ID is authenticated from here on, so it is safe to key
+      // the single-owner guard on it.
+      if (this.activeTransfers.has(metadata.transferId)) {
+        await rejectEarly(ERRORS.FILE_BUSY, 'Transfer is already in progress')
+        return
+      }
+      this.activeTransfers.add(metadata.transferId)
+      guardedTransfer = metadata.transferId
+      let release: ReleaseCoordinates | null = null
+      if (this.releaseMatcher.size > 0) {
+        release = this.releaseMatcher.match(metadata.name, metadata.sourceParent)
+        if (release === null) {
+          await rejectEarly(
+            ERRORS.INVALID_FILENAME,
+            'Artifact name does not match a configured pattern'
+          )
+          return
+        }
+        artifact = this.hookArtifact(metadata, release)
+      }
+      if (this.linkNames.has(metadata.name)) {
+        await rejectEarly(ERRORS.INVALID_FILENAME, 'Artifact name is a configured symlink name')
+        return
+      }
+      const hookArtifact = artifact
+      const stagingHookPath = isTreeMetadata(metadata)
+        ? path.join(this.layout!.staging, `${metadata.transferId}.tree`)
+        : path.join(this.layout!.staging, `${metadata.transferId}.part`)
+      const finish = async (verified: TarSession): Promise<void> => {
+        phase = 'beforeCommit'
+        hookPath = stagingHookPath
+        await this.runHook<BeforeCommitContext>(
+          'beforeCommit',
+          this.hooks.beforeCommit,
+          Object.freeze({
+            artifact: hookArtifact,
+            path: hookPath,
+            resumed,
+            alreadyCommitted: false as const
+          })
         )
-        sentAdmission = true
-        this.emitSafe('offer', {
+        phase = 'commit'
+        commitStarted = true
+        await this.commits!.commit(verified, {
+          retentionManager: this.retention,
+          signal: this.signal,
+          replaceNames: this.replaceNames,
+          release,
+          deferPostCommitRetention: this.hooks.afterCommit !== undefined
+        })
+        this.emitSafe('commit', {
           ...event,
           fingerprint: fingerprint(owner),
-          status: 'rejected',
-          reason
+          status: 'succeeded'
         })
+        commitSucceeded = true
+        hookPath = path.join(this.layout!.root, metadata.name)
+        await this.retireQuietly(verified.transferId, owner)
+        await this.reconcileAfterCommit()
+        phase = 'afterCommit'
+        if (this.hooks.afterCommit !== undefined) {
+          this.owePostCommitRetention(metadata.transferId)
+        }
+        await this.runHook<AfterCommitContext>(
+          'afterCommit',
+          this.hooks.afterCommit,
+          Object.freeze({
+            artifact: hookArtifact,
+            path: hookPath,
+            resumed,
+            alreadyCommitted: false
+          })
+        )
+        hooksFinished = true
+        await this.settleDeferredRetention(metadata.transferId, owner)
+        finalStarted = true
+        await writeFinal(
+          socket,
+          { v: 1, status: 'COMMITTED' },
+          { signal: this.signal, timeout: this.idleTimeout }
+        )
+      }
+      const payloadBytes = this.payloadBytes(metadata)
+      if (payloadBytes > this.maxFileBytes || this.activeUploads.size >= this.maxActiveUploads) {
+        if (payloadBytes > this.maxFileBytes) {
+          await rejectEarly(ERRORS.FILE_TOO_LARGE, 'File exceeds the maximum size')
+        } else {
+          await rejectEarly(ERRORS.ACTIVE_UPLOAD_LIMIT, 'Active upload capacity exceeded')
+        }
         return
       }
       const inspected = await this.commits.inspect(
         metadata.name,
         {
           name: metadata.name,
-          size: metadata.fileSize,
-          digest: b4a.from(metadata.fileSha256, 'hex'),
-          transferId: b4a.from(metadata.transferId, 'hex')
+          kind: this.artifactKind(metadata),
+          size: payloadBytes,
+          digest: b4a.from(this.payloadDigest(metadata), 'hex'),
+          ...(isTreeMetadata(metadata) ? { entryCount: metadata.entryCount } : {}),
+          transferId: b4a.from(metadata.transferId, 'hex'),
+          release
         },
         { replaceNames: this.replaceNames }
       )
       if (inspected.status === 'ALREADY_COMMITTED') {
+        alreadyCommitted = true
+        hookPath = path.join(this.layout!.root, metadata.name)
+        await this.reconcileAfterCommit()
+        phase = 'afterCommit'
+        await this.runHook<AfterCommitContext>(
+          'afterCommit',
+          this.hooks.afterCommit,
+          Object.freeze({
+            artifact: hookArtifact,
+            path: hookPath,
+            resumed: false,
+            alreadyCommitted: true
+          })
+        )
+        hooksFinished = true
+        // Only a transfer this process committed can still owe a deferred
+        // pass; an ordinary duplicate offer never starts one.
+        if (this.pendingAfterCommit.has(metadata.transferId)) {
+          await this.settleDeferredRetention(metadata.transferId, owner)
+        }
         await writeAdmission(
           socket,
           { v: 1, status: 'ALREADY_COMMITTED' },
@@ -406,26 +783,17 @@ export class Server extends EventEmitter {
         return
       }
       if (inspected.status === 'FILE_EXISTS') {
-        throw fail(ERRORS.FILE_EXISTS, 'Destination already exists')
+        await rejectEarly(ERRORS.FILE_EXISTS, 'Destination already exists')
+        return
       }
       if (this.activeUploads.size >= this.maxActiveUploads) {
-        await writeAdmission(
-          socket,
-          { v: 1, status: 'REJECTED', code: ERRORS.ACTIVE_UPLOAD_LIMIT },
-          { signal: this.signal, timeout: this.idleTimeout }
-        )
-        sentAdmission = true
-        this.emitSafe('offer', {
-          ...event,
-          fingerprint: fingerprint(owner),
-          status: 'rejected',
-          reason: ERRORS.ACTIVE_UPLOAD_LIMIT
-        })
+        await rejectEarly(ERRORS.ACTIVE_UPLOAD_LIMIT, 'Active upload capacity exceeded')
         return
       }
       this.activeUploads.add(socket)
       const admission = await this.sessions.admit(owner, metadata)
       current.transfer = metadata.transferId
+      resumed = admission.status !== 'ACCEPT'
       if (admission.status === 'VERIFIED') {
         await writeAdmission(
           socket,
@@ -433,6 +801,8 @@ export class Server extends EventEmitter {
           { signal: this.signal, timeout: this.idleTimeout }
         )
         sentAdmission = true
+        phase = 'verification'
+        hookPath = stagingHookPath
         this.emitSafe('verification', {
           ...event,
           fingerprint: fingerprint(owner),
@@ -446,24 +816,7 @@ export class Server extends EventEmitter {
           status: 'succeeded'
         })
         verificationSucceeded = true
-        commitStarted = true
-        await this.commits.commit(verified, {
-          retentionManager: this.retention,
-          signal: this.signal,
-          replaceNames: this.replaceNames
-        })
-        this.emitSafe('commit', {
-          ...event,
-          fingerprint: fingerprint(owner),
-          status: 'succeeded'
-        })
-        commitSucceeded = true
-        await this.retireQuietly(b4a.from(metadata.transferId, 'hex'), owner)
-        await writeFinal(
-          socket,
-          { v: 1, status: 'COMMITTED' },
-          { signal: this.signal, timeout: this.idleTimeout }
-        )
+        await finish(verified)
         return
       }
       await writeAdmission(
@@ -479,6 +832,8 @@ export class Server extends EventEmitter {
         { signal: this.signal, timeout: this.idleTimeout }
       )
       sentAdmission = true
+      phase = 'transfer'
+      hookPath = path.join(this.layout!.staging, `${metadata.transferId}.tar.part`)
       this.emitSafe('offer', {
         ...event,
         fingerprint: fingerprint(owner),
@@ -523,6 +878,7 @@ export class Server extends EventEmitter {
       )
       await flush()
       await reader.requireEnd(this.signal, this.idleTimeout)
+      phase = 'verification'
       this.emitSafe('verification', {
         ...event,
         fingerprint: fingerprint(owner),
@@ -536,24 +892,7 @@ export class Server extends EventEmitter {
         status: 'succeeded'
       })
       verificationSucceeded = true
-      commitStarted = true
-      await this.commits.commit(verified, {
-        retentionManager: this.retention,
-        signal: this.signal,
-        replaceNames: this.replaceNames
-      })
-      this.emitSafe('commit', {
-        ...event,
-        fingerprint: fingerprint(owner),
-        status: 'succeeded'
-      })
-      commitSucceeded = true
-      await this.retireQuietly(verified.transferId, owner)
-      await writeFinal(
-        socket,
-        { v: 1, status: 'COMMITTED' },
-        { signal: this.signal, timeout: this.idleTimeout }
-      )
+      await finish(verified)
     } catch (error) {
       const reason = codeOf(error)
       this.logger.warn('Direct upload failed', {
@@ -584,7 +923,7 @@ export class Server extends EventEmitter {
             { v: 1, status: 'REJECTED', code: reason },
             { timeout: this.idleTimeout }
           )
-        } else if (!commitSucceeded) {
+        } else if (!finalStarted) {
           await writeFinal(
             socket,
             { v: 1, status: 'FAILED', code: reason },
@@ -595,9 +934,54 @@ export class Server extends EventEmitter {
       try {
         socket.destroy()
       } catch {}
+      this.activeUploads.delete(socket)
+      if (!hooksFinished) await reportFailure(callbackError(error))
     } finally {
       this.activeUploads.delete(socket)
+      releaseTransfer()
       reader.closeReader()
+    }
+  }
+
+  /**
+   * Records that a transfer still owes its deferred post-commit retention
+   * pass, keeping at most `MAX_OWED_POST_COMMIT_RETENTION` entries.
+   *
+   * `Set` preserves insertion order, so the oldest owed transfer is evicted
+   * first and eviction is deterministic. An evicted transfer loses nothing
+   * durable: its artifact is already committed and its rotation falls back to
+   * the next startup, scheduled, or commit-triggered pass.
+   */
+  private owePostCommitRetention(transferId: string): void {
+    if (this.pendingAfterCommit.has(transferId)) return
+    if (this.pendingAfterCommit.size >= MAX_OWED_POST_COMMIT_RETENTION) {
+      const oldest = this.pendingAfterCommit.values().next()
+      if (!oldest.done) this.pendingAfterCommit.delete(oldest.value)
+    }
+    this.pendingAfterCommit.add(transferId)
+  }
+
+  /**
+   * Runs the post-commit retention pass that a configured `afterCommit` hook
+   * deferred, only after that hook succeeded, and then stops owing it. The
+   * retention manager already reports its own failures as non-fatal, so
+   * nothing here can fail the upload; the pass is attempted exactly once per
+   * successful hook, which is why the transfer is cleared either way.
+   */
+  private async settleDeferredRetention(
+    transferId: string,
+    owner: Uint8Array | null
+  ): Promise<void> {
+    if (this.hooks.afterCommit === undefined) return
+    try {
+      if (this.retention) await this.retention.afterCommit()
+    } catch (error) {
+      this.logger.warn('Post-commit retention failed', {
+        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        reason: codeOf(error)
+      })
+    } finally {
+      this.pendingAfterCommit.delete(transferId)
     }
   }
 
@@ -640,6 +1024,12 @@ export class Server extends EventEmitter {
         storage: this.storage,
         logger: this.logger
       })
+      if (this.symlinks.length > 0) {
+        this.links = new LinkStore({
+          layout: this.layout,
+          storage: this.storage as SymlinkCapableStorage
+        })
+      }
       this.emitSafe('recovery', { status: 'started' })
       await prepareStorageRecovery({
         layout: this.layout,
@@ -670,6 +1060,9 @@ export class Server extends EventEmitter {
         sessionStore: this.sessions,
         commitStore: this.commits,
         maxAge: this.maxAge,
+        maxCount: this.maxCount,
+        maxVersions: this.maxVersions,
+        versionGranularity: this.versionGranularity,
         maxStorageBytes: this.maxStorageBytes,
         resumeTtl: this.resumeTtl,
         cleanupInterval: this.cleanupInterval,
@@ -681,6 +1074,9 @@ export class Server extends EventEmitter {
           ),
         hasActiveUploads: () => this.activeUploads.size > 0,
         isPinned: (record) => this.replaceNames.has(record.name),
+        managedLinkNames: () => this.linkNames,
+        reconcileLinks: (records) => this.reconcileLinksUnlocked(records),
+        linkPinsFallback: (records) => this.linkPinsFallbackUnlocked(records),
         logger: this.logger,
         onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
@@ -724,8 +1120,11 @@ export class Server extends EventEmitter {
     this.transport = null
     await Promise.allSettled([...this.receives])
     this.active.clear()
+    this.activeTransfers.clear()
+    this.pendingAfterCommit.clear()
     await this.retention?.stop().catch(() => {})
     this.retention = null
+    this.links = null
     await this.sessions?.close().catch(() => {})
     this.sessions = null
     if (this.releaseLock) await this.releaseLock().catch(() => {})

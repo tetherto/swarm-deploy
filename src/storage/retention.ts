@@ -7,7 +7,9 @@ import { assertSafeDirectory, openSafeRegularFile, withSafeDirectoryIdentity } f
 import { digestMatches, SodiumSha256 } from '../tar-protocol/hash.js'
 import { assertSafeUint } from '../validation.js'
 import { withRootLease } from './root-coordinator.js'
-import type { CommitRecord } from './commit-journal.js'
+import { compareReleaseVersions, releaseVersionGroup, type VersionGranularity } from '../release.js'
+import { commitRecordKind, compareCommitOrder, type CommitRecord } from './commit-journal.js'
+import { digestTree } from './tree-fs.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
 
 const DEFAULT_RESUME_TTL = 7 * 24 * 60 * 60 * 1000
@@ -62,6 +64,8 @@ type RetentionEvent =
       expiredSessions: number
       scrubbed: number
       ageDeleted: number
+      countDeleted: number
+      versionDeleted: number
       storageDeleted: number
     }
   | { type: 'retention'; trigger: string; status: 'failed'; reason: string }
@@ -74,6 +78,8 @@ type RetentionEventPayload =
       expiredSessions: number
       scrubbed: number
       ageDeleted: number
+      countDeleted: number
+      versionDeleted: number
       storageDeleted: number
     }
   | { trigger: string; status: 'failed'; reason: string }
@@ -89,6 +95,9 @@ interface RetentionManagerOptions {
   sessionStore: SessionStore
   commitStore: CommitStore
   maxAge?: number
+  maxCount?: number
+  maxVersions?: number
+  versionGranularity?: VersionGranularity
   maxStorageBytes?: number
   resumeTtl?: number
   cleanupInterval?: number
@@ -97,6 +106,19 @@ interface RetentionManagerOptions {
   isSessionActive: (session: Session) => boolean
   hasActiveUploads?: () => boolean
   isPinned?: (record: CommitRecord) => boolean
+  /**
+   * Reconciles managed symlinks and returns the transfer IDs pinned by a rule.
+   * Called once per pass with the scrubbed record set, with the root lease
+   * already held; it must not acquire the root lease itself.
+   */
+  reconcileLinks?: (records: CommitRecord[]) => Promise<ReadonlySet<string>>
+  /**
+   * When link reconciliation fails, returns transfer IDs that must stay pinned
+   * from desired links and durable ownership records.
+   */
+  linkPinsFallback?: (records: CommitRecord[]) => Promise<ReadonlySet<string>>
+  /** Names in the storage root that are server-managed symlinks, not artifacts. */
+  managedLinkNames?: () => ReadonlySet<string>
   logger?: Logger | null
   scheduler?: Scheduler
   onEvent?: ((event: RetentionEvent) => void) | null
@@ -134,6 +156,61 @@ function report(
 function compareRecords(left: CommitRecord, right: CommitRecord): number {
   if (left.committedAt !== right.committedAt) return left.committedAt - right.committedAt
   return left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+}
+
+interface RetentionResult {
+  expiredSessions: number
+  scrubbed: number
+  ageDeleted: number
+  countDeleted: number
+  versionDeleted: number
+  storageDeleted: number
+}
+
+function bySeries(records: CommitRecord[]): Map<string, CommitRecord[]> {
+  const groups = new Map<string, CommitRecord[]>()
+  for (const record of records) {
+    if (!record.release) continue
+    const group = groups.get(record.release.series)
+    if (group) group.push(record)
+    else groups.set(record.release.series, [record])
+  }
+  return groups
+}
+
+/** Transfer IDs of the newest `maxCount` released records in every series. */
+function countKeepSet(records: CommitRecord[], maxCount: number): Set<string> {
+  const keep = new Set<string>()
+  for (const group of bySeries(records).values()) {
+    for (const record of group.sort(compareCommitOrder).slice(0, maxCount)) {
+      keep.add(record.transferId)
+    }
+  }
+  return keep
+}
+
+/** Transfer IDs of every versioned record in each series' newest `maxVersions` groups. */
+function versionKeepSet(
+  records: CommitRecord[],
+  maxVersions: number,
+  granularity: VersionGranularity
+): Set<string> {
+  const keep = new Set<string>()
+  for (const group of bySeries(records).values()) {
+    const versioned = group.filter((record) => record.release?.version !== undefined)
+    versioned.sort((left, right) => {
+      const order = compareReleaseVersions(right.release!.version!, left.release!.version!)
+      return order !== 0 ? order : compareCommitOrder(left, right)
+    })
+    const groups = new Set<string>()
+    for (const record of versioned) {
+      const key = releaseVersionGroup(record.release!.version!, granularity)
+      if (!groups.has(key) && groups.size >= maxVersions) continue
+      groups.add(key)
+      keep.add(record.transferId)
+    }
+  }
+  return keep
 }
 
 function identityMatches(left: StorageStat, right: StorageStat): boolean {
@@ -178,6 +255,22 @@ function inspectManagedFinal(
       throw err
     }
     if (initial.isSymbolicLink()) return 'SYMLINK'
+    if (commitRecordKind(record) === 'directory') {
+      if (initial.isSymbolicLink() || !initial.isDirectory()) return 'NON_REGULAR'
+      if (!hash) return 'VALID'
+      let digested
+      try {
+        digested = await digestTree(finalPath, storage)
+      } catch {
+        return 'DIGEST_INVALID'
+      }
+      if (digested.entryCount !== record.entryCount || digested.payloadBytes !== record.size) {
+        return 'WRONG_SIZE'
+      }
+      return digestMatches(digested.treeSha256, b4a.from(record.sha256, 'hex'))
+        ? 'VALID'
+        : 'DIGEST_INVALID'
+    }
     if (!initial.isFile()) return 'NON_REGULAR'
     if (initial.size !== record.size) return 'WRONG_SIZE'
     if (!hash) return 'VALID'
@@ -224,6 +317,9 @@ class RetentionManager {
   sessionStore: SessionStore
   commitStore: CommitStore
   maxAge: number | undefined
+  maxCount: number | undefined
+  maxVersions: number | undefined
+  versionGranularity: VersionGranularity | undefined
   maxStorageBytes: number | undefined
   resumeTtl: number
   cleanupInterval: number
@@ -232,6 +328,9 @@ class RetentionManager {
   isSessionActive: (session: Session) => boolean
   hasActiveUploads: () => boolean
   isPinned: (record: CommitRecord) => boolean
+  reconcileLinks: ((records: CommitRecord[]) => Promise<ReadonlySet<string>>) | undefined
+  linkPinsFallback: ((records: CommitRecord[]) => Promise<ReadonlySet<string>>) | undefined
+  managedLinkNames: (() => ReadonlySet<string>) | undefined
   logger: Logger | null
   timer: unknown | null
   cleanupFailure: unknown | null
@@ -247,6 +346,9 @@ class RetentionManager {
     sessionStore,
     commitStore,
     maxAge,
+    maxCount,
+    maxVersions,
+    versionGranularity,
     maxStorageBytes,
     resumeTtl = DEFAULT_RESUME_TTL,
     cleanupInterval = DEFAULT_CLEANUP_INTERVAL,
@@ -255,6 +357,9 @@ class RetentionManager {
     isSessionActive,
     hasActiveUploads = () => false,
     isPinned = () => false,
+    reconcileLinks,
+    linkPinsFallback,
+    managedLinkNames,
     logger = null,
     scheduler = { setInterval, clearInterval },
     onEvent = null
@@ -288,11 +393,27 @@ class RetentionManager {
       throw storageError('Invalid active upload predicate')
     }
     if (typeof isPinned !== 'function') throw storageError('Invalid retention pin predicate')
+    if (reconcileLinks !== undefined && typeof reconcileLinks !== 'function') {
+      throw storageError('Invalid link reconciliation callback')
+    }
+    if (linkPinsFallback !== undefined && typeof linkPinsFallback !== 'function') {
+      throw storageError('Invalid link pin fallback callback')
+    }
+    if (managedLinkNames !== undefined && typeof managedLinkNames !== 'function') {
+      throw storageError('Invalid managed link name callback')
+    }
     if (onEvent !== null && typeof onEvent !== 'function') {
       throw storageError('Invalid retention event callback')
     }
     if (maxAge !== undefined) assertSafeUint(maxAge, 'maxAge')
     if (maxStorageBytes !== undefined) assertSafeUint(maxStorageBytes, 'maxStorageBytes')
+    if (maxCount !== undefined) assertPositiveSafeUint(maxCount, 'maxCount')
+    if (maxVersions !== undefined) assertPositiveSafeUint(maxVersions, 'maxVersions')
+    if (maxVersions === undefined) {
+      if (versionGranularity !== undefined) throw storageError('Invalid versionGranularity')
+    } else if (versionGranularity !== 'major' && versionGranularity !== 'minor') {
+      throw storageError('Invalid versionGranularity')
+    }
     assertPositiveSafeUint(resumeTtl, 'resumeTtl')
     assertPositiveSafeUint(cleanupInterval, 'cleanupInterval')
     if (cleanupInterval > MAX_CLEANUP_INTERVAL) throw storageError('Invalid cleanupInterval')
@@ -301,6 +422,9 @@ class RetentionManager {
     this.sessionStore = sessionStore
     this.commitStore = commitStore
     this.maxAge = maxAge
+    this.maxCount = maxCount
+    this.maxVersions = maxVersions
+    this.versionGranularity = versionGranularity
     this.maxStorageBytes = maxStorageBytes
     this.resumeTtl = resumeTtl
     this.cleanupInterval = cleanupInterval
@@ -309,6 +433,9 @@ class RetentionManager {
     this.isSessionActive = isSessionActive
     this.hasActiveUploads = hasActiveUploads
     this.isPinned = isPinned
+    this.reconcileLinks = reconcileLinks
+    this.linkPinsFallback = linkPinsFallback
+    this.managedLinkNames = managedLinkNames
     this.logger = logger
     this.timer = null
     this.cleanupFailure = null
@@ -360,8 +487,9 @@ class RetentionManager {
     const rootNames = await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
       this.storage.readdir(this.layout.root)
     )
+    const linkNames = this.managedLinkNames ? this.managedLinkNames() : new Set<string>()
     const unknown = rootNames
-      .filter((name) => name !== '.swarm-deploy' && !knownNames.has(name))
+      .filter((name) => name !== '.swarm-deploy' && !knownNames.has(name) && !linkNames.has(name))
       .sort()
     for (const name of unknown) {
       report(this.logger, 'warn', 'Ignoring unknown committed path', { name })
@@ -381,7 +509,9 @@ class RetentionManager {
       }
       let purged
       try {
-        purged = await this.commitStore.purge(record, { preservePath: status === 'CHANGED' })
+        purged = await this.commitStore.purge(record, {
+          preservePath: status === 'CHANGED' || commitRecordKind(record) === 'directory'
+        })
         if (!purged) {
           throw storageError('Managed commit record disappeared during scrub')
         }
@@ -403,7 +533,10 @@ class RetentionManager {
     return { records: valid, deleted, unknown: unknown.sort() }
   }
 
-  async _deleteRecord(record: CommitRecord, reason: 'MAX_AGE' | 'MAX_STORAGE'): Promise<void> {
+  async _deleteRecord(
+    record: CommitRecord,
+    reason: 'MAX_AGE' | 'MAX_COUNT' | 'MAX_VERSIONS' | 'MAX_STORAGE'
+  ): Promise<void> {
     try {
       if (!(await this.commitStore.delete(record))) {
         throw storageError('Managed commit record disappeared during retention')
@@ -434,25 +567,15 @@ class RetentionManager {
     return total
   }
 
-  run(options: RetentionRunOptions = {}): Promise<{
-    expiredSessions: number
-    scrubbed: number
-    ageDeleted: number
-    storageDeleted: number
-  }> {
+  run(options: RetentionRunOptions = {}): Promise<RetentionResult> {
     return withRootLease(this.layout.root, () => this._runUnlocked(options))
   }
 
-  async _runUnlocked(options: RetentionRunOptions = {}): Promise<{
-    expiredSessions: number
-    scrubbed: number
-    ageDeleted: number
-    storageDeleted: number
-  }> {
+  async _runUnlocked(options: RetentionRunOptions = {}): Promise<RetentionResult> {
     const trigger = options.trigger || 'manual'
     try {
       const result = await this._run(options)
-      this.cleanupFailure = null
+      if (!this.cleanupFailure) this.cleanupFailure = null
       this._emit({ trigger, status: 'completed', ...result })
       return result
     } catch (err) {
@@ -462,12 +585,10 @@ class RetentionManager {
     }
   }
 
-  async _run({ incomingBytes = 0 }: RetentionRunOptions = {}): Promise<{
-    expiredSessions: number
-    scrubbed: number
-    ageDeleted: number
-    storageDeleted: number
-  }> {
+  async _run({
+    incomingBytes = 0,
+    trigger = 'manual'
+  }: RetentionRunOptions = {}): Promise<RetentionResult> {
     assertSafeUint(incomingBytes, 'incomingBytes')
     if (this.maxStorageBytes !== undefined && incomingBytes > this.maxStorageBytes) {
       throw new SwarmDeployError(
@@ -479,16 +600,56 @@ class RetentionManager {
     const expiredSessions = await this.expireSessions()
     const scrub = await this.scrubCommitted({ hash: false })
     const current = scrub.records.slice()
+    let linkPinned = new Set<string>()
+    let linkReconcileError: unknown = null
+    if (this.reconcileLinks) {
+      try {
+        linkPinned = new Set(await this.reconcileLinks(current.slice()))
+      } catch (err) {
+        linkReconcileError = err
+        if (this.linkPinsFallback) {
+          linkPinned = new Set(await this.linkPinsFallback(current.slice()))
+        }
+        report(this.logger, 'warn', 'Managed link reconciliation failed during retention', {
+          reason: errorMessage(err)
+        })
+      }
+    }
+    const pinned = (record: CommitRecord): boolean =>
+      this._isPinned(record) || linkPinned.has(record.transferId)
     let ageDeleted = 0
     if (this.maxAge !== undefined) {
       const now = this.clock.now()
       assertSafeUint(now, 'current timestamp')
       for (const record of current.slice().sort(compareRecords)) {
-        if (this._isPinned(record)) continue
+        if (pinned(record)) continue
         if (now < record.committedAt || now - record.committedAt < this.maxAge) continue
         await this._deleteRecord(record, 'MAX_AGE')
         current.splice(current.indexOf(record), 1)
         ageDeleted++
+      }
+    }
+
+    let countDeleted = 0
+    if (this.maxCount !== undefined) {
+      const keep = countKeepSet(current, this.maxCount)
+      for (const record of current.slice().sort(compareRecords)) {
+        if (!record.release || keep.has(record.transferId) || pinned(record)) continue
+        await this._deleteRecord(record, 'MAX_COUNT')
+        current.splice(current.indexOf(record), 1)
+        countDeleted++
+      }
+    }
+
+    let versionDeleted = 0
+    if (this.maxVersions !== undefined && this.versionGranularity !== undefined) {
+      const keep = versionKeepSet(current, this.maxVersions, this.versionGranularity)
+      for (const record of current.slice().sort(compareRecords)) {
+        if (record.release?.version === undefined) continue
+        if (keep.has(record.transferId) || pinned(record)) continue
+        await this._deleteRecord(record, 'MAX_VERSIONS')
+        current.splice(current.indexOf(record), 1)
+        versionDeleted++
       }
     }
 
@@ -498,14 +659,25 @@ class RetentionManager {
       let total = this._totalSize(current)
       for (const record of current.slice().sort(compareRecords)) {
         if (total <= permitted) break
-        if (this._isPinned(record)) continue
+        if (pinned(record)) continue
         await this._deleteRecord(record, 'MAX_STORAGE')
         total -= record.size
         storageDeleted++
       }
       if (total > permitted) throw storageError('Unable to reserve committed storage capacity')
     }
-    return { expiredSessions, scrubbed: scrub.deleted, ageDeleted, storageDeleted }
+    if (linkReconcileError) {
+      this.cleanupFailure = linkReconcileError
+      if (trigger !== 'commit') throw linkReconcileError
+    }
+    return {
+      expiredSessions,
+      scrubbed: scrub.deleted,
+      ageDeleted,
+      countDeleted,
+      versionDeleted,
+      storageDeleted
+    }
   }
 
   afterCommit(): Promise<boolean> {

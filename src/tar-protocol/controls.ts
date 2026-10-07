@@ -1,23 +1,50 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError, type ErrorCode } from '../errors.js'
-import { deterministicTarSize } from './ustar.js'
+import { MAX_TREE_ENTRIES } from './tree-path.js'
+import { deterministicTarSize, MAX_USTAR_FILE_BYTES, TAR_BLOCK_BYTES } from './ustar.js'
 
 export const CONTROL_VERSION = 1
 export const MAX_CONTROL_RECORD_BYTES = 4 * 1024
 const HEX_32 = /^[0-9a-f]{64}$/
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
+const SAFE_SOURCE_PARENT = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$/
 const HISTORY_PREFIX = 'history-'
 const STABLE_CODES = new Set<string>(Object.values(ERRORS))
 
 export interface MetadataRecord {
   v: typeof CONTROL_VERSION
   name: string
+  sourceParent?: string
   fileSize: number
   fileSha256: string
   tarSize: number
   tarSha256: string
   transferId: string
   reset: boolean
+}
+
+/**
+ * A recursive directory offer. The key set is disjoint from the file record's,
+ * so an older server's `exactKeys()` check rejects it before touching storage.
+ */
+export interface TreeMetadataRecord {
+  v: typeof CONTROL_VERSION
+  kind: 'directory'
+  name: string
+  sourceParent?: string
+  entryCount: number
+  payloadBytes: number
+  treeSha256: string
+  tarSize: number
+  tarSha256: string
+  transferId: string
+  reset: boolean
+}
+
+export type AnyMetadataRecord = MetadataRecord | TreeMetadataRecord
+
+export function isTreeMetadata(value: AnyMetadataRecord): value is TreeMetadataRecord {
+  return (value as TreeMetadataRecord).kind === 'directory'
 }
 
 export type AdmissionRecord =
@@ -77,6 +104,16 @@ function assertName(value: unknown): asserts value is string {
   }
 }
 
+export function assertSourceParent(value: unknown): asserts value is string {
+  if (
+    typeof value !== 'string' ||
+    !SAFE_SOURCE_PARENT.test(value) ||
+    b4a.from(value).byteLength > 100
+  ) {
+    throw new SwarmDeployError(ERRORS.INVALID_FILENAME, 'Invalid source parent')
+  }
+}
+
 function assertStableCode(value: unknown): asserts value is ErrorCode {
   if (typeof value !== 'string' || !STABLE_CODES.has(value)) throw invalid('Invalid error code')
 }
@@ -103,7 +140,7 @@ function encodeRecord<T>(value: T, validate: (value: unknown) => T): Buffer {
 
 function validateMetadata(value: unknown): MetadataRecord {
   if (!isRecord(value)) throw invalid('Metadata record must be an object')
-  exactKeys(value, [
+  const expected = [
     'v',
     'name',
     'fileSize',
@@ -112,9 +149,16 @@ function validateMetadata(value: unknown): MetadataRecord {
     'tarSha256',
     'transferId',
     'reset'
-  ])
+  ]
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
+    expected.push('sourceParent')
+  }
+  exactKeys(value, expected)
   assertVersion(value.v)
   assertName(value.name)
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
+    assertSourceParent(value.sourceParent)
+  }
   assertSafeUint(value.fileSize, 'file size')
   assertHex32(value.fileSha256, 'file digest')
   assertSafeUint(value.tarSize, 'TAR size')
@@ -123,6 +167,71 @@ function validateMetadata(value: unknown): MetadataRecord {
   assertHex32(value.transferId, 'transfer ID')
   if (typeof value.reset !== 'boolean') throw invalid('Invalid reset flag')
   return value as unknown as MetadataRecord
+}
+
+const TAR_END_BLOCKS = 2 * TAR_BLOCK_BYTES
+
+/**
+ * The exact set of TAR sizes a canonical generator can produce for these counts.
+ *
+ * Every entry owns one header block and the archive ends with two zero blocks. Only files carry
+ * payload, and each non-empty file pads to a block boundary with at most 511 bytes. At least one
+ * file exists when there is any payload, so the unpadded total is `minimum`, and at most
+ * `min(entryCount, payloadBytes)` files can each hold a padded tail. Real archives are whole blocks,
+ * so the window is the whole-block sizes from `minimum` rounded up to `maximum` rounded down.
+ */
+function assertTreeTarSize(entryCount: number, payloadBytes: number, tarSize: number): void {
+  if (payloadBytes > entryCount * MAX_USTAR_FILE_BYTES) throw invalid('Invalid tree payload size')
+  if (payloadBytes > 0 && entryCount === 0) throw invalid('Invalid tree payload size')
+  const base = TAR_END_BLOCKS + TAR_BLOCK_BYTES * entryCount
+  const minimum = base + payloadBytes
+  const maximum = minimum + (TAR_BLOCK_BYTES - 1) * Math.min(entryCount, payloadBytes)
+  const lowest = Math.ceil(minimum / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES
+  const highest = Math.floor(maximum / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES
+  if (tarSize % TAR_BLOCK_BYTES !== 0 || tarSize < lowest || tarSize > highest) {
+    throw invalid('Noncanonical TAR size')
+  }
+}
+
+function validateTreeMetadata(value: unknown): TreeMetadataRecord {
+  if (!isRecord(value)) throw invalid('Metadata record must be an object')
+  const expected = [
+    'v',
+    'kind',
+    'name',
+    'entryCount',
+    'payloadBytes',
+    'treeSha256',
+    'tarSize',
+    'tarSha256',
+    'transferId',
+    'reset'
+  ]
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) expected.push('sourceParent')
+  exactKeys(value, expected)
+  assertVersion(value.v)
+  if (value.kind !== 'directory') throw invalid('Invalid artifact kind')
+  assertName(value.name)
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
+    assertSourceParent(value.sourceParent)
+  }
+  assertSafeUint(value.entryCount, 'tree entry count')
+  if (value.entryCount > MAX_TREE_ENTRIES) throw invalid('Invalid tree entry count')
+  assertSafeUint(value.payloadBytes, 'tree payload size')
+  assertHex32(value.treeSha256, 'tree digest')
+  assertSafeUint(value.tarSize, 'TAR size')
+  assertHex32(value.tarSha256, 'TAR digest')
+  assertHex32(value.transferId, 'transfer ID')
+  if (typeof value.reset !== 'boolean') throw invalid('Invalid reset flag')
+  assertTreeTarSize(value.entryCount, value.payloadBytes, value.tarSize)
+  return value as unknown as TreeMetadataRecord
+}
+
+function validateAnyMetadata(value: unknown): AnyMetadataRecord {
+  if (!isRecord(value)) throw invalid('Metadata record must be an object')
+  return Object.prototype.hasOwnProperty.call(value, 'kind')
+    ? validateTreeMetadata(value)
+    : validateMetadata(value)
 }
 
 function validateAdmission(value: unknown): AdmissionRecord {
@@ -167,6 +276,22 @@ export function encodeMetadataRecord(value: MetadataRecord): Buffer {
 
 export function decodeMetadataRecord(bytes: Uint8Array): MetadataRecord {
   return validateMetadata(parseRecord(bytes))
+}
+
+export function encodeTreeMetadataRecord(value: TreeMetadataRecord): Buffer {
+  return encodeRecord(value, validateTreeMetadata)
+}
+
+export function decodeTreeMetadataRecord(bytes: Uint8Array): TreeMetadataRecord {
+  return validateTreeMetadata(parseRecord(bytes))
+}
+
+export function encodeAnyMetadataRecord(value: AnyMetadataRecord): Buffer {
+  return encodeRecord(value, validateAnyMetadata)
+}
+
+export function decodeAnyMetadataRecord(bytes: Uint8Array): AnyMetadataRecord {
+  return validateAnyMetadata(parseRecord(bytes))
 }
 
 export function encodeAdmissionRecord(value: AdmissionRecord): Buffer {

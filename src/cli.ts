@@ -8,6 +8,9 @@ import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS } from './errors.js'
 import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './identity.js'
 import { validateReplaceNames } from './files.js'
+import { compileSymlinkRules } from './symlinks.js'
+import { loadHooksModule } from './hooks-module.js'
+import type { ServerHooks } from './hooks.js'
 import { Server, type ServerLogger, type ServerOptions } from './server.js'
 import { Client, type ClientOptions, type ClientUploadResult } from './client.js'
 import type { DirectDhtNode } from './direct-dht.js'
@@ -28,6 +31,8 @@ type CliIo = {
   dht?: DirectDhtNode
   connectTimeout?: number
   idleTimeout?: number
+  /** Directory that relative `--hooks` paths resolve against; defaults to `process.cwd()`. */
+  cwd?: string
 }
 
 const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload'])
@@ -41,8 +46,8 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]...',
-  '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <file-or-directory>',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> <link-name>]... [--hooks <module>]',
+  '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] <file-or-directory>',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
 ].join('\n')
@@ -299,10 +304,14 @@ function parseOptions(
   args: string[],
   allowed: ReadonlySet<string>,
   repeatable: ReadonlySet<string> = new Set(),
-  keyValues: ReadonlySet<string> = new Set()
+  keyValues: ReadonlySet<string> = new Set(),
+  flags: ReadonlySet<string> = new Set(),
+  pairs: ReadonlySet<string> = new Set()
 ): {
   options: Record<string, string | undefined>
   repeatedOptions: Record<string, string[] | undefined>
+  pairOptions: Record<string, Array<[string, string]> | undefined>
+  flagOptions: Record<string, true | undefined>
   positionals: string[]
 } {
   const options: Record<string, string | undefined> = Object.create(null) as Record<
@@ -312,6 +321,13 @@ function parseOptions(
   const repeatedOptions: Record<string, string[] | undefined> = Object.create(null) as Record<
     string,
     string[] | undefined
+  >
+  const pairOptions: Record<string, Array<[string, string]> | undefined> = Object.create(
+    null
+  ) as Record<string, Array<[string, string]> | undefined>
+  const flagOptions: Record<string, true | undefined> = Object.create(null) as Record<
+    string,
+    true | undefined
   >
   const positionals: string[] = []
   for (let i = 0; i < args.length; i++) {
@@ -323,10 +339,35 @@ function parseOptions(
       if (arg.includes('=') || !allowed.has(arg)) throw usageError('Unknown option')
       if (
         !repeatable.has(arg) &&
+        !pairs.has(arg) &&
         (Object.prototype.hasOwnProperty.call(options, arg) ||
-          Object.prototype.hasOwnProperty.call(repeatedOptions, arg))
+          Object.prototype.hasOwnProperty.call(repeatedOptions, arg) ||
+          Object.prototype.hasOwnProperty.call(flagOptions, arg))
       ) {
         throw usageError('Duplicate option')
+      }
+      // A flag takes no value, so the next argument keeps its own meaning.
+      if (flags.has(arg)) {
+        flagOptions[arg] = true
+        continue
+      }
+      if (pairs.has(arg)) {
+        const first = args[i + 1]
+        const second = args[i + 2]
+        if (
+          first === undefined ||
+          first.startsWith('-') ||
+          second === undefined ||
+          second.startsWith('-')
+        ) {
+          throw usageError('Missing option value')
+        }
+        if (isCanonicalHexToken(second) && !keyValues.has(arg)) rejectUnexpectedSeed()
+        const values = pairOptions[arg] || []
+        values.push([first, second])
+        pairOptions[arg] = values
+        i += 2
+        continue
       }
       const value = args[i + 1]
       if (value === undefined || value.startsWith('-')) {
@@ -345,7 +386,7 @@ function parseOptions(
     }
     positionals.push(arg)
   }
-  return { options, repeatedOptions, positionals }
+  return { options, repeatedOptions, pairOptions, flagOptions, positionals }
 }
 
 function requireOption(options: Record<string, string | undefined>, name: string): string {
@@ -514,7 +555,7 @@ async function runPublicKey(args: string[]): Promise<string> {
 }
 
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, repeatedOptions, positionals } = parseOptions(
+  const { options, repeatedOptions, pairOptions, positionals } = parseOptions(
     args,
     new Set([
       '--seed-file',
@@ -525,10 +566,18 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--max-staging-bytes',
       '--max-storage-bytes',
       '--max-age-days',
-      '--replace-name'
+      '--replace-name',
+      '--artifact-pattern',
+      '--max-count',
+      '--max-versions',
+      '--version-granularity',
+      '--symlink',
+      '--hooks'
     ]),
-    new Set(['--replace-name', '--allow-key']),
-    new Set(['--allow-key', '--seed'])
+    new Set(['--replace-name', '--allow-key', '--artifact-pattern', '--symlink']),
+    new Set(['--allow-key', '--seed']),
+    new Set(),
+    new Set(['--symlink'])
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
@@ -551,6 +600,19 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     replaceNames = validateReplaceNames(repeatedOptions['--replace-name'] || [])
   } catch {
     throw usageError('Invalid --replace-name')
+  }
+  const artifactPatterns = repeatedOptions['--artifact-pattern']
+  const maxCount =
+    options['--max-count'] === undefined
+      ? undefined
+      : parsePositiveSafeInteger(options['--max-count'], 'max-count')
+  const maxVersions =
+    options['--max-versions'] === undefined
+      ? undefined
+      : parsePositiveSafeInteger(options['--max-versions'], 'max-versions')
+  const granularity = options['--version-granularity']
+  if (granularity !== undefined && granularity !== 'major' && granularity !== 'minor') {
+    throw usageError('Invalid --version-granularity')
   }
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
@@ -575,6 +637,23 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     throw usageError('Invalid --allow-key')
   }
 
+  let hooks: ServerHooks | undefined
+  if (options['--hooks'] !== undefined) {
+    try {
+      hooks = await loadHooksModule(options['--hooks'], io.cwd ?? process.cwd())
+    } catch (err) {
+      throw configError(errorMessage(err))
+    }
+  }
+
+  const symlinkPairs = pairOptions['--symlink'] || []
+  const symlinks = symlinkPairs.map(([selector, name]) => ({ selector, name }))
+  try {
+    compileSymlinkRules(symlinks)
+  } catch {
+    throw usageError('Invalid --symlink')
+  }
+
   const ServerImpl = io.Server || Server
   let server: Server
   try {
@@ -587,6 +666,12 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       maxStorageBytes,
       maxAge,
       replaceNames,
+      artifactPatterns,
+      maxCount,
+      maxVersions,
+      versionGranularity: granularity,
+      ...(symlinks.length > 0 ? { symlinks } : {}),
+      hooks,
       dht: io.dht,
       logger: createLogger(io)
     })
@@ -630,27 +715,17 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
 }
 
 function printUploadResult(result: ClientUploadResult, io: CliIo): number {
-  if ('results' in result) {
-    for (const skipped of result.skipped || []) {
-      writeLine(io.stdout, `${skipped.name} skipped ${skipped.reason}`)
-    }
-    let failed = false
-    for (const entry of result.results) {
-      writeLine(io.stdout, `${entry.name} ${entry.status}`)
-      if (entry.status !== 'COMMITTED' && entry.status !== 'ALREADY_COMMITTED') failed = true
-    }
-    return failed ? 1 : 0
-  }
-  writeLine(io.stdout, `${result.name} ${result.status}`)
+  writeLine(io.stdout, `${result.name} ${result.kind} ${result.status}`)
   return result.status === 'COMMITTED' || result.status === 'ALREADY_COMMITTED' ? 0 : 1
 }
 
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, positionals } = parseOptions(
+  const { options, flagOptions, positionals } = parseOptions(
     args,
-    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout']),
+    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout', '--no-source-parent']),
     new Set(),
-    new Set(['--server-key', '--seed'])
+    new Set(['--server-key', '--seed']),
+    new Set(['--no-source-parent'])
   )
   const [inputPath] = requirePositionals(positionals, 1, 'upload requires a file or directory')
   const seed = await resolveSeed({
@@ -680,6 +755,7 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
       dht: io.dht,
       connectTimeout: io.connectTimeout,
       idleTimeout,
+      ...(flagOptions['--no-source-parent'] ? { includeSourceParent: false } : {}),
       logger: createLogger(io)
     })
   } catch (err) {

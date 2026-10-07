@@ -7,11 +7,10 @@ refactor. Swarm Deploy is a Node.js and Bare package for authenticated,
 encrypted, resumable, one-way artifact uploads to one server on Linux and
 macOS. It stores regular files and never executes or serves them.
 
-A client uploads either one regular file or the immediate regular-file
-children of one directory. Directory children are processed in lexical order;
-each child is an independent upload on a fresh connection. Directories,
-symlinks, nested entries, and unsafe names are rejected or skipped before
-connecting. Names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`;
+A client uploads either one regular file or one recursive directory artifact.
+Directory uploads commit exactly one managed tree named after the input
+basename; unsafe members reject the whole offer before connecting. Names match
+`^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`;
 names are limited to 100 UTF-8 bytes, and the server-managed `history-`
 namespace is reserved.
 
@@ -62,10 +61,10 @@ There is no reload, revocation message, or mid-process allowlist mutation.
 
 One connection carries exactly one file and follows this sequence:
 
-1. The client sends bounded metadata: protocol version, file name, file size,
-   file SHA-256, and deterministic TAR length.
-2. The server validates identity, metadata, limits, name policy, destination
-   policy, and persistent staging capacity.
+1. The client sends bounded metadata: protocol version, file name, optional
+   `sourceParent`, file size, file SHA-256, and deterministic TAR length.
+2. The server validates identity, metadata, limits, name policy, configured
+   artifact-pattern match, destination policy, and persistent staging capacity.
 3. The server replies `ACCEPT` at offset zero or `RESUME` with a TAR byte offset
    and SHA-256 of the staged TAR prefix.
 4. The client deterministically creates the one-entry TAR stream. For a resume,
@@ -119,6 +118,27 @@ depends on no TAR parser; these canonical rules, byte counts, and validation
 are Swarm Deploy protocol requirements. The two must agree byte for byte, and
 a test pins the canonical header against the packer's output.
 
+### Deterministic recursive tree TAR
+
+A directory offer carries a canonical multi-entry USTAR archive. Entries are
+ordered bytewise on normalized TAR names with parents before children. Regular
+files use mode `0644`; directories use mode `0755` with a trailing slash in the
+stored name. uid, gid, mtime, uname, and gname are fixed. Each path component
+and whole stored name is limited to 100 UTF-8 bytes; depth is 32; entry count is
+10,000. Aggregate payload bytes obey `maxFileBytes`. The tree digest uses the
+`swarm-deploy/tree/v1` framing over normalized headers and payload bytes.
+Symlinks, hard links, devices, sockets, FIFOs, cycles, traversal, duplicates,
+and case-fold collisions are rejected.
+
+### Directory offer metadata
+
+Directory metadata is disjoint from the file record key set so an older server
+rejects it through its exact-key check without mutating storage. Required keys
+include `kind: 'directory'`, `entryCount`, `payloadBytes`, `treeSha256`, and
+the usual TAR length and transfer fields. Transfer IDs use the
+`swarm-deploy/direct-tree/v1` domain. Committed directory records carry the
+same descriptive fields plus the authenticated uploader fingerprint.
+
 ### Resume state
 
 Resume offsets are byte offsets in the deterministic TAR, not source-file
@@ -127,7 +147,7 @@ offsets. The server only advertises a durable staged length. Before replying
 Staging writes are synchronized before their offset becomes resumable.
 
 Sessions are keyed by authenticated client public key plus immutable offered
-metadata. Inactive incomplete sessions expire seven days after their last
+metadata, including `sourceParent` when present. Inactive incomplete sessions expire seven days after their last
 durable progress. Expiration never removes an active receive. A mismatch reset
 reuses the admitted session after durably truncating it to zero; it does not
 append to or trust a divergent prefix.
@@ -136,6 +156,230 @@ Startup purges all legacy chunk-session state, including chunk maps, partial
 chunk payloads, and obsolete reservations. It preserves committed current
 artifacts, history artifacts, commit sidecars, and v2 journals, which remain
 subject to normal validation and recovery.
+
+File sessions remain at persisted versions 2 and 3. Directory sessions use
+version 4 and verify into `.swarm-deploy/staging/<transfer-id>.tree/` by
+rebuilding canonical headers and recomputing the tree digest independently.
+
+## Release identity, rotation, and hooks
+
+### Source parent
+
+The offer metadata record may carry one optional `sourceParent` string: the
+basename of the client's immediate local parent directory. It is omitted unless
+it matches `^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$` and is at most 100 UTF-8 bytes
+(`+` is permitted for SemVer build metadata, unlike artifact names). Absolute
+paths and higher components are never sent. When present it is a field of the
+transfer-ID derivation, so it is authenticated by the owner key and immutable
+across resume attempts; when absent the derivation and wire shape are identical
+to earlier clients. The field is persisted with the resumable session, so a
+verified reconnect retains its release identity.
+
+A client may suppress the field for privacy with `includeSourceParent: false`
+(CLI `--no-source-parent`, which takes no value). The option defaults to `true`,
+applies to every file in a run, and makes the upload indistinguishable on the
+wire from a client that predates the field, including its transfer ID. A server
+pattern with a parent segment therefore rejects an opted-out upload with
+`INVALID_FILENAME`.
+
+Session records carry an on-disk version that follows the field rather than the
+writing code: a session with a `sourceParent` is written as version 3 and a
+session without one as version 2. Both are readable. A version-2 record that
+contains `sourceParent` is invalid.
+
+### Artifact patterns
+
+A server may be configured with an ordered list of templates made of literal
+text and the placeholders `{series}` and `{version}`. A template has at least
+one placeholder, at most one of each, no adjacent placeholders, one or two
+`/`-separated non-empty segments (`basename` or `parent/basename`), no residual
+`{` or `}` in its literal text, and is unique. `{version}` values are strict
+SemVer 2.0.0 and are normalized without build metadata; a template without
+`{series}` is a fixed series whose key is `fixed-` followed by the lowercase hex
+SHA-256 of the exact template text. That key is a 70-byte safe basename, so it
+satisfies commit-record validation and is byte-identical on every runtime and
+across restarts. That shape is reserved: a captured `{series}` of exactly
+`fixed-` followed by 64 lowercase hex characters is not a valid capture, so an
+offered name cannot claim the series of a version-only template; the pattern is
+simply a non-match. Matching evaluates templates in declaration order; templates
+with a parent segment are skipped when no `sourceParent` was offered; the first
+template that yields coordinates wins.
+
+If at least one template is configured, matching is mandatory: an unmatched
+offer is rejected with `INVALID_FILENAME` before session admission, destination
+inspection, staging, verification, commit, or the `beforeCommit` and
+`afterCommit` hooks. The failure hook still observes the rejection. A server
+with no templates preserves the earlier behavior and stores no release identity.
+
+The normalized `{series, version?}` coordinates are decided at commit time and
+persisted in the commit record, copied to replacement-history records,
+included in record comparison, journal serialization, and recovery, and
+therefore stable across restarts and configuration changes. One transfer ID
+cannot be committed with two different coordinates: the offer fails closed
+instead of reporting `ALREADY_COMMITTED`. Records without coordinates (written
+before the feature or by a server without templates) are legacy: they are
+subject to age and quota retention but never to count or version rotation.
+
+### Rotation and retention order
+
+Retention serializes under the root lease. After session expiry and a
+committed-state scrub, it applies in order: age, count, version, storage quota.
+Each stage sees the records the previous stage kept, so configured count and
+version bounds retain the intersection of their keep sets.
+
+Count rotation groups released records by series, orders them by `committedAt`
+descending then transfer ID and name ascending, and keeps the first `maxCount`.
+Version rotation groups versioned records by series, orders them by SemVer
+precedence descending (ties by the commit order above), maps each version to its
+`major` or `major.minor` group per `versionGranularity`, and keeps every record
+in the first `maxVersions` distinct groups. Prereleases and history records in a
+retained group are kept; build metadata does not exist in stored versions.
+Current mutable artifacts are pinned: they are counted but never deleted, so a
+limit is best-effort when one exceeds it.
+
+Retention runs before a commit's link step and again after the commit becomes
+durable, so rotation may remove an artifact that falls outside the retained
+window immediately after it is committed. When an `afterCommit` hook is
+configured the post-commit pass is deferred: the order is commit, `afterCommit`,
+then the post-commit pass only after the callback succeeded, then the terminal
+`COMMITTED` or `ALREADY_COMMITTED` reply. The deferred pass therefore runs before
+that reply, and a slow retention pass can delay it. When `afterCommit` begins in
+the sequential server flow, the final path and sidecar exist, including for
+out-of-window releases and for replacement commits and their history. This is
+not a lock: a concurrent commit's retention pass, a scheduled pass, or a manual
+pass can remove the file while the callback runs, so a hook needing stable bytes should open or copy
+it promptly. A failing `afterCommit` skips the pass for that connection and
+leaves the artifact and record, so an immediate retry normally is
+`ALREADY_COMMITTED`, reruns `afterCommit`, and then runs the pass. The deferred
+pass is owed per transfer: the server tracks in memory the transfer IDs it
+committed whose `afterCommit` has not yet succeeded, and an already-committed
+offer starts a pass only for one of those. Any other duplicate offer still runs
+`afterCommit` but performs no retention pass, so duplicate offers cannot force
+repeated full scans. The owed set is cleared once a hook succeeds and its pass
+has been attempted, and server close clears it. It holds at most 1024 transfers,
+the same ceiling as `maxConnections`; a persistently failing hook that reaches
+the bound evicts the oldest owed transfer first. Eviction is deterministic and
+loses nothing durable: the artifact stays committed and its rotation falls back
+to the next startup, scheduled, or commit-triggered pass.
+Servers without an `afterCommit` hook (including `beforeCommit`-only and
+`onFailure`-only) run the pass immediately after the commit. Pre-commit quota and
+age checks are never deferred, and post-commit retention failures remain
+non-fatal. Because no persistent hook-pending marker exists, any intervening
+retention pass (startup after a restart, scheduled or manual cleanup, or a
+concurrent commit's retention) can remove an out-of-window artifact whose
+`afterCommit` failed before the retry; the retry is then a fresh upload, not
+`ALREADY_COMMITTED`. Every retry statement in this document is qualified by that
+caveat.
+`retention` events and results expose `ageDeleted`, `countDeleted`,
+`versionDeleted`, and `storageDeleted`; deletions log the stable reasons
+`MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and `MAX_STORAGE`.
+
+`maxCount` requires at least one template; `maxVersions` requires a template
+with `{version}` and `versionGranularity`; `versionGranularity` requires
+`maxVersions`. Violations are construction-time `PROTOCOL_INVALID` errors and
+CLI exit code 2.
+
+### Hooks
+
+A server may be configured with `beforeCommit`, `afterCommit`, and `onFailure`
+callbacks. Direct `ServerOptions.hooks` accepts only a hook object whose own keys
+are those names and whose values are functions; it is snapshotted at
+construction. The CLI `--hooks` option loads a module before the server listens,
+selecting only those names (named exports win over a default object; one
+`__esModule` interop level is unwrapped; other exports are ignored) and failing
+with exit code 2 on any load or shape error. The path's extension must be
+exactly `.js`, `.mjs`, or `.cjs`; any other extension is rejected before the
+load is attempted. Hooks are
+trusted code; contexts are frozen and exclude seeds, keys, TAR data, and session
+material. Callbacks are invoked without a receiver. There is no hook timeout;
+only server shutdown abandons a pending callback, which then continues detached.
+A callback on a fresh or resumed upload runs while its connection still holds an
+active-upload slot and its session's staging reservation, so hung callbacks
+consume upload capacity and can make further offers fail with
+`ACTIVE_UPLOAD_LIMIT` until the server closes. Only the already-committed path
+holds no upload slot. Bounded timeout and anti-spam controls are deferred to
+issue #8.
+
+A transfer ID has a single owner for its commit lifecycle. From the moment
+metadata authenticates until that lifecycle ends, a second connection offering
+the same transfer ID is rejected with `FILE_BUSY` during the offer phase, before
+any staging work, so verification, `beforeCommit`, commit, and `afterCommit`
+never execute concurrently against one transfer identity. The guard is per
+process and in memory, holds at most one entry per connection, and is released
+when the connection finishes or the server closes.
+
+The guard covers the lifecycle, not observation. A failing connection releases
+the transfer before awaiting `onFailure`, since that callback only reports an
+already-settled outcome; the `finally` release is then a no-op and cannot take
+ownership from whichever connection acquired the transfer next. A retry is
+therefore admitted while the previous `onFailure` is still running, and its own
+lifecycle hooks may overlap that callback. Each connection still invokes
+`onFailure` at most once.
+
+Observable order:
+
+- fresh or partially resumed upload: offer, ACCEPT or RESUME, TAR receipt,
+  verification, `beforeCommit`, commit, `afterCommit`, `COMMITTED`;
+- verified reconnect (`VERIFIED`): re-read of the verified staging file,
+  `beforeCommit` with `resumed: true`, commit, `afterCommit`, `COMMITTED`;
+- already committed: `afterCommit` with `alreadyCommitted: true` and
+  `resumed: false`, then the deferred retention pass only when this process
+  still owes one for that transfer, then `ALREADY_COMMITTED`, with no
+  verification or `beforeCommit`.
+
+A `beforeCommit` failure prevents commit mutation and leaves the verified
+session resumable. An `afterCommit` failure leaves the artifact durably
+committed, fails the connection, and (unless retention removed the artifact
+first; see the retention caveat above) makes a retry take the already-committed
+path, so both callbacks may run more than once for a transfer ID and must be
+idempotent. A callback exception becomes the stable wire code `HOOK_FAILED` with
+a fixed message.
+
+`onFailure` runs at most once per connection after metadata was decoded and the
+failure was sent, unless both gating hooks already succeeded. Its context phase
+is `offer`, `transfer`, `verification`, `beforeCommit`, `commit`, or
+`afterCommit`; its `error` is the raw callback exception for hook failures and
+the original error otherwise. Its path is `null` for `offer`; the `.tar.part`
+staging file during transfer and for fresh-upload verification; the extracted
+`.part` staging file for `beforeCommit`, `commit`, and verified-reconnect
+verification; and the final path for `afterCommit`. An `onFailure` exception is
+logged as a secondary warning and never replaces the original failure.
+
+An `offer`-phase context is assembled from decoded metadata before the transfer
+ID is authenticated, and is reported even when that authentication is the
+failure. Its artifact fields are then unauthenticated peer input and must not be
+used as audit or idempotency keys. Contexts for all later phases follow
+successful authentication.
+
+### Rollout compatibility
+
+Servers must be upgraded before clients. A server that predates `sourceParent`
+decodes offers with an exact key set and rejects the new field, so a new client
+that sends it to an old server fails. A new server accepts older clients,
+version-2 sessions, and older commit records; offers without `sourceParent` can
+match only patterns without a parent segment. Only a parent-bearing session is
+written as version 3, so a rollback loses the resumability of those sessions
+alone; draining in-flight uploads first avoids it.
+
+Release identity in a commit record is durable and is never rewritten.
+Enabling patterns, or changing one an in-flight upload already matched, makes a
+retry of already-committed bytes compute a different identity, and the server
+fails closed: a create-only name is rejected with `FILE_EXISTS` and a
+replaceable name retried under the same transfer ID with a different release is
+rejected as a release-identity conflict. In-flight uploads should therefore be
+drained before patterns are enabled or changed.
+
+Commit-record compatibility is asserted only in the reading direction: a record
+without release coordinates is read by this version and is excluded from count
+and version rotation. Whether older code tolerates records this version writes
+is untested.
+
+Direct file TAR bytes, transfer IDs, sessions, records, commit, replacement,
+hooks, and retention for files are unchanged. Directory metadata, session
+version 4, commit record version 3, directory journals, directory trash, and
+managed symlinks are not downgrade-compatible. Drain uploads before upgrading
+and do not roll back after committing a directory artifact without restoring
+from backup.
 
 ## Storage accounting
 
@@ -161,8 +405,23 @@ account for every current and historical artifact exactly once.
 
 ## Commit, replacement, and recovery
 
+Commit records for directories use version 3. Directory journals use version 3
+with phases `journaled → renamed → sidecar → cleanup`. A directory publishes by
+renaming its verified staging tree under the name and root leases. Recovery
+handles crashes before rename, after rename, after the sidecar, and during
+symlink reconciliation. Directory artifacts are create-only; configured
+`replaceNames`, file-to-directory, and directory-to-file offers are rejected.
+Committed artifacts, including directories, are immutable on disk: hooks and
+operators must not write into a published directory (`npm ci`, `.cache`,
+dotfiles, or extra symlinks). If a committed tree changes, startup hash scrub
+drops the sidecar while leaving bytes in place, the name stays occupied
+(`FILE_EXISTS`), the tree falls outside quota and rotation, and a managed
+`latest` link can repoint to an older release.
+Deletion renames a managed directory into `.swarm-deploy/trash/<transfer-id>.tree`
+before recursive removal without following symlinks; startup sweeps proven trash.
+
 The existing create-only commit behavior and retained replacement/history
-model remain:
+model remain for files:
 
 - names are create-only unless present in the configured `replaceNames`;
 - identical managed content returns `ALREADY_COMMITTED`;
@@ -186,6 +445,21 @@ before mutation, re-hashes managed committed files, removes invalid managed
 records, reports unknown paths, restores valid direct-TAR sessions, then runs
 retention. Recovery and retention preserve the create/replace/history
 linearization and fail closed on corruption.
+
+## Managed symlinks
+
+Ownership records live at
+`.swarm-deploy/links/<sha256(link-name)>.json` with exact fields `version`,
+`name`, `target`, `transferId`, and `targetKind`. A destination is replaced
+only when a valid record exists, the destination is a symbolic link, and
+`readlink()` returns the recorded or desired relative sibling basename. A
+pre-existing file, directory, unrecorded symlink, changed symlink, or foreign
+ownership record is unmanaged: it is never replaced, moved, or deleted, and
+reconciliation fails closed. Updates follow a six-step transaction with
+level-triggered recovery from startup, commit, already-committed retry,
+recovery, and retention. Selected symlink targets are pinned against age, count,
+SemVer, and quota deletion; the desired set is recomputed under the root lease
+before any deletion.
 
 ## Public API, CLI, and observability migration
 

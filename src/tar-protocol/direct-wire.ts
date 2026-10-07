@@ -4,15 +4,15 @@ import { ERRORS, SwarmDeployError } from '../errors.js'
 import type { DirectDhtSocket } from '../direct-dht.js'
 import {
   decodeAdmissionRecord,
+  decodeAnyMetadataRecord,
   decodeFinalRecord,
-  decodeMetadataRecord,
   encodeAdmissionRecord,
+  encodeAnyMetadataRecord,
   encodeFinalRecord,
-  encodeMetadataRecord,
   MAX_CONTROL_RECORD_BYTES,
   type AdmissionRecord,
-  type FinalRecord,
-  type MetadataRecord
+  type AnyMetadataRecord,
+  type FinalRecord
 } from './controls.js'
 import {
   writeFramedProtocolRecord,
@@ -201,10 +201,10 @@ export function endWrite(socket: DirectDhtSocket): void {
 }
 export function writeMetadata(
   socket: DirectDhtSocket,
-  metadata: MetadataRecord,
+  metadata: AnyMetadataRecord,
   options: ProtocolWriteOptions = {}
 ): Promise<void> {
-  return writeFramedProtocolRecord(socket as never, encodeMetadataRecord(metadata), options)
+  return writeFramedProtocolRecord(socket as never, encodeAnyMetadataRecord(metadata), options)
 }
 export function writeAdmission(
   socket: DirectDhtSocket,
@@ -227,6 +227,6 @@ export function writeTar(
 ): Promise<void> {
   return writeProtocolBytes(socket as never, value, options)
 }
-export const decodeDirectMetadata = decodeMetadataRecord
+export const decodeDirectMetadata = decodeAnyMetadataRecord
 export const decodeDirectAdmission = decodeAdmissionRecord
 export const decodeDirectFinal = decodeFinalRecord

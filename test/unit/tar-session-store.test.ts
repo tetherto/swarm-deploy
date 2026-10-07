@@ -19,9 +19,17 @@ import {
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
+import { digestTree } from '../../dist/storage/tree-fs.js'
+import {
+  buildTreeManifest,
+  regenerateTreeTarSuffix,
+  treeMetadataFromManifest
+} from '../../dist/tar-protocol/tree-manifest.js'
+import type { TreeMetadataRecord } from '../../dist/tar-protocol/controls.js'
 import { createClock } from '../helpers/clock.js'
 import { createTempDir } from '../helpers/files.js'
 import { createStorage } from '../helpers/storage.js'
+import { writeTree } from '../helpers/trees.js'
 
 const OWNER = b4a.alloc(32, 7)
 const OTHER_OWNER = b4a.alloc(32, 8)
@@ -89,6 +97,11 @@ test('TAR admission reconstructs a durable offset and rehashes its prefix on res
   await first.admit(OWNER, metadata)
   await first.append(OWNER, metadata, 0, archive.subarray(0, 777))
   await first.close()
+  const persisted = JSON.parse(
+    await fs.promises.readFile(path.join(layout.sessions, `${metadata.transferId}.json`), 'utf8')
+  ) as { version: number; sourceParent?: string }
+  t.is(persisted.version, 3)
+  t.is(persisted.sourceParent, 'source')
 
   const restarted = new SessionStore({
     layout,
@@ -102,6 +115,108 @@ test('TAR admission reconstructs a durable offset and rehashes its prefix on res
   t.is(admission.offset, 777)
   t.alike(admission.prefixSha256, sodiumSha256(archive.subarray(0, 777)))
   t.is(restarted.reservedBytes, metadata.tarSize + metadata.fileSize)
+  t.is(
+    (restarted.sessions.get(metadata.transferId) as { sourceParent?: string } | undefined)
+      ?.sourceParent,
+    'source'
+  )
+})
+
+test('a session without a source parent is written as v2 and resumes after restart', async (t) => {
+  const { layout, metadata, archive } = await fixture(t)
+  const parentless = { ...metadata } as typeof metadata & { sourceParent?: string }
+  delete parentless.sourceParent
+  parentless.transferId = b4a.toString(
+    computeTarTransferId(OWNER, {
+      name: parentless.name,
+      fileSize: parentless.fileSize,
+      fileSha256: b4a.from(parentless.fileSha256, 'hex'),
+      tarSize: parentless.tarSize,
+      tarSha256: b4a.from(parentless.tarSha256, 'hex')
+    }),
+    'hex'
+  )
+
+  const first = new SessionStore({
+    layout,
+    maxStagingBytes: parentless.tarSize + parentless.fileSize
+  })
+  await first.init()
+  await first.admit(OWNER, parentless)
+  await first.append(OWNER, parentless, 0, archive.subarray(0, 512))
+  await first.close()
+
+  const sessionPath = path.join(layout.sessions, `${parentless.transferId}.json`)
+  const record = JSON.parse(await fs.promises.readFile(sessionPath, 'utf8')) as Record<
+    string,
+    unknown
+  >
+  t.is(record.version, 2, 'a parentless session needs no v3 field')
+  t.is(Object.prototype.hasOwnProperty.call(record, 'sourceParent'), false)
+
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: parentless.tarSize + parentless.fileSize
+  })
+  await restarted.init()
+  t.teardown(() => restarted.close())
+  const admission = await restarted.admit(OWNER, parentless)
+  t.is(admission.status, 'RESUME')
+  if (admission.status !== 'RESUME') throw new Error('Expected resumable TAR admission')
+  t.is(admission.offset, 512)
+  t.alike(admission.prefixSha256, sodiumSha256(archive.subarray(0, 512)))
+})
+
+test('restart restores legacy v2 sessions without a source parent and rejects it on v2', async (t) => {
+  const { layout, metadata } = await fixture(t)
+  const legacy = { ...metadata } as typeof metadata & { sourceParent?: string }
+  delete legacy.sourceParent
+  legacy.transferId = b4a.toString(
+    computeTarTransferId(OWNER, {
+      name: legacy.name,
+      fileSize: legacy.fileSize,
+      fileSha256: b4a.from(legacy.fileSha256, 'hex'),
+      tarSize: legacy.tarSize,
+      tarSha256: b4a.from(legacy.tarSha256, 'hex')
+    }),
+    'hex'
+  )
+
+  const first = new SessionStore({ layout, maxStagingBytes: legacy.tarSize + legacy.fileSize })
+  await first.init()
+  await first.admit(OWNER, legacy)
+  await first.close()
+  const sessionPath = path.join(layout.sessions, `${legacy.transferId}.json`)
+  const persisted = JSON.parse(await fs.promises.readFile(sessionPath, 'utf8')) as {
+    version: number
+    sourceParent?: string
+  }
+  persisted.version = 2
+  delete persisted.sourceParent
+  await fs.promises.writeFile(sessionPath, JSON.stringify(persisted))
+
+  const restarted = new SessionStore({
+    layout,
+    maxStagingBytes: legacy.tarSize + legacy.fileSize
+  })
+  await restarted.init()
+  t.is(
+    (restarted.sessions.get(legacy.transferId) as { sourceParent?: string } | undefined)
+      ?.sourceParent,
+    undefined
+  )
+  await restarted.close()
+
+  persisted.sourceParent = '2.4.1'
+  await fs.promises.writeFile(sessionPath, JSON.stringify(persisted))
+  const invalid = new SessionStore({
+    layout,
+    maxStagingBytes: legacy.tarSize + legacy.fileSize
+  })
+  await invalid.init()
+  t.teardown(() => invalid.close())
+  t.is(invalid.sessions.has(legacy.transferId), false)
+  t.is(invalid.purgedSessions, 1)
 })
 
 test('restart purges malformed TAR session metadata and its discardable TAR staging', async (t) => {
@@ -275,6 +390,7 @@ test('restart purges corrupt canonical metadata and reconstructs valid reservati
     transferId: b4a.toString(
       computeTarTransferId(OTHER_OWNER, {
         name: validName,
+        sourceParent: metadata.sourceParent,
         fileSize: metadata.fileSize,
         fileSha256: b4a.from(metadata.fileSha256, 'hex'),
         tarSize: metadata.tarSize,
@@ -322,6 +438,7 @@ test('TAR admission rejects owner mismatch and reset durably truncates the admit
     transferId: b4a.toString(
       computeTarTransferId(OTHER_OWNER, {
         name: metadata.name,
+        sourceParent: metadata.sourceParent,
         fileSize: metadata.fileSize,
         fileSha256: b4a.from(metadata.fileSha256, 'hex'),
         tarSize: metadata.tarSize,
@@ -901,6 +1018,7 @@ test('admission free-space checks include prior TAR peak reservations', async (t
     transferId: b4a.toString(
       computeTarTransferId(OTHER_OWNER, {
         name: 'second.bin',
+        sourceParent: metadata.sourceParent,
         fileSize: metadata.fileSize,
         fileSha256: b4a.from(metadata.fileSha256, 'hex'),
         tarSize: metadata.tarSize,
@@ -1155,4 +1273,237 @@ test('a non-regular staging path fails with a typed error, not a null dereferenc
   t.ok(failure, 'the unsafe path is rejected')
   t.absent(failure instanceof TypeError, 'the guard does not dereference a null cause')
   t.is((failure as { code?: string }).code, ERRORS.PROTOCOL_INVALID, 'the error stays typed')
+})
+
+async function createStore(t: Assert, storage = createStorage()) {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const store = new SessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
+  await store.init()
+  t.teardown(() => store.close())
+  return { store, layout, storage }
+}
+
+async function treeInput(
+  t: Assert,
+  name: string,
+  spec: Record<string, string>
+): Promise<{ metadata: TreeMetadataRecord; archive: Buffer }> {
+  const source = path.join(await createTempDir(t), name)
+  await fs.promises.mkdir(source)
+  await writeTree(source, spec)
+  const manifest = await buildTreeManifest(source, OWNER)
+  const chunks: Buffer[] = []
+  await regenerateTreeTarSuffix(manifest, 0, (chunk) => {
+    chunks.push(b4a.from(chunk))
+  })
+  return { metadata: treeMetadataFromManifest(manifest), archive: b4a.concat(chunks) }
+}
+
+test('a directory session verifies into a staging tree at version 4', async (t) => {
+  const { store, layout } = await createStore(t)
+  const tree = await treeInput(t, '0.18.1', { 'a/b.bin': 'bb', 'a/empty/': '', 'z.bin': 'zzz' })
+  t.alike(await store.admit(OWNER, tree.metadata), { status: 'ACCEPT', offset: 0 })
+  await store.append(OWNER, tree.metadata, 0, tree.archive)
+  const session = await store.verify(OWNER, tree.metadata)
+  t.is(session.kind, 'directory')
+  t.is(session.entryCount, tree.metadata.entryCount)
+  t.is(session.size, tree.metadata.payloadBytes)
+  t.is(session.treePath, path.join(layout.staging, `${tree.metadata.transferId}.tree`))
+
+  const persisted = JSON.parse(
+    await fs.promises.readFile(
+      path.join(layout.sessions, `${tree.metadata.transferId}.json`),
+      'utf8'
+    )
+  ) as { version: number; kind: string; entryCount: number }
+  t.is(persisted.version, 4)
+  t.is(persisted.kind, 'directory')
+  t.is(persisted.entryCount, tree.metadata.entryCount)
+
+  const digested = await digestTree(session.treePath!, createStorage())
+  t.is(b4a.toString(digested.treeSha256, 'hex'), tree.metadata.treeSha256)
+  t.is((await store.readVerified(b4a.from(tree.metadata.transferId, 'hex'))).kind, 'directory')
+  // A directory session never leaves a file staging path behind.
+  await t.exception(() =>
+    fs.promises.lstat(path.join(layout.staging, `${tree.metadata.transferId}.part`))
+  )
+})
+
+test('a file session keeps writing version 3 and reports kind file', async (t) => {
+  const file = await fixture(t, 'payload')
+  const fileStore = new SessionStore({ layout: file.layout, maxStagingBytes: 1024 * 1024 })
+  t.teardown(() => fileStore.close())
+  await fileStore.init()
+  await fileStore.admit(OWNER, file.metadata)
+  await fileStore.append(OWNER, file.metadata, 0, file.archive)
+  const session = await fileStore.verify(OWNER, file.metadata)
+  t.is(session.kind, 'file')
+  t.is(session.treePath, undefined)
+  t.is(session.entryCount, undefined)
+  const persisted = JSON.parse(
+    await fs.promises.readFile(
+      path.join(file.layout.sessions, `${file.metadata.transferId}.json`),
+      'utf8'
+    )
+  ) as { version: number; kind?: string }
+  t.is(persisted.version, 3)
+  t.is(persisted.kind, undefined)
+})
+
+test('a verified directory session survives a restart and rejects a kind change', async (t) => {
+  const { store, layout, storage } = await createStore(t)
+  const tree = await treeInput(t, '0.18.1', { 'a.bin': 'aaaa' })
+  await store.admit(OWNER, tree.metadata)
+  await store.append(OWNER, tree.metadata, 0, tree.archive)
+  await store.verify(OWNER, tree.metadata)
+  await store.close()
+
+  const restarted = new SessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
+  t.teardown(() => restarted.close())
+  await restarted.init()
+  t.alike(await restarted.admit(OWNER, tree.metadata), { status: 'VERIFIED' })
+  const session = await restarted.readVerified(b4a.from(tree.metadata.transferId, 'hex'))
+  t.is(session.kind, 'directory')
+  t.is(session.entryCount, 1)
+  t.is(restarted.reservedBytes, tree.metadata.tarSize + tree.metadata.payloadBytes)
+
+  const fileShape = {
+    v: 1 as const,
+    name: tree.metadata.name,
+    fileSize: 4,
+    fileSha256: 'a'.repeat(64),
+    tarSize: 2048,
+    tarSha256: 'b'.repeat(64),
+    transferId: tree.metadata.transferId,
+    reset: false
+  }
+  await t.exception(() => restarted.admit(OWNER, fileShape), { code: ERRORS.PROTOCOL_INVALID })
+  await t.exception(() => restarted.admit(OTHER_OWNER, tree.metadata), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+})
+
+test('a corrupt directory archive is rejected and leaves no staging tree', async (t) => {
+  const { store, layout } = await createStore(t)
+  const tree = await treeInput(t, '0.18.1', { 'a/b.bin': 'bb', 'z.bin': 'zzz' })
+  const corrupt = b4a.from(tree.archive)
+  corrupt[1024] = 0x42
+  await store.admit(OWNER, tree.metadata)
+  await store.append(OWNER, tree.metadata, 0, corrupt)
+  await t.exception(() => store.verify(OWNER, tree.metadata), { code: ERRORS.CHECKSUM_MISMATCH })
+  const treePath = path.join(layout.staging, `${tree.metadata.transferId}.tree`)
+  await t.exception(() => fs.promises.lstat(treePath))
+  t.is(store.sessions.get(tree.metadata.transferId)?.state, 'receiving')
+  await t.exception(() => store.readVerified(b4a.from(tree.metadata.transferId, 'hex')), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+})
+
+test('startup removes a stray staging tree with no session and no journal', async (t) => {
+  const { store, layout, storage } = await createStore(t)
+  await store.close()
+  const stray = path.join(layout.staging, `${'a'.repeat(64)}.tree`)
+  await writeTree(stray, { 'nested/x.bin': 'x' })
+  const restarted = new SessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
+  t.teardown(() => restarted.close())
+  await restarted.init()
+  await t.exception(() => fs.promises.lstat(stray))
+  t.ok(restarted.purgedSessions >= 1)
+})
+
+test('startup removes the partial tree of an interrupted directory verification', async (t) => {
+  const { store, layout, storage } = await createStore(t)
+  const tree = await treeInput(t, '0.18.1', { 'a.bin': 'aaaa' })
+  await store.admit(OWNER, tree.metadata)
+  await store.append(OWNER, tree.metadata, 0, tree.archive)
+  await store.close()
+  const partial = path.join(layout.staging, `${tree.metadata.transferId}.tree`)
+  await writeTree(partial, { 'a.bin': 'aa' })
+
+  const restarted = new SessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
+  t.teardown(() => restarted.close())
+  await restarted.init()
+  await t.exception(() => fs.promises.lstat(partial))
+  t.alike(await restarted.admit(OWNER, tree.metadata), {
+    status: 'RESUME',
+    offset: tree.metadata.tarSize,
+    prefixSha256: sodiumSha256(tree.archive)
+  })
+  t.is((await restarted.verify(OWNER, tree.metadata)).state, 'verified')
+})
+
+test('startup fails closed for a symlink or file at a staging tree path', async (t) => {
+  const { store, layout, storage } = await createStore(t)
+  await store.close()
+  const target = path.join(layout.root, 'outside-target')
+  await fs.promises.mkdir(target)
+  await fs.promises.writeFile(path.join(target, 'keep'), 'must not be removed')
+  const link = path.join(layout.staging, `${'b'.repeat(64)}.tree`)
+  await fs.promises.symlink(target, link)
+
+  const restarted = new SessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
+  await t.exception(() => restarted.init(), { code: ERRORS.PROTOCOL_INVALID })
+  t.ok((await fs.promises.lstat(link)).isSymbolicLink())
+  t.alike(await fs.promises.readFile(path.join(target, 'keep')), b4a.from('must not be removed'))
+})
+
+test('a corrupt directory session record is purged on startup', async (t) => {
+  const { store, layout, storage } = await createStore(t)
+  await store.close()
+  const id = 'c'.repeat(64)
+  await fs.promises.writeFile(
+    path.join(layout.sessions, `${id}.json`),
+    JSON.stringify({ version: 4, kind: 'directory', transferId: id, entryCount: -1 })
+  )
+  const restarted = new SessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
+  t.teardown(() => restarted.close())
+  await restarted.init()
+  t.is(restarted.sessions.size, 0)
+  t.ok(restarted.purgedSessions >= 1)
+  await t.exception(() => fs.promises.lstat(path.join(layout.sessions, `${id}.json`)))
+})
+
+test('deleting a directory session removes its staging tree', async (t) => {
+  const { store, layout } = await createStore(t)
+  const tree = await treeInput(t, '0.18.1', { 'a.bin': 'a' })
+  await store.admit(OWNER, tree.metadata)
+  await store.append(OWNER, tree.metadata, 0, tree.archive)
+  await store.verify(OWNER, tree.metadata)
+  const treePath = path.join(layout.staging, `${tree.metadata.transferId}.tree`)
+  t.ok((await fs.promises.lstat(treePath)).isDirectory())
+  t.is(await store.delete(b4a.from(tree.metadata.transferId, 'hex')), true)
+  await t.exception(() => fs.promises.lstat(treePath))
+  await t.exception(() =>
+    fs.promises.lstat(path.join(layout.sessions, `${tree.metadata.transferId}.json`))
+  )
+  t.is(store.reservedBytes, 0)
+})
+
+test('an interrupted directory session delete finishes on restart', async (t) => {
+  let fail = true
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (fail && name === 'unlink' && target.endsWith('.tar.part')) {
+        fail = false
+        throw new Error('interrupted delete')
+      }
+    }
+  })
+  const { store, layout } = await createStore(t, storage)
+  const tree = await treeInput(t, '0.18.1', { 'a.bin': 'a' })
+  await store.admit(OWNER, tree.metadata)
+  await store.append(OWNER, tree.metadata, 0, tree.archive)
+  await store.verify(OWNER, tree.metadata)
+  await t.exception(() => store.delete(b4a.from(tree.metadata.transferId, 'hex')))
+  await store.close()
+
+  const restarted = new SessionStore({ layout, maxStagingBytes: 1024 * 1024 })
+  t.teardown(() => restarted.close())
+  await restarted.init()
+  await t.exception(() =>
+    fs.promises.lstat(path.join(layout.staging, `${tree.metadata.transferId}.tree`))
+  )
+  t.is(restarted.reservedBytes, 0)
+  t.alike(await restarted.admit(OWNER, tree.metadata), { status: 'ACCEPT', offset: 0 })
 })

@@ -7,11 +7,15 @@ import fs from '#fs'
 import path from '#path'
 import { ERRORS } from '../../dist/errors.js'
 import { historyName } from '../../dist/files.js'
+import { ReleaseMatcher } from '../../dist/release.js'
 import { initLayout } from '../../dist/storage/layout.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import type { CommitRecord } from '../../dist/storage/commit-journal.js'
 import { RetentionManager } from '../../dist/storage/retention.js'
+import { LinkStore } from '../../dist/storage/link-store.js'
+import { compileSymlinkRules, selectDesiredLinks } from '../../dist/symlinks.js'
+import { recoverStorage } from '../../dist/storage/recovery.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import {
   buildTarManifest,
@@ -19,6 +23,12 @@ import {
   regenerateTarSuffix,
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
+import {
+  buildTreeManifest,
+  regenerateTreeTarSuffix,
+  treeMetadataFromManifest
+} from '../../dist/tar-protocol/tree-manifest.js'
+import { writeTree } from '../helpers/trees.js'
 import type { MetadataRecord } from '../../dist/tar-protocol/controls.js'
 import { createClock, type TestClock } from '../helpers/clock.js'
 import { createTempDir } from '../helpers/files.js'
@@ -38,6 +48,13 @@ interface RetentionEvent {
   scrubbed?: number
   ageDeleted?: number
   storageDeleted?: number
+  countDeleted?: number
+  versionDeleted?: number
+}
+
+interface ReleaseCoordinates {
+  series: string
+  version?: string
 }
 
 interface FakeTimer {
@@ -57,7 +74,18 @@ interface Harness {
   commits: CommitStore
   input(name: string, content: Buffer): Promise<{ metadata: MetadataRecord; archive: Buffer }>
   stage(name: string, content: Buffer): Promise<TarSession>
-  publish(name: string, content: Buffer, mutable?: boolean): Promise<CommitRecord>
+  stageTree(name: string, spec: Record<string, string>): Promise<TarSession>
+  publish(
+    name: string,
+    content: Buffer,
+    mutable?: boolean,
+    release?: ReleaseCoordinates
+  ): Promise<CommitRecord>
+  publishTree(
+    name: string,
+    spec: Record<string, string>,
+    release?: ReleaseCoordinates
+  ): Promise<CommitRecord>
   manager(options?: Partial<RetentionOptions>): RetentionManager
 }
 
@@ -129,6 +157,20 @@ async function createHarness(
     return sessions.verify(OWNER, tar.metadata)
   }
 
+  async function stageTree(name: string, spec: Record<string, string>): Promise<TarSession> {
+    const sourceRoot = await createTempDir(t)
+    await writeTree(path.join(sourceRoot, name), spec)
+    const manifest = await buildTreeManifest(path.join(sourceRoot, name), OWNER)
+    const metadata = treeMetadataFromManifest(manifest)
+    const chunks: Buffer[] = []
+    await regenerateTreeTarSuffix(manifest, 0, (chunk) => {
+      chunks.push(b4a.from(chunk))
+    })
+    await sessions.admit(OWNER, metadata)
+    await sessions.append(OWNER, metadata, 0, b4a.concat(chunks))
+    return sessions.verify(OWNER, metadata)
+  }
+
   return {
     layout,
     clock,
@@ -136,11 +178,19 @@ async function createHarness(
     commits,
     input,
     stage,
-    async publish(name, content, mutable = false) {
+    stageTree,
+    async publish(name, content, mutable = false, release) {
       const session = await stage(name, content)
       const record = await commits.commit(session, {
-        ...(mutable ? { replaceNames: [name] } : {})
+        ...(mutable ? { replaceNames: [name] } : {}),
+        ...(release === undefined ? {} : { release })
       })
+      await sessions.retireCommitted(session.transferId)
+      return record
+    },
+    async publishTree(name, spec, release) {
+      const session = await stageTree(name, spec)
+      const record = await commits.commit(session, release === undefined ? {} : { release })
       await sessions.retireCommitted(session.transferId)
       return record
     },
@@ -215,7 +265,14 @@ test('age deletes at its boundary before quota deletes the oldest remaining reco
 
   const result = await manager.run({ incomingBytes: 2 })
 
-  t.alike(result, { expiredSessions: 0, scrubbed: 0, ageDeleted: 1, storageDeleted: 1 })
+  t.alike(result, {
+    expiredSessions: 0,
+    scrubbed: 0,
+    ageDeleted: 1,
+    countDeleted: 0,
+    versionDeleted: 0,
+    storageDeleted: 1
+  })
   t.is(await exists(path.join(harness.layout.root, expired.name)), false)
   t.is(await exists(path.join(harness.layout.root, alpha.name)), false)
   t.alike(await harness.commits.list(), [bravo])
@@ -394,4 +451,622 @@ test('scrub detects an inode swap while hashing and preserves the replacement pa
   t.alike(result.unknown, [record.name])
   t.alike(await fs.promises.readFile(managedPath), content)
   t.alike(await harness.commits.list(), [])
+})
+
+test('count rotation keeps newest commits per series including history', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish(MUTABLE, b4a.from('1.0.0'), true, {
+    series: 'api',
+    version: '1.0.0'
+  })
+  harness.clock.advance(1)
+  const second = await harness.publish(MUTABLE, b4a.from('1.1.0'), true, {
+    series: 'api',
+    version: '1.1.0'
+  })
+  harness.clock.advance(1)
+  const third = await harness.publish(MUTABLE, b4a.from('1.2.0'), true, {
+    series: 'api',
+    version: '1.2.0'
+  })
+  const result = await harness
+    .manager({
+      maxCount: 2,
+      isPinned: (record) => record.name === MUTABLE
+    })
+    .run()
+
+  t.is(result.countDeleted, 1)
+  t.is(result.versionDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [second.transferId, third.transferId].sort()
+  )
+  t.is(await exists(path.join(harness.layout.root, historyName(first.transferId))), false)
+})
+
+test('version rotation keeps newest distinct SemVer minor groups', async (t) => {
+  const harness = await createHarness(t)
+  const releases = ['1.9.9', '2.0.0-rc.1', '2.0.0', '2.1.0', '2.1.1']
+  for (const [index, version] of releases.entries()) {
+    await harness.publish(`api-${index}.bin`, b4a.from(version), false, {
+      series: 'api',
+      version
+    })
+    harness.clock.advance(1)
+  }
+  const result = await harness
+    .manager({
+      maxVersions: 2,
+      versionGranularity: 'minor'
+    })
+    .run()
+
+  t.is(result.versionDeleted, 1)
+  t.is(result.countDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.release?.version).sort(),
+    ['2.0.0-rc.1', '2.0.0', '2.1.0', '2.1.1'].sort()
+  )
+})
+
+interface RotationCase {
+  name: string
+  versions: string[]
+  maxCount?: number
+  maxVersions?: number
+  tie?: boolean
+  expected: (published: CommitRecord[]) => number[]
+}
+
+const ROTATION_CASES: RotationCase[] = [
+  {
+    name: 'equal-time count ties',
+    versions: ['1.0.0', '1.0.1', '1.0.2'],
+    maxCount: 2,
+    tie: true,
+    expected: (published) => {
+      const ordered = published
+        .map((record, index) => ({ id: record.transferId, index }))
+        .sort((left, right) => (left.id < right.id ? -1 : 1))
+      return ordered.slice(0, 2).map((entry) => entry.index)
+    }
+  },
+  {
+    name: 'major groups',
+    versions: ['1.9.9', '2.0.0-rc.1', '2.1.0', '3.0.0'],
+    maxVersions: 2,
+    expected: () => [1, 2, 3]
+  },
+  {
+    name: 'count and version intersection',
+    versions: ['1.0.0', '2.0.0', '2.0.1'],
+    maxCount: 1,
+    maxVersions: 1,
+    expected: () => [2]
+  }
+]
+
+for (const scenario of ROTATION_CASES) {
+  test(`rotation selection: ${scenario.name}`, async (t) => {
+    const harness = await createHarness(t)
+    const pinned = await harness.publish(MUTABLE, b4a.from('pinned'), true, {
+      series: 'api',
+      version: '0.0.1'
+    })
+    harness.clock.advance(1)
+    const legacy = await harness.publish('legacy.bin', b4a.from('legacy'))
+    const other = await harness.publish('other.bin', b4a.from('other'), false, {
+      series: 'other',
+      version: '9.9.9'
+    })
+    const published: CommitRecord[] = []
+    for (const [index, version] of scenario.versions.entries()) {
+      published.push(
+        await harness.publish(`api-${index}.bin`, b4a.from(version), false, {
+          series: 'api',
+          version
+        })
+      )
+      if (!scenario.tie) harness.clock.advance(1)
+    }
+
+    const result = await harness
+      .manager({
+        ...(scenario.maxCount === undefined ? {} : { maxCount: scenario.maxCount }),
+        ...(scenario.maxVersions === undefined
+          ? {}
+          : { maxVersions: scenario.maxVersions, versionGranularity: 'major' as const }),
+        isPinned: (record) => record.name === MUTABLE
+      })
+      .run()
+
+    const kept = scenario.expected(published).map((index) => published[index].transferId)
+    t.alike(
+      (await harness.commits.list()).map((record) => record.transferId).sort(),
+      [pinned.transferId, legacy.transferId, other.transferId, ...kept].sort()
+    )
+    t.is(
+      (result.countDeleted ?? 0) + (result.versionDeleted ?? 0),
+      scenario.versions.length - kept.length
+    )
+    t.is(await exists(path.join(harness.layout.root, MUTABLE)), true)
+    t.is(await exists(path.join(harness.layout.root, 'legacy.bin')), true)
+    t.is(await exists(path.join(harness.layout.root, 'other.bin')), true)
+  })
+}
+
+test('count and version rotation each remove records the other would keep', async (t) => {
+  const harness = await createHarness(t)
+  // Commit order: 2.0.0, 2.0.1, 1.0.0. Count(2) alone keeps 2.0.1 + 1.0.0;
+  // version(1 major) alone keeps 2.0.0 + 2.0.1; only both leaves 2.0.1.
+  const records: CommitRecord[] = []
+  for (const version of ['2.0.0', '2.0.1', '1.0.0']) {
+    records.push(
+      await harness.publish(`api-${version}.bin`, b4a.from(version), false, {
+        series: 'api',
+        version
+      })
+    )
+    harness.clock.advance(1)
+  }
+
+  const result = await harness
+    .manager({ maxCount: 2, maxVersions: 1, versionGranularity: 'major' })
+    .run()
+
+  t.is(result.countDeleted, 1)
+  t.is(result.versionDeleted, 1)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId),
+    [records[1].transferId]
+  )
+})
+
+test('source-parent build metadata is normalized before persistence and then groups as an ordinary version', async (t) => {
+  const harness = await createHarness(t)
+  // The matcher strips `+build` metadata, so persisted versions never carry it and
+  // retention only sees ordinary versions. This test does not exercise SemVer build
+  // precedence (covered by compareReleaseVersions in release.test.ts).
+  const matcher = new ReleaseMatcher(['{version}/{series}.tar.gz'])
+  const kept: CommitRecord[] = []
+  for (const [parent, expectKept] of [
+    ['1.2.3+build.2', true],
+    ['1.2.3+build.1', true],
+    ['1.1.9+build.9', false]
+  ] as const) {
+    const release = matcher.match('api.tar.gz', parent)
+    t.alike(release, {
+      series: 'api',
+      version: parent.split('+', 1)[0]
+    })
+    const record = await harness.publish(
+      `api-${parent.replace('+', '_')}.bin`,
+      b4a.from(parent),
+      false,
+      release as ReleaseCoordinates
+    )
+    t.is(record.release?.version, parent.split('+', 1)[0])
+    if (expectKept) kept.push(record)
+    harness.clock.advance(1)
+  }
+
+  const result = await harness.manager({ maxVersions: 1, versionGranularity: 'minor' }).run()
+
+  t.is(result.versionDeleted, 1)
+  t.is(result.countDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    kept.map((record) => record.transferId).sort()
+  )
+})
+
+test('count rotation applies independently per series', async (t) => {
+  const harness = await createHarness(t)
+  const records: CommitRecord[] = []
+  for (const series of ['api', 'web']) {
+    for (const version of ['1.0.0', '1.0.1']) {
+      records.push(
+        await harness.publish(`${series}-${version}.bin`, b4a.from(`${series}${version}`), false, {
+          series,
+          version
+        })
+      )
+      harness.clock.advance(1)
+    }
+  }
+
+  const result = await harness.manager({ maxCount: 1 }).run()
+
+  t.is(result.countDeleted, 2)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [records[1].transferId, records[3].transferId].sort()
+  )
+})
+
+test('count-only releases without versions are ignored by version rotation', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publish('api-a.bin', b4a.from('a'), false, { series: 'api' })
+  harness.clock.advance(1)
+  const second = await harness.publish('api-b.bin', b4a.from('b'), false, { series: 'api' })
+
+  const result = await harness.manager({ maxVersions: 1, versionGranularity: 'major' }).run()
+
+  t.is(result.versionDeleted, 0)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [first.transferId, second.transferId].sort()
+  )
+})
+
+test('count and version stages run after age and before quota with stable reasons and events', async (t) => {
+  const harness = await createHarness(t)
+  const reasons: Array<[string, unknown]> = []
+  const events: RetentionEvent[] = []
+  const expired = await harness.publish('old.bin', b4a.from('old'), false, {
+    series: 'api',
+    version: '1.0.0'
+  })
+  harness.clock.advance(10)
+  const countVictim = await harness.publish('api-1.bin', b4a.from('c1'), false, {
+    series: 'api',
+    version: '1.0.1'
+  })
+  harness.clock.advance(1)
+  const webOld = await harness.publish('web-1.bin', b4a.from('w1'), false, {
+    series: 'web',
+    version: '1.0.0'
+  })
+  harness.clock.advance(1)
+  const keep = await harness.publish('web-2.bin', b4a.from('w2'), false, {
+    series: 'web',
+    version: '2.0.0'
+  })
+  harness.clock.advance(1)
+  const survivor = await harness.publish('api-2.bin', b4a.from('c2'), false, {
+    series: 'api',
+    version: '1.0.2'
+  })
+
+  const manager = harness.manager({
+    maxAge: 10,
+    maxCount: 1,
+    maxVersions: 1,
+    versionGranularity: 'major',
+    maxStorageBytes: 100,
+    logger: {
+      info(_message, details) {
+        reasons.push([details.name as string, details.reason])
+      }
+    },
+    onEvent: (event) => events.push(event)
+  })
+
+  const result = await manager.run()
+
+  t.alike(result, {
+    expiredSessions: 0,
+    scrubbed: 0,
+    ageDeleted: 1,
+    countDeleted: 2,
+    versionDeleted: 0,
+    storageDeleted: 0
+  })
+  t.alike(reasons, [
+    [expired.name, 'MAX_AGE'],
+    [countVictim.name, 'MAX_COUNT'],
+    [webOld.name, 'MAX_COUNT']
+  ])
+  t.alike(events.at(-1), { type: 'retention', trigger: 'manual', status: 'completed', ...result })
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId).sort(),
+    [keep.transferId, survivor.transferId].sort()
+  )
+})
+
+test('version stage reports MAX_VERSIONS deletions after count keeps every record', async (t) => {
+  const harness = await createHarness(t)
+  const reasons: Array<[string, unknown]> = []
+  const old = await harness.publish('api-old.bin', b4a.from('old'), false, {
+    series: 'api',
+    version: '1.0.0'
+  })
+  harness.clock.advance(1)
+  await harness.publish('api-new.bin', b4a.from('new'), false, { series: 'api', version: '2.0.0' })
+
+  const result = await harness
+    .manager({
+      maxCount: 5,
+      maxVersions: 1,
+      versionGranularity: 'major',
+      logger: {
+        info(_message, details) {
+          reasons.push([details.name as string, details.reason])
+        }
+      }
+    })
+    .run()
+
+  t.is(result.countDeleted, 0)
+  t.is(result.versionDeleted, 1)
+  t.alike(reasons, [[old.name, 'MAX_VERSIONS']])
+})
+
+test('rotation options are validated', async (t) => {
+  const harness = await createHarness(t)
+  for (const options of [
+    { maxCount: 0 },
+    { maxCount: 1.5 },
+    { maxVersions: 0, versionGranularity: 'major' },
+    { maxVersions: 1 },
+    { versionGranularity: 'major' },
+    { maxVersions: 1, versionGranularity: 'patch' }
+  ]) {
+    await t.exception(
+      () => harness.manager(options as Partial<RetentionOptions>),
+      undefined,
+      JSON.stringify(options)
+    )
+  }
+})
+
+test('replacement reclaims space in its own pre-commit pass, not the deferred one', async (t) => {
+  const harness = await createHarness(t)
+  const manager = harness.manager({ maxAge: 10, isPinned: (record) => record.name === MUTABLE })
+  await harness.publish(MUTABLE, b4a.from('old'), true)
+  const stale = await harness.publish('stale.bin', b4a.from('stale'))
+  harness.clock.advance(10)
+
+  const session = await harness.stage(MUTABLE, b4a.from('new'))
+  await harness.commits.commit(session, {
+    replaceNames: [MUTABLE],
+    retentionManager: manager,
+    // The post-commit pass is withheld, so anything reclaimed here was
+    // reclaimed by the replacement's own pre-commit pass.
+    deferPostCommitRetention: true
+  })
+
+  t.is(
+    await exists(path.join(harness.layout.root, stale.name)),
+    false,
+    'the replacement ran a pre-commit retention pass'
+  )
+  t.is(await fs.promises.readFile(path.join(harness.layout.root, MUTABLE), 'utf8'), 'new')
+})
+
+test('deleting a directory artifact renames it into private trash first', async (t) => {
+  const renames: Array<[string, string]> = []
+  const storage = createStorage({
+    afterOperation: (name, target, ...rest) => {
+      if (name === 'rename') renames.push([target, String(rest[0])])
+    }
+  })
+  const harness = await createHarness(t, { storage })
+  const record = await harness.publishTree('0.18.1', { 'a/b.bin': 'bb' })
+  const finalPath = path.join(harness.layout.root, '0.18.1')
+  t.ok((await fs.promises.lstat(finalPath)).isDirectory())
+
+  t.is(await harness.commits.delete(record), true)
+  t.is(await exists(finalPath), false)
+  t.is(await exists(path.join(harness.layout.trash, `${record.transferId}.tree`)), false)
+  t.ok(
+    renames.some(
+      ([from, to]) => from === finalPath && to.includes(path.join('.swarm-deploy', 'trash'))
+    )
+  )
+  t.alike(await harness.commits.list(), [])
+})
+
+test('trash sweeping removes proven residue and ignores foreign entries', async (t) => {
+  const harness = await createHarness(t)
+  const stray = path.join(harness.layout.trash, `${'b'.repeat(64)}.tree`)
+  await fs.promises.mkdir(path.join(stray, 'nested'), { recursive: true })
+  await fs.promises.writeFile(path.join(stray, 'nested', 'x.bin'), 'x')
+  const foreign = path.join(harness.layout.trash, 'operator-notes.txt')
+  await fs.promises.writeFile(foreign, 'keep me')
+  t.is(await harness.commits.sweepTrash(), 1)
+  t.is(await exists(stray), false)
+  t.is(await fs.promises.readFile(foreign, 'utf8'), 'keep me')
+  t.is(await harness.commits.sweepTrash(), 0)
+})
+
+test('storage recovery sweeps trash residue and reports it once', async (t) => {
+  const harness = await createHarness(t)
+  const stray = path.join(harness.layout.trash, `${'c'.repeat(64)}.tree`)
+  await fs.promises.mkdir(stray, { recursive: true })
+  await fs.promises.writeFile(path.join(stray, 'x.bin'), 'x')
+  const events: Array<Record<string, unknown>> = []
+  await recoverStorage({
+    layout: harness.layout,
+    commitStore: harness.commits,
+    sessionStore: harness.sessions,
+    onEvent: (event) => events.push(event as unknown as Record<string, unknown>)
+  })
+  t.is(await exists(stray), false)
+  t.alike(
+    events.filter((event) => event.type === 'cleanup'),
+    [{ type: 'cleanup', transfer: 'trash', name: null, reason: 'trash-residue' }]
+  )
+})
+
+test('scrub validates a directory artifact by type cheaply and by digest at startup', async (t) => {
+  const harness = await createHarness(t)
+  const record = await harness.publishTree('0.18.1', { 'a.bin': 'aaa' })
+  const manager = harness.manager()
+  t.is((await manager.scrubCommitted({ hash: false })).records.length, 1)
+  t.is((await manager.scrubCommitted({ hash: true })).records.length, 1)
+
+  await fs.promises.writeFile(path.join(harness.layout.root, '0.18.1', 'a.bin'), 'mutated')
+  const cheap = await manager.scrubCommitted({ hash: false })
+  t.is(cheap.records.length, 1)
+  const hashed = await manager.scrubCommitted({ hash: true })
+  t.is(hashed.records.length, 0)
+  t.is(hashed.deleted, 1)
+  t.ok(hashed.unknown.includes('0.18.1'))
+  t.ok((await fs.promises.lstat(path.join(harness.layout.root, '0.18.1'))).isDirectory())
+  t.is(await exists(path.join(harness.layout.commits, `${record.transferId}.json`)), false)
+})
+
+test('age, count, version, and quota retention delete directory artifacts', async (t) => {
+  const harness = await createHarness(t)
+  const first = await harness.publishTree(
+    'api-1.0.0',
+    { 'a.bin': 'a' },
+    { series: 'api', version: '1.0.0' }
+  )
+  harness.clock.advance(10)
+  const second = await harness.publishTree(
+    'api-2.0.0',
+    { 'a.bin': 'bb' },
+    { series: 'api', version: '2.0.0' }
+  )
+  const result = await harness.manager({ maxCount: 1 }).run()
+  t.is(result.countDeleted, 1)
+  t.alike(
+    (await harness.commits.list()).map((value) => value.transferId),
+    [second.transferId]
+  )
+  t.is(await exists(path.join(harness.layout.root, 'api-1.0.0')), false)
+  t.is(first.kind, 'directory')
+})
+
+test('link reconciliation runs before deletion and pins every selected target', async (t) => {
+  const harness = await createHarness(t)
+  const old = await harness.publishTree('0.18.0', { 'a.bin': 'a' })
+  harness.clock.advance(10)
+  const fresh = await harness.publishTree('0.18.1', { 'a.bin': 'b' })
+  const seen: string[][] = []
+  const manager = harness.manager({
+    maxCount: undefined,
+    maxAge: 1,
+    reconcileLinks: (records) => {
+      seen.push(records.map((record) => record.name).sort())
+      return Promise.resolve(new Set([fresh.transferId]))
+    }
+  })
+  harness.clock.advance(100)
+  const result = await manager.run()
+  t.alike(seen, [['0.18.0', '0.18.1']])
+  t.is(result.ageDeleted, 1)
+  t.alike(
+    (await harness.commits.list()).map((value) => value.transferId),
+    [fresh.transferId]
+  )
+  t.is(await exists(path.join(harness.layout.root, '0.18.0')), false)
+  t.is(old.name, '0.18.0')
+})
+
+test('scrub ignores a configured managed link name instead of reporting it unknown', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publishTree('0.18.1', { 'a.bin': 'a' })
+  await fs.promises.symlink('0.18.1', path.join(harness.layout.root, 'latest'))
+  const scrub = await harness
+    .manager({ managedLinkNames: () => new Set(['latest']) })
+    .scrubCommitted({ hash: false })
+  t.alike(scrub.unknown, [])
+  t.is(scrub.records.length, 1)
+})
+
+test('a dormant managed link is removed before retention deletes its old target', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publishTree('0.18.0', { 'a.bin': 'a' })
+  harness.clock.advance(10)
+  await harness.publishTree('0.18.1', { 'a.bin': 'b' })
+  const links = new LinkStore({ layout: harness.layout })
+  const rules = compileSymlinkRules([{ selector: '/^0\\.18\\.0$/', name: 'latest' }])
+  await links.reconcile(
+    selectDesiredLinks(rules, await harness.commits.list()),
+    new Set(['latest'])
+  )
+  const rulesV2 = compileSymlinkRules([{ selector: '/^0\\.18\\.1$/', name: 'latest' }])
+  const manager = harness.manager({
+    maxAge: 1,
+    reconcileLinks: async (records) => {
+      await links.reconcile(selectDesiredLinks(rulesV2, records), new Set(['latest']), {
+        managedArtifactNames: new Set(records.map((record) => record.name))
+      })
+      return new Set(selectDesiredLinks(rulesV2, records).map((link) => link.transferId))
+    }
+  })
+  harness.clock.advance(100)
+  await manager.run()
+  t.is((await links.read('latest'))?.target, '0.18.1')
+  t.is(await exists(path.join(harness.layout.root, '0.18.0')), false)
+  t.ok(await exists(path.join(harness.layout.root, '0.18.1')))
+})
+
+test('retention still evicts over quota when link reconciliation conflicts', async (t) => {
+  const harness = await createHarness(t)
+  const old = await harness.publishTree('0.18.0', { 'a.bin': 'aa' })
+  harness.clock.advance(10)
+  const kept = await harness.publishTree('0.18.1', { 'a.bin': 'bb' })
+  const links = new LinkStore({ layout: harness.layout })
+  await links.reconcile(
+    [{ name: 'latest', target: '0.18.1', transferId: kept.transferId, targetKind: 'directory' }],
+    new Set(['latest'])
+  )
+  await fs.promises.unlink(path.join(harness.layout.root, 'latest'))
+  await fs.promises.writeFile(path.join(harness.layout.root, 'latest'), 'operator')
+  const rules = compileSymlinkRules([{ selector: '/^0\\.18\\.1$/', name: 'latest' }])
+  const manager = harness.manager({
+    maxStorageBytes: 3,
+    reconcileLinks: async (records) => {
+      await links.reconcile(selectDesiredLinks(rules, records), new Set(['latest']), {
+        managedArtifactNames: new Set(records.map((record) => record.name))
+      })
+      return new Set()
+    },
+    linkPinsFallback: async (records) => {
+      const pins = new Set<string>()
+      for (const ledger of await links.list()) {
+        pins.add(ledger.transferId)
+        const target = records.find((record) => record.name === ledger.target)
+        if (target) pins.add(target.transferId)
+      }
+      return pins
+    }
+  })
+  await t.exception(() => manager.run(), { code: ERRORS.LINK_CONFLICT })
+  t.is(manager.cleanupFailure !== null, true)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.transferId),
+    [kept.transferId]
+  )
+  t.is(await exists(path.join(harness.layout.root, '0.18.0')), false)
+  t.is(await exists(path.join(harness.layout.root, '0.18.1')), true)
+  t.is(await fs.promises.readFile(path.join(harness.layout.root, 'latest'), 'utf8'), 'operator')
+
+  const session = await harness.stageTree('0.18.2', { 'a.bin': 'c' })
+  await harness.commits.commit(session, { retentionManager: manager })
+  await harness.sessions.retireCommitted(session.transferId)
+  t.ok(await exists(path.join(harness.layout.root, '0.18.2')))
+})
+
+test('commit defers post-commit retention only when asked and keeps pre-commit checks', async (t) => {
+  for (const defer of [false, true]) {
+    const harness = await createHarness(t)
+    const manager = harness.manager({ maxVersions: 1, versionGranularity: 'major' })
+    await harness.publish('api-2.0.0.bin', b4a.from('newer'), false, {
+      series: 'api',
+      version: '2.0.0'
+    })
+    harness.clock.advance(1)
+    const session = await harness.stage('api-1.0.0.bin', b4a.from('older'))
+    const record = await harness.commits.commit(session, {
+      retentionManager: manager,
+      release: { series: 'api', version: '1.0.0' },
+      deferPostCommitRetention: defer
+    })
+
+    t.is(await exists(path.join(harness.layout.root, 'api-1.0.0.bin')), defer, `defer=${defer}`)
+    if (defer) {
+      t.ok(
+        (await harness.commits.list()).some((entry) => entry.transferId === record.transferId),
+        'record survives until the caller runs retention'
+      )
+      t.is(await manager.afterCommit(), true)
+      t.is(await exists(path.join(harness.layout.root, 'api-1.0.0.bin')), false)
+    }
+  }
 })

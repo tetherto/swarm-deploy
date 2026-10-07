@@ -18,6 +18,8 @@ export type StorageOperationName =
   | 'writeFile'
   | 'rename'
   | 'link'
+  | 'symlink'
+  | 'readlink'
   | 'unlink'
   | 'rmdir'
   | 'rm'
@@ -55,6 +57,8 @@ export interface TestStorageFileHandle extends StorageFileHandle {
 }
 
 export interface TestStorage extends StorageAdapter {
+  symlink(target: string, path: string): Promise<void>
+  readlink(path: string): Promise<string>
   writeFile(path: string, data: string | Uint8Array): Promise<void>
   open(path: string, flags: string | number, mode?: number): Promise<TestStorageFileHandle>
 }
@@ -105,6 +109,17 @@ export function createStorage({
       await beforeOperation('link', existingPath, newPath)
       await promises.link(existingPath, newPath)
       await afterOperation('link', existingPath, newPath)
+    },
+    async symlink(target: string, linkPath: string): Promise<void> {
+      await beforeOperation('symlink', linkPath, target)
+      await promises.symlink(target, linkPath)
+      await afterOperation('symlink', linkPath, target)
+    },
+    async readlink(target: string): Promise<string> {
+      await beforeOperation('readlink', target)
+      const result = await promises.readlink(target)
+      await afterOperation('readlink', target)
+      return result
     },
     async unlink(target: string): Promise<void> {
       await beforeOperation('unlink', target)

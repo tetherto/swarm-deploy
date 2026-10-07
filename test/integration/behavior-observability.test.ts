@@ -5,13 +5,7 @@ import test from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import {
-  Client,
-  ERRORS,
-  keyPairFromSeed,
-  Server,
-  type ClientResultEvent
-} from '../../dist/index.js'
+import { Client, ERRORS, keyPairFromSeed, Server } from '../../dist/index.js'
 import { DirectDhtClient } from '../../dist/direct-dht.js'
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
@@ -103,7 +97,11 @@ test('public events and loggers contain failures while forwarding private lifecy
   t.ok(
     serverEvents.some(
       (event) =>
-        event.type === 'retention' && event.trigger === 'startup' && event.status === 'completed'
+        event.type === 'retention' &&
+        event.trigger === 'startup' &&
+        event.status === 'completed' &&
+        event.countDeleted === 0 &&
+        event.versionDeleted === 0
     )
   )
   t.ok(serverEvents.some((event) => event.type === 'progress'))
@@ -127,19 +125,76 @@ test('public events and loggers contain failures while forwarding private lifecy
   }
 })
 
-test('directory uploads emit per-file nonfinal results and one exact aggregate result', async (t) => {
+test('count and version rotation counters reach retention events and rejected offers stay observable', async (t) => {
   const testnet = await createLocalTestnet(t)
   const storage = await createTempDir(t)
   const source = await createTempDir(t)
+  const clientKey = keyPairFromSeed(CLIENT_SEED).publicKey
+  const retention: Array<Record<string, unknown>> = []
+  const offers: Array<Record<string, unknown>> = []
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: storage,
+    allowedKeys: [clientKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    dht: testnet.createNode(),
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxCount: 5,
+    maxVersions: 1,
+    versionGranularity: 'major'
+  })
+  server.on('retention', (event) => retention.push({ ...event }))
+  server.on('offer', (event) => offers.push({ ...event }))
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    idleTimeout: 1_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
+  await server.listen()
+
+  for (const name of ['api-1.0.0.bin', 'api-2.0.0.bin']) {
+    const input = path.join(source, name)
+    await fs.promises.writeFile(input, name)
+    t.is((await client.upload(input)).status, 'COMMITTED')
+  }
+  const unmatched = path.join(source, 'unmatched.txt')
+  await fs.promises.writeFile(unmatched, 'unmatched')
+  await t.exception(client.upload(unmatched), { code: ERRORS.INVALID_FILENAME })
+
+  const completed = retention.filter((event) => event.status === 'completed')
+  t.ok(completed.every((event) => event.countDeleted === 0))
+  t.is(
+    completed.reduce((total, event) => total + (event.versionDeleted as number), 0),
+    1
+  )
+  t.ok(completed.some((event) => event.trigger === 'post-commit' && event.versionDeleted === 1))
+  t.ok(
+    offers.some((event) => event.status === 'rejected' && event.reason === ERRORS.INVALID_FILENAME)
+  )
+  t.alike(
+    (await fs.promises.readdir(storage)).filter((name) => name.endsWith('.bin')),
+    ['api-2.0.0.bin']
+  )
+})
+
+test('a directory upload commits one recursive artifact and one final result', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const storage = await createTempDir(t)
+  const source = path.join(await createTempDir(t), '0.18.1')
+  await fs.promises.mkdir(path.join(source, 'nested'), { recursive: true })
   await fs.promises.writeFile(path.join(source, 'b.txt'), 'b')
-  await fs.promises.writeFile(path.join(source, 'a.txt'), 'a')
-  await fs.promises.mkdir(path.join(source, 'ignored'))
+  await fs.promises.writeFile(path.join(source, 'nested', 'a.txt'), 'a')
   const server = new Server({
     seed: SERVER_SEED,
     storageDir: storage,
     allowedKeys: [keyPairFromSeed(CLIENT_SEED).publicKey],
     maxFileBytes: 1024,
-    maxStagingBytes: 4096,
+    maxStagingBytes: 16 * 1024,
     minFreeBytes: 0,
     dht: testnet.createNode()
   })
@@ -149,31 +204,62 @@ test('directory uploads emit per-file nonfinal results and one exact aggregate r
     connectTimeout: 5_000,
     dht: testnet.createNode()
   })
-  const events: ClientResultEvent[] = []
-  client.on('result', (event) => events.push(event))
+  const clientResults: Array<Record<string, unknown>> = []
+  const serverCommits: Array<Record<string, unknown>> = []
+  client.on('result', (event) => clientResults.push(event as unknown as Record<string, unknown>))
+  server.on('commit', (event) => serverCommits.push(event as unknown as Record<string, unknown>))
   t.teardown(() => Promise.allSettled([client.close(), server.close()]))
 
   await server.listen()
   const result = await client.upload(source)
-  if (!('results' in result)) throw new Error('Expected directory result')
   t.is(result.status, 'COMMITTED')
-  t.alike(
-    result.results.map((entry) => entry.name),
-    ['a.txt', 'b.txt']
-  )
-  t.is(result.skipped.length, 1)
-
-  const perFile = events.filter((event) => event.name !== undefined)
-  const aggregate = events.filter((event) => event.name === undefined)
-  t.is(perFile.length, 2)
-  t.ok(perFile.every((event) => event.final === false))
-  t.is(aggregate.length, 1)
-  t.alike(aggregate[0], {
+  t.is(result.kind, 'directory')
+  t.is(result.name, '0.18.1')
+  t.is(result.entryCount, 3)
+  t.is(result.size, 2)
+  t.is(clientResults.length, 1)
+  t.alike(clientResults[0], {
+    name: '0.18.1',
+    kind: 'directory',
     status: 'COMMITTED',
-    final: true,
-    files: 2,
-    committed: 2,
-    failed: 0,
-    skipped: 1
+    final: true
   })
+  t.ok(serverCommits.every((event) => event.kind === 'directory'))
+  t.alike((await fs.promises.readdir(path.join(storage, '0.18.1'))).sort(), ['b.txt', 'nested'])
+  t.alike(await fs.promises.readdir(path.join(storage, '0.18.1', 'nested')), ['a.txt'])
+  t.ok((await fs.promises.lstat(path.join(storage, '0.18.1'))).isDirectory())
+  t.is(await fs.promises.readFile(path.join(storage, '0.18.1', 'nested', 'a.txt'), 'utf8'), 'a')
+})
+
+test('a configured symlink follows the newest committed directory end to end', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const storage = await createTempDir(t)
+  const sourceRoot = await createTempDir(t)
+  const server = new Server({
+    seed: SERVER_SEED,
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(CLIENT_SEED).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 16 * 1024,
+    minFreeBytes: 0,
+    dht: testnet.createNode(),
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' }]
+  })
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => Promise.allSettled([client.close(), server.close()]))
+  await server.listen()
+
+  for (const version of ['0.18.0', '0.18.1']) {
+    const source = path.join(sourceRoot, version)
+    await fs.promises.mkdir(source)
+    await fs.promises.writeFile(path.join(source, 'a.bin'), version)
+    t.is((await client.upload(source)).status, 'COMMITTED')
+    t.is(await fs.promises.readlink(path.join(storage, 'latest')), version)
+  }
+  t.is(await fs.promises.readFile(path.join(storage, 'latest', 'a.bin'), 'utf8'), '0.18.1')
 })

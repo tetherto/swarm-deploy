@@ -1,6 +1,5 @@
 import b4a from 'b4a'
 import events from '#events'
-import fs from '#fs'
 import { createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
 import {
   DirectDhtClient,
@@ -9,7 +8,7 @@ import {
   type DirectDhtSocket
 } from './direct-dht.js'
 import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
-import { selectUploadPaths, type SkippedUploadReason } from './files.js'
+import { selectUploadTarget } from './files.js'
 import { keyPairFromSeed } from './identity.js'
 import {
   decodeDirectAdmission,
@@ -23,10 +22,19 @@ import {
   buildTarManifest,
   metadataFromManifest,
   regenerateTarSuffix,
-  type TarManifest
+  type TarManifest,
+  type TarResumeResult
 } from './tar-protocol/manifest.js'
+import {
+  buildTreeManifest,
+  regenerateTreeTarSuffix,
+  treeMetadataFromManifest,
+  type TreeManifest
+} from './tar-protocol/tree-manifest.js'
+import type { AnyMetadataRecord } from './tar-protocol/controls.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 import type {
+  ArtifactKind,
   Digest,
   FingerprintEvent,
   Logger,
@@ -48,6 +56,13 @@ export interface ClientOptions {
   serverPublicKey: PublicKeyInput
   connectTimeout?: number
   idleTimeout?: number
+  /**
+   * Send the immediate source directory name with the offer. Defaults to
+   * `true`. Set it to `false` where the staging folder name is itself
+   * sensitive; uploads then keep the legacy transfer identity and cannot match
+   * a server pattern that needs a parent segment.
+   */
+  includeSourceParent?: boolean
   dht?: DirectDhtNode
   dhtFactory?: DirectDhtFactory
   logger?: Logger | null
@@ -55,27 +70,17 @@ export interface ClientOptions {
 export type UploadStatus = 'COMMITTED' | 'ALREADY_COMMITTED'
 export interface UploadResult {
   status: UploadStatus
+  kind: ArtifactKind
   name: string
+  /** Payload bytes: the file size, or the aggregate regular-file bytes of a tree. */
   size: number
+  /** The file digest, or the canonical tree digest of a directory artifact. */
   digest: Digest
   transferId: TransferId
+  /** Present only for a directory artifact. */
+  entryCount?: number
 }
-export interface BatchUploadFailure {
-  name: string
-  status: ErrorCode
-  reason?: string
-}
-export interface SkippedUploadEntry {
-  name: string
-  path: string
-  reason: SkippedUploadReason
-}
-export interface BatchUploadResult {
-  status: 'COMMITTED' | 'FAILED'
-  results: Array<UploadResult | BatchUploadFailure>
-  skipped: SkippedUploadEntry[]
-}
-export type ClientUploadResult = UploadResult | BatchUploadResult
+export type ClientUploadResult = UploadResult
 export interface ClientOfferEvent {
   status: 'offered' | 'accepted' | 'resumed' | 'reset' | 'rejected' | 'already-committed'
   name: string
@@ -88,13 +93,10 @@ export interface ClientProgressEvent {
   totalBytes: number
 }
 export interface ClientResultEvent {
-  name?: string
-  status: UploadStatus | ErrorCode | 'COMMITTED' | 'FAILED'
+  name: string
+  kind: ArtifactKind
+  status: UploadStatus | ErrorCode
   final: boolean
-  files?: number
-  committed?: number
-  failed?: number
-  skipped?: number
 }
 export interface ClientEventMap {
   connection: FingerprintEvent
@@ -105,7 +107,6 @@ export interface ClientEventMap {
   verification: { name: string; status: 'started' | 'succeeded' | 'failed'; reason?: string }
   commit: { name: string; status: 'succeeded' | 'failed'; reason?: string }
   result: ClientResultEvent
-  skipped: { name: string; reason: SkippedUploadReason }
   failure: FingerprintEvent & { reason: ErrorCode }
   close: { status: 'closed' }
 }
@@ -152,6 +153,33 @@ function logger(log: Logger | null | undefined): Required<Logger> {
   }
 }
 
+type AnyManifest = TarManifest | TreeManifest
+
+function isTreeManifest(manifest: AnyManifest): manifest is TreeManifest {
+  return 'kind' in manifest && manifest.kind === 'directory'
+}
+function manifestMetadata(manifest: AnyManifest, reset: boolean): AnyMetadataRecord {
+  return isTreeManifest(manifest)
+    ? treeMetadataFromManifest(manifest, reset)
+    : metadataFromManifest(manifest, reset)
+}
+function manifestPayloadBytes(manifest: AnyManifest): number {
+  return isTreeManifest(manifest) ? manifest.payloadBytes : manifest.fileSize
+}
+function manifestDigest(manifest: AnyManifest): Buffer {
+  return isTreeManifest(manifest) ? manifest.treeSha256 : manifest.fileSha256
+}
+function regenerateSuffix(
+  manifest: AnyManifest,
+  offset: number,
+  write: (chunk: Buffer) => void | Promise<void>,
+  options: { signal: AbortSignalLike; expectedPrefixSha256: Uint8Array | null }
+): Promise<TarResumeResult> {
+  return isTreeManifest(manifest)
+    ? regenerateTreeTarSuffix(manifest, offset, write, options)
+    : regenerateTarSuffix(manifest, offset, write, options)
+}
+
 /** An authenticated, server-key-pinned direct HyperDHT uploader. */
 export interface Client {
   on<EventName extends ClientEventName>(
@@ -165,6 +193,7 @@ export class Client extends EventEmitter {
   readonly serverPublicKey: PublicKey
   readonly connectTimeout: number
   readonly idleTimeout: number
+  readonly includeSourceParent: boolean
   readonly logger: Required<Logger>
   private readonly direct: DirectDhtClient
   private readonly abort = createAbortController()
@@ -190,6 +219,13 @@ export class Client extends EventEmitter {
       DEFAULT_CONNECT_TIMEOUT
     )
     this.idleTimeout = duration(options.idleTimeout, 'idle timeout', DEFAULT_IDLE_TIMEOUT)
+    if (
+      options.includeSourceParent !== undefined &&
+      typeof options.includeSourceParent !== 'boolean'
+    ) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid source parent option')
+    }
+    this.includeSourceParent = options.includeSourceParent !== false
     this.publicKey = b4a.from(keyPair.publicKey)
     this.direct = new DirectDhtClient({
       keyPair,
@@ -205,11 +241,7 @@ export class Client extends EventEmitter {
     } catch {}
   }
 
-  private async uploadManifest(
-    manifest: TarManifest,
-    reset = false,
-    emitFinal = true
-  ): Promise<UploadResult> {
+  private async uploadManifest(manifest: AnyManifest, reset = false): Promise<UploadResult> {
     throwIfAborted(this.signal)
     const socket = await this.direct.connect(this.serverPublicKey, {
       signal: this.signal,
@@ -226,13 +258,13 @@ export class Client extends EventEmitter {
     const reader = new DirectWireReader(socket)
     let verificationStarted = false
     try {
-      const metadata = metadataFromManifest(manifest, reset)
+      const metadata = manifestMetadata(manifest, reset)
       await writeMetadata(socket, metadata, { signal: this.signal, timeout: this.idleTimeout })
       this.emitSafe('offer', { name: manifest.name, status: 'offered' })
       const admission = await reader.control(decodeDirectAdmission, this.signal, this.idleTimeout)
       if (admission.status === 'ALREADY_COMMITTED') {
         this.emitSafe('offer', { name: manifest.name, status: 'already-committed' })
-        return this.result(manifest, 'ALREADY_COMMITTED', emitFinal)
+        return this.result(manifest, 'ALREADY_COMMITTED')
       }
       if (admission.status === 'REJECTED') throw fail(admission.code, 'Server rejected upload')
       if (admission.status === 'VERIFIED') {
@@ -242,7 +274,7 @@ export class Client extends EventEmitter {
         if (final.status !== 'COMMITTED') throw fail(final.code, 'Server failed verified upload')
         this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
         this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
-        return this.result(manifest, 'COMMITTED', emitFinal)
+        return this.result(manifest, 'COMMITTED')
       }
       const offset = admission.offset
       const expected =
@@ -253,7 +285,7 @@ export class Client extends EventEmitter {
         offset
       })
       let progress = offset
-      const regenerated = await regenerateTarSuffix(
+      const regenerated = await regenerateSuffix(
         manifest,
         offset,
         async (chunk) => {
@@ -272,7 +304,7 @@ export class Client extends EventEmitter {
         this.emitSafe('offer', { name: manifest.name, status: 'reset', offset: 0 })
         reader.closeReader()
         socket.destroy()
-        return this.uploadManifest(manifest, true, emitFinal)
+        return this.uploadManifest(manifest, true)
       }
       if (regenerated.bytesSent !== manifest.tarSize - offset) {
         throw fail(ERRORS.PROTOCOL_INVALID, 'Incomplete deterministic TAR transfer')
@@ -294,7 +326,7 @@ export class Client extends EventEmitter {
       }
       this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
       this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
-      return this.result(manifest, 'COMMITTED', emitFinal)
+      return this.result(manifest, 'COMMITTED')
     } catch (error) {
       const reason = codeOf(error)
       if (verificationStarted) {
@@ -310,82 +342,40 @@ export class Client extends EventEmitter {
     }
   }
 
-  private result(manifest: TarManifest, status: UploadStatus, final: boolean): UploadResult {
-    const result = {
+  private result(manifest: AnyManifest, status: UploadStatus): UploadResult {
+    const kind: ArtifactKind = isTreeManifest(manifest) ? 'directory' : 'file'
+    const result: UploadResult = {
       status,
+      kind,
       name: manifest.name,
-      size: manifest.fileSize,
-      digest: b4a.from(manifest.fileSha256),
-      transferId: b4a.from(manifest.transferId)
+      size: manifestPayloadBytes(manifest),
+      digest: b4a.from(manifestDigest(manifest)),
+      transferId: b4a.from(manifest.transferId),
+      ...(isTreeManifest(manifest) ? { entryCount: manifest.entryCount } : {})
     }
     this.logger.info('Direct upload completed', { name: result.name, status: result.status })
-    this.emitSafe('result', { name: result.name, status, final })
+    this.emitSafe('result', { name: result.name, kind, status, final: true })
     return result
   }
-  private async perform(inputPath: string): Promise<ClientUploadResult> {
+  private async perform(inputPath: string): Promise<UploadResult> {
     if (typeof inputPath !== 'string' || !inputPath) {
       throw fail(ERRORS.INVALID_FILENAME, 'Invalid upload path')
     }
-    const root = await fs.promises.lstat(inputPath)
-    const selection = await selectUploadPaths(inputPath, { signal: this.signal })
-    if (!root.isDirectory()) {
-      return this.uploadManifest(
-        await buildTarManifest(selection.paths[0], this.publicKey, { signal: this.signal })
-      )
-    }
-    const results: Array<UploadResult | BatchUploadFailure> = []
-    for (const skipped of selection.skipped) {
-      this.emitSafe('skipped', { name: skipped.name, reason: skipped.reason })
-    }
-    for (const entry of selection.entries) {
-      if (entry.kind === 'skipped') continue
-      if (entry.kind === 'failed') {
-        results.push({ name: entry.name, status: ERRORS.PROTOCOL_INVALID, reason: entry.reason })
-        continue
-      }
-      try {
-        results.push(
-          await this.uploadManifest(
-            await buildTarManifest(entry.path, this.publicKey, { signal: this.signal }),
-            false,
-            false
-          )
-        )
-      } catch (error) {
-        const status = codeOf(error)
-        results.push({ name: entry.name, status })
-        this.emitSafe('result', { name: entry.name, status, final: false })
-      }
-    }
-    const failed = results.some(
-      (result) => result.status !== 'COMMITTED' && result.status !== 'ALREADY_COMMITTED'
+    const target = await selectUploadTarget(inputPath, { signal: this.signal })
+    const options = { signal: this.signal, includeSourceParent: this.includeSourceParent }
+    return this.uploadManifest(
+      target.kind === 'directory'
+        ? await buildTreeManifest(target.path, this.publicKey, options)
+        : await buildTarManifest(target.path, this.publicKey, options)
     )
-    const result: BatchUploadResult = {
-      status: failed ? 'FAILED' : 'COMMITTED',
-      results,
-      skipped: selection.skipped
-    }
-    const committed = results.filter(
-      (entry) => entry.status === 'COMMITTED' || entry.status === 'ALREADY_COMMITTED'
-    ).length
-    this.emitSafe('result', {
-      status: result.status,
-      final: true,
-      files: results.length,
-      committed,
-      failed: results.length - committed,
-      skipped: selection.skipped.length
-    })
-    return result
   }
-  upload(inputPath: string): Promise<ClientUploadResult> {
+  upload(inputPath: string): Promise<UploadResult> {
     if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Client is closed'))
     const operation = this.queue
       .then(() => this.perform(inputPath))
       .catch((error: unknown) => {
         const reason = codeOf(error)
         this.emitSafe('failure', { fingerprint: fingerprint(this.serverPublicKey), reason })
-        this.emitSafe('result', { status: reason, final: true })
         throw error
       })
     this.queue = operation.then(

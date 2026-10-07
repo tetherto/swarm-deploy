@@ -2,6 +2,10 @@ export interface StorageStats {
   dev: number | bigint
   ino: number | bigint
   size: number
+  /** Hard-link count; tree primitives reject any file reporting more than one. */
+  nlink?: number
+  /** Modification time, compared across hashing when the adapter reports it. */
+  mtimeMs?: number
   isSymbolicLink(): boolean
   isDirectory(): boolean
   isFile(): boolean
@@ -62,6 +66,14 @@ export interface StorageAdapter {
   rmdir(path: string): Promise<void>
   readdir(path: string): Promise<string[]>
   statfs?(path: string): Promise<StorageStatFs>
+  /** Required only when symlink rules are configured. */
+  symlink?(target: string, path: string): Promise<void>
+  readlink?(path: string): Promise<string>
+}
+
+export type SymlinkCapableStorage = StorageAdapter & {
+  symlink(target: string, path: string): Promise<void>
+  readlink(path: string): Promise<string>
 }
 
 export interface StorageLayout {
@@ -73,6 +85,10 @@ export interface StorageLayout {
   journals: string
   /** Private destinations for replacement publications before they are visible. */
   publications: string
+  /** Private managed-symlink ownership records. */
+  links: string
+  /** Private destination a managed directory is renamed into before deletion. */
+  trash: string
   lock: string
 }
 

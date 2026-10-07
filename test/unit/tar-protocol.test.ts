@@ -11,6 +11,8 @@ import { ERRORS } from '../../dist/errors.js'
 import {
   assertMetadataTransferId,
   buildTarManifest,
+  computeTarTransferId,
+  deriveSourceParent,
   deterministicTarSize,
   metadataFromManifest,
   regenerateTarSuffix,
@@ -154,8 +156,27 @@ test('canonical TAR is deterministic and bound into its manifest', async (t) => 
     '00e2b1271cceb3d62531532827f9487ed0253365ad311822ce3b2e1ec734f3d6'
   )
   t.is(
-    b4a.toString(first.transferId, 'hex'),
+    b4a.toString(
+      computeTarTransferId(CLIENT_KEY, {
+        name: first.name,
+        fileSize: first.fileSize,
+        fileSha256: first.fileSha256,
+        tarSize: first.tarSize,
+        tarSha256: first.tarSha256
+      }),
+      'hex'
+    ),
     '1c1e719f9bb199367352c667f1e9edbf7cc8f2b73630c832cd9ab6d558615e7c'
+  )
+  t.unlike(
+    first.transferId,
+    computeTarTransferId(CLIENT_KEY, {
+      name: first.name,
+      fileSize: first.fileSize,
+      fileSha256: first.fileSha256,
+      tarSize: first.tarSize,
+      tarSha256: first.tarSha256
+    })
   )
   t.is(firstTar.readUInt8(156), 48)
   t.is(
@@ -286,6 +307,170 @@ test('bounded control records round-trip exact strict schemas', (t) => {
     { v: 1, status: 'FAILED', code: ERRORS.CHECKSUM_MISMATCH } as const
   ]
   for (const value of finals) t.alike(decodeFinalRecord(encodeFinalRecord(value)), value)
+})
+
+test('source parent is authenticated while legacy metadata keeps its transfer ID', async (t) => {
+  const dir = await createTempDir(t)
+  const releaseDir = path.join(dir, 'releases', '2.4.1')
+  await fs.promises.mkdir(releaseDir, { recursive: true })
+  const file = path.join(releaseDir, 'api.tar.gz')
+  await fs.promises.writeFile(file, b4a.from('payload'))
+
+  const manifest = await buildTarManifest(file, CLIENT_KEY)
+  const metadata = metadataFromManifest(manifest)
+  t.is((manifest as TarManifest & { sourceParent?: string }).sourceParent, '2.4.1')
+  t.is((metadata as MetadataRecord & { sourceParent?: string }).sourceParent, '2.4.1')
+  assertMetadataTransferId(CLIENT_KEY, metadata)
+  t.exception(
+    () =>
+      assertMetadataTransferId(CLIENT_KEY, {
+        ...metadata,
+        sourceParent: '2.4.2'
+      } as MetadataRecord),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+
+  const legacy = { ...metadata } as MetadataRecord & { sourceParent?: string }
+  delete legacy.sourceParent
+  legacy.transferId = b4a.toString(
+    computeTarTransferId(CLIENT_KEY, {
+      name: legacy.name,
+      fileSize: legacy.fileSize,
+      fileSha256: b4a.from(legacy.fileSha256, 'hex'),
+      tarSize: legacy.tarSize,
+      tarSha256: b4a.from(legacy.tarSha256, 'hex')
+    }),
+    'hex'
+  )
+  const encoded = encodeMetadataRecord(legacy)
+  t.alike(decodeMetadataRecord(encoded), legacy)
+  assertMetadataTransferId(CLIENT_KEY, legacy)
+})
+
+test('opting out of the source parent restores the legacy authenticated identity', async (t) => {
+  const dir = await createTempDir(t)
+  const releaseDir = path.join(dir, 'releases', '2.4.1')
+  await fs.promises.mkdir(releaseDir, { recursive: true })
+  const file = path.join(releaseDir, 'api.tar.gz')
+  await fs.promises.writeFile(file, b4a.from('payload'))
+
+  const included = await buildTarManifest(file, CLIENT_KEY)
+  const omitted = await buildTarManifest(file, CLIENT_KEY, { includeSourceParent: false })
+  t.is(included.sourceParent, '2.4.1')
+  t.is(omitted.sourceParent, undefined, 'the manifest carries no parent')
+
+  const metadata = metadataFromManifest(omitted)
+  t.is(Object.prototype.hasOwnProperty.call(metadata, 'sourceParent'), false, 'no wire key')
+  assertMetadataTransferId(CLIENT_KEY, metadata)
+  t.is(
+    metadata.transferId,
+    b4a.toString(
+      computeTarTransferId(CLIENT_KEY, {
+        name: metadata.name,
+        fileSize: metadata.fileSize,
+        fileSha256: b4a.from(metadata.fileSha256, 'hex'),
+        tarSize: metadata.tarSize,
+        tarSha256: b4a.from(metadata.tarSha256, 'hex')
+      }),
+      'hex'
+    ),
+    'the transfer ID matches a client that never sent a parent'
+  )
+  t.not(b4a.toString(omitted.transferId, 'hex'), b4a.toString(included.transferId, 'hex'))
+
+  t.is(
+    (await buildTarManifest(file, CLIENT_KEY, { includeSourceParent: true })).sourceParent,
+    '2.4.1',
+    'the parent is included by default and on an explicit true'
+  )
+})
+
+test('source parent is one bounded safe component with SemVer build metadata', (t) => {
+  const valid = {
+    ...metadataForTar(b4a.alloc(deterministicTarSize(7))),
+    sourceParent: '1.2.3+build.1'
+  } as MetadataRecord
+  t.alike(decodeMetadataRecord(encodeMetadataRecord(valid)), valid)
+  t.alike(
+    (
+      decodeMetadataRecord(
+        encodeMetadataRecord({ ...valid, sourceParent: 'history-release' } as MetadataRecord)
+      ) as MetadataRecord & { sourceParent?: string }
+    ).sourceParent,
+    'history-release'
+  )
+
+  for (const sourceParent of [
+    '.',
+    '..',
+    '/absolute',
+    'nested/release',
+    'nested\\release',
+    'white space',
+    'x'.repeat(101)
+  ]) {
+    t.exception(() => encodeMetadataRecord({ ...valid, sourceParent } as MetadataRecord))
+  }
+})
+
+test('unsafe local source parents are omitted and keep the legacy authenticated transfer ID', async (t) => {
+  const dir = await createTempDir(t)
+  for (const parent of ['My Releases', '.hidden', 'x'.repeat(101), 'bad@parent']) {
+    const parentDir = path.join(dir, parent)
+    await fs.promises.mkdir(parentDir)
+    const file = path.join(parentDir, 'api.tar.gz')
+    await fs.promises.writeFile(file, b4a.from('payload'))
+
+    const manifest = await buildTarManifest(file, CLIENT_KEY)
+    t.is(manifest.sourceParent, undefined, `${parent.slice(0, 12)} omitted from manifest`)
+    const metadata = metadataFromManifest(manifest)
+    t.is(Object.prototype.hasOwnProperty.call(metadata, 'sourceParent'), false, 'no wire key')
+    t.alike(decodeMetadataRecord(encodeMetadataRecord(metadata)), metadata)
+    assertMetadataTransferId(CLIENT_KEY, metadata)
+    t.is(
+      metadata.transferId,
+      b4a.toString(
+        computeTarTransferId(CLIENT_KEY, {
+          name: metadata.name,
+          fileSize: metadata.fileSize,
+          fileSha256: b4a.from(metadata.fileSha256, 'hex'),
+          tarSize: metadata.tarSize,
+          tarSha256: b4a.from(metadata.tarSha256, 'hex')
+        }),
+        'hex'
+      ),
+      'legacy-style transfer ID'
+    )
+  }
+})
+
+test('source parent derivation omits unsafe or absent immediate parents', (t) => {
+  t.is(deriveSourceParent('/'), undefined)
+  t.is(deriveSourceParent('/api.tar.gz'), undefined)
+  t.is(deriveSourceParent('/releases/My Releases/api.tar.gz'), undefined)
+  t.is(deriveSourceParent('/releases/.hidden/api.tar.gz'), undefined)
+  t.is(deriveSourceParent(`/releases/${'x'.repeat(101)}/api.tar.gz`), undefined)
+  t.is(deriveSourceParent(`/releases/${'x'.repeat(100)}/api.tar.gz`), 'x'.repeat(100))
+  t.is(deriveSourceParent('/releases/2.4.1+build.5/api.tar.gz'), '2.4.1+build.5')
+  t.is(deriveSourceParent('/releases/old/../2.4.1/api.tar.gz'), '2.4.1')
+})
+
+test('explicit wire metadata with an unsafe source parent is rejected by strict decoding', (t) => {
+  const valid = metadataForTar(b4a.alloc(deterministicTarSize(7)))
+  for (const sourceParent of ['My Releases', '.hidden', '', '..', 'a/b', 'x'.repeat(101)]) {
+    t.exception(
+      () => decodeMetadataRecord(b4a.from(JSON.stringify({ ...valid, sourceParent }))),
+      { code: ERRORS.INVALID_FILENAME },
+      `rejects ${JSON.stringify(sourceParent.slice(0, 12))}`
+    )
+  }
+  t.exception(
+    () =>
+      decodeMetadataRecord(
+        b4a.from(JSON.stringify({ ...valid, sourceParent: undefined, extra: 1 }))
+      ),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
 })
 
 test('control decoders reject unknown fields, versions, types, hex, and bounds', (t) => {
@@ -612,6 +797,7 @@ test('manifest metadata conversion is exact and reset-aware', async (t) => {
   t.alike(Object.keys(metadata), [
     'v',
     'name',
+    'sourceParent',
     'fileSize',
     'fileSha256',
     'tarSize',

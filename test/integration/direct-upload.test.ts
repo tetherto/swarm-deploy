@@ -5,7 +5,7 @@ import test from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import { Client, Server, keyPairFromSeed } from '../../dist/index.js'
+import { Client, ERRORS, Server, keyPairFromSeed } from '../../dist/index.js'
 import {
   buildTarManifest,
   deterministicTarSize,
@@ -66,7 +66,6 @@ test('direct server-key upload commits only after an explicit final result', asy
   await server.listen()
   const result = await client.upload(input)
   t.is(result.status, 'COMMITTED')
-  if (!('size' in result)) throw new Error('Expected single upload result')
   t.is(await fs.promises.readFile(path.join(storage, 'artifact.txt'), 'utf8'), 'direct TAR payload')
   t.alike(serverEvents, [
     'offer',
@@ -199,46 +198,6 @@ test('terminal delivery failure never contradicts durable lifecycle events', asy
     'durably committed before terminal delivery fails'
   )
   t.alike(phases, ['verification:started', 'verification:succeeded', 'commit:succeeded', 'failure'])
-})
-
-test('directory uploads use separate direct connections in lexical order', async (t) => {
-  const testnet = await createLocalTestnet(t)
-  const serverSeed = b4a.alloc(32, 93)
-  const clientSeed = b4a.alloc(32, 94)
-  const storage = await createTempDir(t)
-  const source = await createTempDir(t)
-  await fs.promises.writeFile(path.join(source, 'z.txt'), 'z')
-  await fs.promises.writeFile(path.join(source, 'a.txt'), 'a')
-  const connections: string[] = []
-  const server = new Server({
-    seed: serverSeed,
-    storageDir: storage,
-    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
-    maxFileBytes: 1024,
-    maxStagingBytes: 4096,
-    minFreeBytes: 0,
-    dht: testnet.createNode()
-  })
-  server.on('offer', (event) => {
-    if (event.status === 'accepted') connections.push(event.name)
-  })
-  const client = new Client({
-    seed: clientSeed,
-    serverPublicKey: server.publicKey,
-    connectTimeout: 5_000,
-    dht: testnet.createNode()
-  })
-  t.teardown(async () => {
-    await client.close()
-    await server.close()
-  })
-
-  await server.listen()
-  const result = await client.upload(source)
-  t.is(result.status, 'COMMITTED')
-  t.alike(connections, ['a.txt', 'z.txt'])
-  t.is(await fs.promises.readFile(path.join(storage, 'a.txt'), 'utf8'), 'a')
-  t.is(await fs.promises.readFile(path.join(storage, 'z.txt'), 'utf8'), 'z')
 })
 
 test('a divergent durable TAR prefix is reset once before direct commit', async (t) => {
@@ -406,4 +365,40 @@ test('a committed upload still reports success when session cleanup fails', asyn
     'cleanup failure payload',
     'the artifact is published'
   )
+})
+
+test('re-uploading an unchanged directory is already committed and never replaced', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 71)
+  const clientSeed = b4a.alloc(32, 72)
+  const storage = await createTempDir(t)
+  const source = path.join(await createTempDir(t), '0.18.1')
+  await fs.promises.mkdir(source)
+  await fs.promises.writeFile(path.join(source, 'a.bin'), 'a')
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 16 * 1024,
+    minFreeBytes: 0,
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  t.is((await client.upload(source)).status, 'COMMITTED')
+  t.is((await client.upload(source)).status, 'ALREADY_COMMITTED')
+  await fs.promises.writeFile(path.join(source, 'a.bin'), 'b')
+  await t.exception(client.upload(source), { code: ERRORS.FILE_EXISTS })
+  t.is(await fs.promises.readFile(path.join(storage, '0.18.1', 'a.bin'), 'utf8'), 'a')
 })

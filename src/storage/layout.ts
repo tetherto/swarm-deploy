@@ -88,6 +88,8 @@ export function initLayout(storageDir: string): StorageLayout {
     commits: path.join(internal, 'commits'),
     journals: path.join(internal, 'journals'),
     publications: path.join(internal, 'publications'),
+    links: path.join(internal, 'links'),
+    trash: path.join(internal, 'trash'),
     lock: path.join(internal, 'lock')
   }
 
@@ -98,6 +100,8 @@ export function initLayout(storageDir: string): StorageLayout {
   assertDirectorySync(layout.commits)
   assertDirectorySync(layout.journals)
   assertDirectorySync(layout.publications)
+  assertDirectorySync(layout.links)
+  assertDirectorySync(layout.trash)
 
   return layout
 }
@@ -111,7 +115,9 @@ export function protectedDirectories(layout: StorageLayout): string[] {
     layout.sessions,
     layout.commits,
     layout.journals,
-    layout.publications
+    layout.publications,
+    layout.links,
+    layout.trash
   ]
 }
 
