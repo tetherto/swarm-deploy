@@ -248,6 +248,39 @@ test('storage failures surface as stable link errors without paths or errno text
   t.is(await links.read('latest'), null)
 })
 
+test('a dormant rule removes its link and ownership record', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['0.18.0', '0.18.1'])
+  const names = new Set(['latest'])
+  await links.reconcile([desired('latest', '0.18.0', '1'.repeat(64))], names)
+  const removed = await links.reconcile([], names)
+  t.alike(removed.removed, ['latest'])
+  t.is(await links.read('latest'), null)
+  await t.exception(() => fs.promises.lstat(path.join(layout.root, 'latest')))
+})
+
+test('a crash before the record rewrite is removed with the rule', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['0.18.0', '0.18.1'])
+  await links.reconcile([desired('latest', '0.18.0', '1'.repeat(64))], new Set(['latest']))
+  await fs.promises.unlink(path.join(layout.root, 'latest'))
+  await fs.promises.symlink('0.18.1', path.join(layout.root, 'latest'))
+  const removed = await links.reconcile([], new Set(), {
+    managedArtifactNames: new Set(['0.18.0', '0.18.1'])
+  })
+  t.alike(removed.removed, ['latest'])
+  t.is(await links.read('latest'), null)
+  await t.exception(() => fs.promises.lstat(path.join(layout.root, 'latest')))
+})
+
+test('stale temporary links are swept at the start of reconciliation', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['0.18.1'])
+  await fs.promises.symlink('0.18.1', path.join(layout.publications, '.link-' + 'a'.repeat(32)))
+  await links.reconcile([desired('latest', '0.18.1', '1'.repeat(64))], new Set(['latest']))
+  t.alike(await fs.promises.readdir(layout.publications), [])
+})
+
 test('a temporary link is cleaned up when the rename fails', async (t) => {
   const layout = initLayout(await createTempDir(t))
   await fs.promises.mkdir(path.join(layout.root, '0.18.0'))

@@ -32,6 +32,11 @@ export interface LinkReconcileResult {
   unchanged: string[]
 }
 
+export interface LinkReconcileOptions {
+  /** Managed artifact basenames used to prove a crash-residual symlink target. */
+  managedArtifactNames?: ReadonlySet<string>
+}
+
 export interface LinkStoreOptions {
   layout: StorageLayout
   /** Must provide `symlink` and `readlink`, or construction fails closed. */
@@ -310,9 +315,11 @@ export class LinkStore {
     }
   }
 
-  private async removeLink(record: ManagedSymlinkRecord): Promise<void> {
+  private async removeLink(record: ManagedSymlinkRecord, desiredTarget?: string): Promise<void> {
     const destination = await this.classify(record.name)
-    if (destination.state === 'SYMLINK' && destination.target === record.target) {
+    const allowed = new Set([record.target])
+    if (desiredTarget) allowed.add(desiredTarget)
+    if (destination.state === 'SYMLINK' && allowed.has(destination.target)) {
       await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
         this.storage.unlink(this.finalPath(record.name))
       )
@@ -332,23 +339,57 @@ export class LinkStore {
    */
   async reconcile(
     desired: readonly DesiredLink[],
-    ruleNames: ReadonlySet<string>
+    ruleNames: ReadonlySet<string>,
+    options: LinkReconcileOptions = {}
   ): Promise<LinkReconcileResult> {
     try {
-      return await this.converge(desired, ruleNames)
+      return await this.converge(desired, ruleNames, options)
     } catch (error: unknown) {
       throw asLinkError(error)
     }
   }
 
+  private async sweepTemporaryLinks(): Promise<void> {
+    const names = await withSafeDirectoryIdentity(this.layout.publications, this.storage, () =>
+      this.storage.readdir(this.layout.publications)
+    )
+    for (const name of names) {
+      if (!/^\.link-[0-9a-f]{32}$/.test(name)) continue
+      await this.removeTemporary(path.join(this.layout.publications, name))
+    }
+  }
+
   private async converge(
     desired: readonly DesiredLink[],
-    ruleNames: ReadonlySet<string>
+    ruleNames: ReadonlySet<string>,
+    { managedArtifactNames }: LinkReconcileOptions = {}
   ): Promise<LinkReconcileResult> {
+    await this.sweepTemporaryLinks()
     const result: LinkReconcileResult = { created: [], updated: [], removed: [], unchanged: [] }
+    const desiredByName = new Map(desired.map((link) => [link.name, link]))
     for (const record of await this.listRecords()) {
-      if (ruleNames.has(record.name)) continue
-      await this.removeLink(record)
+      if (ruleNames.has(record.name)) {
+        if (!desiredByName.has(record.name)) {
+          const destination = await this.classify(record.name)
+          const desiredTarget =
+            destination.state === 'SYMLINK' && destination.target !== record.target
+              ? destination.target
+              : undefined
+          await this.removeLink(record, desiredTarget)
+          result.removed.push(record.name)
+        }
+        continue
+      }
+      const destination = await this.classify(record.name)
+      let desiredTarget: string | undefined
+      if (destination.state === 'SYMLINK' && destination.target !== record.target) {
+        const pending = desiredByName.get(record.name)
+        if (pending) desiredTarget = pending.target
+        else if (managedArtifactNames?.has(destination.target)) {
+          desiredTarget = destination.target
+        }
+      }
+      await this.removeLink(record, desiredTarget)
       result.removed.push(record.name)
     }
     for (const link of desired) {
