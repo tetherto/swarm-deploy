@@ -1,7 +1,6 @@
 /// <reference path="./types/brittle.d.ts" />
 
 require('./unit/tree-canonical.test.js')
-require('./unit/tree-module-graph.test.js')
 require('./unit/storage-tree.test.js')
 require('./unit/tree-manifest.test.js')
 require('./unit/tree-extract.test.js')

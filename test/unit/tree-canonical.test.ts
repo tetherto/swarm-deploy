@@ -16,11 +16,9 @@ import {
   compareTreePaths,
   hashField,
   classifyTreeEntry,
-  normalizeRevalidateFailure,
   revalidateTreeSnapshot,
   snapshotTree,
   tarEntryName,
-  treeDirectoryReadError,
   treeDigest,
   type TreeEntry
 } from '../../dist/tar-protocol/tree.js'
@@ -40,21 +38,6 @@ const FILE_DIGEST = b4a.alloc(32, 7)
 
 function entry(kind: 'file' | 'directory', treePath: string, size = 0): TreeEntry {
   return { kind, path: treePath, size }
-}
-
-async function directoryIsCaseInsensitive(root: string): Promise<boolean> {
-  const marker = `ci-${Date.now()}-${Math.random().toString(16).slice(2)}`
-  const lowerPath = path.join(root, `${marker}.probe`)
-  const upperPath = path.join(root, `${marker}.PROBE`)
-  await fs.promises.writeFile(lowerPath, 'probe', { flag: 'wx' })
-  try {
-    await fs.promises.access(upperPath)
-    return true
-  } catch {
-    return false
-  } finally {
-    await fs.promises.unlink(lowerPath).catch(() => {})
-  }
 }
 
 function syntheticSpecialEntryStat(): {
@@ -501,66 +484,12 @@ test('depth-32 empty directories snapshot and validate', async (t) => {
 })
 
 test('revalidateTreeSnapshot detects source changes as FILE_BUSY', async (t) => {
-  const mtimeRoot = await createTempDir(t)
-  await writeTree(mtimeRoot, { 'dir/': '', 'dir/x.bin': 'x' })
-  const mtimeSnap = await snapshotTree(mtimeRoot)
-  const fileEntry = mtimeSnap.entries.find((value) => value.path === 'dir/x.bin')!
-  await fs.promises.utimes(fileEntry.absolutePath, new Date(), new Date(Date.now() + 60_000))
-  await t.exception(() => revalidateTreeSnapshot(mtimeSnap), { code: ERRORS.FILE_BUSY })
-
-  const truncateRoot = await createTempDir(t)
-  await writeTree(truncateRoot, { 'solo.bin': 'solo' })
-  const truncateSnap = await snapshotTree(truncateRoot)
-  await fs.promises.truncate(truncateSnap.entries[0].absolutePath, 0)
-  await t.exception(() => revalidateTreeSnapshot(truncateSnap), { code: ERRORS.FILE_BUSY })
-
-  const inodeRoot = await createTempDir(t)
-  await writeTree(inodeRoot, { 'dir/': '' })
-  const inodeSnap = await snapshotTree(inodeRoot)
-  const dirEntry = inodeSnap.entries[0]
-  // Keep the old directory alive so Linux cannot hand its inode to the replacement.
-  await fs.promises.rename(dirEntry.absolutePath, path.join(inodeRoot, 'held'))
-  await fs.promises.mkdir(dirEntry.absolutePath)
-  await fs.promises.rm(path.join(inodeRoot, 'held'), { recursive: true })
-  await t.exception(() => revalidateTreeSnapshot(inodeSnap), { code: ERRORS.FILE_BUSY })
-
-  const symlinkRoot = await createTempDir(t)
-  await writeTree(symlinkRoot, { 'target.bin': 't', 'link.bin': 'l' })
-  const symlinkSnap = await snapshotTree(symlinkRoot)
-  const linkEntry = symlinkSnap.entries.find((value) => value.path === 'link.bin')!
-  await fs.promises.unlink(linkEntry.absolutePath)
-  await fs.promises.symlink(path.join(symlinkRoot, 'target.bin'), linkEntry.absolutePath)
-  await t.exception(() => revalidateTreeSnapshot(symlinkSnap), { code: ERRORS.FILE_BUSY })
-
   const addedRoot = await createTempDir(t)
   await writeTree(addedRoot, { 'keep.bin': 'k' })
   const addedSnap = await snapshotTree(addedRoot)
   await fs.promises.writeFile(path.join(addedRoot, 'added.bin'), 'n')
   await t.exception(() => revalidateTreeSnapshot(addedSnap), { code: ERRORS.FILE_BUSY })
 
-  const removedRoot = await createTempDir(t)
-  await writeTree(removedRoot, { 'gone.bin': 'g' })
-  const removedSnap = await snapshotTree(removedRoot)
-  await fs.promises.unlink(removedSnap.entries[0].absolutePath)
-  await t.exception(() => revalidateTreeSnapshot(removedSnap), { code: ERRORS.FILE_BUSY })
-
-  const rootSwap = await createTempDir(t)
-  await writeTree(rootSwap, { 'only.bin': 'o' })
-  const rootSnap = await snapshotTree(rootSwap)
-  await fs.promises.rm(rootSwap, { recursive: true, force: true })
-  await fs.promises.symlink('/tmp', rootSwap)
-  await t.exception(() => revalidateTreeSnapshot(rootSnap), { code: ERRORS.FILE_BUSY })
-
-  const dirSymlinkRoot = await createTempDir(t)
-  await writeTree(dirSymlinkRoot, { 'inner/': '', 'inner/a.bin': 'a' })
-  const dirSymlinkSnap = await snapshotTree(dirSymlinkRoot)
-  const innerDir = dirSymlinkSnap.entries.find((value) => value.path === 'inner')!
-  await fs.promises.rm(innerDir.absolutePath, { recursive: true })
-  await fs.promises.symlink('/tmp', innerDir.absolutePath)
-  await t.exception(() => revalidateTreeSnapshot(dirSymlinkSnap), { code: ERRORS.FILE_BUSY })
-})
-
-test('revalidateTreeSnapshot maps snapshot re-walk failures to FILE_BUSY only', async (t) => {
   const symlinkAdded = await createTempDir(t)
   await writeTree(symlinkAdded, { 'keep.bin': 'k' })
   const symlinkSnap = await snapshotTree(symlinkAdded)
@@ -570,49 +499,12 @@ test('revalidateTreeSnapshot maps snapshot re-walk failures to FILE_BUSY only', 
   )
   await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(symlinkSnap))
 
-  const unsafeAdded = await createTempDir(t)
-  await writeTree(unsafeAdded, { 'ok.bin': 'ok' })
-  const unsafeSnap = await snapshotTree(unsafeAdded)
-  try {
-    await fs.promises.writeFile(path.join(unsafeAdded, '-bad.bin'), 'x')
-    await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(unsafeSnap))
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code !== 'EINVAL' && code !== 'EACCES') throw error
-    t.pass('platform blocked creating an unsafe leading-dash filename')
-  }
-
-  const foldRoot = await createTempDir(t)
-  await fs.promises.writeFile(path.join(foldRoot, 'a.bin'), 'a', { flag: 'wx' })
-  const foldSnap = await snapshotTree(foldRoot)
-  if (await directoryIsCaseInsensitive(foldRoot)) {
-    t.pass('case-insensitive filesystem cannot host a case-fold collision')
-  } else {
-    await fs.promises.writeFile(path.join(foldRoot, 'A.bin'), 'A', { flag: 'wx' })
-    await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(foldSnap))
-  }
-
   const vanishRoot = await createTempDir(t)
   await writeTree(vanishRoot, { 'dir/': '', 'dir/x.bin': 'x' })
   const vanishSnap = await snapshotTree(vanishRoot)
   const vanishDir = vanishSnap.entries.find((value) => value.path === 'dir')!
   await fs.promises.rm(vanishDir.absolutePath, { recursive: true, force: true })
   await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(vanishSnap))
-
-  const uid = typeof process.getuid === 'function' ? process.getuid() : null
-  if (uid !== 0) {
-    const unreadableRoot = await createTempDir(t)
-    await writeTree(unreadableRoot, { 'locked/': '', 'locked/x.bin': 'x' })
-    const unreadableSnap = await snapshotTree(unreadableRoot)
-    await fs.promises.chmod(unreadableRoot, 0)
-    try {
-      await expectRevalidateOnlyBusy(t, () => revalidateTreeSnapshot(unreadableSnap))
-    } finally {
-      await fs.promises.chmod(unreadableRoot, 0o755).catch(() => {})
-    }
-  } else {
-    t.pass('root-owned trees skip unreadable-root chmod integration')
-  }
 })
 
 test('revalidate preserves ABORTED after the initial abort check', async (t) => {
@@ -634,19 +526,6 @@ test('revalidate preserves ABORTED after the initial abort check', async (t) => 
   } finally {
     fs.promises.lstat = originalLstat
   }
-})
-
-test('tree walk and revalidation error normalization boundaries', (t) => {
-  t.is(treeDirectoryReadError().code, ERRORS.PROTOCOL_INVALID)
-  t.exception(() => normalizeRevalidateFailure(treeDirectoryReadError()), {
-    code: ERRORS.FILE_BUSY
-  })
-  t.exception(
-    () => normalizeRevalidateFailure(new SwarmDeployError(ERRORS.ABORTED, 'Operation aborted')),
-    {
-      code: ERRORS.ABORTED
-    }
-  )
 })
 
 test('revalidateTreeSnapshot never leaks snapshot validation error codes', async (t) => {

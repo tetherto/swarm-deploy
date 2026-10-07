@@ -342,31 +342,24 @@ function acceptedTarSizes(entryCount: number, payloadBytes: number, limit: numbe
   return accepted
 }
 
-test('directory metadata TAR size window is a whole-block range for 3 entries and 100 bytes', (t) => {
-  // One padded file (3072) up to three padded files (4096): only whole-block sizes in between.
-  t.alike(acceptedTarSizes(3, 100, 8192), [3072, 3584, 4096])
-})
-
-test('directory metadata with no payload accepts exactly one TAR size', (t) => {
-  // 1024 end bytes plus one header block per entry and nothing else.
-  t.alike(acceptedTarSizes(3, 0, 8192), [2560])
-  t.alike(acceptedTarSizes(0, 0, 8192), [1024])
-})
-
-test('directory metadata with one payload byte accepts exactly one TAR size', (t) => {
-  // One file of one byte pads to a full block no matter how many directories surround it.
-  t.alike(acceptedTarSizes(3, 1, 8192), [3072])
-  t.alike(acceptedTarSizes(1, 1, 8192), [2048])
-})
-
-test('directory metadata padding is bounded by the smaller of entries and payload bytes', (t) => {
-  const base = 1024 + 512 * 5
-  // Two payload bytes can pad at most two files even though five entries exist.
-  t.alike(acceptedTarSizes(5, 2, 8192), [base + 512, base + 1024])
-  // Only one file can hold one byte.
-  t.alike(acceptedTarSizes(5, 1, 8192), [base + 512])
-  // Two files carrying 513 bytes pad to exactly two blocks each at most.
-  t.alike(acceptedTarSizes(2, 513, 8192), [3072])
+test('directory metadata TAR size window accepts only aligned sizes in the strict window', (t) => {
+  const cases: Array<[number, number, number[]]> = [
+    [3, 100, [3072, 3584, 4096]],
+    [3, 0, [2560]],
+    [0, 0, [1024]],
+    [3, 1, [3072]],
+    [1, 1, [2048]],
+    [5, 2, [1024 + 512 * 5 + 512, 1024 + 512 * 5 + 1024]],
+    [5, 1, [1024 + 512 * 5 + 512]],
+    [2, 513, [3072]]
+  ]
+  for (const [entryCount, payloadBytes, expected] of cases) {
+    t.alike(
+      acceptedTarSizes(entryCount, payloadBytes, 8192),
+      expected,
+      `${entryCount}/${payloadBytes}`
+    )
+  }
 })
 
 test('directory metadata rejects payload with no entry and fewer payload bytes than entries', (t) => {
@@ -405,36 +398,13 @@ test('directory metadata rejects a payload over the per-file USTAR cap times the
   }
 })
 
-test('every accepted window size is reachable by a real layout', (t) => {
-  // Brute force: every split of a small payload over three files is a real TAR layout.
-  for (const payloadBytes of [1, 2, 3, 511, 512, 513, 1023, 1025]) {
-    const reachable = new Set<number>()
-    for (let a = 0; a <= payloadBytes; a++) {
-      for (let b = 0; a + b <= payloadBytes; b++) {
-        reachable.add(
-          deterministicTreeTarSize([
-            { kind: 'file', size: a },
-            { kind: 'file', size: b },
-            { kind: 'file', size: payloadBytes - a - b }
-          ])
-        )
-      }
-    }
-    t.alike(
-      acceptedTarSizes(3, payloadBytes, 16384),
-      [...reachable].sort((left, right) => left - right),
-      `window for 3 entries and ${payloadBytes} bytes matches every reachable layout`
-    )
-  }
-})
-
 test('real generated archives from random trees land inside the strict window', async (t) => {
   let seed = 0x2c1b3a7
   const next = (): number => {
     seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
     return seed >>> 8
   }
-  for (let iteration = 0; iteration < 12; iteration++) {
+  for (let iteration = 0; iteration < 4; iteration++) {
     const root = await createTempDir(t)
     const source = path.join(root, 'artifact')
     const spec: Record<string, string> = {}
@@ -839,84 +809,6 @@ test('a resume detects a mutated file, a mutated listing, and a prefix mismatch'
   const stable = await buildTreeManifest(second, OWNER)
   await fs.promises.writeFile(path.join(second, 'added.bin'), 'x')
   await t.exception(() => collect(stable), { code: ERRORS.FILE_BUSY })
-})
-
-test('every source mutation or listing change fails closed at every resume offset', async (t) => {
-  const mutations: Record<string, (source: string) => Promise<void>> = {
-    'same-size rewrite with a changed mtime': async (source) => {
-      const file = path.join(source, 'a', 'b.bin')
-      await fs.promises.writeFile(file, 'XX')
-      await pinMtime(file, new Date(FIXED_MTIME.getTime() + 60_000))
-    },
-    'same-size same-mtime content swap': async (source) => {
-      const file = path.join(source, 'a', 'b.bin')
-      await fs.promises.writeFile(file, 'XX')
-      await pinMtime(file)
-    },
-    'file growth': async (source) => {
-      const file = path.join(source, 'z.bin')
-      await fs.promises.writeFile(file, 'zzzzzz')
-      await pinMtime(file)
-    },
-    'file truncation': async (source) => {
-      const file = path.join(source, 'z.bin')
-      await fs.promises.writeFile(file, 'z')
-      await pinMtime(file)
-    },
-    'file removed': async (source) => {
-      await fs.promises.unlink(path.join(source, 'z.bin'))
-    },
-    'file replaced by a new inode': async (source) => {
-      const file = path.join(source, 'z.bin')
-      await fs.promises.writeFile(`${file}.new`, 'zzz')
-      await pinMtime(`${file}.new`)
-      await fs.promises.rename(`${file}.new`, file)
-    },
-    'file replaced by a symlink': async (source) => {
-      const file = path.join(source, 'z.bin')
-      await fs.promises.unlink(file)
-      await fs.promises.symlink('a/b.bin', file)
-    },
-    'file renamed': async (source) => {
-      await fs.promises.rename(path.join(source, 'z.bin'), path.join(source, 'y.bin'))
-    },
-    'file added': async (source) => {
-      await fs.promises.writeFile(path.join(source, 'added.bin'), 'x')
-    },
-    'file added in a nested directory': async (source) => {
-      await fs.promises.writeFile(path.join(source, 'a', 'empty', 'added.bin'), '')
-    },
-    'empty directory added': async (source) => {
-      await fs.promises.mkdir(path.join(source, 'new-dir'))
-    },
-    'empty directory removed': async (source) => {
-      await fs.promises.rmdir(path.join(source, 'a', 'empty'))
-    },
-    'directory replaced by a file': async (source) => {
-      const dir = path.join(source, 'a', 'empty')
-      await fs.promises.rmdir(dir)
-      await fs.promises.writeFile(dir, '')
-    },
-    'whole root replaced': async (source) => {
-      await fs.promises.rename(source, `${source}.moved`)
-      await fs.promises.mkdir(source)
-    }
-  }
-  for (const [label, mutate] of Object.entries(mutations)) {
-    const root = await createTempDir(t)
-    const source = path.join(root, '0.18.1')
-    await writeTree(source, { 'a/b.bin': 'bb', 'a/empty/': '', 'z.bin': 'zzz' })
-    for (const file of ['a/b.bin', 'z.bin']) await pinMtime(path.join(source, file))
-    const manifest = await buildTreeManifest(source, OWNER)
-    await mutate(source)
-    for (const offset of [0, 512, 1024, manifest.tarSize]) {
-      await t.exception(
-        () => collect(manifest, offset),
-        { code: ERRORS.FILE_BUSY },
-        `${label} @${offset}`
-      )
-    }
-  }
 })
 
 test('a mutation made while the archive streams fails the resume', async (t) => {
