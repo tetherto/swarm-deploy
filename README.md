@@ -371,6 +371,12 @@ Optional retention applies to managed artifacts only:
 - Directory artifacts are create-only. A directory offer for a configured
   `replaceNames` entry, a file-to-directory kind change, or a directory-to-file
   kind change is rejected. Directory replacement and history are deferred.
+- Committed artifacts, including directories, are immutable on disk. Do not write
+  into a committed directory after publish: hooks must not run `npm ci`, create
+  `.cache`, dotfiles, or extra symlinks inside the tree. If the tree changes,
+  startup hash scrub drops the sidecar while leaving the bytes in place, the
+  name stays occupied (`FILE_EXISTS`), the tree falls outside quota and rotation,
+  and a managed `latest` link can move to an older release.
 - Managed directories are deleted by renaming into `.swarm-deploy/trash` before
   recursive removal. Startup sweeps proven trash residue.
 - Startup recovery re-hashes managed files and recursively verifies directory

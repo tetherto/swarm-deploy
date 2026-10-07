@@ -411,6 +411,12 @@ renaming its verified staging tree under the name and root leases. Recovery
 handles crashes before rename, after rename, after the sidecar, and during
 symlink reconciliation. Directory artifacts are create-only; configured
 `replaceNames`, file-to-directory, and directory-to-file offers are rejected.
+Committed artifacts, including directories, are immutable on disk: hooks and
+operators must not write into a published directory (`npm ci`, `.cache`,
+dotfiles, or extra symlinks). If a committed tree changes, startup hash scrub
+drops the sidecar while leaving bytes in place, the name stays occupied
+(`FILE_EXISTS`), the tree falls outside quota and rotation, and a managed
+`latest` link can repoint to an older release.
 Deletion renames a managed directory into `.swarm-deploy/trash/<transfer-id>.tree`
 before recursive removal without following symlinks; startup sweeps proven trash.
 
