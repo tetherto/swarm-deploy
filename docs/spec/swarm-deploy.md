@@ -7,11 +7,10 @@ refactor. Swarm Deploy is a Node.js and Bare package for authenticated,
 encrypted, resumable, one-way artifact uploads to one server on Linux and
 macOS. It stores regular files and never executes or serves them.
 
-A client uploads either one regular file or the immediate regular-file
-children of one directory. Directory children are processed in lexical order;
-each child is an independent upload on a fresh connection. Directories,
-symlinks, nested entries, and unsafe names are rejected or skipped before
-connecting. Names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`;
+A client uploads either one regular file or one recursive directory artifact.
+Directory uploads commit exactly one managed tree named after the input
+basename; unsafe members reject the whole offer before connecting. Names match
+`^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`;
 names are limited to 100 UTF-8 bytes, and the server-managed `history-`
 namespace is reserved.
 
@@ -119,6 +118,27 @@ depends on no TAR parser; these canonical rules, byte counts, and validation
 are Swarm Deploy protocol requirements. The two must agree byte for byte, and
 a test pins the canonical header against the packer's output.
 
+### Deterministic recursive tree TAR
+
+A directory offer carries a canonical multi-entry USTAR archive. Entries are
+ordered bytewise on normalized TAR names with parents before children. Regular
+files use mode `0644`; directories use mode `0755` with a trailing slash in the
+stored name. uid, gid, mtime, uname, and gname are fixed. Each path component
+and whole stored name is limited to 100 UTF-8 bytes; depth is 32; entry count is
+10,000. Aggregate payload bytes obey `maxFileBytes`. The tree digest uses the
+`swarm-deploy/tree/v1` framing over normalized headers and payload bytes.
+Symlinks, hard links, devices, sockets, FIFOs, cycles, traversal, duplicates,
+and case-fold collisions are rejected.
+
+### Directory offer metadata
+
+Directory metadata is disjoint from the file record key set so an older server
+rejects it through its exact-key check without mutating storage. Required keys
+include `kind: 'directory'`, `entryCount`, `payloadBytes`, `treeSha256`, and
+the usual TAR length and transfer fields. Transfer IDs use the
+`swarm-deploy/direct-tree/v1` domain. Committed directory records carry the
+same descriptive fields plus the authenticated uploader fingerprint.
+
 ### Resume state
 
 Resume offsets are byte offsets in the deterministic TAR, not source-file
@@ -136,6 +156,10 @@ Startup purges all legacy chunk-session state, including chunk maps, partial
 chunk payloads, and obsolete reservations. It preserves committed current
 artifacts, history artifacts, commit sidecars, and v2 journals, which remain
 subject to normal validation and recovery.
+
+File sessions remain at persisted versions 2 and 3. Directory sessions use
+version 4 and verify into `.swarm-deploy/staging/<transfer-id>.tree/` by
+rebuilding canonical headers and recomputing the tree digest independently.
 
 ## Release identity, rotation, and hooks
 
@@ -350,6 +374,13 @@ without release coordinates is read by this version and is excluded from count
 and version rotation. Whether older code tolerates records this version writes
 is untested.
 
+Direct file TAR bytes, transfer IDs, sessions, records, commit, replacement,
+hooks, and retention for files are unchanged. Directory metadata, session
+version 4, commit record version 3, directory journals, directory trash, and
+managed symlinks are not downgrade-compatible. Drain uploads before upgrading
+and do not roll back after committing a directory artifact without restoring
+from backup.
+
 ## Storage accounting
 
 `maxFileBytes` limits the extracted artifact size. Required
@@ -374,8 +405,17 @@ account for every current and historical artifact exactly once.
 
 ## Commit, replacement, and recovery
 
+Commit records for directories use version 3. Directory journals use version 3
+with phases `journaled → renamed → sidecar → cleanup`. A directory publishes by
+renaming its verified staging tree under the name and root leases. Recovery
+handles crashes before rename, after rename, after the sidecar, and during
+symlink reconciliation. Directory artifacts are create-only; configured
+`replaceNames`, file-to-directory, and directory-to-file offers are rejected.
+Deletion renames a managed directory into `.swarm-deploy/trash/<transfer-id>.tree`
+before recursive removal without following symlinks; startup sweeps proven trash.
+
 The existing create-only commit behavior and retained replacement/history
-model remain:
+model remain for files:
 
 - names are create-only unless present in the configured `replaceNames`;
 - identical managed content returns `ALREADY_COMMITTED`;
@@ -399,6 +439,21 @@ before mutation, re-hashes managed committed files, removes invalid managed
 records, reports unknown paths, restores valid direct-TAR sessions, then runs
 retention. Recovery and retention preserve the create/replace/history
 linearization and fail closed on corruption.
+
+## Managed symlinks
+
+Ownership records live at
+`.swarm-deploy/links/<sha256(link-name)>.json` with exact fields `version`,
+`name`, `target`, `transferId`, and `targetKind`. A destination is replaced
+only when a valid record exists, the destination is a symbolic link, and
+`readlink()` returns the recorded or desired relative sibling basename. A
+pre-existing file, directory, unrecorded symlink, changed symlink, or foreign
+ownership record is unmanaged: it is never replaced, moved, or deleted, and
+reconciliation fails closed. Updates follow a six-step transaction with
+level-triggered recovery from startup, commit, already-committed retry,
+recovery, and retention. Selected symlink targets are pinned against age, count,
+SemVer, and quota deletion; the desired set is recomputed under the root lease
+before any deletion.
 
 ## Public API, CLI, and observability migration
 

@@ -6,7 +6,9 @@ import {
   parseAllowlist,
   parsePublicKey,
   type AfterCommitContext,
+  type ArtifactKind,
   type BeforeCommitContext,
+  type ClientEventMap,
   type ClientOptions,
   type HookArtifact,
   type HookFailureContext,
@@ -17,7 +19,9 @@ import {
   type ServerOptions,
   type StorageAdapter,
   type SymlinkCapableStorage,
+  type SymlinkRule,
   type UploadResult,
+  type UploadTarget,
   type VersionGranularity
 } from '../../dist/index.js'
 
@@ -49,15 +53,51 @@ const stringSeedServerOptions = {
 
 function readArtifact(artifact: HookArtifact): void {
   const name: string = artifact.name
+  const kind: ArtifactKind = artifact.kind
   const size: number = artifact.size
   const sha256: string = artifact.sha256
   const transferId: string = artifact.transferId
+  const entryCount: number | undefined = artifact.entryCount
   const sourceParent: string | undefined = artifact.sourceParent
   const release: ReleaseCoordinates | undefined = artifact.release
   const series: string | undefined = release?.series
   const version: string | undefined = release?.version
-  void [name, size, sha256, transferId, sourceParent, release, series, version]
+  void [name, kind, size, sha256, transferId, entryCount, sourceParent, release, series, version]
 }
+
+const kinds: ArtifactKind[] = ['file', 'directory']
+const symlinkRules: SymlinkRule[] = [
+  { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
+  { selector: 'release.tar.gz', name: 'current.tar.gz' }
+]
+const symlinkServerOptions = {
+  seed: serverSeed,
+  storageDir: '/srv/swarm-deploy',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096,
+  symlinks: symlinkRules
+} satisfies ServerOptions
+const target: UploadTarget = { kind: 'directory', name: '0.18.1', path: '/srv/build/0.18.1' }
+void [kinds, symlinkServerOptions, target]
+
+function readDirectoryArtifact(artifact: HookArtifact): void {
+  const kind: ArtifactKind = artifact.kind
+  const entryCount: number | undefined = artifact.entryCount
+  void [kind, entryCount]
+}
+void readDirectoryArtifact
+
+const directoryResult: UploadResult = {
+  status: 'COMMITTED',
+  kind: 'directory',
+  name: '0.18.1',
+  size: 10,
+  digest: Buffer.alloc(32),
+  transferId: Buffer.alloc(32),
+  entryCount: 4
+}
+void directoryResult
 
 const hooks = {
   beforeCommit(context: BeforeCommitContext) {
@@ -222,3 +262,22 @@ const linked: Promise<void> = symlinkStorage.symlink('target', 'link')
 void storageAdapter
 void linkTarget
 void linked
+
+// @ts-expect-error Artifact kinds are a closed set.
+const badKind: ArtifactKind = 'symlink'
+void badKind
+// @ts-expect-error A symlink rule needs both a selector and a name.
+const badRule: SymlinkRule = { selector: 'release.tar.gz' }
+void badRule
+// @ts-expect-error Symlink rules are two-string records, not regular expressions.
+const badRules: ServerOptions['symlinks'] = [/^\d+$/]
+void badRules
+// @ts-expect-error Directory batch upload results were removed.
+const batch = ({} as UploadResult).results
+void batch
+// @ts-expect-error The client no longer reports skipped directory members.
+const skippedEvent: keyof ClientEventMap = 'skipped'
+void skippedEvent
+// @ts-expect-error There is no user-facing atomic-directory option.
+const atomicOptions: ServerOptions = { ...symlinkServerOptions, atomicDirectory: true }
+void atomicOptions

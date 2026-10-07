@@ -2488,7 +2488,7 @@ test('a link reconciliation failure after a durable commit is retried as already
     if (desired.length > 0 && ++reconcilesWithTargets === 2) {
       throw new Error('injected link failure')
     }
-    return (original as (...rest: unknown[]) => unknown).apply(links, args)
+    return await (original as (...rest: unknown[]) => Promise<unknown>).apply(links, args)
   }
   const built = await treeManifest(t, '0.18.1', { 'a.bin': 'a' })
   const first = new FakeSocket(CLIENT_KEY)

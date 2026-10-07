@@ -159,6 +159,7 @@ swarm-deploy server \
   [--artifact-pattern <template>]... \
   [--max-count <count>] \
   [--max-versions <count> --version-granularity <major|minor>] \
+  [--symlink <selector> <link-name>]... \
   [--hooks <module>]
 ```
 
@@ -196,6 +197,11 @@ Optional options:
 - `--version-granularity <major|minor>`: how versions are grouped for
   `--max-versions`. It is rejected without `--max-versions`, and there is no
   default.
+- `--symlink <selector> <link-name>`: declarative managed symlink rule.
+  Repeat for multiple links. A selector that begins and ends with `/` is an
+  unflagged regular expression matched against managed artifact basenames;
+  anything else is an exact managed basename. The link name must be a safe
+  single-component basename and must not collide with another rule.
 - `--hooks <module>`: JavaScript module (`.js`, `.mjs`, or `.cjs`) exporting
   trusted lifecycle callbacks. The path is resolved against the working
   directory. See [Deployment hooks](#deployment-hooks).
@@ -234,12 +240,13 @@ seed inline.
 - `--no-source-parent` takes no value and suppresses that metadata for every
   file in the run. The upload then keeps the legacy transfer identity and
   cannot match a server pattern with a parent segment.
-- A directory processes immediate regular-file children once, in lexical
-  order, with one independent connection and result per file.
-- Subdirectories, symlinks, non-regular files, unsafe names, and names in the
-  reserved `history-` namespace are skipped and reported.
-- An unreadable directory entry is reported as a failure while later entries
-  continue.
+- A directory input commits exactly one recursive managed directory artifact
+  named after the input basename. Every member must be a safe regular file or
+  directory; symlinks, hard links, devices, sockets, FIFOs, unsafe names,
+  over-depth, over-count, or over-length members reject the whole upload.
+  Nothing is silently skipped.
+- On success the CLI prints one line: `<name> <kind> <status>` (for example
+  `0.18.1 directory COMMITTED`).
 
 Accepted names start with an ASCII letter or digit, contain only letters,
 digits, `.`, `_`, and `-`, and occupy at most 100 UTF-8 bytes. `history-` is
@@ -270,12 +277,9 @@ tooling logs is acceptable.
 
 ### CLI exit codes
 
-- `0`: every selected file was committed or already committed.
+- `0`: the upload committed or was already committed.
 - `1`: upload, network, protocol, storage, cleanup, or runtime failure.
 - `2`: usage or configuration error.
-
-For a directory, the CLI prints one line for every selected or skipped entry and
-returns `1` if any selected upload failed.
 
 ## CI uploader example
 
@@ -364,10 +368,14 @@ Optional retention applies to managed artifacts only:
 - `maxCount`/`--max-count` and `maxVersions`/`--max-versions` rotate released
   artifacts by series; see
   [Artifact patterns and rotation](#artifact-patterns-and-rotation).
-- Startup recovery re-hashes managed files. Scheduled cleanup validates managed
-  metadata and file sizes, removes invalid managed records safely, reports
-  unknown paths without deleting them, and applies age, count, version, and
-  quota retention in that order.
+- Directory artifacts are create-only. A directory offer for a configured
+  `replaceNames` entry, a file-to-directory kind change, or a directory-to-file
+  kind change is rejected. Directory replacement and history are deferred.
+- Managed directories are deleted by renaming into `.swarm-deploy/trash` before
+  recursive removal. Startup sweeps proven trash residue.
+- Startup recovery re-hashes managed files and recursively verifies directory
+  tree digests. Scheduled and pre-commit passes validate type, sidecar, and root
+  identity without re-hashing entire trees on every tick.
 
 Runtime defaults:
 
@@ -680,6 +688,66 @@ version's tests assert: an older record without release coordinates is read by
 this version and is not count or version rotated. Whether older code tolerates
 the release coordinates this version writes is untested.
 
+## Managed symlinks
+
+Configure repeatable managed symlinks so the server keeps versioned artifacts
+and maintains declarative links in the storage root:
+
+```sh
+swarm-deploy server \
+  --seed-file ./server.seed \
+  --storage /srv/artifacts \
+  --allow-key <64-lower-hex> \
+  --max-file-bytes 1073741824 \
+  --max-staging-bytes 4294967296 \
+  --symlink '/^\d+\.\d+\.\d+$/' latest \
+  --symlink release.tar.gz current.tar.gz
+```
+
+Resulting layout:
+
+```text
+/srv/artifacts/
+├── 0.18.0/
+├── 0.18.1/
+└── latest -> 0.18.1
+```
+
+Runtime equivalent:
+
+```js
+const server = new Server({
+  seed,
+  storageDir: '/srv/artifacts',
+  allowedKeys,
+  maxFileBytes: 1024 ** 3,
+  maxStagingBytes: 4 * 1024 ** 3,
+  symlinks: [
+    { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
+    { selector: 'release.tar.gz', name: 'current.tar.gz' }
+  ]
+})
+```
+
+Selection uses only validated managed commit records. The newest `committedAt`
+wins, tie-broken by transfer ID then name. Replacement history names never
+match. A rule is dormant until its target exists.
+
+Safety: an unmanaged file, directory, unrecorded symlink, changed symlink, or
+foreign ownership record is never replaced, moved, or deleted and causes a
+fail-closed error. An upload whose name equals a configured link name is
+rejected before admission.
+
+Retention pins every selected symlink target against age, count, SemVer, and
+quota deletion. Pinned targets still count toward the quota. The desired-link
+set is recomputed under the root lease before any deletion, so a repoint always
+precedes the old target becoming eligible. Removing a rule removes its ownership
+record and visible link only while ownership is still proven.
+
+`symlinks` requires `StorageAdapter.symlink` and `readlink`. The Node and Bare
+default adapters provide them; a custom adapter without symlink rules stays
+source-compatible.
+
 ## Deployment hooks
 
 Hooks let a trusted server operator run code around the commit. They are
@@ -688,26 +756,29 @@ seeds, secret keys, TAR bytes, or session material.
 
 ### Lifecycle points
 
-- `beforeCommit(context)`: after the TAR and extracted file verified, before
-  any commit mutation. Its failure aborts the commit.
-- `afterCommit(context)`: after the artifact is durably committed, before the
-  terminal success reply. Its failure fails the upload even though the artifact
-  is already stored. When it is configured, post-commit rotation is deferred
-  until it succeeds (see "Immediate effect" above).
+- `beforeCommit(context)`: after verification, before any commit mutation. For a
+  file, `path` is the verified `.part` staging file; for a directory, `path` is
+  the verified `.tree` staging directory. Its failure aborts the commit.
+- `afterCommit(context)`: after the artifact is durably committed and configured
+  links are reconciled, before the terminal success reply. For a directory,
+  `path` is the committed directory tree. Its failure fails the upload even
+  though the artifact is already stored. When it is configured, post-commit
+  rotation is deferred until it succeeds (see "Immediate effect" above).
 - `onFailure(context)`: once per failed connection whose metadata was decoded,
   after the client has been answered.
 
 Callbacks may return `void` or a promise, are called with no receiver, and
 receive a frozen context. The artifact is
-`{ name, size, sha256, transferId, sourceParent?, release? }`, where `release`
-is `{ series, version? }` when patterns are configured. These descriptive
-fields come from decoded offer metadata, not yet from verified content.
+`{ name, kind, size, sha256, transferId, entryCount?, sourceParent?, release? }`,
+where `entryCount` is present only for directories and `release` is
+`{ series, version? }` when patterns are configured. These descriptive fields
+come from decoded offer metadata, not yet from verified content.
 
-| Callback       | Extra context                                                              |
-| -------------- | -------------------------------------------------------------------------- |
-| `beforeCommit` | `path` (verified staging file), `resumed`, `alreadyCommitted: false`       |
-| `afterCommit`  | `path` (committed file), `resumed`, `alreadyCommitted`                     |
-| `onFailure`    | `path` (`string \| null`), `phase`, `resumed`, `alreadyCommitted`, `error` |
+| Callback       | Extra context                                                                |
+| -------------- | ---------------------------------------------------------------------------- |
+| `beforeCommit` | `path` (verified staging file or tree), `resumed`, `alreadyCommitted: false` |
+| `afterCommit`  | `path` (committed artifact), `resumed`, `alreadyCommitted`                   |
+| `onFailure`    | `path` (`string \| null`), `phase`, `resumed`, `alreadyCommitted`, `error`   |
 
 `resumed` is `true` when the server admitted the connection as `RESUME` or
 `VERIFIED`. Closing the server aborts the wait; a callback that outlives the
@@ -1022,36 +1093,18 @@ A direct file resolves to:
 ```ts
 interface UploadResult {
   status: 'COMMITTED' | 'ALREADY_COMMITTED'
+  kind: 'file' | 'directory'
   name: string
   size: number
   digest: Buffer
   transferId: Buffer
+  entryCount?: number
 }
 ```
 
-A directory resolves to:
-
-```ts
-interface BatchUploadResult {
-  status: 'COMMITTED' | 'FAILED'
-  results: Array<
-    | UploadResult
-    | {
-        name: string
-        status: ErrorCode
-        reason?: string
-      }
-  >
-  skipped: Array<{
-    name: string
-    path: string
-    reason: SkippedUploadReason
-  }>
-}
-```
-
-Directory members are processed sequentially. A failed member does not prevent
-later members from being attempted.
+Files and directories share the same result shape. For a directory, `size` is
+aggregate payload bytes and `entryCount` counts stored entries (files and
+directories).
 
 ### Events
 
@@ -1069,7 +1122,9 @@ Server events:
 - `connection`, `connection-open`, `connection-close`: authenticated connection
   lifecycle and current count.
 - `offer`: accepted, resumed, reset, rejected, or already-committed state.
-- `progress`: durable TAR bytes received and total TAR bytes.
+  Includes artifact `kind`.
+- `progress`: durable TAR bytes received and total TAR bytes. Includes artifact
+  `kind`.
 - `verification`: started, succeeded, or failed.
 - `commit`: succeeded or failed.
 - `recovery`: startup, per-journal, corruption, resumable, and completion
@@ -1088,8 +1143,7 @@ Client events:
 - `progress`: cumulative TAR `bytesSent` and full `totalBytes`, including a
   durable resume offset.
 - `verification`, `commit`
-- `result`: direct result or per-file/aggregate directory result.
-- `skipped`: skipped directory member and stable reason.
+- `result`: terminal upload result with artifact `kind`.
 - `failure`, `close`
 
 Use the exported `ServerEventMap`, `ClientEventMap`, `ServerEventName`, and
@@ -1152,8 +1206,12 @@ callback. Its message is fixed and the original exception is available only as
 Stable codes include authentication and server-key rejection, invalid
 configuration and protocol records, file and staging limits, disk reserve,
 filename and replacement conflicts, checksum failures, connection or upload
-timeouts, aborts, commit failures, and cleanup failures. Import `ERRORS` rather
-than matching exception messages.
+timeouts, aborts, commit failures, cleanup failures, and managed-link failures
+(`LINK_CONFLICT`, `LINK_FAILED`, `UNSUPPORTED_STORAGE`). A link reconciliation
+failure after a durable commit behaves like other post-commit deployment
+failures: the artifact stays committed, the client receives a stable failure,
+and an already-committed retry reruns reconciliation before succeeding. Import
+`ERRORS` rather than matching exception messages.
 
 ## Production operations
 
