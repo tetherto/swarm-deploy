@@ -402,3 +402,43 @@ test('re-uploading an unchanged directory is already committed and never replace
   await t.exception(client.upload(source), { code: ERRORS.FILE_EXISTS })
   t.is(await fs.promises.readFile(path.join(storage, '0.18.1', 'a.bin'), 'utf8'), 'a')
 })
+
+test('a client promotes a committed directory through an authenticated manual link', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 121)
+  const clientSeed = b4a.alloc(32, 122)
+  const storage = await createTempDir(t)
+  const source = path.join(await createTempDir(t), 'release-1')
+  await fs.promises.mkdir(source)
+  await fs.promises.writeFile(path.join(source, 'nested.bin'), 'directory payload')
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 16 * 1024,
+    minFreeBytes: 0,
+    dht: testnet.createNode(),
+    symlinks: [{ selector: '/^release-\\d+$/' }]
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  t.is((await client.upload(source)).kind, 'directory')
+  t.alike(await client.link('release-1', 'current'), {
+    target: 'release-1',
+    name: 'current',
+    status: 'LINKED'
+  })
+  t.is(await fs.promises.readlink(path.join(storage, 'current')), 'release-1')
+  t.is((await client.link('release-1', 'current')).status, 'UNCHANGED')
+})

@@ -1070,3 +1070,34 @@ test('commit defers post-commit retention only when asked and keeps pre-commit c
     }
   }
 })
+
+test('retention preserves manual targets from normal and fallback link pin sets', async (t) => {
+  for (const fallback of [false, true]) {
+    const harness = await createHarness(t)
+    const target = await harness.publishTree('release-1', { 'a.bin': 'a' })
+    const expendable = await harness.publishTree('release-2', { 'a.bin': 'b' })
+    harness.clock.advance(1)
+    const manager = harness.manager({
+      maxAge: 1,
+      reconcileLinks: () =>
+        fallback
+          ? Promise.reject(new Error('reconciliation failed'))
+          : Promise.resolve(new Set([target.transferId])),
+      linkPinsFallback: () => Promise.resolve(new Set([target.transferId]))
+    })
+
+    if (fallback) {
+      await t.exception(() => manager.run(), { message: 'reconciliation failed' })
+    } else {
+      await manager.run()
+    }
+    t.ok(
+      (await harness.commits.list()).some((record) => record.transferId === target.transferId),
+      `manual target survives fallback=${fallback}`
+    )
+    t.absent(
+      (await harness.commits.list()).some((record) => record.transferId === expendable.transferId),
+      `unlinked artifact expires fallback=${fallback}`
+    )
+  }
+})

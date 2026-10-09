@@ -47,6 +47,7 @@ export {
   type ServerEvent,
   type ServerEventName,
   type ServerEventMap,
+  type ServerLinkEvent,
   type ServerListeningEvent,
   type ServerOfferEvent,
   type ServerOptions,

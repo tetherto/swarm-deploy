@@ -21,6 +21,8 @@ import {
   type LinkRequestRecord,
   type LinkResultRecord,
   type ServerHooks,
+  type ServerEventMap,
+  type ServerLinkEvent,
   type ServerOptions,
   type StorageAdapter,
   type SymlinkCapableStorage,
@@ -77,6 +79,22 @@ const linkEvent: ClientLinkEvent = {
 }
 const clientLinkEvent: ClientEventMap['link'] = linkEvent
 void [linkRequest, linkResults, linkStatus, clientLink, clientLinkEvent]
+
+const serverLinkEvent: ServerLinkEvent = {
+  fingerprint: '0123456789ab',
+  target: 'release-1.2.3',
+  name: 'current',
+  status: 'linked'
+}
+const rejectedServerLinkEvent: ServerLinkEvent = {
+  fingerprint: '0123456789ab',
+  target: 'missing',
+  name: 'current',
+  status: 'rejected',
+  reason: 'LINK_TARGET_NOT_FOUND'
+}
+const mappedServerLinkEvent: ServerEventMap['link'] = serverLinkEvent
+void [rejectedServerLinkEvent, mappedServerLinkEvent]
 
 function readArtifact(artifact: HookArtifact): void {
   const name: string = artifact.name

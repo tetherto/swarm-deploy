@@ -27,11 +27,13 @@ import type {
 import {
   decodeAdmissionRecord,
   decodeFinalRecord,
+  decodeLinkResultRecord,
   decodeMetadataRecord,
   decodeTreeMetadataRecord,
   encodeAdmissionRecord,
   encodeControlFrame,
   encodeFinalRecord,
+  encodeLinkRequestRecord,
   encodeMetadataRecord,
   encodeTreeMetadataRecord
 } from '../../dist/tar-protocol/controls.js'
@@ -1766,6 +1768,139 @@ test('a configured link name cannot be uploaded as an artifact', async (t) => {
   const rejection = JSON.parse(b4a.toString(socket.writes[0].subarray(4))) as { code: string }
   t.is(rejection.code, ERRORS.INVALID_FILENAME)
   await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'latest')))
+})
+
+test('Server links an authenticated request target after a clean close', async (t) => {
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }]
+  })
+  const artifact = await manifest(t, 'release-1', 'release payload')
+  await uploadAll(node, artifact)
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(
+    encodeControlFrame(
+      encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'release-1', name: 'current' })
+    )
+  )
+  socket.finishInput()
+  await waitFor(() => socket.writes.length === 1)
+
+  t.alike(decodeLinkResultRecord(socket.writes[0].subarray(4)), { v: 1, status: 'LINKED' })
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
+})
+
+async function linkAll(
+  node: FakeServerNode,
+  target: string,
+  name: string
+): Promise<{ socket: FakeSocket; result: { v: number; status: string; code?: string } }> {
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(encodeControlFrame(encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })))
+  socket.finishInput()
+  await waitFor(() => socket.writes.length === 1)
+  return {
+    socket,
+    result: decodeLinkResultRecord(socket.writes[0].subarray(4)) as {
+      v: number
+      status: string
+      code?: string
+    }
+  }
+}
+
+test('Server maps manual link outcomes, excludes hooks, and reserves durable names', async (t) => {
+  const hooks: string[] = []
+  const events: Array<{ status: string; reason?: string }> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      beforeCommit: () => void hooks.push('before'),
+      afterCommit: () => void hooks.push('after'),
+      onFailure: () => void hooks.push('failure')
+    }
+  })
+  server.on('link', (event) => events.push({ status: event.status, reason: event.reason }))
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  await uploadAll(node, await manifest(t, 'release-2', 'second'))
+  hooks.length = 0
+
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'UNCHANGED' })
+  t.alike((await linkAll(node, 'release-2', 'current')).result, { v: 1, status: 'LINKED' })
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-2')
+  t.alike((await linkAll(node, 'release-1', 'release-1')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_NOT_ALLOWED
+  })
+  t.alike((await linkAll(node, 'release-3', 'other')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_TARGET_NOT_FOUND
+  })
+  t.alike((await linkAll(node, 'release-1', 'latest')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_NOT_ALLOWED
+  })
+  t.alike((await linkAll(node, 'release-1', 'release-2')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_CONFLICT
+  })
+  await fs.promises.writeFile(path.join(server.storageDir, 'operator'), 'operator')
+  t.alike((await linkAll(node, 'release-1', 'operator')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_CONFLICT
+  })
+  t.alike(hooks, [], 'link requests never run artifact hooks')
+  const rejectedUpload = await uploadAll(node, await manifest(t, 'current', 'reserved'))
+  t.is(finalCode(rejectedUpload), ERRORS.INVALID_FILENAME)
+  t.alike(
+    events.map((event) => event.status),
+    ['linked', 'unchanged', 'linked', 'rejected', 'rejected', 'rejected', 'rejected', 'rejected']
+  )
+  t.alike(
+    events.slice(3).map((event) => event.reason),
+    [
+      ERRORS.LINK_NOT_ALLOWED,
+      ERRORS.LINK_TARGET_NOT_FOUND,
+      ERRORS.LINK_NOT_ALLOWED,
+      ERRORS.LINK_CONFLICT,
+      ERRORS.LINK_CONFLICT
+    ]
+  )
+})
+
+test('Server keeps durable manual names managed after rules are removed on restart', async (t) => {
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^release-\\d+$/' }]
+  })
+  await uploadAll(first.node, await manifest(t, 'release-1', 'release'))
+  t.alike((await linkAll(first.node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
+
+  const node = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    dht: node
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+  const rejected = await uploadAll(node, await manifest(t, 'current', 'must stay reserved'))
+  t.is(finalCode(rejected), ERRORS.INVALID_FILENAME)
+  t.is(await fs.promises.readlink(path.join(storageDir, 'current')), 'release-1')
 })
 
 test('a link is repointed to the newest match before the old target is rotated', async (t) => {
