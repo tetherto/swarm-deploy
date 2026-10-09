@@ -68,7 +68,8 @@ function readArtifact(artifact: HookArtifact): void {
 const kinds: ArtifactKind[] = ['file', 'directory']
 const symlinkRules: SymlinkRule[] = [
   { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
-  { selector: 'release.tar.gz', name: 'current.tar.gz' }
+  { selector: 'release.tar.gz', name: 'current.tar.gz' },
+  { selector: '/^app-\\d+\\.\\d+\\.\\d+\\.tar\\.gz$/' }
 ]
 const symlinkServerOptions = {
   seed: serverSeed,
@@ -266,9 +267,6 @@ void linked
 // @ts-expect-error Artifact kinds are a closed set.
 const badKind: ArtifactKind = 'symlink'
 void badKind
-// @ts-expect-error A symlink rule needs both a selector and a name.
-const badRule: SymlinkRule = { selector: 'release.tar.gz' }
-void badRule
 // @ts-expect-error Symlink rules are two-string records, not regular expressions.
 const badRules: ServerOptions['symlinks'] = [/^\d+$/]
 void badRules

@@ -13,13 +13,17 @@ export const MAX_SYMLINK_SELECTOR_BYTES = 200
 export interface SymlinkRule {
   /** An exact managed artifact basename, or `/pattern/` with no flags. */
   selector: string
-  /** The safe basename of the managed link, a sibling of its target. */
-  name: string
+  /**
+   * The safe basename of an automatically reconciled managed link. When
+   * omitted, the selector only authorizes client-selected targets.
+   */
+  name?: string
 }
 
 export interface CompiledSymlinkRule {
   readonly selector: string
-  readonly name: string
+  /** `null` for a manual target-authorization rule. */
+  readonly name: string | null
   /** The exact target basename, or `null` for a regular-expression selector. */
   readonly exact: string | null
   matches(name: string): boolean
@@ -66,23 +70,31 @@ export function compileSymlinkRules(
   }
   const compiled: CompiledSymlinkRule[] = []
   const names = new Set<string>()
+  const manualSelectors = new Set<string>()
   for (const rule of rules) {
     if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
       throw invalid('Invalid symlink rule')
     }
     const keys = Object.keys(rule).sort()
-    if (keys.length !== 2 || keys[0] !== 'name' || keys[1] !== 'selector') {
+    const automatic = keys.length === 2 && keys[0] === 'name' && keys[1] === 'selector'
+    const manual = keys.length === 1 && keys[0] === 'selector'
+    if (!automatic && !manual) {
       throw invalid('Invalid symlink rule')
     }
-    const { selector, name: rawName } = rule
-    const name = assertLinkName(rawName)
-    if (names.has(name)) throw invalid('Duplicate symlink name')
-    names.add(name)
+    const { selector } = rule
     if (typeof selector !== 'string' || selector.length === 0) {
       throw invalid('Invalid symlink selector')
     }
     if (b4a.from(selector).byteLength > MAX_SYMLINK_SELECTOR_BYTES) {
       throw invalid('Invalid symlink selector')
+    }
+    const name = automatic ? assertLinkName(rule.name) : null
+    if (name === null) {
+      if (manualSelectors.has(selector)) throw invalid('Duplicate symlink rule')
+      manualSelectors.add(selector)
+    } else {
+      if (names.has(name)) throw invalid('Duplicate symlink name')
+      names.add(name)
     }
     if (selector.length >= 2 && selector.startsWith('/') && selector.endsWith('/')) {
       const source = selector.slice(1, -1)
@@ -105,7 +117,7 @@ export function compileSymlinkRules(
     }
     const exact = validateBasename(selector)
     if (isReservedHistoryName(exact)) throw invalid('Reserved symlink selector')
-    if (exact === name) throw invalid('Symlink selector equals its own name')
+    if (name !== null && exact === name) throw invalid('Symlink selector equals its own name')
     compiled.push(
       Object.freeze({
         selector,
@@ -119,7 +131,21 @@ export function compileSymlinkRules(
 }
 
 export function symlinkRuleNames(rules: readonly CompiledSymlinkRule[]): ReadonlySet<string> {
-  return new Set(rules.map((rule) => rule.name))
+  return new Set(rules.flatMap((rule) => (rule.name === null ? [] : [rule.name])))
+}
+
+/** Returns whether a safe managed target is authorized by a manual rule. */
+export function isManualSymlinkTargetAllowed(
+  rules: readonly CompiledSymlinkRule[],
+  target: string
+): boolean {
+  try {
+    validateBasename(target)
+  } catch {
+    return false
+  }
+  if (isReservedHistoryName(target)) return false
+  return rules.some((rule) => rule.name === null && rule.matches(target))
 }
 
 /**
@@ -133,6 +159,7 @@ export function selectDesiredLinks(
 ): DesiredLink[] {
   const desired: DesiredLink[] = []
   for (const rule of rules) {
+    if (rule.name === null) continue
     let selected: CommitRecord | null = null
     for (const record of records) {
       if (isReservedHistoryName(record.name)) continue
