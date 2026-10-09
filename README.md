@@ -1222,8 +1222,11 @@ Client events:
   durable resume offset.
 - `verification`, `commit`
 - `result`: terminal upload result with artifact `kind`.
-- `link`: `requested` with `final: false`, then `LINKED`, `UNCHANGED`, or a
-  stable error code with `final: true`.
+- `link`: after the request is written, `requested` with `final: false`,
+  followed by exactly one `LINKED`, `UNCHANGED`, or stable error code with
+  `final: true`. A request-write failure after connection can emit only the
+  terminal failed event. Local argument validation, an already closed or
+  cancelled client, and connection failure can reject before any `link` event.
 - `failure`, `close`
 
 Use the exported `ServerEventMap`, `ClientEventMap`, `ServerEventName`, and

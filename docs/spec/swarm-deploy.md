@@ -614,11 +614,15 @@ Listener and logger failures cannot affect protocol correctness.
 
 `Client.link(target, name)` returns
 `ClientLinkResult { target, name, status: 'LINKED' | 'UNCHANGED' }`.
-The client `link` event first reports `requested` with `final: false`, then a
-success status or stable error code with `final: true`. The server `link` event
-reports one terminal `linked`, `unchanged`, `rejected`, or `failed` status with
-the authenticated client fingerprint, target, name, and a stable reason on
-error. Link errors also use each side's existing `failure` event.
+After the request write succeeds, the client `link` event reports `requested`
+with `final: false`, followed by exactly one success status or stable error code
+with `final: true`. A request-write failure after connection can emit only the
+terminal failed event. Local argument validation, prior cancellation or closed
+state, and connection failure can reject before any client `link` event. The
+server `link` event reports one terminal `linked`, `unchanged`, `rejected`, or
+`failed` status with the authenticated client fingerprint, target, name, and a
+stable reason on error. Link errors also use each side's existing `failure`
+event.
 
 ## Test and package migration
 
