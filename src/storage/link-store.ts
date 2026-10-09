@@ -15,10 +15,14 @@ import type { StorageAdapter, StorageLayout, StorageStats, SymlinkCapableStorage
 
 const MAX_LINK_RECORD_BYTES = 4 * 1024
 const RECORD_FILENAME = /^[0-9a-f]{64}\.json$/
-const RECORD_KEYS = 'name,target,targetKind,transferId,version'
+const V1_RECORD_KEYS = 'name,target,targetKind,transferId,version'
+const V2_RECORD_KEYS = 'mode,name,target,targetKind,transferId,version'
+
+export type LinkOwnershipMode = 'automatic' | 'manual'
 
 export interface ManagedSymlinkRecord {
-  version: 1
+  version: 1 | 2
+  mode: LinkOwnershipMode
   name: string
   target: string
   transferId: string
@@ -35,6 +39,17 @@ export interface LinkReconcileResult {
 export interface LinkReconcileOptions {
   /** Managed artifact basenames used to prove a crash-residual symlink target. */
   managedArtifactNames?: ReadonlySet<string>
+}
+
+export interface ManualLinkOptions {
+  /** Current managed artifact basenames; the manual target must be one of them. */
+  managedArtifactNames: ReadonlySet<string>
+  /** Current automatic link names; manual names may not collide with them. */
+  automaticLinkNames: ReadonlySet<string>
+}
+
+export interface ManualLinkResult {
+  status: 'LINKED' | 'UNCHANGED'
 }
 
 export interface LinkStoreOptions {
@@ -97,9 +112,14 @@ function assertRecord(value: unknown, expectedName: string): ManagedSymlinkRecor
     throw failure('Invalid managed link record')
   }
   const candidate = value as Record<string, unknown>
+  const keys = Object.keys(candidate).sort().join(',')
+  const v1 = candidate.version === 1 && keys === V1_RECORD_KEYS
+  const v2 =
+    candidate.version === 2 &&
+    keys === V2_RECORD_KEYS &&
+    (candidate.mode === 'automatic' || candidate.mode === 'manual')
   if (
-    Object.keys(candidate).sort().join(',') !== RECORD_KEYS ||
-    candidate.version !== 1 ||
+    (!v1 && !v2) ||
     candidate.name !== expectedName ||
     (candidate.targetKind !== 'file' && candidate.targetKind !== 'directory') ||
     typeof candidate.transferId !== 'string' ||
@@ -107,9 +127,16 @@ function assertRecord(value: unknown, expectedName: string): ManagedSymlinkRecor
   ) {
     throw failure('Invalid managed link record')
   }
-  assertSafeName(candidate.name, 'Invalid managed link record')
-  assertSafeName(candidate.target, 'Invalid managed link record')
-  return candidate as unknown as ManagedSymlinkRecord
+  const name = assertSafeName(candidate.name, 'Invalid managed link record')
+  const target = assertSafeName(candidate.target, 'Invalid managed link record')
+  return {
+    version: candidate.version as 1 | 2,
+    mode: v1 ? 'automatic' : (candidate.mode as LinkOwnershipMode),
+    name,
+    target,
+    transferId: candidate.transferId,
+    targetKind: candidate.targetKind
+  }
 }
 
 function randomSuffix(): string {
@@ -229,9 +256,10 @@ export class LinkStore {
     })
   }
 
-  private async writeRecord(link: DesiredLink): Promise<void> {
+  private async writeRecord(link: DesiredLink, mode: LinkOwnershipMode): Promise<void> {
     const record: ManagedSymlinkRecord = {
-      version: 1,
+      version: 2,
+      mode,
       name: link.name,
       target: link.target,
       transferId: link.transferId,
@@ -260,8 +288,8 @@ export class LinkStore {
    * link itself is created without overwriting, so a path that appeared since
    * classification is never replaced and its record is withdrawn.
    */
-  private async createLink(link: DesiredLink): Promise<void> {
-    await this.writeRecord(link)
+  private async createLink(link: DesiredLink, mode: LinkOwnershipMode): Promise<void> {
+    await this.writeRecord(link, mode)
     try {
       await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
         this.storage.symlink(link.target, this.finalPath(link.name))
@@ -292,7 +320,7 @@ export class LinkStore {
   }
 
   /** Atomically swaps an owned link by renaming a private temporary link over it. */
-  private async replaceLink(link: DesiredLink): Promise<void> {
+  private async replaceLink(link: DesiredLink, mode: LinkOwnershipMode): Promise<void> {
     const temporary = path.join(this.layout.publications, `.link-${randomSuffix()}`)
     try {
       await withSafeDirectoryIdentity(this.layout.publications, this.storage, () =>
@@ -309,7 +337,7 @@ export class LinkStore {
       await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
         syncDirectory(this.layout.root, this.storage)
       )
-      await this.writeRecord(link)
+      await this.writeRecord(link, mode)
     } finally {
       await this.removeTemporary(temporary)
     }
@@ -349,6 +377,19 @@ export class LinkStore {
     }
   }
 
+  /**
+   * Atomically creates, keeps, or repoints one explicitly requested manual
+   * link. The caller supplies the current namespace so manual ownership cannot
+   * claim artifact or automatic-link destinations.
+   */
+  async linkManual(link: DesiredLink, options: ManualLinkOptions): Promise<ManualLinkResult> {
+    try {
+      return await this.convergeManual(link, options)
+    } catch (error: unknown) {
+      throw asLinkError(error)
+    }
+  }
+
   private async sweepTemporaryLinks(): Promise<void> {
     const names = await withSafeDirectoryIdentity(this.layout.publications, this.storage, () =>
       this.storage.readdir(this.layout.publications)
@@ -368,6 +409,7 @@ export class LinkStore {
     const result: LinkReconcileResult = { created: [], updated: [], removed: [], unchanged: [] }
     const desiredByName = new Map(desired.map((link) => [link.name, link]))
     for (const record of await this.listRecords()) {
+      if (record.mode === 'manual') continue
       if (ruleNames.has(record.name)) {
         if (!desiredByName.has(record.name)) {
           const destination = await this.classify(record.name)
@@ -399,11 +441,14 @@ export class LinkStore {
       if (link.target === link.name) throw failure('Managed link cannot target itself')
       const record = await this.readRecord(link.name)
       const destination = await this.classify(link.name)
+      if (record?.mode === 'manual') {
+        throw conflict('Manual managed link at a configured automatic link name')
+      }
       if (destination.state === 'UNMANAGED') {
         throw conflict('Unmanaged path at a configured managed link name')
       }
       if (destination.state === 'MISSING') {
-        await this.createLink(link)
+        await this.createLink(link, 'automatic')
         result.created.push(link.name)
         continue
       }
@@ -422,13 +467,69 @@ export class LinkStore {
           result.unchanged.push(link.name)
           continue
         }
-        await this.writeRecord(link)
+        await this.writeRecord(link, 'automatic')
         result.updated.push(link.name)
         continue
       }
-      await this.replaceLink(link)
+      await this.replaceLink(link, 'automatic')
       result.updated.push(link.name)
     }
     return result
+  }
+
+  private async convergeManual(
+    link: DesiredLink,
+    { managedArtifactNames, automaticLinkNames }: ManualLinkOptions
+  ): Promise<ManualLinkResult> {
+    if (
+      !managedArtifactNames ||
+      typeof managedArtifactNames.has !== 'function' ||
+      !automaticLinkNames ||
+      typeof automaticLinkNames.has !== 'function'
+    ) {
+      throw failure('Invalid manual link options')
+    }
+    assertSafeName(link.name, 'Invalid managed link name')
+    assertSafeName(link.target, 'Invalid managed link target')
+    if (link.target === link.name) throw failure('Managed link cannot target itself')
+    if (
+      (link.targetKind !== 'file' && link.targetKind !== 'directory') ||
+      !/^[0-9a-f]{64}$/.test(link.transferId)
+    ) {
+      throw failure('Invalid manual managed link')
+    }
+    if (!managedArtifactNames.has(link.target)) {
+      throw conflict('Manual managed link target is not a current artifact')
+    }
+    if (managedArtifactNames.has(link.name) || automaticLinkNames.has(link.name)) {
+      throw conflict('Manual managed link name is reserved')
+    }
+
+    await this.sweepTemporaryLinks()
+    const record = await this.readRecord(link.name)
+    if (record !== null && record.mode !== 'manual') {
+      throw conflict('Automatic managed link at a requested manual link name')
+    }
+    const destination = await this.classify(link.name)
+    if (destination.state === 'UNMANAGED') {
+      throw conflict('Unmanaged path at a requested manual link name')
+    }
+    if (destination.state === 'MISSING') {
+      await this.createLink(link, 'manual')
+      return { status: 'LINKED' }
+    }
+    if (record === null) {
+      throw conflict('Unrecorded symlink at a requested manual link name')
+    }
+    if (destination.target !== record.target && destination.target !== link.target) {
+      throw conflict('Managed link does not match its ownership record')
+    }
+    if (destination.target === link.target) {
+      if (record.target === link.target) return { status: 'UNCHANGED' }
+      await this.writeRecord(link, 'manual')
+      return { status: 'LINKED' }
+    }
+    await this.replaceLink(link, 'manual')
+    return { status: 'LINKED' }
   }
 }

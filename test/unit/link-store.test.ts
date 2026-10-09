@@ -21,8 +21,13 @@ async function createStore(
   return { links: new LinkStore({ layout, storage: createStorage(options) }), layout }
 }
 
-function desired(name: string, target: string, transferId: string): DesiredLink {
-  return { name, target, transferId, targetKind: 'directory' }
+function desired(
+  name: string,
+  target: string,
+  transferId: string,
+  targetKind: DesiredLink['targetKind'] = 'directory'
+): DesiredLink {
+  return { name, target, transferId, targetKind }
 }
 
 async function mkdirs(layout: StorageLayout, names: string[]): Promise<void> {
@@ -43,7 +48,8 @@ test('reconciliation creates, keeps, and repoints an owned link', async (t) => {
   t.is(await fs.promises.readlink(path.join(layout.root, 'latest')), '0.18.0')
   const record = await links.read('latest')
   t.alike(record, {
-    version: 1,
+    version: 2,
+    mode: 'automatic',
     name: 'latest',
     target: '0.18.0',
     transferId: '1'.repeat(64),
@@ -304,4 +310,237 @@ test('a temporary link is cleaned up when the rename fails', async (t) => {
   t.alike(await fs.promises.readdir(layout.publications), [])
   t.is(await fs.promises.readlink(path.join(layout.root, 'latest')), '0.18.0')
   t.is((await links.read('latest'))?.target, '0.18.0')
+})
+
+test('manual linking creates, keeps, and repoints a durable manual link', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['release-1', 'release-2'])
+  const options = {
+    managedArtifactNames: new Set(['release-1', 'release-2']),
+    automaticLinkNames: new Set(['latest'])
+  }
+
+  t.alike(await links.linkManual(desired('current', 'release-1', '1'.repeat(64)), options), {
+    status: 'LINKED'
+  })
+  t.alike(await links.read('current'), {
+    version: 2,
+    mode: 'manual',
+    name: 'current',
+    target: 'release-1',
+    transferId: '1'.repeat(64),
+    targetKind: 'directory'
+  } satisfies ManagedSymlinkRecord)
+  t.is(await fs.promises.readlink(path.join(layout.root, 'current')), 'release-1')
+
+  t.alike(await links.linkManual(desired('current', 'release-1', '2'.repeat(64)), options), {
+    status: 'UNCHANGED'
+  })
+  t.is((await links.read('current'))?.transferId, '1'.repeat(64))
+
+  t.alike(await links.linkManual(desired('current', 'release-2', '2'.repeat(64)), options), {
+    status: 'LINKED'
+  })
+  t.is(await fs.promises.readlink(path.join(layout.root, 'current')), 'release-2')
+  t.alike(await links.read('current'), {
+    version: 2,
+    mode: 'manual',
+    name: 'current',
+    target: 'release-2',
+    transferId: '2'.repeat(64),
+    targetKind: 'directory'
+  } satisfies ManagedSymlinkRecord)
+  t.alike(await fs.promises.readdir(layout.publications), [])
+})
+
+test('v1 records normalize to automatic ownership and strict v2 records reject malformed input', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['release-1'])
+  await fs.promises.writeFile(
+    recordFile(layout, 'latest'),
+    JSON.stringify({
+      version: 1,
+      name: 'latest',
+      target: 'release-1',
+      transferId: '1'.repeat(64),
+      targetKind: 'directory'
+    })
+  )
+  await fs.promises.symlink('release-1', path.join(layout.root, 'latest'))
+  t.alike(await links.read('latest'), {
+    version: 1,
+    mode: 'automatic',
+    name: 'latest',
+    target: 'release-1',
+    transferId: '1'.repeat(64),
+    targetKind: 'directory'
+  } satisfies ManagedSymlinkRecord)
+  t.alike(await links.reconcile([], new Set()), {
+    created: [],
+    updated: [],
+    removed: ['latest'],
+    unchanged: []
+  })
+
+  for (const value of [
+    {
+      version: 2,
+      mode: 'manual',
+      name: 'current',
+      target: 'release-1',
+      transferId: '1'.repeat(64),
+      targetKind: 'directory',
+      extra: true
+    },
+    {
+      version: 3,
+      mode: 'manual',
+      name: 'current',
+      target: 'release-1',
+      transferId: '1'.repeat(64),
+      targetKind: 'directory'
+    },
+    {
+      version: 1,
+      mode: 'automatic',
+      name: 'current',
+      target: 'release-1',
+      transferId: '1'.repeat(64),
+      targetKind: 'directory'
+    }
+  ]) {
+    await fs.promises.writeFile(recordFile(layout, 'current'), JSON.stringify(value))
+    await t.exception(() => links.read('current'), { code: ERRORS.LINK_FAILED })
+    await fs.promises.unlink(recordFile(layout, 'current'))
+  }
+})
+
+test('automatic reconciliation preserves manual ownership and rejects manual collisions', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['release-1', 'release-2'])
+  await links.linkManual(desired('current', 'release-1', '1'.repeat(64)), {
+    managedArtifactNames: new Set(['release-1', 'release-2']),
+    automaticLinkNames: new Set()
+  })
+
+  t.alike(await links.reconcile([], new Set()), {
+    created: [],
+    updated: [],
+    removed: [],
+    unchanged: []
+  })
+  t.is((await links.read('current'))?.mode, 'manual')
+  t.is(await fs.promises.readlink(path.join(layout.root, 'current')), 'release-1')
+
+  await t.exception(
+    () => links.reconcile([desired('current', 'release-2', '2'.repeat(64))], new Set(['current'])),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+  t.is((await links.read('current'))?.mode, 'manual')
+  t.is(await fs.promises.readlink(path.join(layout.root, 'current')), 'release-1')
+})
+
+test('manual linking fails closed for automatic, v1, unmanaged, and reserved destinations', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['release-1', 'release-2'])
+  const options = {
+    managedArtifactNames: new Set(['release-1', 'release-2']),
+    automaticLinkNames: new Set(['latest'])
+  }
+  await links.reconcile([desired('latest', 'release-1', '1'.repeat(64))], new Set(['latest']))
+  await t.exception(
+    () => links.linkManual(desired('latest', 'release-2', '2'.repeat(64)), options),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+  t.is(await fs.promises.readlink(path.join(layout.root, 'latest')), 'release-1')
+
+  await fs.promises.symlink('release-1', path.join(layout.root, 'unrecorded'))
+  await t.exception(
+    () => links.linkManual(desired('unrecorded', 'release-2', '2'.repeat(64)), options),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+  t.is(await fs.promises.readlink(path.join(layout.root, 'unrecorded')), 'release-1')
+
+  await fs.promises.writeFile(path.join(layout.root, 'operator'), 'operator file')
+  await t.exception(
+    () => links.linkManual(desired('operator', 'release-2', '2'.repeat(64)), options),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+  t.is(await fs.promises.readFile(path.join(layout.root, 'operator'), 'utf8'), 'operator file')
+
+  await t.exception(
+    () => links.linkManual(desired('release-1', 'release-2', '2'.repeat(64)), options),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+  await t.exception(
+    () => links.linkManual(desired('current', 'missing', '2'.repeat(64)), options),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+})
+
+test('manual linking does not adopt legacy ownership or externally changed manual links', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['release-1', 'release-2', 'rogue'])
+  const options = {
+    managedArtifactNames: new Set(['release-1', 'release-2']),
+    automaticLinkNames: new Set<string>()
+  }
+  await fs.promises.writeFile(
+    recordFile(layout, 'legacy'),
+    JSON.stringify({
+      version: 1,
+      name: 'legacy',
+      target: 'release-1',
+      transferId: '1'.repeat(64),
+      targetKind: 'directory'
+    })
+  )
+  await fs.promises.symlink('release-1', path.join(layout.root, 'legacy'))
+  await t.exception(
+    () => links.linkManual(desired('legacy', 'release-2', '2'.repeat(64)), options),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+  t.is(await fs.promises.readlink(path.join(layout.root, 'legacy')), 'release-1')
+  t.is((await links.read('legacy'))?.version, 1)
+
+  await links.linkManual(desired('current', 'release-1', '1'.repeat(64)), options)
+  await fs.promises.unlink(path.join(layout.root, 'current'))
+  await fs.promises.symlink('rogue', path.join(layout.root, 'current'))
+  await t.exception(
+    () => links.linkManual(desired('current', 'release-2', '2'.repeat(64)), options),
+    { code: ERRORS.LINK_CONFLICT }
+  )
+  t.is(await fs.promises.readlink(path.join(layout.root, 'current')), 'rogue')
+  t.is((await links.read('current'))?.target, 'release-1')
+})
+
+test('manual links preserve file and directory target kinds across crash convergence', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['directory-1', 'directory-2'])
+  await fs.promises.writeFile(path.join(layout.root, 'file-1'), 'one')
+  const options = {
+    managedArtifactNames: new Set(['directory-1', 'directory-2', 'file-1']),
+    automaticLinkNames: new Set<string>()
+  }
+  await links.linkManual(desired('file-current', 'file-1', '1'.repeat(64), 'file'), options)
+  await links.linkManual(desired('directory-current', 'directory-1', '2'.repeat(64)), options)
+  t.is((await links.read('file-current'))?.targetKind, 'file')
+  t.is((await links.read('directory-current'))?.targetKind, 'directory')
+
+  // Simulate a crash after the visible swap but before the manual record rewrite.
+  await fs.promises.unlink(path.join(layout.root, 'directory-current'))
+  await fs.promises.symlink('directory-2', path.join(layout.root, 'directory-current'))
+  t.alike(
+    await links.linkManual(desired('directory-current', 'directory-2', '3'.repeat(64)), options),
+    { status: 'LINKED' }
+  )
+  t.is((await links.read('directory-current'))?.target, 'directory-2')
+
+  // Simulate a crash after the durable manual record but before the first link.
+  await fs.promises.unlink(path.join(layout.root, 'file-current'))
+  t.alike(
+    await links.linkManual(desired('file-current', 'file-1', '1'.repeat(64), 'file'), options),
+    { status: 'LINKED' }
+  )
+  t.is(await fs.promises.readlink(path.join(layout.root, 'file-current')), 'file-1')
 })
