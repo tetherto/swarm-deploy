@@ -572,6 +572,7 @@ export class Server extends EventEmitter {
     request: LinkRequestRecord
   ): Promise<void> {
     let emitted = false
+    let resultWriteStarted = false
     const emitTerminal = (status: ServerLinkEvent['status'], reason?: ErrorCode): void => {
       if (emitted) return
       emitted = true
@@ -619,6 +620,7 @@ export class Server extends EventEmitter {
         await this.refreshManagedLinkNames()
         return linked
       })
+      resultWriteStarted = true
       await writeLinkResult(
         socket,
         { v: 1, status: result.status },
@@ -626,19 +628,30 @@ export class Server extends EventEmitter {
       )
       emitTerminal(result.status === 'LINKED' ? 'linked' : 'unchanged')
     } catch (error) {
-      let reason = codeOf(error)
+      let reason =
+        error instanceof SwarmDeployError &&
+        (error.code === ERRORS.LINK_NOT_ALLOWED ||
+          error.code === ERRORS.LINK_TARGET_NOT_FOUND ||
+          error.code === ERRORS.LINK_CONFLICT ||
+          error.code === ERRORS.LINK_FAILED)
+          ? error.code
+          : ERRORS.LINK_FAILED
       const rejected =
         reason === ERRORS.LINK_NOT_ALLOWED ||
         reason === ERRORS.LINK_TARGET_NOT_FOUND ||
-        reason === ERRORS.LINK_CONFLICT ||
-        reason === ERRORS.PROTOCOL_INVALID
-      try {
-        await writeLinkResult(
-          socket,
-          { v: 1, status: 'FAILED', code: reason },
-          { timeout: this.idleTimeout }
-        )
-      } catch {
+        reason === ERRORS.LINK_CONFLICT
+      if (!resultWriteStarted) {
+        resultWriteStarted = true
+        try {
+          await writeLinkResult(
+            socket,
+            { v: 1, status: 'FAILED', code: reason },
+            { timeout: this.idleTimeout }
+          )
+        } catch {
+          reason = ERRORS.LINK_FAILED
+        }
+      } else {
         reason = ERRORS.LINK_FAILED
       }
       this.logger.warn('Direct link failed', { fingerprint: fingerprint(owner), reason })

@@ -54,6 +54,7 @@ import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
 import type { CommitStore } from '../../dist/storage/commit-store.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
 import { createTempDir } from '../helpers/files.js'
+import { createStorage } from '../helpers/storage.js'
 import { waitFor } from '../helpers/testnet.js'
 
 const EventEmitter = events.EventEmitter
@@ -1810,6 +1811,88 @@ async function linkAll(
     }
   }
 }
+
+test('Server maps durable link storage failures to one LINK_FAILED result and event', async (t) => {
+  let failLedgerRead = false
+  const events: Array<{ status: string; reason?: string }> = []
+  const storage = createStorage({
+    beforeOperation(operation, target) {
+      if (failLedgerRead && operation === 'readdir' && target.endsWith(path.join('commits'))) {
+        throw new Error('injected ledger read failure')
+      }
+    }
+  })
+  const { server, node } = await createServer(t, {
+    storage,
+    symlinks: [{ selector: 'release-1' }]
+  })
+  server.on('link', (event) => events.push({ status: event.status, reason: event.reason }))
+  await uploadAll(node, await manifest(t, 'release-1', 'release'))
+  failLedgerRead = true
+
+  t.alike((await linkAll(node, 'release-1', 'current')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_FAILED
+  })
+  t.alike(events, [{ status: 'failed', reason: ERRORS.LINK_FAILED }])
+})
+
+test('Server never attempts a second result after successful link-result delivery fails', async (t) => {
+  const events: Array<{ status: string; reason?: string }> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: 'release-1' }]
+  })
+  server.on('link', (event) => events.push({ status: event.status, reason: event.reason }))
+  await uploadAll(node, await manifest(t, 'release-1', 'release'))
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  const write = socket.write.bind(socket)
+  const destroy = socket.destroy.bind(socket)
+  let resultWriteAttempts = 0
+  let destroyCalls = 0
+  socket.write = ((bytes: Uint8Array): boolean => {
+    resultWriteAttempts++
+    return write(bytes)
+  }) as typeof socket.write
+  socket.destroy = ((error?: unknown): void => {
+    if (++destroyCalls > 1) destroy(error)
+  }) as typeof socket.destroy
+  socket.onWrite = (_bytes, index) => {
+    if (index !== 0) return true
+    queueMicrotask(() => socket.emit('close'))
+    return false
+  }
+  node.accept(socket)
+  socket.feed(
+    encodeControlFrame(
+      encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'release-1', name: 'current' })
+    )
+  )
+  socket.finishInput()
+  await waitFor(() => events.length === 1)
+
+  t.is(resultWriteAttempts, 1)
+  t.is(socket.writes.length, 1)
+  t.alike(events, [{ status: 'failed', reason: ERRORS.LINK_FAILED }])
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'UNCHANGED' })
+})
+
+test('Server authorizes an exact one-argument manual selector', async (t) => {
+  const { node } = await createServer(t, {
+    symlinks: [{ selector: 'release-1' }]
+  })
+  await uploadAll(node, await manifest(t, 'release-1', 'release'))
+  await uploadAll(node, await manifest(t, 'release-2', 'other'))
+
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  t.alike((await linkAll(node, 'release-2', 'other')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_NOT_ALLOWED
+  })
+})
 
 test('Server maps manual link outcomes, excludes hooks, and reserves durable names', async (t) => {
   const hooks: string[] = []
