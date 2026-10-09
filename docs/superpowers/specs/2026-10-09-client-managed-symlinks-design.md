@@ -99,9 +99,10 @@ dormant. Managed artifacts and unmanaged occupied paths are never replaced by a
 manual link. These collision rules preserve the existing invariant that the
 server mutates only paths whose managed ownership it can prove.
 
-## Implementation boundary
+## Completed implementation
 
-The first implementation slice adds this specification and the compiled policy
-model: one-argument rule validation, manual-target matching, automatic-name
-filtering, and exclusion of manual rules from automatic selection. Later slices
-add the wire RPC, durable manual ownership, server dispatch, and CLI command.
+The completed implementation includes compiled one-argument authorization
+rules, automatic-name filtering, the authenticated link control RPC, durable
+manual ownership records, server dispatch and retention pinning, and the
+`swarm-deploy link` CLI command. Manual rules remain excluded from automatic
+selection.
