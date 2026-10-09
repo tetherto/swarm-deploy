@@ -1797,14 +1797,6 @@ async function linkAll(
   }
 }
 
-type RetentionRunner = { run(): Promise<unknown> }
-
-function retentionRunner(server: Server): RetentionRunner {
-  const retention = (server as unknown as { retention: RetentionRunner | null }).retention
-  if (retention === null) throw new Error('Server retention did not initialize')
-  return retention
-}
-
 test('Server maps durable link storage failures to one LINK_FAILED result and event', async (t) => {
   let failLedgerRead = false
   const events: Array<{ status: string; reason?: string }> = []
@@ -1992,38 +1984,39 @@ test('Server fallback retention pins a manual target while deleting an unpinned 
       }
     }
   })
-  const { server, node } = await createServer(t, {
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
     storage,
-    maxStorageBytes: 4,
-    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: 'release-3', name: 'latest' }],
-    hooks: {
-      afterCommit({ artifact }) {
-        if (artifact.name === 'release-3') throw new Error('defer retention')
-      }
-    }
+    storageDir,
+    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: 'release-3', name: 'latest' }]
   })
-  for (const name of ['release-1', 'release-2']) {
-    const result = await uploadAll(node, await manifest(t, name, 'aa'))
+  for (const name of ['release-1', 'release-2', 'release-3']) {
+    const result = await uploadAll(first.node, await manifest(t, name, 'aa'))
     t.absent(finalCode(result), `${name} commits before retention pressure`)
   }
-  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
-  const third = await uploadAll(node, await manifest(t, 'release-3', 'aa'))
-  t.is(finalCode(third), ERRORS.HOOK_FAILED, 'release-3 commits but defers retention')
-  t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-3'))).isFile())
+  t.is(await fs.promises.readlink(path.join(storageDir, 'latest')), 'release-3')
+  t.alike((await linkAll(first.node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
 
-  const retentionFailures: string[] = []
-  server.on('retention', (event) => {
-    if (event.status === 'failed' && event.reason !== undefined) {
-      retentionFailures.push(event.reason)
-    }
-  })
   failAutomaticReconciliation = true
-  await t.exception(() => retentionRunner(server).run(), { code: ERRORS.LINK_FAILED })
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 4,
+    dht: new FakeServerNode(),
+    storage,
+    symlinks: [{ selector: 'release-3', name: 'latest' }]
+  })
+  t.teardown(() => restarted.close())
+  await t.exception(() => restarted.listen(), { code: ERRORS.LINK_FAILED })
 
-  t.alike(retentionFailures, [ERRORS.LINK_FAILED])
-  t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-1'))).isFile())
-  t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-3'))).isFile())
-  await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'release-2')))
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'release-1'))).isFile())
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'release-3'))).isFile())
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'release-2')))
 })
 
 test('Server startup retention preserves manual links after authorization rules are removed', async (t) => {
