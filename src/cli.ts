@@ -313,7 +313,8 @@ function parseOptions(
   repeatable: ReadonlySet<string> = new Set(),
   keyValues: ReadonlySet<string> = new Set(),
   flags: ReadonlySet<string> = new Set(),
-  pairs: ReadonlySet<string> = new Set()
+  pairs: ReadonlySet<string> = new Set(),
+  allowCanonicalHexPositionals = false
 ): {
   options: Record<string, string | undefined>
   repeatedOptions: Record<string, string[] | undefined>
@@ -338,7 +339,11 @@ function parseOptions(
   const positionals: string[] = []
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
-    if (isCanonicalHexToken(arg) && !keyValues.has(args[i - 1])) {
+    if (
+      isCanonicalHexToken(arg) &&
+      !keyValues.has(args[i - 1]) &&
+      !(allowCanonicalHexPositionals && !arg.startsWith('-'))
+    ) {
       rejectUnexpectedSeed()
     }
     if (arg.startsWith('-')) {
@@ -811,7 +816,10 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
     args,
     new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout']),
     new Set(),
-    new Set(['--server-key', '--seed'])
+    new Set(['--server-key', '--seed']),
+    new Set(),
+    new Set(),
+    true
   )
   const [target, name] = requirePositionals(positionals, 2, 'link requires a target and link name')
   try {

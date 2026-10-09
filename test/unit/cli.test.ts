@@ -151,6 +151,48 @@ test('CLI links through the direct client and prints only the link result', asyn
   t.absent(`${stdout.text()}${stderr.text()}`.includes(serverKey))
 })
 
+test('CLI accepts canonical hexadecimal link targets and names', async (t) => {
+  const hex = 'ab'.repeat(32)
+  const calls: Array<[string, string]> = []
+  class Client {
+    constructor(_options: ClientOptions) {}
+    link(target: string, name: string) {
+      calls.push([target, name])
+      return Promise.resolve({ target, name, status: 'LINKED' as const })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  t.is(
+    await main(
+      ['link', '--server-key', b4a.toString(SERVER_KEY, 'hex'), hex, hex],
+      { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: stdout.stream
+      }
+    ),
+    0
+  )
+  t.alike(calls, [[hex, hex]])
+  t.is(stdout.text(), `${hex} -> ${hex} LINKED\n`)
+
+  const stderr = output()
+  t.is(
+    await main(
+      ['upload', '--server-key', b4a.toString(SERVER_KEY, 'hex'), hex],
+      { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+      { stderr: stderr.stream }
+    ),
+    2
+  )
+  t.ok(stderr.text().includes('Seed strings must be passed with --seed'))
+})
+
 test('CLI rejects unsafe link arguments as configuration errors', async (t) => {
   const stderr = output()
   const clientSeed = b4a.toString(CLIENT_SEED, 'hex')
