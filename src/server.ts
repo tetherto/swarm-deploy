@@ -518,9 +518,9 @@ export class Server extends EventEmitter {
     const pins = new Set(desired.map((link) => link.transferId))
     for (const link of ledger) {
       if (link.mode !== 'manual') continue
-      pins.add(link.transferId)
       const target = records.find((record) => record.name === link.target)
       if (target) pins.add(target.transferId)
+      else pins.add(link.transferId)
     }
     return pins
   }

@@ -14,6 +14,9 @@ All notable changes to this package are documented here.
   any managed link, its v2 ledger record is unreadable by v0.2.0. Rollback
   requires restoring the complete pre-upgrade storage backup or staying on the
   upgraded server. `swarm-deploy link` also requires an upgraded server.
+- **Type change.** `SymlinkRule` is now a closed union of automatic
+  `{ selector, name }` and manual `{ selector }` rule shapes, rather than an
+  extendable interface.
 
 ## 0.2.0
 

@@ -103,6 +103,14 @@ const symlinkRules: SymlinkRule[] = [
   { selector: 'release.tar.gz', name: 'current.tar.gz' },
   { selector: '/^app-\\d+\\.\\d+\\.\\d+\\.tar\\.gz$/' }
 ]
+type ManualSymlinkRule = Extract<SymlinkRule, { name?: never }>
+const manualSymlinkRule: ManualSymlinkRule = { selector: 'release.tar.gz' }
+const invalidManualSymlinkRule: ManualSymlinkRule = {
+  selector: 'release.tar.gz',
+  // @ts-expect-error A manual rule cannot include an automatic-link name.
+  name: 'current.tar.gz'
+}
+void [manualSymlinkRule, invalidManualSymlinkRule]
 const symlinkServerOptions = {
   seed: serverSeed,
   storageDir: '/srv/swarm-deploy',

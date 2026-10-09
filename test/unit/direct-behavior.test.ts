@@ -1979,41 +1979,51 @@ test('Server keeps durable manual names managed after rules are removed on resta
   t.is(await fs.promises.readlink(path.join(storageDir, 'current')), 'release-1')
 })
 
-test('Server retention pins a manual target through normal and fallback reconciliation', async (t) => {
-  for (const fallback of [false, true]) {
-    let failAutomaticReconciliation = false
-    const storage = createStorage({
-      beforeOperation(operation, target) {
-        if (
-          failAutomaticReconciliation &&
-          operation === 'readdir' &&
-          target.endsWith(path.join('.swarm-deploy', 'publications'))
-        ) {
-          throw new Error('injected automatic reconciliation failure')
-        }
+test('Server fallback retention pins a manual target while deleting an unpinned artifact', async (t) => {
+  let failAutomaticReconciliation = false
+  const storage = createStorage({
+    beforeOperation(operation, target) {
+      if (
+        failAutomaticReconciliation &&
+        operation === 'readdir' &&
+        target.endsWith(path.join('.swarm-deploy', 'publications'))
+      ) {
+        throw new Error('injected automatic reconciliation failure')
       }
-    })
-    const { server, node } = await createServer(t, {
-      storage,
-      maxStorageBytes: 2,
-      symlinks: [{ selector: 'release-1' }, { selector: 'release-2', name: 'latest' }]
-    })
-    await uploadAll(node, await manifest(t, 'release-1', 'aa'))
-    t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
-    await uploadAll(node, await manifest(t, 'release-2', 'bb'))
-
-    if (fallback) {
-      failAutomaticReconciliation = true
-      await t.exception(() => retentionRunner(server).run())
-    } else {
-      await retentionRunner(server).run()
     }
-
-    t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-1'))).isFile())
-    if (!fallback) {
-      await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'release-2')))
+  })
+  const { server, node } = await createServer(t, {
+    storage,
+    maxStorageBytes: 4,
+    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: 'release-3', name: 'latest' }],
+    hooks: {
+      afterCommit({ artifact }) {
+        if (artifact.name === 'release-3') throw new Error('defer retention')
+      }
     }
+  })
+  for (const name of ['release-1', 'release-2']) {
+    const result = await uploadAll(node, await manifest(t, name, 'aa'))
+    t.absent(finalCode(result), `${name} commits before retention pressure`)
   }
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  const third = await uploadAll(node, await manifest(t, 'release-3', 'aa'))
+  t.is(finalCode(third), ERRORS.HOOK_FAILED, 'release-3 commits but defers retention')
+  t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-3'))).isFile())
+
+  const retentionFailures: string[] = []
+  server.on('retention', (event) => {
+    if (event.status === 'failed' && event.reason !== undefined) {
+      retentionFailures.push(event.reason)
+    }
+  })
+  failAutomaticReconciliation = true
+  await t.exception(() => retentionRunner(server).run(), { code: ERRORS.LINK_FAILED })
+
+  t.alike(retentionFailures, [ERRORS.LINK_FAILED])
+  t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-1'))).isFile())
+  t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-3'))).isFile())
+  await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'release-2')))
 })
 
 test('Server startup retention preserves manual links after authorization rules are removed', async (t) => {
@@ -2046,23 +2056,22 @@ test('Server startup retention preserves manual links after authorization rules 
   t.is(await fs.promises.readlink(path.join(storageDir, 'current')), 'release-1')
 })
 
-test('Server refreshes a manual target after replacement so retention releases its history', async (t) => {
+test('Server reconciliation releases stale manual replacement history without a relink', async (t) => {
   const { server, node } = await createServer(t, {
     maxStorageBytes: 8,
     replaceNames: ['release'],
     symlinks: [{ selector: 'release' }]
   })
   const old = await manifest(t, 'release', 'old!')
-  await uploadAll(node, old)
+  t.absent(finalCode(await uploadAll(node, old)))
   t.alike((await linkAll(node, 'release', 'current')).result, { v: 1, status: 'LINKED' })
-  await uploadAll(node, await manifest(t, 'release', 'new!'))
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'release', 'new!'))))
 
   const oldHistory = path.join(
     server.storageDir,
     historyName(b4a.toString(old.manifest.transferId, 'hex'))
   )
   t.ok((await fs.promises.lstat(oldHistory)).isFile())
-  t.alike((await linkAll(node, 'release', 'current')).result, { v: 1, status: 'UNCHANGED' })
   await server.close()
 
   const restartedNode = new FakeServerNode()
@@ -2081,6 +2090,39 @@ test('Server refreshes a manual target after replacement so retention releases i
 
   await t.exception(() => fs.promises.lstat(oldHistory))
   t.ok((await fs.promises.lstat(path.join(restarted.storageDir, 'release'))).isFile())
+})
+
+test('Server retention keeps only a repointed manual target after restart', async (t) => {
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^r[1-3]$/' }]
+  })
+  for (const name of ['r1', 'r2', 'r3']) {
+    const result = await uploadAll(first.node, await manifest(t, name, 'aa'))
+    t.absent(finalCode(result), `${name} commits in deterministic order`)
+  }
+  t.alike((await linkAll(first.node, 'r1', 'current')).result, { v: 1, status: 'LINKED' })
+  t.alike((await linkAll(first.node, 'r2', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
+
+  const restartedNode = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 2,
+    dht: restartedNode
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'r1')))
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'r2'))).isFile())
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'r3')))
 })
 
 test('a link is repointed to the newest match before the old target is rotated', async (t) => {
