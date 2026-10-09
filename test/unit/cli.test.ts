@@ -100,8 +100,8 @@ test('CLI passes --server-key only to the direct client', async (t) => {
     ),
     0
   )
-  if (options === null) return
-  const clientOptions = options as unknown as ClientOptions
+  if (options === null) throw new Error('Client was not constructed')
+  const clientOptions = options as ClientOptions
   t.alike(clientOptions.serverPublicKey, SERVER_KEY)
   t.is(clientOptions.idleTimeout, 4321)
   t.absent('topic' in clientOptions)
@@ -140,8 +140,8 @@ test('CLI links through the direct client and prints only the link result', asyn
     ),
     0
   )
-  if (options === null) return
-  const clientOptions = options as unknown as ClientOptions
+  if (options === null) throw new Error('Client was not constructed')
+  const clientOptions = options as ClientOptions
   t.alike(clientOptions.seed, CLIENT_SEED)
   t.alike(clientOptions.serverPublicKey, SERVER_KEY)
   t.is(clientOptions.idleTimeout, 4321)
@@ -191,6 +191,82 @@ test('CLI accepts canonical hexadecimal link targets and names', async (t) => {
     2
   )
   t.ok(stderr.text().includes('Seed strings must be passed with --seed'))
+})
+
+test('CLI rejects link positional secrets without echoing them', async (t) => {
+  const clientSeed = b4a.toString(CLIENT_SEED, 'hex')
+  const serverKey = b4a.toString(SERVER_KEY, 'hex')
+  let constructed = 0
+  class Client {
+    constructor(_options: ClientOptions) {
+      constructed++
+    }
+    link() {
+      throw new Error('Link should not be attempted')
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+
+  for (const [target, name] of [
+    [clientSeed, 'current'],
+    [serverKey, 'current'],
+    ['release-1.2.3', clientSeed],
+    ['release-1.2.3', serverKey]
+  ]) {
+    const stdout = output()
+    const stderr = output()
+    t.is(
+      await main(
+        ['link', '--server-key', serverKey, target, name],
+        { SWARM_DEPLOY_CLIENT_SEED: clientSeed },
+        {
+          Client: Client as unknown as new (
+            options: ClientOptions
+          ) => import('../../dist/client.js').Client,
+          stdout: stdout.stream,
+          stderr: stderr.stream
+        }
+      ),
+      2
+    )
+    t.absent(`${stdout.text()}${stderr.text()}`.includes(clientSeed))
+    t.absent(`${stdout.text()}${stderr.text()}`.includes(serverKey))
+  }
+  t.is(constructed, 0)
+})
+
+test('CLI prints stable link failures without raw server messages', async (t) => {
+  const secret = 'raw storage path /srv/private'
+  class Client {
+    constructor(_options: ClientOptions) {}
+    link() {
+      return Promise.reject(new SwarmDeployError(ERRORS.LINK_CONFLICT, secret))
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  const stderr = output()
+  t.is(
+    await main(
+      ['link', '--server-key', b4a.toString(SERVER_KEY, 'hex'), 'release-1.2.3', 'current'],
+      { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: stdout.stream,
+        stderr: stderr.stream
+      }
+    ),
+    1
+  )
+  t.is(stdout.text(), '')
+  t.is(stderr.text(), `${ERRORS.LINK_CONFLICT}\n`)
+  t.absent(stderr.text().includes(secret))
 })
 
 test('CLI rejects unsafe link arguments as configuration errors', async (t) => {

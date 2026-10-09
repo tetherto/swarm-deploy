@@ -739,6 +739,19 @@ function printLinkResult(result: ClientLinkResult, io: CliIo): number {
   return result.status === 'LINKED' || result.status === 'UNCHANGED' ? 0 : 1
 }
 
+function linkErrorMessage(err: unknown): string {
+  if (
+    err instanceof SwarmDeployError &&
+    (err.code === ERRORS.LINK_NOT_ALLOWED ||
+      err.code === ERRORS.LINK_TARGET_NOT_FOUND ||
+      err.code === ERRORS.LINK_CONFLICT ||
+      err.code === ERRORS.LINK_FAILED)
+  ) {
+    return err.code
+  }
+  return errorMessage(err)
+}
+
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, flagOptions, positionals } = parseOptions(
     args,
@@ -840,6 +853,16 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
   } catch {
     throw usageError('Invalid --server-key')
   }
+  const clientSeedHex = b4a.toString(seed, 'hex')
+  const serverKeyHex = b4a.toString(serverPublicKey, 'hex')
+  if (
+    target === clientSeedHex ||
+    target === serverKeyHex ||
+    name === clientSeedHex ||
+    name === serverKeyHex
+  ) {
+    throw usageError('Invalid link target or link name')
+  }
   const idleTimeout =
     options['--idle-timeout'] === undefined
       ? io.idleTimeout
@@ -875,7 +898,7 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
       const result = await client.link(target, name)
       code = printLinkResult(result, io)
     } catch (err) {
-      runError = new CliError(errorMessage(err), 1)
+      runError = new CliError(linkErrorMessage(err), 1)
     }
   } finally {
     detach()

@@ -16,10 +16,8 @@ import {
   type HookArtifact,
   type HookFailureContext,
   type HookFailurePhase,
-  type ReleaseCoordinates,
   type RetentionEvent,
-  type LinkRequestRecord,
-  type LinkResultRecord,
+  type ReleaseCoordinates,
   type ServerHooks,
   type ServerEventMap,
   type ServerLinkEvent,
@@ -58,17 +56,6 @@ const stringSeedServerOptions = {
   maxStagingBytes: 4096
 } satisfies ServerOptions
 
-const linkRequest: LinkRequestRecord = {
-  v: 1,
-  kind: 'link',
-  target: 'release-1.2.3',
-  name: 'current'
-}
-const linkResults: LinkResultRecord[] = [
-  { v: 1, status: 'LINKED' },
-  { v: 1, status: 'UNCHANGED' },
-  { v: 1, status: 'FAILED', code: 'LINK_TARGET_NOT_FOUND' }
-]
 const linkStatus: ClientLinkStatus = 'LINKED'
 const clientLink: Promise<ClientLinkResult> = client.link('release-1.2.3', 'current')
 const linkEvent: ClientLinkEvent = {
@@ -78,7 +65,7 @@ const linkEvent: ClientLinkEvent = {
   final: true
 }
 const clientLinkEvent: ClientEventMap['link'] = linkEvent
-void [linkRequest, linkResults, linkStatus, clientLink, clientLinkEvent]
+void [linkStatus, clientLink, clientLinkEvent]
 
 const serverLinkEvent: ServerLinkEvent = {
   fingerprint: '0123456789ab',

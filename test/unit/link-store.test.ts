@@ -333,10 +333,20 @@ test('manual linking creates, keeps, and repoints a durable manual link', async 
   } satisfies ManagedSymlinkRecord)
   t.is(await fs.promises.readlink(path.join(layout.root, 'current')), 'release-1')
 
-  t.alike(await links.linkManual(desired('current', 'release-1', '2'.repeat(64)), options), {
-    status: 'UNCHANGED'
-  })
-  t.is((await links.read('current'))?.transferId, '1'.repeat(64))
+  t.alike(
+    await links.linkManual(desired('current', 'release-1', '2'.repeat(64), 'file'), options),
+    {
+      status: 'UNCHANGED'
+    }
+  )
+  t.alike(await links.read('current'), {
+    version: 2,
+    mode: 'manual',
+    name: 'current',
+    target: 'release-1',
+    transferId: '2'.repeat(64),
+    targetKind: 'file'
+  } satisfies ManagedSymlinkRecord)
 
   t.alike(await links.linkManual(desired('current', 'release-2', '2'.repeat(64)), options), {
     status: 'LINKED'

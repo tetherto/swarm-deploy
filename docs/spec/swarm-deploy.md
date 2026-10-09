@@ -522,7 +522,9 @@ never replaced, moved, or deleted.
 completed. `UNCHANGED` means the durable manual ownership already selects the
 requested target. The operation is idempotent: a retry after an acknowledged
 or ambiguous result converges to that target and returns `UNCHANGED` once the
-durable state already agrees.
+durable state already agrees. When a current target was replaced in place, an
+`UNCHANGED` retry refreshes its stored transfer ID and target kind without
+rewriting the visible symlink.
 
 ### Ownership, recovery, and isolation
 
@@ -545,8 +547,15 @@ or removes a manual link. Manual mutation rejects automatic records and
 configured automatic names. Removing a manual authorization rule prevents
 future requests that depend on it but does not remove or rewrite an existing
 manual link. Removing an automatic rule removes only its proven automatic
-record and visible link. Existing version-1 records retain the automatic
-behavior from v0.2.0.
+record and visible link. If all automatic rules are removed, proven stale
+automatic links are still reconciled away; malformed or conflicting ledgers
+fail closed. Existing version-1 records retain the automatic behavior from
+v0.2.0.
+
+There is no unlink RPC. An operator removes a managed link only while the
+server is stopped: remove the visible symlink and its matching
+`.swarm-deploy/links/<sha256(link-name)>.json` ownership record, then restart.
+The ledger must never be edited while the server runs.
 
 At startup the default Node and Bare adapters load the entire ledger, including
 manual records whose authorization policy was removed. Persisted automatic and
@@ -583,11 +592,12 @@ symlink policy needs an adapter without `symlink` and `readlink`.
 
 Old upload clients remain compatible because link is a separate first-control
 variant. A client that sends a link request to an older strict server is not
-compatible: that server rejects the unknown record. This version reads v1
-automatic ledgers and writes v2 mode-aware ledgers. Older code does not
-understand v2 records, so rollback after any v2 link write is unsupported
-without restoring the link ledger and visible links from a compatible backup.
-Automatic v0.2.0 policy behavior otherwise remains unchanged.
+compatible: `swarm-deploy link` requires an upgraded server. This version reads
+v1 automatic ledgers and writes v2 mode-aware ledgers. After an upgraded server
+creates, repairs, or repoints any managed link, v0.2.0 cannot read its v2
+record. Rollback then requires restoring the complete pre-upgrade storage
+backup, including visible links and `.swarm-deploy/links`, or staying on the
+upgraded server.
 
 ## Public API, CLI, and observability migration
 

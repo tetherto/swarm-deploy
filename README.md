@@ -676,6 +676,17 @@ count or version rotated.
 Roll out the server, then the pattern configuration, then clients that stage
 into conforming folders.
 
+#### Managed-link rollback warning
+
+**Do not roll a server back to v0.2.0 after an upgraded server has created,
+repaired, or repointed any managed link.** Those operations write a v2
+ownership record, which v0.2.0 cannot read. Rollback requires restoring the
+complete pre-upgrade storage backup (including visible links and
+`.swarm-deploy/links`), or keeping the upgraded server in place.
+
+`swarm-deploy link` requires an upgraded server; v0.2.0 does not recognize
+link control requests.
+
 #### Overlapping retries now get `FILE_BUSY`
 
 **Behavior change.** A transfer ID may have only one in-flight commit
@@ -789,6 +800,13 @@ Automatic and manual targets are pinned against age, count, SemVer, and quota
 retention and still count toward those limits. Reconciliation and manual
 mutation run under the storage-root lease, and uploads cannot claim any
 persisted managed-link name.
+
+There is no unlink RPC. To remove a managed link safely, stop the server,
+remove the visible symlink and its matching
+`.swarm-deploy/links/<sha256(link-name)>.json` ownership record, then restart
+the server. Never edit the ledger while the server runs. Removing all automatic
+rules intentionally reconciles proven stale automatic links away; malformed or
+conflicting ledgers still fail closed on the default symlink-capable storage.
 
 A safe promotion workflow is:
 

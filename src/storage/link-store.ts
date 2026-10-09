@@ -525,7 +525,13 @@ export class LinkStore {
       throw conflict('Managed link does not match its ownership record')
     }
     if (destination.target === link.target) {
-      if (record.target === link.target) return { status: 'UNCHANGED' }
+      if (record.target === link.target) {
+        if (record.transferId === link.transferId && record.targetKind === link.targetKind) {
+          return { status: 'UNCHANGED' }
+        }
+        await this.writeRecord(link, 'manual')
+        return { status: 'UNCHANGED' }
+      }
       await this.writeRecord(link, 'manual')
       return { status: 'LINKED' }
     }

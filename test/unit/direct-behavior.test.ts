@@ -50,6 +50,7 @@ import {
   regenerateTarSuffix,
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
+import { historyName } from '../../dist/files.js'
 import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
 import type { CommitStore } from '../../dist/storage/commit-store.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
@@ -524,24 +525,18 @@ test('Client link half-closes one control request and requires an explicit link 
     idleTimeout: 1_000,
     dht: fakeClientNode(successSocket)
   })
-  const successLink = successClient as unknown as {
-    link(target: string, name: string): Promise<{ target: string; name: string; status: string }>
-  }
-  t.ok(typeof successLink.link === 'function')
-  if (typeof successLink.link === 'function') {
-    t.alike(await successLink.link('release-1.2.3', 'current'), {
-      target: 'release-1.2.3',
-      name: 'current',
-      status: 'LINKED'
-    })
-    t.alike(JSON.parse(b4a.toString(successSocket.writes[0].subarray(4))), {
-      v: 1,
-      kind: 'link',
-      target: 'release-1.2.3',
-      name: 'current'
-    })
-    t.is(successSocket.writes.length, 1)
-  }
+  t.alike(await successClient.link('release-1.2.3', 'current'), {
+    target: 'release-1.2.3',
+    name: 'current',
+    status: 'LINKED'
+  })
+  t.alike(JSON.parse(b4a.toString(successSocket.writes[0].subarray(4))), {
+    v: 1,
+    kind: 'link',
+    target: 'release-1.2.3',
+    name: 'current'
+  })
+  t.is(successSocket.writes.length, 1)
   await successClient.close()
   t.is(successSocket.destroyed, true)
 
@@ -553,15 +548,9 @@ test('Client link half-closes one control request and requires an explicit link 
     idleTimeout: 1_000,
     dht: fakeClientNode(failedSocket)
   })
-  const failedLink = failedClient as unknown as {
-    link(target: string, name: string): Promise<unknown>
-  }
-  t.ok(typeof failedLink.link === 'function')
-  if (typeof failedLink.link === 'function') {
-    await t.exception(failedLink.link('release-1.2.3', 'current'), {
-      code: (ERRORS as Record<string, string>).LINK_TARGET_NOT_FOUND
-    })
-  }
+  await t.exception(failedClient.link('release-1.2.3', 'current'), {
+    code: ERRORS.LINK_TARGET_NOT_FOUND
+  })
   await failedClient.close()
   t.is(failedSocket.destroyed, true)
 
@@ -573,11 +562,7 @@ test('Client link half-closes one control request and requires an explicit link 
     idleTimeout: 1_000,
     dht: fakeClientNode(eofSocket)
   })
-  const eofLink = eofClient as unknown as { link(target: string, name: string): Promise<unknown> }
-  t.ok(typeof eofLink.link === 'function')
-  if (typeof eofLink.link === 'function') {
-    await t.exception(eofLink.link('release-1.2.3', 'current'), { code: ERRORS.PROTOCOL_INVALID })
-  }
+  await t.exception(eofClient.link('release-1.2.3', 'current'), { code: ERRORS.PROTOCOL_INVALID })
   await eofClient.close()
   t.is(eofSocket.destroyed, true)
 })
@@ -1812,6 +1797,14 @@ async function linkAll(
   }
 }
 
+type RetentionRunner = { run(): Promise<unknown> }
+
+function retentionRunner(server: Server): RetentionRunner {
+  const retention = (server as unknown as { retention: RetentionRunner | null }).retention
+  if (retention === null) throw new Error('Server retention did not initialize')
+  return retention
+}
+
 test('Server maps durable link storage failures to one LINK_FAILED result and event', async (t) => {
   let failLedgerRead = false
   const events: Array<{ status: string; reason?: string }> = []
@@ -1984,6 +1977,110 @@ test('Server keeps durable manual names managed after rules are removed on resta
   const rejected = await uploadAll(node, await manifest(t, 'current', 'must stay reserved'))
   t.is(finalCode(rejected), ERRORS.INVALID_FILENAME)
   t.is(await fs.promises.readlink(path.join(storageDir, 'current')), 'release-1')
+})
+
+test('Server retention pins a manual target through normal and fallback reconciliation', async (t) => {
+  for (const fallback of [false, true]) {
+    let failAutomaticReconciliation = false
+    const storage = createStorage({
+      beforeOperation(operation, target) {
+        if (
+          failAutomaticReconciliation &&
+          operation === 'readdir' &&
+          target.endsWith(path.join('.swarm-deploy', 'publications'))
+        ) {
+          throw new Error('injected automatic reconciliation failure')
+        }
+      }
+    })
+    const { server, node } = await createServer(t, {
+      storage,
+      maxStorageBytes: 2,
+      symlinks: [{ selector: 'release-1' }, { selector: 'release-2', name: 'latest' }]
+    })
+    await uploadAll(node, await manifest(t, 'release-1', 'aa'))
+    t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+    await uploadAll(node, await manifest(t, 'release-2', 'bb'))
+
+    if (fallback) {
+      failAutomaticReconciliation = true
+      await t.exception(() => retentionRunner(server).run())
+    } else {
+      await retentionRunner(server).run()
+    }
+
+    t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-1'))).isFile())
+    if (!fallback) {
+      await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'release-2')))
+    }
+  }
+})
+
+test('Server startup retention preserves manual links after authorization rules are removed', async (t) => {
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^release-\\d+$/' }]
+  })
+  await uploadAll(first.node, await manifest(t, 'release-1', 'aa'))
+  await uploadAll(first.node, await manifest(t, 'release-2', 'bb'))
+  t.alike((await linkAll(first.node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
+
+  const node = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 2,
+    dht: node
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'release-1'))).isFile())
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'release-2')))
+  t.is(await fs.promises.readlink(path.join(storageDir, 'current')), 'release-1')
+})
+
+test('Server refreshes a manual target after replacement so retention releases its history', async (t) => {
+  const { server, node } = await createServer(t, {
+    maxStorageBytes: 8,
+    replaceNames: ['release'],
+    symlinks: [{ selector: 'release' }]
+  })
+  const old = await manifest(t, 'release', 'old!')
+  await uploadAll(node, old)
+  t.alike((await linkAll(node, 'release', 'current')).result, { v: 1, status: 'LINKED' })
+  await uploadAll(node, await manifest(t, 'release', 'new!'))
+
+  const oldHistory = path.join(
+    server.storageDir,
+    historyName(b4a.toString(old.manifest.transferId, 'hex'))
+  )
+  t.ok((await fs.promises.lstat(oldHistory)).isFile())
+  t.alike((await linkAll(node, 'release', 'current')).result, { v: 1, status: 'UNCHANGED' })
+  await server.close()
+
+  const restartedNode = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir: server.storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 4,
+    dht: restartedNode
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+
+  await t.exception(() => fs.promises.lstat(oldHistory))
+  t.ok((await fs.promises.lstat(path.join(restarted.storageDir, 'release'))).isFile())
 })
 
 test('a link is repointed to the newest match before the old target is rotated', async (t) => {

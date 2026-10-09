@@ -8,8 +8,12 @@ All notable changes to this package are documented here.
   `--symlink <selector>` rules authorize current managed file or directory
   targets, `Client.link(target, name)` and `swarm-deploy link` create or
   idempotently repoint durable manual links, and `LINKED`/`UNCHANGED` results,
-  typed link events, stable policy/target errors, retention pinning, and v1
-  automatic-link ledger compatibility preserve fail-closed managed ownership.
+  typed link events, stable policy/target errors, retention pinning, and v2
+  mode-aware ledger records preserve fail-closed managed ownership.
+- **Rollback warning.** After an upgraded server creates, repairs, or repoints
+  any managed link, its v2 ledger record is unreadable by v0.2.0. Rollback
+  requires restoring the complete pre-upgrade storage backup or staying on the
+  upgraded server. `swarm-deploy link` also requires an upgraded server.
 
 ## 0.2.0
 

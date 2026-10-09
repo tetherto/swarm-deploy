@@ -32,11 +32,6 @@ export { parseAllowlist } from './allowlist.js'
 export type { ArtifactKind } from './types.js'
 export type { UploadTarget } from './files.js'
 export type { SymlinkRule } from './symlinks.js'
-export type {
-  FirstControlRecord,
-  LinkRequestRecord,
-  LinkResultRecord
-} from './tar-protocol/controls.js'
 export {
   Server,
   type AllowlistKey,

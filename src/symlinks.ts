@@ -10,15 +10,18 @@ import type { ArtifactKind } from './types.js'
 
 export const MAX_SYMLINK_SELECTOR_BYTES = 200
 
-export interface SymlinkRule {
+export type SymlinkRule =
   /** An exact managed artifact basename, or `/pattern/` with no flags. */
-  selector: string
-  /**
-   * The safe basename of an automatically reconciled managed link. When
-   * omitted, the selector only authorizes client-selected targets.
-   */
-  name?: string
-}
+  | {
+      selector: string
+      /** The safe basename of an automatically reconciled managed link. */
+      name: string
+    }
+  | {
+      selector: string
+      /** An omitted name makes this a client-selected target-authorization rule. */
+      name?: never
+    }
 
 export interface CompiledSymlinkRule {
   readonly selector: string
