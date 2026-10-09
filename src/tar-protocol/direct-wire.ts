@@ -6,13 +6,20 @@ import {
   decodeAdmissionRecord,
   decodeAnyMetadataRecord,
   decodeFinalRecord,
+  decodeFirstControlRecord,
+  decodeLinkRequestRecord,
+  decodeLinkResultRecord,
   encodeAdmissionRecord,
   encodeAnyMetadataRecord,
   encodeFinalRecord,
+  encodeLinkRequestRecord,
+  encodeLinkResultRecord,
   MAX_CONTROL_RECORD_BYTES,
   type AdmissionRecord,
   type AnyMetadataRecord,
-  type FinalRecord
+  type FinalRecord,
+  type LinkRequestRecord,
+  type LinkResultRecord
 } from './controls.js'
 import {
   writeFramedProtocolRecord,
@@ -206,6 +213,13 @@ export function writeMetadata(
 ): Promise<void> {
   return writeFramedProtocolRecord(socket as never, encodeAnyMetadataRecord(metadata), options)
 }
+export function writeLinkRequest(
+  socket: DirectDhtSocket,
+  request: LinkRequestRecord,
+  options: ProtocolWriteOptions = {}
+): Promise<void> {
+  return writeFramedProtocolRecord(socket as never, encodeLinkRequestRecord(request), options)
+}
 export function writeAdmission(
   socket: DirectDhtSocket,
   value: AdmissionRecord,
@@ -220,6 +234,13 @@ export function writeFinal(
 ): Promise<void> {
   return writeFramedProtocolRecord(socket as never, encodeFinalRecord(value), options)
 }
+export function writeLinkResult(
+  socket: DirectDhtSocket,
+  value: LinkResultRecord,
+  options: ProtocolWriteOptions = {}
+): Promise<void> {
+  return writeFramedProtocolRecord(socket as never, encodeLinkResultRecord(value), options)
+}
 export function writeTar(
   socket: DirectDhtSocket,
   value: Uint8Array,
@@ -228,5 +249,8 @@ export function writeTar(
   return writeProtocolBytes(socket as never, value, options)
 }
 export const decodeDirectMetadata = decodeAnyMetadataRecord
+export const decodeDirectFirstControl = decodeFirstControlRecord
+export const decodeDirectLinkRequest = decodeLinkRequestRecord
 export const decodeDirectAdmission = decodeAdmissionRecord
 export const decodeDirectFinal = decodeFinalRecord
+export const decodeDirectLinkResult = decodeLinkResultRecord

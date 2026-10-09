@@ -12,7 +12,13 @@ import { compileSymlinkRules } from './symlinks.js'
 import { loadHooksModule } from './hooks-module.js'
 import type { ServerHooks } from './hooks.js'
 import { Server, type ServerLogger, type ServerOptions } from './server.js'
-import { Client, type ClientOptions, type ClientUploadResult } from './client.js'
+import { encodeLinkRequestRecord } from './tar-protocol/controls.js'
+import {
+  Client,
+  type ClientLinkResult,
+  type ClientOptions,
+  type ClientUploadResult
+} from './client.js'
 import type { DirectDhtNode } from './direct-dht.js'
 
 type Env = Record<string, string | undefined>
@@ -35,7 +41,7 @@ type CliIo = {
   cwd?: string
 }
 
-const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload'])
+const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload', 'link'])
 const HELP_ARGS = new Set(['--help', '-h'])
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MAX_SEED_FILE_BYTES = 65
@@ -46,8 +52,9 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> <link-name>]... [--hooks <module>]',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module>]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] <file-or-directory>',
+  '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <target> <link-name>',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
 ].join('\n')
@@ -310,7 +317,7 @@ function parseOptions(
 ): {
   options: Record<string, string | undefined>
   repeatedOptions: Record<string, string[] | undefined>
-  pairOptions: Record<string, Array<[string, string]> | undefined>
+  pairOptions: Record<string, Array<[string, string | undefined]> | undefined>
   flagOptions: Record<string, true | undefined>
   positionals: string[]
 } {
@@ -322,9 +329,8 @@ function parseOptions(
     string,
     string[] | undefined
   >
-  const pairOptions: Record<string, Array<[string, string]> | undefined> = Object.create(
-    null
-  ) as Record<string, Array<[string, string]> | undefined>
+  const pairOptions: Record<string, Array<[string, string | undefined]> | undefined> =
+    Object.create(null) as Record<string, Array<[string, string | undefined]> | undefined>
   const flagOptions: Record<string, true | undefined> = Object.create(null) as Record<
     string,
     true | undefined
@@ -354,19 +360,21 @@ function parseOptions(
       if (pairs.has(arg)) {
         const first = args[i + 1]
         const second = args[i + 2]
-        if (
-          first === undefined ||
-          first.startsWith('-') ||
-          second === undefined ||
-          second.startsWith('-')
-        ) {
+        if (first === undefined || first.startsWith('-')) {
           throw usageError('Missing option value')
         }
-        if (isCanonicalHexToken(second) && !keyValues.has(arg)) rejectUnexpectedSeed()
+        const optionalSecond = second === undefined || second.startsWith('-') ? undefined : second
+        if (
+          optionalSecond !== undefined &&
+          isCanonicalHexToken(optionalSecond) &&
+          !keyValues.has(arg)
+        ) {
+          rejectUnexpectedSeed()
+        }
         const values = pairOptions[arg] || []
-        values.push([first, second])
+        values.push([first, optionalSecond])
         pairOptions[arg] = values
-        i += 2
+        i += optionalSecond === undefined ? 1 : 2
         continue
       }
       const value = args[i + 1]
@@ -647,7 +655,9 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   }
 
   const symlinkPairs = pairOptions['--symlink'] || []
-  const symlinks = symlinkPairs.map(([selector, name]) => ({ selector, name }))
+  const symlinks = symlinkPairs.map(([selector, name]) =>
+    name === undefined ? { selector } : { selector, name }
+  )
   try {
     compileSymlinkRules(symlinks)
   } catch {
@@ -717,6 +727,11 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
 function printUploadResult(result: ClientUploadResult, io: CliIo): number {
   writeLine(io.stdout, `${result.name} ${result.kind} ${result.status}`)
   return result.status === 'COMMITTED' || result.status === 'ALREADY_COMMITTED' ? 0 : 1
+}
+
+function printLinkResult(result: ClientLinkResult, io: CliIo): number {
+  writeLine(io.stdout, `${result.name} -> ${result.target} ${result.status}`)
+  return result.status === 'LINKED' || result.status === 'UNCHANGED' ? 0 : 1
 }
 
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
@@ -791,6 +806,81 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   return code
 }
 
+async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
+  const { options, positionals } = parseOptions(
+    args,
+    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout']),
+    new Set(),
+    new Set(['--server-key', '--seed'])
+  )
+  const [target, name] = requirePositionals(positionals, 2, 'link requires a target and link name')
+  try {
+    encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })
+  } catch {
+    throw usageError('Invalid link target or link name')
+  }
+  const seed = await resolveSeed({
+    seedFile: options['--seed-file'],
+    seedText: options['--seed'],
+    env,
+    envName: CLIENT_SEED_ENV,
+    role: 'client'
+  })
+  let serverPublicKey: Buffer
+  try {
+    serverPublicKey = parsePublicKey(requireOption(options, '--server-key'))
+  } catch {
+    throw usageError('Invalid --server-key')
+  }
+  const idleTimeout =
+    options['--idle-timeout'] === undefined
+      ? io.idleTimeout
+      : parsePositiveSafeInteger(options['--idle-timeout'], 'idle-timeout')
+
+  const ClientImpl = io.Client || Client
+  let client: Client
+  try {
+    client = new ClientImpl({
+      seed,
+      serverPublicKey,
+      dht: io.dht,
+      connectTimeout: io.connectTimeout,
+      idleTimeout,
+      logger: createLogger(io)
+    })
+  } catch (err) {
+    throw new CliError(errorMessage(err), 2)
+  }
+
+  const proc = io.process || process
+  const close = onceClose(client)
+  const detach = attachSignals(proc, () => {
+    close().then(
+      () => {},
+      () => {}
+    )
+  })
+  let runError = null
+  let code = 0
+  try {
+    try {
+      const result = await client.link(target, name)
+      code = printLinkResult(result, io)
+    } catch (err) {
+      runError = new CliError(errorMessage(err), 1)
+    }
+  } finally {
+    detach()
+    try {
+      await close()
+    } catch {
+      if (!runError && code === 0) runError = new CliError('Cleanup failed', 1)
+    }
+  }
+  if (runError) throw runError
+  return code
+}
+
 async function dispatch(argv: string[], env: Env, io: CliIo): Promise<number> {
   if (argv.length === 1 && HELP_ARGS.has(argv[0])) {
     writeLine(io.stdout, USAGE)
@@ -810,7 +900,8 @@ async function dispatch(argv: string[], env: Env, io: CliIo): Promise<number> {
     return 0
   }
   if (command === 'server') return runServer(args, env, io)
-  return runUpload(args, env, io)
+  if (command === 'upload') return runUpload(args, env, io)
+  return runLink(args, env, io)
 }
 
 async function main(

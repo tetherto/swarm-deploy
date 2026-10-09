@@ -8,6 +8,9 @@ import {
   type AfterCommitContext,
   type ArtifactKind,
   type BeforeCommitContext,
+  type ClientLinkEvent,
+  type ClientLinkResult,
+  type ClientLinkStatus,
   type ClientEventMap,
   type ClientOptions,
   type HookArtifact,
@@ -15,6 +18,8 @@ import {
   type HookFailurePhase,
   type ReleaseCoordinates,
   type RetentionEvent,
+  type LinkRequestRecord,
+  type LinkResultRecord,
   type ServerHooks,
   type ServerOptions,
   type StorageAdapter,
@@ -50,6 +55,28 @@ const stringSeedServerOptions = {
   maxFileBytes: 1024,
   maxStagingBytes: 4096
 } satisfies ServerOptions
+
+const linkRequest: LinkRequestRecord = {
+  v: 1,
+  kind: 'link',
+  target: 'release-1.2.3',
+  name: 'current'
+}
+const linkResults: LinkResultRecord[] = [
+  { v: 1, status: 'LINKED' },
+  { v: 1, status: 'UNCHANGED' },
+  { v: 1, status: 'FAILED', code: 'LINK_TARGET_NOT_FOUND' }
+]
+const linkStatus: ClientLinkStatus = 'LINKED'
+const clientLink: Promise<ClientLinkResult> = client.link('release-1.2.3', 'current')
+const linkEvent: ClientLinkEvent = {
+  target: 'release-1.2.3',
+  name: 'current',
+  status: 'LINKED',
+  final: true
+}
+const clientLinkEvent: ClientEventMap['link'] = linkEvent
+void [linkRequest, linkResults, linkStatus, clientLink, clientLinkEvent]
 
 function readArtifact(artifact: HookArtifact): void {
   const name: string = artifact.name

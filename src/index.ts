@@ -32,6 +32,11 @@ export { parseAllowlist } from './allowlist.js'
 export type { ArtifactKind } from './types.js'
 export type { UploadTarget } from './files.js'
 export type { SymlinkRule } from './symlinks.js'
+export type {
+  FirstControlRecord,
+  LinkRequestRecord,
+  LinkResultRecord
+} from './tar-protocol/controls.js'
 export {
   Server,
   type AllowlistKey,
@@ -53,6 +58,9 @@ export {
   type ClientEvent,
   type ClientEventMap,
   type ClientEventName,
+  type ClientLinkEvent,
+  type ClientLinkResult,
+  type ClientLinkStatus,
   type ClientOfferEvent,
   type ClientOptions,
   type ClientProgressEvent,

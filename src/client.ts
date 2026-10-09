@@ -13,8 +13,10 @@ import { keyPairFromSeed } from './identity.js'
 import {
   decodeDirectAdmission,
   decodeDirectFinal,
+  decodeDirectLinkResult,
   DirectWireReader,
   endWrite,
+  writeLinkRequest,
   writeMetadata,
   writeTar
 } from './tar-protocol/direct-wire.js'
@@ -31,7 +33,7 @@ import {
   treeMetadataFromManifest,
   type TreeManifest
 } from './tar-protocol/tree-manifest.js'
-import type { AnyMetadataRecord } from './tar-protocol/controls.js'
+import { encodeLinkRequestRecord, type AnyMetadataRecord } from './tar-protocol/controls.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 import type {
   ArtifactKind,
@@ -81,6 +83,12 @@ export interface UploadResult {
   entryCount?: number
 }
 export type ClientUploadResult = UploadResult
+export type ClientLinkStatus = 'LINKED' | 'UNCHANGED'
+export interface ClientLinkResult {
+  target: string
+  name: string
+  status: ClientLinkStatus
+}
 export interface ClientOfferEvent {
   status: 'offered' | 'accepted' | 'resumed' | 'reset' | 'rejected' | 'already-committed'
   name: string
@@ -98,6 +106,12 @@ export interface ClientResultEvent {
   status: UploadStatus | ErrorCode
   final: boolean
 }
+export interface ClientLinkEvent {
+  target: string
+  name: string
+  status: 'requested' | ClientLinkStatus | ErrorCode
+  final: boolean
+}
 export interface ClientEventMap {
   connection: FingerprintEvent
   'connection-open': FingerprintEvent
@@ -107,6 +121,7 @@ export interface ClientEventMap {
   verification: { name: string; status: 'started' | 'succeeded' | 'failed'; reason?: string }
   commit: { name: string; status: 'succeeded' | 'failed'; reason?: string }
   result: ClientResultEvent
+  link: ClientLinkEvent
   failure: FingerprintEvent & { reason: ErrorCode }
   close: { status: 'closed' }
 }
@@ -357,6 +372,48 @@ export class Client extends EventEmitter {
     this.emitSafe('result', { name: result.name, kind, status, final: true })
     return result
   }
+  private async performLink(target: string, name: string): Promise<ClientLinkResult> {
+    const request = { v: 1 as const, kind: 'link' as const, target, name }
+    // Validate before opening a connection so malformed names never leave the client.
+    encodeLinkRequestRecord(request)
+    throwIfAborted(this.signal)
+    const socket = await this.direct.connect(this.serverPublicKey, {
+      signal: this.signal,
+      timeout: this.connectTimeout
+    })
+    const remote = socket.remotePublicKey
+    this.emitSafe('connection', { fingerprint: remote ? fingerprint(remote) : 'invalid' })
+    this.emitSafe('connection-open', { fingerprint: remote ? fingerprint(remote) : 'invalid' })
+    socket.once('close', () =>
+      this.emitSafe('connection-close', {
+        fingerprint: this.serverPublicKey ? fingerprint(this.serverPublicKey) : 'invalid'
+      })
+    )
+    const reader = new DirectWireReader(socket)
+    try {
+      await writeLinkRequest(socket, request, { signal: this.signal, timeout: this.idleTimeout })
+      this.emitSafe('link', { target, name, status: 'requested', final: false })
+      endWrite(socket)
+      const response = await reader.control(decodeDirectLinkResult, this.signal, this.idleTimeout)
+      if (response.status === 'FAILED') throw fail(response.code, 'Server failed link request')
+      const result: ClientLinkResult = { target, name, status: response.status }
+      this.logger.info('Direct link completed', {
+        target: result.target,
+        name: result.name,
+        status: result.status
+      })
+      this.emitSafe('link', { ...result, final: true })
+      return result
+    } catch (error) {
+      this.emitSafe('link', { target, name, status: codeOf(error), final: true })
+      throw error
+    } finally {
+      reader.closeReader()
+      try {
+        socket.destroy()
+      } catch {}
+    }
+  }
   private async perform(inputPath: string): Promise<UploadResult> {
     if (typeof inputPath !== 'string' || !inputPath) {
       throw fail(ERRORS.INVALID_FILENAME, 'Invalid upload path')
@@ -373,6 +430,21 @@ export class Client extends EventEmitter {
     if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Client is closed'))
     const operation = this.queue
       .then(() => this.perform(inputPath))
+      .catch((error: unknown) => {
+        const reason = codeOf(error)
+        this.emitSafe('failure', { fingerprint: fingerprint(this.serverPublicKey), reason })
+        throw error
+      })
+    this.queue = operation.then(
+      () => undefined,
+      () => undefined
+    )
+    return operation
+  }
+  link(target: string, name: string): Promise<ClientLinkResult> {
+    if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Client is closed'))
+    const operation = this.queue
+      .then(() => this.performLink(target, name))
       .catch((error: unknown) => {
         const reason = codeOf(error)
         this.emitSafe('failure', { fingerprint: fingerprint(this.serverPublicKey), reason })

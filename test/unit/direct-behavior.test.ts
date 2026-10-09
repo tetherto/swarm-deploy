@@ -506,6 +506,79 @@ test('Client rejects final-result inactivity and EOF without a terminal result',
   }
 })
 
+test('Client link half-closes one control request and requires an explicit link result', async (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const linkResult = (status: 'LINKED' | 'UNCHANGED' | 'FAILED', code?: string): Buffer =>
+    encodeControlFrame(
+      b4a.from(JSON.stringify({ v: 1, status, ...(code === undefined ? {} : { code }) }))
+    )
+
+  const successSocket = new FakeSocket(serverKey)
+  successSocket.onEnd = () => successSocket.feed(linkResult('LINKED'))
+  const successClient = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(successSocket)
+  })
+  const successLink = successClient as unknown as {
+    link(target: string, name: string): Promise<{ target: string; name: string; status: string }>
+  }
+  t.ok(typeof successLink.link === 'function')
+  if (typeof successLink.link === 'function') {
+    t.alike(await successLink.link('release-1.2.3', 'current'), {
+      target: 'release-1.2.3',
+      name: 'current',
+      status: 'LINKED'
+    })
+    t.alike(JSON.parse(b4a.toString(successSocket.writes[0].subarray(4))), {
+      v: 1,
+      kind: 'link',
+      target: 'release-1.2.3',
+      name: 'current'
+    })
+    t.is(successSocket.writes.length, 1)
+  }
+  await successClient.close()
+  t.is(successSocket.destroyed, true)
+
+  const failedSocket = new FakeSocket(serverKey)
+  failedSocket.onEnd = () => failedSocket.feed(linkResult('FAILED', 'LINK_TARGET_NOT_FOUND'))
+  const failedClient = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(failedSocket)
+  })
+  const failedLink = failedClient as unknown as {
+    link(target: string, name: string): Promise<unknown>
+  }
+  t.ok(typeof failedLink.link === 'function')
+  if (typeof failedLink.link === 'function') {
+    await t.exception(failedLink.link('release-1.2.3', 'current'), {
+      code: (ERRORS as Record<string, string>).LINK_TARGET_NOT_FOUND
+    })
+  }
+  await failedClient.close()
+  t.is(failedSocket.destroyed, true)
+
+  const eofSocket = new FakeSocket(serverKey)
+  eofSocket.onEnd = () => eofSocket.finishInput()
+  const eofClient = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(eofSocket)
+  })
+  const eofLink = eofClient as unknown as { link(target: string, name: string): Promise<unknown> }
+  t.ok(typeof eofLink.link === 'function')
+  if (typeof eofLink.link === 'function') {
+    await t.exception(eofLink.link('release-1.2.3', 'current'), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  await eofClient.close()
+  t.is(eofSocket.destroyed, true)
+})
+
 test('Client close aborts pending work promptly and removes direct-wire listeners', async (t) => {
   const root = await createTempDir(t)
   const input = path.join(root, 'abort.txt')

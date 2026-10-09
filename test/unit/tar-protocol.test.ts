@@ -22,6 +22,7 @@ import {
   CONTROL_VERSION,
   MAX_CONTROL_RECORD_BYTES,
   decodeAdmissionRecord,
+  decodeAnyMetadataRecord,
   decodeFinalRecord,
   decodeMetadataRecord,
   encodeAdmissionRecord,
@@ -307,6 +308,62 @@ test('bounded control records round-trip exact strict schemas', (t) => {
     { v: 1, status: 'FAILED', code: ERRORS.CHECKSUM_MISMATCH } as const
   ]
   for (const value of finals) t.alike(decodeFinalRecord(encodeFinalRecord(value)), value)
+})
+
+test('link control records are exact, bounded, and distinct from upload metadata', (t) => {
+  const controls = require('../../dist/tar-protocol/controls.js') as {
+    encodeLinkRequestRecord?: (value: unknown) => Buffer
+    decodeLinkRequestRecord?: (value: Uint8Array) => unknown
+    encodeLinkResultRecord?: (value: unknown) => Buffer
+    decodeLinkResultRecord?: (value: Uint8Array) => unknown
+    decodeFirstControlRecord?: (value: Uint8Array) => unknown
+  }
+  t.ok(typeof controls.encodeLinkRequestRecord === 'function')
+  t.ok(typeof controls.decodeLinkRequestRecord === 'function')
+  t.ok(typeof controls.encodeLinkResultRecord === 'function')
+  t.ok(typeof controls.decodeLinkResultRecord === 'function')
+  t.ok(typeof controls.decodeFirstControlRecord === 'function')
+  if (
+    typeof controls.encodeLinkRequestRecord !== 'function' ||
+    typeof controls.decodeLinkRequestRecord !== 'function' ||
+    typeof controls.encodeLinkResultRecord !== 'function' ||
+    typeof controls.decodeLinkResultRecord !== 'function' ||
+    typeof controls.decodeFirstControlRecord !== 'function'
+  ) {
+    return
+  }
+
+  const linkNotAllowed = (ERRORS as Record<string, string>).LINK_NOT_ALLOWED
+  const linkTargetNotFound = (ERRORS as Record<string, string>).LINK_TARGET_NOT_FOUND
+  t.is(linkNotAllowed, 'LINK_NOT_ALLOWED')
+  t.is(linkTargetNotFound, 'LINK_TARGET_NOT_FOUND')
+  const request = { v: 1, kind: 'link', target: 'release-1.2.3', name: 'current' }
+  const requestBytes = controls.encodeLinkRequestRecord(request)
+  t.alike(controls.decodeLinkRequestRecord(requestBytes), request)
+  t.alike(controls.decodeFirstControlRecord(requestBytes), request)
+  t.exception(() => decodeAnyMetadataRecord(requestBytes), { code: ERRORS.PROTOCOL_INVALID })
+
+  for (const result of [
+    { v: 1, status: 'LINKED' },
+    { v: 1, status: 'UNCHANGED' },
+    { v: 1, status: 'FAILED', code: linkNotAllowed }
+  ]) {
+    t.alike(controls.decodeLinkResultRecord(controls.encodeLinkResultRecord(result)), result)
+  }
+
+  for (const requestValue of [
+    { ...request, extra: true },
+    { ...request, target: '../escape' },
+    { ...request, name: 'history-current' },
+    { ...request, kind: 'upload' }
+  ]) {
+    t.exception(() => controls.encodeLinkRequestRecord!(requestValue))
+  }
+  t.exception(
+    () =>
+      controls.decodeLinkResultRecord!(b4a.from(JSON.stringify({ v: 1, status: 'LINKED', x: 1 }))),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
 })
 
 test('source parent is authenticated while legacy metadata keeps its transfer ID', async (t) => {
