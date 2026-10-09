@@ -448,18 +448,146 @@ linearization and fail closed on corruption.
 
 ## Managed symlinks
 
+### Policy model
+
+`ServerOptions.symlinks` is snapshotted and compiled at construction. Every
+entry has exactly one of these shapes:
+
+```ts
+{ selector: string, name: string } // automatic newest-match reconciliation
+{ selector: string }               // manual target authorization
+```
+
+The CLI equivalent is repeatable `--symlink <selector> [<link-name>]`. A
+selector is either an exact safe managed-artifact basename or an unflagged
+regular expression written `/pattern/`. Selectors are non-empty and limited to
+200 UTF-8 bytes. Exact selectors, automatic names, request targets, and request
+names are safe top-level basenames of at most 100 UTF-8 bytes and may not use
+the reserved `history-` namespace.
+
+Configuration rejects malformed iterables and record shapes, duplicate
+automatic names, duplicate manual selectors, malformed or oversized regular
+expressions, unsafe or reserved exact selectors and automatic names, and an
+exact automatic selector equal to its own name. Automatic names alone form the
+configured link-name set and alone participate in newest-match selection.
+Manual rules are only a target allowlist and never create or reconcile a link
+by themselves.
+
+Automatic selection uses validated current commit records, excludes history,
+and skips a candidate whose artifact name equals the link name. The newest
+`committedAt` wins, with transfer ID then artifact name as deterministic
+tie-breakers. A rule with no matching current artifact is dormant, but its
+automatic name remains reserved from manual requests.
+
+### Manual link control protocol
+
+An authenticated client sends one strict bounded first control record:
+
+```ts
+{ v: 1, kind: 'link', target: string, name: string }
+```
+
+The record has exactly those fields. It is a control RPC separate from upload
+offers and TAR bytes. The client half-closes after the request; the server
+requires EOF immediately, so trailing control records or payload bytes fail the
+request. The response is exactly one strict record:
+
+```ts
+{ v: 1, status: 'LINKED' }
+{ v: 1, status: 'UNCHANGED' }
+{ v: 1, status: 'FAILED', code: ErrorCode }
+```
+
+HyperDHT Noise identity, pinned server identity, the server firewall, and the
+immutable client allowlist authenticate a link caller exactly as for upload.
+Only after authentication and strict request decoding does the server apply
+manual-link policy: target and name must differ, the target must match a manual
+authorization rule, and the name must not be an automatic name. Under the
+storage-root lease it then resolves the target from current commit records,
+rejects missing and history targets, snapshots current artifact and automatic
+link names, and performs the namespace check and mutation. The lease serializes
+the decision and mutation with commit, recovery, retention, and other link
+requests.
+
+The target must be a current managed top-level file or directory. The
+destination name cannot be the target, an automatic name, or a managed artifact
+name. A missing destination may be created; an existing destination may be
+changed only when its valid ownership record says it is manual and its visible
+symlink still points to the recorded or requested relative sibling basename.
+A regular file, directory, unrecorded symlink, changed symlink, automatic
+record, foreign record, or other occupied unmanaged path fails closed and is
+never replaced, moved, or deleted.
+
+`LINKED` means the link was created, repointed, or its crash-residual state was
+completed. `UNCHANGED` means the durable manual ownership already selects the
+requested target. The operation is idempotent: a retry after an acknowledged
+or ambiguous result converges to that target and returns `UNCHANGED` once the
+durable state already agrees.
+
+### Ownership, recovery, and isolation
+
 Ownership records live at
-`.swarm-deploy/links/<sha256(link-name)>.json` with exact fields `version`,
-`name`, `target`, `transferId`, and `targetKind`. A destination is replaced
-only when a valid record exists, the destination is a symbolic link, and
-`readlink()` returns the recorded or desired relative sibling basename. A
-pre-existing file, directory, unrecorded symlink, changed symlink, or foreign
-ownership record is unmanaged: it is never replaced, moved, or deleted, and
-reconciliation fails closed. Updates follow a six-step transaction with
-level-triggered recovery from startup, commit, already-committed retry,
-recovery, and retention. Selected symlink targets are pinned against age, count,
-SemVer, and quota deletion; the desired set is recomputed under the root lease
-before any deletion.
+`.swarm-deploy/links/<sha256(link-name)>.json`. Version 1 has the exact fields
+`version`, `name`, `target`, `transferId`, and `targetKind`; it is read as
+automatic ownership. Version 2 adds the exact `mode` field, whose only values
+are `automatic` and `manual`. Unknown versions, fields, modes, unsafe values,
+filename hashes, target kinds, or transfer IDs fail closed. New and rewritten
+records use version 2.
+
+For creation, the record is durable before the non-overwriting visible symlink
+is created. For replacement, a private sibling-target symlink is synchronized
+and atomically renamed over the proven owned destination before the record is
+rewritten. Temporary links are swept and each operation is level-triggered, so
+a retry can complete either crash point without claiming an unmanaged path.
+
+Automatic reconciliation ignores manual records and therefore never repoints
+or removes a manual link. Manual mutation rejects automatic records and
+configured automatic names. Removing a manual authorization rule prevents
+future requests that depend on it but does not remove or rewrite an existing
+manual link. Removing an automatic rule removes only its proven automatic
+record and visible link. Existing version-1 records retain the automatic
+behavior from v0.2.0.
+
+At startup the default Node and Bare adapters load the entire ledger, including
+manual records whose authorization policy was removed. Persisted automatic and
+manual names join configured automatic names in the protected namespace used
+by upload admission and retention, so an upload cannot claim a managed-link
+path after restart. Automatic reconciliation runs from startup, commit,
+already-committed retry, recovery, and retention; manual records remain
+isolated throughout.
+
+### Retention, hooks, errors, and compatibility
+
+Every desired automatic target and every durable manual target is pinned
+against age, count, SemVer, and storage-quota deletion. Pinned targets still
+participate in accounting. The desired automatic set and durable manual ledger
+are recomputed under the root lease before deletion. If reconciliation fails,
+the fallback pin set includes recorded transfer IDs and any matching current
+target records, preferring retention to unsafe deletion. Repointing a manual
+link moves the durable pin to its newly selected target.
+
+Link control requests do not upload or commit an artifact and invoke none of
+`beforeCommit`, `afterCommit`, or `onFailure`. They emit link and failure
+events, not upload offer, transfer, verification, commit, or hook events.
+
+Stable manual-link failures are:
+
+- `LINK_NOT_ALLOWED`: self-link, target-policy, or automatic-name rejection;
+- `LINK_TARGET_NOT_FOUND`: no current managed target with that name;
+- `LINK_CONFLICT`: artifact-name collision or an unowned, changed, automatic,
+  or otherwise unmanaged destination;
+- `LINK_FAILED`: storage, transport-result, or other link-operation failure.
+
+`UNSUPPORTED_STORAGE` remains the construction-time failure when configured
+symlink policy needs an adapter without `symlink` and `readlink`.
+
+Old upload clients remain compatible because link is a separate first-control
+variant. A client that sends a link request to an older strict server is not
+compatible: that server rejects the unknown record. This version reads v1
+automatic ledgers and writes v2 mode-aware ledgers. Older code does not
+understand v2 records, so rollback after any v2 link write is unsupported
+without restoring the link ledger and visible links from a compatible backup.
+Automatic v0.2.0 policy behavior otherwise remains unchanged.
 
 ## Public API, CLI, and observability migration
 
@@ -471,17 +599,26 @@ allowlist, storage limits, replacement policy, and optional injected DHT.
 Topic parsing/derivation, swarm factories, discovery controls, reconnect
 budgets, Protomux types, and chunk protocol internals are removed.
 
-The CLI keeps role-specific seed generation and server/upload commands. Server
-startup prints the server public key and then `ready`. Upload requires
-`--server-key <64-lower-hex>` plus client seed configuration. Topic commands
-and `--topic` are removed. A directory upload is a lexical loop over immediate
-files and reports each independent result.
+The CLI keeps role-specific seed generation and server/upload commands and adds
+`link`. Server startup prints the server public key and then `ready`. Upload and
+link require `--server-key <64-lower-hex>` plus client seed configuration and
+accept the same idle timeout. `swarm-deploy link <target> <link-name>` prints
+exactly `<link-name> -> <target> <LINKED|UNCHANGED>` on success. Topic commands
+and `--topic` are removed.
 
 Events and logs expose lifecycle milestones for direct connection, offer,
 accept/resume/reset, transfer progress, verification, commit, recovery,
 retention, and failure. They use short SHA-256 fingerprints and never expose
 seeds, secret keys, full public keys, TAR contents, or session material.
 Listener and logger failures cannot affect protocol correctness.
+
+`Client.link(target, name)` returns
+`ClientLinkResult { target, name, status: 'LINKED' | 'UNCHANGED' }`.
+The client `link` event first reports `requested` with `final: false`, then a
+success status or stable error code with `final: true`. The server `link` event
+reports one terminal `linked`, `unchanged`, `rejected`, or `failed` status with
+the authenticated client fingerprint, target, name, and a stable reason on
+error. Link errors also use each side's existing `failure` event.
 
 ## Test and package migration
 
