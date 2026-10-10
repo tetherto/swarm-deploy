@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented here.
 
-## Unreleased
+## 0.3.0
 
 - Add authenticated client-managed symlinks: one-argument
   `--symlink <selector>` rules authorize current managed file or directory
