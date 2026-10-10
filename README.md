@@ -159,7 +159,7 @@ swarm-deploy server \
   [--artifact-pattern <template>]... \
   [--max-count <count>] \
   [--max-versions <count> --version-granularity <major|minor>] \
-  [--symlink <selector> <link-name>]... \
+  [--symlink <selector> [<link-name>]]... \
   [--hooks <module>]
 ```
 
@@ -197,11 +197,13 @@ Optional options:
 - `--version-granularity <major|minor>`: how versions are grouped for
   `--max-versions`. It is rejected without `--max-versions`, and there is no
   default.
-- `--symlink <selector> <link-name>`: declarative managed symlink rule.
-  Repeat for multiple links. A selector that begins and ends with `/` is an
-  unflagged regular expression matched against managed artifact basenames;
-  anything else is an exact managed basename. The link name must be a safe
-  single-component basename and must not collide with another rule.
+- `--symlink <selector> [<link-name>]`: repeatable managed-symlink policy.
+  With two arguments, the server automatically points `<link-name>` at the
+  newest matching managed artifact. With one argument, the rule creates no
+  link by itself; it authorizes authenticated clients to choose any matching
+  current managed artifact as a manual-link target. A selector that begins and
+  ends with `/` is an unflagged regular expression matched against managed
+  artifact basenames; anything else is an exact managed basename.
 - `--hooks <module>`: JavaScript module (`.js`, `.mjs`, or `.cjs`) exporting
   trusted lifecycle callbacks. The path is resolved against the working
   directory. See [Deployment hooks](#deployment-hooks).
@@ -256,9 +258,35 @@ If a basename is exactly 64 lowercase hexadecimal characters, pass it with a
 directory component such as `./<name>` so the CLI does not treat it as an
 accidentally pasted seed.
 
+### `link`
+
+```sh
+swarm-deploy link \
+  --seed-file <seed-file> \
+  --server-key <64-lower-hex> \
+  [--idle-timeout <milliseconds>] \
+  <target> <link-name>
+```
+
+Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>`, or use
+`SWARM_DEPLOY_CLIENT_SEED`, exactly as for `upload`. `--server-key` pins the
+server identity, and `--idle-timeout` has the same 60-second default and
+inactivity semantics as upload.
+
+The command asks the authenticated server to point `<link-name>` at the
+existing managed file or directory `<target>`. The target must match a
+one-argument `--symlink` rule. Success prints exactly:
+
+```text
+<link-name> -> <target> <LINKED|UNCHANGED>
+```
+
+`LINKED` means the link was created or repointed. `UNCHANGED` means the same
+managed link already points at that target; the operation is idempotent.
+
 ### Seed sources
 
-Server and upload commands accept exactly one of:
+Server, upload, and link commands accept exactly one of:
 
 - `--seed-file <seed-file>`
 - `--seed <64-lower-hex>`
@@ -277,7 +305,8 @@ tooling logs is acceptable.
 
 ### CLI exit codes
 
-- `0`: the upload committed or was already committed.
+- `0`: the upload committed or was already committed, or the link is linked or
+  unchanged.
 - `1`: upload, network, protocol, storage, cleanup, or runtime failure.
 - `2`: usage or configuration error.
 
@@ -647,6 +676,17 @@ count or version rotated.
 Roll out the server, then the pattern configuration, then clients that stage
 into conforming folders.
 
+#### Managed-link rollback warning
+
+**Do not roll a server back to v0.2.0 after an upgraded server has created,
+repaired, or repointed any managed link.** Those operations write a v2
+ownership record, which v0.2.0 cannot read. Rollback requires restoring the
+complete pre-upgrade storage backup (including visible links and
+`.swarm-deploy/links`), or keeping the upgraded server in place.
+
+`swarm-deploy link` requires an upgraded server; v0.2.0 does not recognize
+link control requests.
+
 #### Overlapping retries now get `FILE_BUSY`
 
 **Behavior change.** A transfer ID may have only one in-flight commit
@@ -696,8 +736,8 @@ the release coordinates this version writes is untested.
 
 ## Managed symlinks
 
-Configure repeatable managed symlinks so the server keeps versioned artifacts
-and maintains declarative links in the storage root:
+Managed symlinks support both automatic newest-match aliases and explicit
+client promotions. Configure either form with repeatable `--symlink` options:
 
 ```sh
 swarm-deploy server \
@@ -706,17 +746,20 @@ swarm-deploy server \
   --allow-key <64-lower-hex> \
   --max-file-bytes 1073741824 \
   --max-staging-bytes 4294967296 \
-  --symlink '/^\d+\.\d+\.\d+$/' latest \
-  --symlink release.tar.gz current.tar.gz
+  --symlink '/^\d+\.\d+\.\d+$/' newest \
+  --symlink '/^app-\d+\.\d+\.\d+\.tar\.gz$/'
 ```
 
-Resulting layout:
+The two-argument rule automatically reconciles `newest` to the newest matching
+artifact. The one-argument rule is a target allowlist: it creates no link until
+an authenticated client explicitly chooses a matching current artifact:
 
-```text
-/srv/artifacts/
-├── 0.18.0/
-├── 0.18.1/
-└── latest -> 0.18.1
+```sh
+swarm-deploy link --seed-file ./client.seed --server-key "$SERVER_KEY" \
+  app-2.4.1.tar.gz latest-app
+
+# app-2.4.1.tar.gz is the tested target
+# output: latest-app -> app-2.4.1.tar.gz LINKED
 ```
 
 Runtime equivalent:
@@ -729,28 +772,52 @@ const server = new Server({
   maxFileBytes: 1024 ** 3,
   maxStagingBytes: 4 * 1024 ** 3,
   symlinks: [
-    { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
-    { selector: 'release.tar.gz', name: 'current.tar.gz' }
+    { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'newest' },
+    { selector: '/^app-\\d+\\.\\d+\\.\\d+\\.tar\\.gz$/' }
   ]
 })
 ```
 
-Selection uses only validated managed commit records. The newest `committedAt`
-wins, tie-broken by transfer ID then name. Replacement history names never
-match. A rule is dormant until its target exists.
+Selectors are exact safe managed-artifact basenames or unflagged `/regex/`
+expressions. Automatic selection uses only validated managed commit records.
+The newest `committedAt` wins, tie-broken by transfer ID then name; replacement
+history never matches, and a rule is dormant until a target exists. Automatic
+link names are unique and reserved even while their rule is dormant, so a
+manual request cannot claim one.
 
-Safety: an unmanaged file, directory, unrecorded symlink, changed symlink, or
-foreign ownership record is never replaced, moved, or deleted and causes a
-fail-closed error. An upload whose name equals a configured link name is
-rejected before admission.
+Manual targets must be current managed top-level files or directories, must
+match a one-argument rule, and cannot be history names. Manual link names are
+safe top-level basenames and cannot equal the target, an automatic link name,
+or any managed artifact name. A missing destination may be created, and an
+existing manual managed link may be repointed. An unmanaged file, directory,
+unrecorded symlink, changed symlink, or foreign ownership record is never
+replaced, moved, or deleted: the operation fails closed.
 
-Retention pins every selected symlink target against age, count, SemVer, and
-quota deletion. Pinned targets still count toward the quota. The desired-link
-set is recomputed under the root lease before any deletion, so a repoint always
-precedes the old target becoming eligible. Removing a rule removes its ownership
-record and visible link only while ownership is still proven.
+Manual links retain their selected target across restart and automatic
+reconciliation. Removing their authorization rule prevents future requests
+that need that rule but does not remove or rewrite the existing link.
+Automatic and manual targets are pinned against age, count, SemVer, and quota
+retention and still count toward those limits. Reconciliation and manual
+mutation run under the storage-root lease, and uploads cannot claim any
+persisted managed-link name.
 
-`symlinks` requires `StorageAdapter.symlink` and `readlink`. The Node and Bare
+There is no unlink RPC. To remove a managed link safely, stop the server,
+remove the visible symlink and its matching
+`.swarm-deploy/links/<sha256(link-name)>.json` ownership record, then restart
+the server. Never edit the ledger while the server runs. Removing all automatic
+rules intentionally reconciles proven stale automatic links away; malformed or
+conflicting ledgers still fail closed on the default symlink-capable storage.
+
+A safe promotion workflow is:
+
+1. Upload a versioned artifact such as `app-2.4.1.tar.gz`.
+2. QA that exact version through its deployed versioned URL.
+3. Run `swarm-deploy link app-2.4.1.tar.gz latest` to point `latest` at the
+   tested artifact.
+
+The explicit link operation is a control request, not an upload. It supports
+files and directories, is idempotent, and does not invoke deployment hooks.
+`symlinks` requires `StorageAdapter.symlink` and `readlink`; the Node and Bare
 default adapters provide them; a custom adapter without symlink rules stays
 source-compatible.
 
@@ -1038,6 +1105,9 @@ Optional operational limits and policies:
 - `artifactPatterns?: Iterable<string>`, `maxCount?: number`,
   `maxVersions?: number`, and `versionGranularity?: 'major' | 'minor'`; see
   [Artifact patterns and rotation](#artifact-patterns-and-rotation).
+- `symlinks?: Iterable<SymlinkRule>` with automatic
+  `{ selector, name }` and manual-authorization `{ selector }` entries; see
+  [Managed symlinks](#managed-symlinks).
 - `hooks?: ServerHooks | null`; see [Deployment hooks](#deployment-hooks).
 
 The root package exports the `ServerHooks`, `BeforeCommitContext`,
@@ -1092,6 +1162,23 @@ values are `connectTimeout`, `idleTimeout`, `includeSourceParent`, `dht`,
 [source parent](#source-parent) for every upload the client makes.
 Calling `close()` aborts pending work, closes active sockets, and is idempotent.
 
+### Link results
+
+`Client.link(target, name)` resolves to:
+
+```ts
+interface ClientLinkResult {
+  target: string
+  name: string
+  status: 'LINKED' | 'UNCHANGED'
+}
+```
+
+The client validates both names before connecting. Link operations share the
+client's pinned server identity, authenticated client identity, connection and
+idle timeouts, serialized operation queue, cancellation, and `close()`
+behavior with uploads.
+
 ### Upload results
 
 A direct file resolves to:
@@ -1138,6 +1225,9 @@ Server events:
 - `retention`: startup, scheduled, manual, commit, or post-commit outcomes,
   with `expiredSessions`, `scrubbed`, `ageDeleted`, `countDeleted`,
   `versionDeleted`, and `storageDeleted` counters.
+- `link`: one terminal manual-link outcome with `target`, `name`, client
+  fingerprint, and status `linked`, `unchanged`, `rejected`, or `failed`.
+  Rejected and failed outcomes also include a stable `reason`.
 - `failure`: stable failure code and peer fingerprint.
 - `listening`: local server-key fingerprint.
 - `close`: closed or failed outcome.
@@ -1150,6 +1240,11 @@ Client events:
   durable resume offset.
 - `verification`, `commit`
 - `result`: terminal upload result with artifact `kind`.
+- `link`: after the request is written, `requested` with `final: false`,
+  followed by exactly one `LINKED`, `UNCHANGED`, or stable error code with
+  `final: true`. A request-write failure after connection can emit only the
+  terminal failed event. Local argument validation, an already closed or
+  cancelled client, and connection failure can reject before any `link` event.
 - `failure`, `close`
 
 Use the exported `ServerEventMap`, `ClientEventMap`, `ServerEventName`, and
@@ -1213,11 +1308,15 @@ Stable codes include authentication and server-key rejection, invalid
 configuration and protocol records, file and staging limits, disk reserve,
 filename and replacement conflicts, checksum failures, connection or upload
 timeouts, aborts, commit failures, cleanup failures, and managed-link failures
-(`LINK_CONFLICT`, `LINK_FAILED`, `UNSUPPORTED_STORAGE`). A link reconciliation
-failure after a durable commit behaves like other post-commit deployment
-failures: the artifact stays committed, the client receives a stable failure,
-and an already-committed retry reruns reconciliation before succeeding. Import
-`ERRORS` rather than matching exception messages.
+(`LINK_NOT_ALLOWED`, `LINK_TARGET_NOT_FOUND`, `LINK_CONFLICT`, `LINK_FAILED`,
+`UNSUPPORTED_STORAGE`). Manual requests use `LINK_NOT_ALLOWED` for policy,
+self-link, and automatic-name rejection; `LINK_TARGET_NOT_FOUND` for an absent
+current managed target; `LINK_CONFLICT` for managed-namespace or unmanaged-path
+collisions; and `LINK_FAILED` for other link-operation failures. A link
+reconciliation failure after a durable commit behaves like other post-commit
+deployment failures: the artifact stays committed, the client receives a
+stable failure, and an already-committed retry reruns reconciliation before
+succeeding. Import `ERRORS` rather than matching exception messages.
 
 ## Production operations
 

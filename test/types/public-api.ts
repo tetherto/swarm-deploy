@@ -8,14 +8,19 @@ import {
   type AfterCommitContext,
   type ArtifactKind,
   type BeforeCommitContext,
+  type ClientLinkEvent,
+  type ClientLinkResult,
+  type ClientLinkStatus,
   type ClientEventMap,
   type ClientOptions,
   type HookArtifact,
   type HookFailureContext,
   type HookFailurePhase,
-  type ReleaseCoordinates,
   type RetentionEvent,
+  type ReleaseCoordinates,
   type ServerHooks,
+  type ServerEventMap,
+  type ServerLinkEvent,
   type ServerOptions,
   type StorageAdapter,
   type SymlinkCapableStorage,
@@ -51,6 +56,33 @@ const stringSeedServerOptions = {
   maxStagingBytes: 4096
 } satisfies ServerOptions
 
+const linkStatus: ClientLinkStatus = 'LINKED'
+const clientLink: Promise<ClientLinkResult> = client.link('release-1.2.3', 'current')
+const linkEvent: ClientLinkEvent = {
+  target: 'release-1.2.3',
+  name: 'current',
+  status: 'LINKED',
+  final: true
+}
+const clientLinkEvent: ClientEventMap['link'] = linkEvent
+void [linkStatus, clientLink, clientLinkEvent]
+
+const serverLinkEvent: ServerLinkEvent = {
+  fingerprint: '0123456789ab',
+  target: 'release-1.2.3',
+  name: 'current',
+  status: 'linked'
+}
+const rejectedServerLinkEvent: ServerLinkEvent = {
+  fingerprint: '0123456789ab',
+  target: 'missing',
+  name: 'current',
+  status: 'rejected',
+  reason: 'LINK_TARGET_NOT_FOUND'
+}
+const mappedServerLinkEvent: ServerEventMap['link'] = serverLinkEvent
+void [rejectedServerLinkEvent, mappedServerLinkEvent]
+
 function readArtifact(artifact: HookArtifact): void {
   const name: string = artifact.name
   const kind: ArtifactKind = artifact.kind
@@ -68,8 +100,17 @@ function readArtifact(artifact: HookArtifact): void {
 const kinds: ArtifactKind[] = ['file', 'directory']
 const symlinkRules: SymlinkRule[] = [
   { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
-  { selector: 'release.tar.gz', name: 'current.tar.gz' }
+  { selector: 'release.tar.gz', name: 'current.tar.gz' },
+  { selector: '/^app-\\d+\\.\\d+\\.\\d+\\.tar\\.gz$/' }
 ]
+type ManualSymlinkRule = Extract<SymlinkRule, { name?: never }>
+const manualSymlinkRule: ManualSymlinkRule = { selector: 'release.tar.gz' }
+const invalidManualSymlinkRule: ManualSymlinkRule = {
+  selector: 'release.tar.gz',
+  // @ts-expect-error A manual rule cannot include an automatic-link name.
+  name: 'current.tar.gz'
+}
+void [manualSymlinkRule, invalidManualSymlinkRule]
 const symlinkServerOptions = {
   seed: serverSeed,
   storageDir: '/srv/swarm-deploy',
@@ -266,9 +307,6 @@ void linked
 // @ts-expect-error Artifact kinds are a closed set.
 const badKind: ArtifactKind = 'symlink'
 void badKind
-// @ts-expect-error A symlink rule needs both a selector and a name.
-const badRule: SymlinkRule = { selector: 'release.tar.gz' }
-void badRule
 // @ts-expect-error Symlink rules are two-string records, not regular expressions.
 const badRules: ServerOptions['symlinks'] = [/^\d+$/]
 void badRules

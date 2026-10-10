@@ -100,12 +100,194 @@ test('CLI passes --server-key only to the direct client', async (t) => {
     ),
     0
   )
-  const clientOptions = options as unknown as ClientOptions
+  if (options === null) throw new Error('Client was not constructed')
+  const clientOptions = options as ClientOptions
   t.alike(clientOptions.serverPublicKey, SERVER_KEY)
   t.is(clientOptions.idleTimeout, 4321)
   t.absent('topic' in clientOptions)
   t.is(stdout.text(), 'artifact.txt file COMMITTED\n')
   t.is(stderr.text(), '')
+})
+
+test('CLI links through the direct client and prints only the link result', async (t) => {
+  let options: ClientOptions | null = null
+  class Client {
+    constructor(value: ClientOptions) {
+      options = value
+    }
+    link(target: string, name: string) {
+      return Promise.resolve({ target, name, status: 'UNCHANGED' as const })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  const stderr = output()
+  const clientSeed = b4a.toString(CLIENT_SEED, 'hex')
+  const serverKey = b4a.toString(SERVER_KEY, 'hex')
+  t.is(
+    await main(
+      ['link', '--server-key', serverKey, '--idle-timeout', '4321', 'release-1.2.3', 'current'],
+      { SWARM_DEPLOY_CLIENT_SEED: clientSeed },
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: stdout.stream,
+        stderr: stderr.stream
+      }
+    ),
+    0
+  )
+  if (options === null) throw new Error('Client was not constructed')
+  const clientOptions = options as ClientOptions
+  t.alike(clientOptions.seed, CLIENT_SEED)
+  t.alike(clientOptions.serverPublicKey, SERVER_KEY)
+  t.is(clientOptions.idleTimeout, 4321)
+  t.is(stdout.text(), 'current -> release-1.2.3 UNCHANGED\n')
+  t.is(stderr.text(), '')
+  t.absent(`${stdout.text()}${stderr.text()}`.includes(clientSeed))
+  t.absent(`${stdout.text()}${stderr.text()}`.includes(serverKey))
+})
+
+test('CLI accepts canonical hexadecimal link targets and names', async (t) => {
+  const hex = 'ab'.repeat(32)
+  const calls: Array<[string, string]> = []
+  class Client {
+    constructor(_options: ClientOptions) {}
+    link(target: string, name: string) {
+      calls.push([target, name])
+      return Promise.resolve({ target, name, status: 'LINKED' as const })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  t.is(
+    await main(
+      ['link', '--server-key', b4a.toString(SERVER_KEY, 'hex'), hex, hex],
+      { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: stdout.stream
+      }
+    ),
+    0
+  )
+  t.alike(calls, [[hex, hex]])
+  t.is(stdout.text(), `${hex} -> ${hex} LINKED\n`)
+
+  const stderr = output()
+  t.is(
+    await main(
+      ['upload', '--server-key', b4a.toString(SERVER_KEY, 'hex'), hex],
+      { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+      { stderr: stderr.stream }
+    ),
+    2
+  )
+  t.ok(stderr.text().includes('Seed strings must be passed with --seed'))
+})
+
+test('CLI rejects link positional secrets without echoing them', async (t) => {
+  const clientSeed = b4a.toString(CLIENT_SEED, 'hex')
+  const serverKey = b4a.toString(SERVER_KEY, 'hex')
+  let constructed = 0
+  class Client {
+    constructor(_options: ClientOptions) {
+      constructed++
+    }
+    link() {
+      throw new Error('Link should not be attempted')
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+
+  for (const [target, name] of [
+    [clientSeed, 'current'],
+    [serverKey, 'current'],
+    ['release-1.2.3', clientSeed],
+    ['release-1.2.3', serverKey]
+  ]) {
+    const stdout = output()
+    const stderr = output()
+    t.is(
+      await main(
+        ['link', '--server-key', serverKey, target, name],
+        { SWARM_DEPLOY_CLIENT_SEED: clientSeed },
+        {
+          Client: Client as unknown as new (
+            options: ClientOptions
+          ) => import('../../dist/client.js').Client,
+          stdout: stdout.stream,
+          stderr: stderr.stream
+        }
+      ),
+      2
+    )
+    t.absent(`${stdout.text()}${stderr.text()}`.includes(clientSeed))
+    t.absent(`${stdout.text()}${stderr.text()}`.includes(serverKey))
+  }
+  t.is(constructed, 0)
+})
+
+test('CLI prints stable link failures without raw server messages', async (t) => {
+  const secret = 'raw storage path /srv/private'
+  class Client {
+    constructor(_options: ClientOptions) {}
+    link() {
+      return Promise.reject(new SwarmDeployError(ERRORS.LINK_CONFLICT, secret))
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  const stderr = output()
+  t.is(
+    await main(
+      ['link', '--server-key', b4a.toString(SERVER_KEY, 'hex'), 'release-1.2.3', 'current'],
+      { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: stdout.stream,
+        stderr: stderr.stream
+      }
+    ),
+    1
+  )
+  t.is(stdout.text(), '')
+  t.is(stderr.text(), `${ERRORS.LINK_CONFLICT}\n`)
+  t.absent(stderr.text().includes(secret))
+})
+
+test('CLI rejects unsafe link arguments as configuration errors', async (t) => {
+  const stderr = output()
+  const clientSeed = b4a.toString(CLIENT_SEED, 'hex')
+  const serverKey = b4a.toString(SERVER_KEY, 'hex')
+  for (const [target, name] of [
+    ['../release-1.2.3', 'current'],
+    ['release-1.2.3', 'history-current']
+  ]) {
+    t.is(
+      await main(
+        ['link', '--server-key', serverKey, target, name],
+        { SWARM_DEPLOY_CLIENT_SEED: clientSeed },
+        { stderr: stderr.stream }
+      ),
+      2
+    )
+  }
+  t.absent(stderr.text().includes(clientSeed))
+  t.absent(stderr.text().includes(serverKey))
 })
 
 test('CLI snapshots repeatable --allow-key values for the direct server', async (t) => {
@@ -1203,21 +1385,24 @@ module.exports.afterCommit = () => { ${record('cjs-function:after')} }\n`
   }
 })
 
-test('--symlink is a repeatable two-value option passed through as rules', async (t) => {
+test('--symlink is a repeatable one-or-two-value option passed through as rules', async (t) => {
   const run = await runServerCli(await createTempDir(t), [
     '--symlink',
     '/^\\d+\\.\\d+\\.\\d+$/',
     'latest',
     '--symlink',
     'release.tar.gz',
-    'current.tar.gz'
+    'current.tar.gz',
+    '--symlink',
+    'build.tar.gz'
   ])
   t.is(run.code, 0)
   t.alike(
     [...((run.options as ServerOptions).symlinks as Iterable<unknown>)],
     [
       { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
-      { selector: 'release.tar.gz', name: 'current.tar.gz' }
+      { selector: 'release.tar.gz', name: 'current.tar.gz' },
+      { selector: 'build.tar.gz' }
     ]
   )
 })
@@ -1228,12 +1413,27 @@ test('a server without --symlink passes no symlinks option', async (t) => {
   t.absent('symlinks' in (run.options as ServerOptions))
 })
 
-test('--symlink rejects a missing second value and an invalid rule with exit code 2', async (t) => {
+test('--symlink leaves a following option available when its name is omitted', async (t) => {
+  const root = await createTempDir(t)
+  await fs.promises.writeFile(
+    path.join(root, 'hooks.cjs'),
+    'module.exports = { afterCommit () {} }\n'
+  )
+  const run = await runServerCli(root, ['--symlink', 'release.tar.gz', '--hooks', './hooks.cjs'], {
+    cwd: root
+  })
+  t.is(run.code, 0)
+  t.alike(
+    [...((run.options as ServerOptions).symlinks as Iterable<unknown>)],
+    [{ selector: 'release.tar.gz' }]
+  )
+  t.alike(Object.keys(run.options?.hooks || {}), ['afterCommit'])
+})
+
+test('--symlink rejects a missing selector and invalid rules with exit code 2', async (t) => {
   const root = await createTempDir(t)
   for (const extra of [
-    ['--symlink', 'release.tar.gz'],
     ['--symlink'],
-    ['--symlink', 'release.tar.gz', '--hooks', './hooks.mjs'],
     ['--symlink', 'release.tar.gz', 'release.tar.gz'],
     ['--symlink', '/[unclosed/', 'latest'],
     ['--symlink', 'one.bin', 'latest', '--symlink', 'two.bin', 'latest'],
@@ -1246,10 +1446,10 @@ test('--symlink rejects a missing second value and an invalid rule with exit cod
   }
 })
 
-test('the usage text documents the repeatable two-value symlink option', async (t) => {
+test('the usage text documents the repeatable optional-name symlink option', async (t) => {
   const stdout = output()
   t.is(await main(['--help'], {}, { stdout: stdout.stream }), 0)
-  t.ok(stdout.text().includes('[--symlink <selector> <link-name>]...'))
+  t.ok(stdout.text().includes('[--symlink <selector> [<link-name>]]...'))
 })
 
 test('upload output names the artifact kind', async (t) => {

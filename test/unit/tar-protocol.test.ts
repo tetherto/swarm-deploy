@@ -22,11 +22,19 @@ import {
   CONTROL_VERSION,
   MAX_CONTROL_RECORD_BYTES,
   decodeAdmissionRecord,
+  decodeAnyMetadataRecord,
   decodeFinalRecord,
+  decodeFirstControlRecord,
+  decodeLinkRequestRecord,
+  decodeLinkResultRecord,
   decodeMetadataRecord,
   encodeAdmissionRecord,
   encodeFinalRecord,
+  encodeLinkRequestRecord,
+  encodeLinkResultRecord,
   encodeMetadataRecord,
+  type LinkRequestRecord,
+  type LinkResultRecord,
   type MetadataRecord
 } from '../../dist/tar-protocol/controls.js'
 import { writeProtocolBytes } from '../../dist/tar-protocol/lifecycle.js'
@@ -307,6 +315,44 @@ test('bounded control records round-trip exact strict schemas', (t) => {
     { v: 1, status: 'FAILED', code: ERRORS.CHECKSUM_MISMATCH } as const
   ]
   for (const value of finals) t.alike(decodeFinalRecord(encodeFinalRecord(value)), value)
+})
+
+test('link control records are exact, bounded, and distinct from upload metadata', (t) => {
+  const linkNotAllowed = ERRORS.LINK_NOT_ALLOWED
+  const linkTargetNotFound = ERRORS.LINK_TARGET_NOT_FOUND
+  t.is(linkNotAllowed, 'LINK_NOT_ALLOWED')
+  t.is(linkTargetNotFound, 'LINK_TARGET_NOT_FOUND')
+  const request = {
+    v: 1,
+    kind: 'link',
+    target: 'release-1.2.3',
+    name: 'current'
+  } satisfies LinkRequestRecord
+  const requestBytes = encodeLinkRequestRecord(request)
+  t.alike(decodeLinkRequestRecord(requestBytes), request)
+  t.alike(decodeFirstControlRecord(requestBytes), request)
+  t.exception(() => decodeAnyMetadataRecord(requestBytes), { code: ERRORS.PROTOCOL_INVALID })
+
+  for (const result of [
+    { v: 1, status: 'LINKED' } satisfies LinkResultRecord,
+    { v: 1, status: 'UNCHANGED' } satisfies LinkResultRecord,
+    { v: 1, status: 'FAILED', code: linkNotAllowed } satisfies LinkResultRecord
+  ]) {
+    t.alike(decodeLinkResultRecord(encodeLinkResultRecord(result)), result)
+  }
+
+  for (const requestValue of [
+    { ...request, extra: true },
+    { ...request, target: '../escape' },
+    { ...request, name: 'history-current' },
+    { ...request, kind: 'upload' }
+  ]) {
+    t.exception(() => encodeLinkRequestRecord(requestValue as unknown as LinkRequestRecord))
+  }
+  t.exception(
+    () => decodeLinkResultRecord(b4a.from(JSON.stringify({ v: 1, status: 'LINKED', x: 1 }))),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
 })
 
 test('source parent is authenticated while legacy metadata keeps its transfer ID', async (t) => {

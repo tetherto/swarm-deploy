@@ -27,11 +27,13 @@ import type {
 import {
   decodeAdmissionRecord,
   decodeFinalRecord,
+  decodeLinkResultRecord,
   decodeMetadataRecord,
   decodeTreeMetadataRecord,
   encodeAdmissionRecord,
   encodeControlFrame,
   encodeFinalRecord,
+  encodeLinkRequestRecord,
   encodeMetadataRecord,
   encodeTreeMetadataRecord
 } from '../../dist/tar-protocol/controls.js'
@@ -48,10 +50,12 @@ import {
   regenerateTarSuffix,
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
+import { historyName } from '../../dist/files.js'
 import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
 import type { CommitStore } from '../../dist/storage/commit-store.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
 import { createTempDir } from '../helpers/files.js'
+import { createStorage } from '../helpers/storage.js'
 import { waitFor } from '../helpers/testnet.js'
 
 const EventEmitter = events.EventEmitter
@@ -504,6 +508,63 @@ test('Client rejects final-result inactivity and EOF without a terminal result',
     t.is(socket.destroyed, true, ending)
     await client.close()
   }
+})
+
+test('Client link half-closes one control request and requires an explicit link result', async (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const linkResult = (status: 'LINKED' | 'UNCHANGED' | 'FAILED', code?: string): Buffer =>
+    encodeControlFrame(
+      b4a.from(JSON.stringify({ v: 1, status, ...(code === undefined ? {} : { code }) }))
+    )
+
+  const successSocket = new FakeSocket(serverKey)
+  successSocket.onEnd = () => successSocket.feed(linkResult('LINKED'))
+  const successClient = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(successSocket)
+  })
+  t.alike(await successClient.link('release-1.2.3', 'current'), {
+    target: 'release-1.2.3',
+    name: 'current',
+    status: 'LINKED'
+  })
+  t.alike(JSON.parse(b4a.toString(successSocket.writes[0].subarray(4))), {
+    v: 1,
+    kind: 'link',
+    target: 'release-1.2.3',
+    name: 'current'
+  })
+  t.is(successSocket.writes.length, 1)
+  await successClient.close()
+  t.is(successSocket.destroyed, true)
+
+  const failedSocket = new FakeSocket(serverKey)
+  failedSocket.onEnd = () => failedSocket.feed(linkResult('FAILED', 'LINK_TARGET_NOT_FOUND'))
+  const failedClient = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(failedSocket)
+  })
+  await t.exception(failedClient.link('release-1.2.3', 'current'), {
+    code: ERRORS.LINK_TARGET_NOT_FOUND
+  })
+  await failedClient.close()
+  t.is(failedSocket.destroyed, true)
+
+  const eofSocket = new FakeSocket(serverKey)
+  eofSocket.onEnd = () => eofSocket.finishInput()
+  const eofClient = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(eofSocket)
+  })
+  await t.exception(eofClient.link('release-1.2.3', 'current'), { code: ERRORS.PROTOCOL_INVALID })
+  await eofClient.close()
+  t.is(eofSocket.destroyed, true)
 })
 
 test('Client close aborts pending work promptly and removes direct-wire listeners', async (t) => {
@@ -1693,6 +1754,368 @@ test('a configured link name cannot be uploaded as an artifact', async (t) => {
   const rejection = JSON.parse(b4a.toString(socket.writes[0].subarray(4))) as { code: string }
   t.is(rejection.code, ERRORS.INVALID_FILENAME)
   await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'latest')))
+})
+
+test('Server links an authenticated request target after a clean close', async (t) => {
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }]
+  })
+  const artifact = await manifest(t, 'release-1', 'release payload')
+  await uploadAll(node, artifact)
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(
+    encodeControlFrame(
+      encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'release-1', name: 'current' })
+    )
+  )
+  socket.finishInput()
+  await waitFor(() => socket.writes.length === 1)
+
+  t.alike(decodeLinkResultRecord(socket.writes[0].subarray(4)), { v: 1, status: 'LINKED' })
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
+})
+
+async function linkAll(
+  node: FakeServerNode,
+  target: string,
+  name: string
+): Promise<{ socket: FakeSocket; result: { v: number; status: string; code?: string } }> {
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(encodeControlFrame(encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })))
+  socket.finishInput()
+  await waitFor(() => socket.writes.length === 1)
+  return {
+    socket,
+    result: decodeLinkResultRecord(socket.writes[0].subarray(4)) as {
+      v: number
+      status: string
+      code?: string
+    }
+  }
+}
+
+test('Server maps durable link storage failures to one LINK_FAILED result and event', async (t) => {
+  let failLedgerRead = false
+  const events: Array<{ status: string; reason?: string }> = []
+  const storage = createStorage({
+    beforeOperation(operation, target) {
+      if (failLedgerRead && operation === 'readdir' && target.endsWith(path.join('commits'))) {
+        throw new Error('injected ledger read failure')
+      }
+    }
+  })
+  const { server, node } = await createServer(t, {
+    storage,
+    symlinks: [{ selector: 'release-1' }]
+  })
+  server.on('link', (event) => events.push({ status: event.status, reason: event.reason }))
+  await uploadAll(node, await manifest(t, 'release-1', 'release'))
+  failLedgerRead = true
+
+  t.alike((await linkAll(node, 'release-1', 'current')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_FAILED
+  })
+  t.alike(events, [{ status: 'failed', reason: ERRORS.LINK_FAILED }])
+})
+
+test('Server never attempts a second result after successful link-result delivery fails', async (t) => {
+  const events: Array<{ status: string; reason?: string }> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: 'release-1' }]
+  })
+  server.on('link', (event) => events.push({ status: event.status, reason: event.reason }))
+  await uploadAll(node, await manifest(t, 'release-1', 'release'))
+
+  const socket = new FakeSocket(CLIENT_KEY)
+  const write = socket.write.bind(socket)
+  const destroy = socket.destroy.bind(socket)
+  let resultWriteAttempts = 0
+  let destroyCalls = 0
+  socket.write = ((bytes: Uint8Array): boolean => {
+    resultWriteAttempts++
+    return write(bytes)
+  }) as typeof socket.write
+  socket.destroy = ((error?: unknown): void => {
+    if (++destroyCalls > 1) destroy(error)
+  }) as typeof socket.destroy
+  socket.onWrite = (_bytes, index) => {
+    if (index !== 0) return true
+    queueMicrotask(() => socket.emit('close'))
+    return false
+  }
+  node.accept(socket)
+  socket.feed(
+    encodeControlFrame(
+      encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'release-1', name: 'current' })
+    )
+  )
+  socket.finishInput()
+  await waitFor(() => events.length === 1)
+
+  t.is(resultWriteAttempts, 1)
+  t.is(socket.writes.length, 1)
+  t.alike(events, [{ status: 'failed', reason: ERRORS.LINK_FAILED }])
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'UNCHANGED' })
+})
+
+test('Server authorizes an exact one-argument manual selector', async (t) => {
+  const { node } = await createServer(t, {
+    symlinks: [{ selector: 'release-1' }]
+  })
+  await uploadAll(node, await manifest(t, 'release-1', 'release'))
+  await uploadAll(node, await manifest(t, 'release-2', 'other'))
+
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  t.alike((await linkAll(node, 'release-2', 'other')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_NOT_ALLOWED
+  })
+})
+
+test('Server maps manual link outcomes, excludes hooks, and reserves durable names', async (t) => {
+  const hooks: string[] = []
+  const events: Array<{ status: string; reason?: string }> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      beforeCommit: () => void hooks.push('before'),
+      afterCommit: () => void hooks.push('after'),
+      onFailure: () => void hooks.push('failure')
+    }
+  })
+  server.on('link', (event) => events.push({ status: event.status, reason: event.reason }))
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  await uploadAll(node, await manifest(t, 'release-2', 'second'))
+  hooks.length = 0
+
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  t.alike((await linkAll(node, 'release-1', 'current')).result, { v: 1, status: 'UNCHANGED' })
+  t.alike((await linkAll(node, 'release-2', 'current')).result, { v: 1, status: 'LINKED' })
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-2')
+  t.alike((await linkAll(node, 'release-1', 'release-1')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_NOT_ALLOWED
+  })
+  t.alike((await linkAll(node, 'release-3', 'other')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_TARGET_NOT_FOUND
+  })
+  t.alike((await linkAll(node, 'release-1', 'latest')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_NOT_ALLOWED
+  })
+  t.alike((await linkAll(node, 'release-1', 'release-2')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_CONFLICT
+  })
+  await fs.promises.writeFile(path.join(server.storageDir, 'operator'), 'operator')
+  t.alike((await linkAll(node, 'release-1', 'operator')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_CONFLICT
+  })
+  t.alike(hooks, [], 'link requests never run artifact hooks')
+  const rejectedUpload = await uploadAll(node, await manifest(t, 'current', 'reserved'))
+  t.is(finalCode(rejectedUpload), ERRORS.INVALID_FILENAME)
+  t.alike(
+    events.map((event) => event.status),
+    ['linked', 'unchanged', 'linked', 'rejected', 'rejected', 'rejected', 'rejected', 'rejected']
+  )
+  t.alike(
+    events.slice(3).map((event) => event.reason),
+    [
+      ERRORS.LINK_NOT_ALLOWED,
+      ERRORS.LINK_TARGET_NOT_FOUND,
+      ERRORS.LINK_NOT_ALLOWED,
+      ERRORS.LINK_CONFLICT,
+      ERRORS.LINK_CONFLICT
+    ]
+  )
+})
+
+test('Server keeps durable manual names managed after rules are removed on restart', async (t) => {
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^release-\\d+$/' }]
+  })
+  await uploadAll(first.node, await manifest(t, 'release-1', 'release'))
+  t.alike((await linkAll(first.node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
+
+  const node = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    dht: node
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+  const rejected = await uploadAll(node, await manifest(t, 'current', 'must stay reserved'))
+  t.is(finalCode(rejected), ERRORS.INVALID_FILENAME)
+  t.is(await fs.promises.readlink(path.join(storageDir, 'current')), 'release-1')
+})
+
+test('Server fallback retention pins a manual target while deleting an unpinned artifact', async (t) => {
+  let failAutomaticReconciliation = false
+  const storage = createStorage({
+    beforeOperation(operation, target) {
+      if (
+        failAutomaticReconciliation &&
+        operation === 'readdir' &&
+        target.endsWith(path.join('.swarm-deploy', 'publications'))
+      ) {
+        throw new Error('injected automatic reconciliation failure')
+      }
+    }
+  })
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
+    storage,
+    storageDir,
+    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: 'release-3', name: 'latest' }]
+  })
+  for (const name of ['release-1', 'release-2', 'release-3']) {
+    const result = await uploadAll(first.node, await manifest(t, name, 'aa'))
+    t.absent(finalCode(result), `${name} commits before retention pressure`)
+  }
+  t.is(await fs.promises.readlink(path.join(storageDir, 'latest')), 'release-3')
+  t.alike((await linkAll(first.node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
+
+  failAutomaticReconciliation = true
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 4,
+    dht: new FakeServerNode(),
+    storage,
+    symlinks: [{ selector: 'release-3', name: 'latest' }]
+  })
+  t.teardown(() => restarted.close())
+  await t.exception(() => restarted.listen(), { code: ERRORS.LINK_FAILED })
+
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'release-1'))).isFile())
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'release-3'))).isFile())
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'release-2')))
+})
+
+test('Server startup retention preserves manual links after authorization rules are removed', async (t) => {
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^release-\\d+$/' }]
+  })
+  await uploadAll(first.node, await manifest(t, 'release-1', 'aa'))
+  await uploadAll(first.node, await manifest(t, 'release-2', 'bb'))
+  t.alike((await linkAll(first.node, 'release-1', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
+
+  const node = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 2,
+    dht: node
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'release-1'))).isFile())
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'release-2')))
+  t.is(await fs.promises.readlink(path.join(storageDir, 'current')), 'release-1')
+})
+
+test('Server reconciliation releases stale manual replacement history without a relink', async (t) => {
+  const { server, node } = await createServer(t, {
+    maxStorageBytes: 8,
+    replaceNames: ['release'],
+    symlinks: [{ selector: 'release' }]
+  })
+  const old = await manifest(t, 'release', 'old!')
+  t.absent(finalCode(await uploadAll(node, old)))
+  t.alike((await linkAll(node, 'release', 'current')).result, { v: 1, status: 'LINKED' })
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'release', 'new!'))))
+
+  const oldHistory = path.join(
+    server.storageDir,
+    historyName(b4a.toString(old.manifest.transferId, 'hex'))
+  )
+  t.ok((await fs.promises.lstat(oldHistory)).isFile())
+  await server.close()
+
+  const restartedNode = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir: server.storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 4,
+    dht: restartedNode
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+
+  await t.exception(() => fs.promises.lstat(oldHistory))
+  t.ok((await fs.promises.lstat(path.join(restarted.storageDir, 'release'))).isFile())
+})
+
+test('Server retention keeps only a repointed manual target after restart', async (t) => {
+  const storageDir = await createTempDir(t)
+  const first = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^r[1-3]$/' }]
+  })
+  for (const name of ['r1', 'r2', 'r3']) {
+    const result = await uploadAll(first.node, await manifest(t, name, 'aa'))
+    t.absent(finalCode(result), `${name} commits in deterministic order`)
+  }
+  t.alike((await linkAll(first.node, 'r1', 'current')).result, { v: 1, status: 'LINKED' })
+  t.alike((await linkAll(first.node, 'r2', 'current')).result, { v: 1, status: 'LINKED' })
+  await first.server.close()
+
+  const restartedNode = new FakeServerNode()
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    maxStorageBytes: 2,
+    dht: restartedNode
+  })
+  t.teardown(() => restarted.close())
+  await restarted.listen()
+
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'r1')))
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'r2'))).isFile())
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'r3')))
 })
 
 test('a link is repointed to the newest match before the old target is rotated', async (t) => {

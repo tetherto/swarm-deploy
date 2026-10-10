@@ -11,7 +11,7 @@ import {
   type DirectDhtSocket
 } from './direct-dht.js'
 import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
-import { validateReplaceNames } from './files.js'
+import { isReservedHistoryName, validateReplaceNames } from './files.js'
 import {
   callbackError,
   hookError,
@@ -41,19 +41,27 @@ import type { TarSession } from './storage/tar-session-store.js'
 import type { StorageAdapter, StorageLayout, SymlinkCapableStorage } from './storage/types.js'
 import { assertSymlinkCapable } from './storage/tree-fs.js'
 import {
-  decodeAnyMetadataRecord,
+  decodeFirstControlRecord,
   isTreeMetadata,
-  type AnyMetadataRecord
+  type AnyMetadataRecord,
+  type LinkRequestRecord
 } from './tar-protocol/controls.js'
-import { DirectWireReader, writeAdmission, writeFinal } from './tar-protocol/direct-wire.js'
+import {
+  DirectWireReader,
+  writeAdmission,
+  writeFinal,
+  writeLinkResult
+} from './tar-protocol/direct-wire.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 import { assertMetadataTransferId } from './tar-protocol/manifest.js'
 import { assertTreeMetadataTransferId } from './tar-protocol/tree-manifest.js'
 import {
   compileSymlinkRules,
+  isManualSymlinkTargetAllowed,
   selectDesiredLinks,
   symlinkRuleNames,
   type CompiledSymlinkRule,
+  type DesiredLink,
   type SymlinkRule
 } from './symlinks.js'
 import type {
@@ -68,7 +76,7 @@ import type {
   TransferEvent,
   TransferLifecycleEvent
 } from './types.js'
-import type { CommitRecord } from './storage/commit-journal.js'
+import { commitRecordKind, type CommitRecord } from './storage/commit-journal.js'
 
 const EventEmitter = events.EventEmitter
 const DEFAULT_MAX_CONNECTIONS = 64
@@ -170,6 +178,12 @@ export interface RetentionEvent {
 export interface ServerCloseEvent {
   status: 'closed' | 'failed'
 }
+export interface ServerLinkEvent extends FingerprintEvent {
+  target: string
+  name: string
+  status: 'linked' | 'unchanged' | 'rejected' | 'failed'
+  reason?: ErrorCode
+}
 export interface ServerEventMap {
   authentication: AuthenticationEvent
   connection: ServerConnectionEvent
@@ -181,6 +195,7 @@ export interface ServerEventMap {
   commit: ServerTransferLifecycleEvent
   recovery: RecoveryEvent
   retention: RetentionEvent
+  link: ServerLinkEvent
   failure: FingerprintEvent & { reason: ErrorCode }
   listening: ServerListeningEvent
   close: ServerCloseEvent
@@ -269,6 +284,7 @@ export class Server extends EventEmitter {
   readonly hooks: Readonly<ServerHooks>
   readonly symlinks: readonly CompiledSymlinkRule[]
   readonly linkNames: ReadonlySet<string>
+  private managedLinkNamesSnapshot: ReadonlySet<string>
   private links: LinkStore | null = null
   listening = false
   closed = false
@@ -405,6 +421,7 @@ export class Server extends EventEmitter {
     this.hooks = snapshotHooks(options.hooks)
     this.symlinks = compileSymlinkRules(options.symlinks)
     this.linkNames = symlinkRuleNames(this.symlinks)
+    this.managedLinkNamesSnapshot = new Set(this.linkNames)
     if (this.symlinks.length > 0) assertSymlinkCapable(this.storage)
     this.logger = safeLogger(options.logger)
     this.signal = this.abort.signal
@@ -491,12 +508,21 @@ export class Server extends EventEmitter {
    * Called with the root lease already held.
    */
   private async reconcileLinksUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
-    if (this.symlinks.length === 0 || !this.links) return new Set()
     const desired = selectDesiredLinks(this.symlinks, records)
+    if (!this.links) return new Set(desired.map((link) => link.transferId))
     await this.links.reconcile(desired, this.linkNames, {
       managedArtifactNames: new Set(records.map((record) => record.name))
     })
-    return new Set(desired.map((link) => link.transferId))
+    const ledger = await this.links.list()
+    this.setManagedLinkNames(ledger)
+    const pins = new Set(desired.map((link) => link.transferId))
+    for (const link of ledger) {
+      if (link.mode !== 'manual') continue
+      const target = records.find((record) => record.name === link.target)
+      if (target) pins.add(target.transferId)
+      else pins.add(link.transferId)
+    }
+    return pins
   }
 
   /** Pins link targets when reconciliation fails but retention must continue. */
@@ -513,7 +539,7 @@ export class Server extends EventEmitter {
 
   /** Reconciles after a durable commit; this is the only caller that leases the root. */
   private async reconcileAfterCommit(): Promise<void> {
-    if (this.symlinks.length === 0 || !this.links || !this.commits) return
+    if (!this.links || !this.commits) return
     try {
       await withRootLease(this.layout!.root, async () =>
         this.reconcileLinksUnlocked(await this.commits!.list())
@@ -521,6 +547,119 @@ export class Server extends EventEmitter {
     } catch (error) {
       if (error instanceof SwarmDeployError && error.code === ERRORS.LINK_CONFLICT) throw error
       throw new SwarmDeployError(ERRORS.LINK_FAILED, 'Unable to reconcile managed symlinks', error)
+    }
+  }
+
+  private setManagedLinkNames(records: readonly { name: string }[]): void {
+    this.managedLinkNamesSnapshot = new Set([
+      ...this.linkNames,
+      ...records.map((record) => record.name)
+    ])
+  }
+
+  private async refreshManagedLinkNames(): Promise<void> {
+    if (!this.links) {
+      this.managedLinkNamesSnapshot = new Set(this.linkNames)
+      return
+    }
+    this.setManagedLinkNames(await this.links.list())
+  }
+
+  private async receiveLink(
+    socket: DirectDhtSocket,
+    reader: DirectWireReader,
+    owner: Uint8Array,
+    request: LinkRequestRecord
+  ): Promise<void> {
+    let emitted = false
+    let resultWriteStarted = false
+    const emitTerminal = (status: ServerLinkEvent['status'], reason?: ErrorCode): void => {
+      if (emitted) return
+      emitted = true
+      this.emitSafe('link', {
+        fingerprint: fingerprint(owner),
+        target: request.target,
+        name: request.name,
+        status,
+        ...(reason === undefined ? {} : { reason })
+      })
+    }
+    try {
+      // A link request has no payload: EOF is the required no-trailing-data boundary.
+      await reader.requireEnd(this.signal, this.idleTimeout)
+      if (request.target === request.name) {
+        throw fail(ERRORS.LINK_NOT_ALLOWED, 'Manual link cannot target itself')
+      }
+      if (!isManualSymlinkTargetAllowed(this.symlinks, request.target)) {
+        throw fail(ERRORS.LINK_NOT_ALLOWED, 'Manual link target is not allowed')
+      }
+      if (this.linkNames.has(request.name)) {
+        throw fail(ERRORS.LINK_NOT_ALLOWED, 'Manual link name is reserved by an automatic rule')
+      }
+      const result = await withRootLease(this.layout!.root, async () => {
+        const records = await this.commits!.list()
+        const target = records.find(
+          (record) => record.name === request.target && !isReservedHistoryName(record.name)
+        )
+        if (!target) throw fail(ERRORS.LINK_TARGET_NOT_FOUND, 'Manual link target was not found')
+        const artifacts = new Set(records.map((record) => record.name))
+        if (artifacts.has(request.name)) {
+          throw fail(ERRORS.LINK_CONFLICT, 'Manual link name conflicts with an artifact')
+        }
+        if (!this.links) throw fail(ERRORS.LINK_FAILED, 'Managed link storage is unavailable')
+        const link: DesiredLink = {
+          name: request.name,
+          target: target.name,
+          transferId: target.transferId,
+          targetKind: commitRecordKind(target)
+        }
+        const linked = await this.links.linkManual(link, {
+          managedArtifactNames: artifacts,
+          automaticLinkNames: this.linkNames
+        })
+        await this.refreshManagedLinkNames()
+        return linked
+      })
+      resultWriteStarted = true
+      await writeLinkResult(
+        socket,
+        { v: 1, status: result.status },
+        { signal: this.signal, timeout: this.idleTimeout }
+      )
+      emitTerminal(result.status === 'LINKED' ? 'linked' : 'unchanged')
+    } catch (error) {
+      let reason =
+        error instanceof SwarmDeployError &&
+        (error.code === ERRORS.LINK_NOT_ALLOWED ||
+          error.code === ERRORS.LINK_TARGET_NOT_FOUND ||
+          error.code === ERRORS.LINK_CONFLICT ||
+          error.code === ERRORS.LINK_FAILED)
+          ? error.code
+          : ERRORS.LINK_FAILED
+      const rejected =
+        reason === ERRORS.LINK_NOT_ALLOWED ||
+        reason === ERRORS.LINK_TARGET_NOT_FOUND ||
+        reason === ERRORS.LINK_CONFLICT
+      if (!resultWriteStarted) {
+        resultWriteStarted = true
+        try {
+          await writeLinkResult(
+            socket,
+            { v: 1, status: 'FAILED', code: reason },
+            { timeout: this.idleTimeout }
+          )
+        } catch {
+          reason = ERRORS.LINK_FAILED
+        }
+      } else {
+        reason = ERRORS.LINK_FAILED
+      }
+      this.logger.warn('Direct link failed', { fingerprint: fingerprint(owner), reason })
+      this.emitSafe('failure', { fingerprint: fingerprint(owner), reason })
+      emitTerminal(rejected && reason !== ERRORS.LINK_FAILED ? 'rejected' : 'failed', reason)
+      try {
+        socket.destroy()
+      } catch {}
     }
   }
 
@@ -637,7 +776,12 @@ export class Server extends EventEmitter {
       await reportFailure(fail(reason, message))
     }
     try {
-      const metadata = await reader.control(decodeAnyMetadataRecord, this.signal, this.idleTimeout)
+      const first = await reader.control(decodeFirstControlRecord, this.signal, this.idleTimeout)
+      if ('kind' in first && first.kind === 'link') {
+        await this.receiveLink(socket, reader, owner, first)
+        return
+      }
+      const metadata = first as AnyMetadataRecord
       // The decoded record is shape-validated but not yet authenticated; the
       // artifact context carries only its non-secret descriptive fields.
       event = this.transfer(metadata)
@@ -664,7 +808,7 @@ export class Server extends EventEmitter {
         }
         artifact = this.hookArtifact(metadata, release)
       }
-      if (this.linkNames.has(metadata.name)) {
+      if (this.managedLinkNamesSnapshot.has(metadata.name)) {
         await rejectEarly(ERRORS.INVALID_FILENAME, 'Artifact name is a configured symlink name')
         return
       }
@@ -1024,7 +1168,10 @@ export class Server extends EventEmitter {
         storage: this.storage,
         logger: this.logger
       })
-      if (this.symlinks.length > 0) {
+      if (
+        this.symlinks.length > 0 ||
+        (typeof this.storage.symlink === 'function' && typeof this.storage.readlink === 'function')
+      ) {
         this.links = new LinkStore({
           layout: this.layout,
           storage: this.storage as SymlinkCapableStorage
@@ -1074,12 +1221,13 @@ export class Server extends EventEmitter {
           ),
         hasActiveUploads: () => this.activeUploads.size > 0,
         isPinned: (record) => this.replaceNames.has(record.name),
-        managedLinkNames: () => this.linkNames,
+        managedLinkNames: () => this.managedLinkNamesSnapshot,
         reconcileLinks: (records) => this.reconcileLinksUnlocked(records),
         linkPinsFallback: (records) => this.linkPinsFallbackUnlocked(records),
         logger: this.logger,
         onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
+      await this.refreshManagedLinkNames()
       await this.retention.start()
       throwIfAborted(this.signal)
       this.transport = new DirectDhtServer({

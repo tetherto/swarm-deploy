@@ -4,6 +4,7 @@ import test from 'brittle'
 import { ERRORS } from '../../dist/errors.js'
 import {
   compileSymlinkRules,
+  isManualSymlinkTargetAllowed,
   selectDesiredLinks,
   symlinkRuleNames,
   type SymlinkRule
@@ -64,6 +65,38 @@ test('rules accept exact and unflagged regex selectors and are repeatable', (t) 
   ])
 })
 
+test('one-argument rules authorize exact and regex-selected targets', (t) => {
+  const rules = compileSymlinkRules([
+    { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
+    { selector: 'release.tar.gz' },
+    { selector: '/^app-\\d+\\.\\d+\\.\\d+\\.tar\\.gz$/' },
+    { selector: '/^history-/' }
+  ])
+  t.is(isManualSymlinkTargetAllowed(rules, 'release.tar.gz'), true)
+  t.is(isManualSymlinkTargetAllowed(rules, 'app-1.2.3.tar.gz'), true)
+  t.is(isManualSymlinkTargetAllowed(rules, '0.18.1'), false)
+  t.is(isManualSymlinkTargetAllowed(rules, 'unrelated.bin'), false)
+  t.is(isManualSymlinkTargetAllowed(rules, 'history-aa'), false)
+  t.is(isManualSymlinkTargetAllowed(rules, '../release.tar.gz'), false)
+  t.alike([...symlinkRuleNames(rules)], ['latest'])
+})
+
+test('manual authorization rules never produce desired automatic links', (t) => {
+  const rules = compileSymlinkRules([
+    { selector: '/^\\d+\\.\\d+\\.\\d+$/', name: 'latest' },
+    { selector: 'release.tar.gz' },
+    { selector: '/^app-/' }
+  ])
+  const records = [
+    directoryRecord('0.18.1', 100, '1'.repeat(64)),
+    fileRecord('release.tar.gz', 200, '2'.repeat(64)),
+    fileRecord('app-1.2.3.tar.gz', 300, '3'.repeat(64))
+  ]
+  t.alike(selectDesiredLinks(rules, records), [
+    { name: 'latest', target: '0.18.1', transferId: '1'.repeat(64), targetKind: 'directory' }
+  ])
+})
+
 test('rule compilation rejects every malformed configuration', (t) => {
   for (const rules of [
     [{ selector: '/[unclosed/', name: 'latest' }],
@@ -82,7 +115,10 @@ test('rule compilation rejects every malformed configuration', (t) => {
       { selector: 'one.bin', name: 'latest' },
       { selector: 'two.bin', name: 'latest' }
     ],
-    [{ selector: 'release.tar.gz' } as unknown as SymlinkRule],
+    [{ selector: 'release.tar.gz' }, { selector: 'release.tar.gz' }],
+    [{ selector: 'history-aa' }],
+    [{ selector: 'release.tar.gz', name: undefined } as unknown as SymlinkRule],
+    [{ selector: 'release.tar.gz', extra: 1 } as unknown as SymlinkRule],
     [{ selector: 'release.tar.gz', name: 'latest', extra: 1 } as unknown as SymlinkRule],
     'release.tar.gz' as unknown as Iterable<SymlinkRule>
   ]) {

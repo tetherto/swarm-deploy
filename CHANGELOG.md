@@ -2,6 +2,22 @@
 
 All notable changes to this package are documented here.
 
+## Unreleased
+
+- Add authenticated client-managed symlinks: one-argument
+  `--symlink <selector>` rules authorize current managed file or directory
+  targets, `Client.link(target, name)` and `swarm-deploy link` create or
+  idempotently repoint durable manual links, and `LINKED`/`UNCHANGED` results,
+  typed link events, stable policy/target errors, retention pinning, and v2
+  mode-aware ledger records preserve fail-closed managed ownership.
+- **Rollback warning.** After an upgraded server creates, repairs, or repoints
+  any managed link, its v2 ledger record is unreadable by v0.2.0. Rollback
+  requires restoring the complete pre-upgrade storage backup or staying on the
+  upgraded server. `swarm-deploy link` also requires an upgraded server.
+- **Type change.** `SymlinkRule` is now a closed union of automatic
+  `{ selector, name }` and manual `{ selector }` rule shapes, rather than an
+  extendable interface.
+
 ## 0.2.0
 
 - **Behavior change.** A directory upload now commits exactly one recursive managed directory artifact instead of a batch of immediate-child file uploads. `BatchUploadResult`, `BatchUploadFailure`, `SkippedUploadEntry`, `SkippedUploadReason`, and the client `skipped` event are removed, `ClientUploadResult` is now `UploadResult`, and `UploadResult` gains `kind` and, for a directory, `entryCount`. Direct file upload stays byte-compatible. Automation that relied on per-child results must now treat the directory as one artifact.

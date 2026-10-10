@@ -47,6 +47,24 @@ export function isTreeMetadata(value: AnyMetadataRecord): value is TreeMetadataR
   return (value as TreeMetadataRecord).kind === 'directory'
 }
 
+export interface LinkRequestRecord {
+  v: typeof CONTROL_VERSION
+  kind: 'link'
+  target: string
+  name: string
+}
+
+export type LinkResultRecord =
+  | { v: typeof CONTROL_VERSION; status: 'LINKED' }
+  | { v: typeof CONTROL_VERSION; status: 'UNCHANGED' }
+  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode }
+
+/**
+ * The first direct control frame may be an upload offer or a link request.
+ * Upload-specific readers remain strict and reject link records.
+ */
+export type FirstControlRecord = AnyMetadataRecord | LinkRequestRecord
+
 export type AdmissionRecord =
   | { v: typeof CONTROL_VERSION; status: 'ACCEPT'; offset: 0 }
   | {
@@ -234,6 +252,21 @@ function validateAnyMetadata(value: unknown): AnyMetadataRecord {
     : validateMetadata(value)
 }
 
+function validateLinkRequest(value: unknown): LinkRequestRecord {
+  if (!isRecord(value)) throw invalid('Link request record must be an object')
+  exactKeys(value, ['v', 'kind', 'target', 'name'])
+  assertVersion(value.v)
+  if (value.kind !== 'link') throw invalid('Invalid control request kind')
+  assertName(value.target)
+  assertName(value.name)
+  return value as unknown as LinkRequestRecord
+}
+
+function validateFirstControl(value: unknown): FirstControlRecord {
+  if (!isRecord(value)) throw invalid('Control record must be an object')
+  return value.kind === 'link' ? validateLinkRequest(value) : validateAnyMetadata(value)
+}
+
 function validateAdmission(value: unknown): AdmissionRecord {
   if (!isRecord(value)) throw invalid('Admission record must be an object')
   assertVersion(value.v)
@@ -270,6 +303,20 @@ function validateFinal(value: unknown): FinalRecord {
   return value as unknown as FinalRecord
 }
 
+function validateLinkResult(value: unknown): LinkResultRecord {
+  if (!isRecord(value)) throw invalid('Link result record must be an object')
+  assertVersion(value.v)
+  if (value.status === 'LINKED' || value.status === 'UNCHANGED') {
+    exactKeys(value, ['v', 'status'])
+  } else if (value.status === 'FAILED') {
+    exactKeys(value, ['v', 'status', 'code'])
+    assertStableCode(value.code)
+  } else {
+    throw invalid('Invalid link result status')
+  }
+  return value as unknown as LinkResultRecord
+}
+
 export function encodeMetadataRecord(value: MetadataRecord): Buffer {
   return encodeRecord(value, validateMetadata)
 }
@@ -294,6 +341,18 @@ export function decodeAnyMetadataRecord(bytes: Uint8Array): AnyMetadataRecord {
   return validateAnyMetadata(parseRecord(bytes))
 }
 
+export function encodeLinkRequestRecord(value: LinkRequestRecord): Buffer {
+  return encodeRecord(value, validateLinkRequest)
+}
+
+export function decodeLinkRequestRecord(bytes: Uint8Array): LinkRequestRecord {
+  return validateLinkRequest(parseRecord(bytes))
+}
+
+export function decodeFirstControlRecord(bytes: Uint8Array): FirstControlRecord {
+  return validateFirstControl(parseRecord(bytes))
+}
+
 export function encodeAdmissionRecord(value: AdmissionRecord): Buffer {
   return encodeRecord(value, validateAdmission)
 }
@@ -308,6 +367,14 @@ export function encodeFinalRecord(value: FinalRecord): Buffer {
 
 export function decodeFinalRecord(bytes: Uint8Array): FinalRecord {
   return validateFinal(parseRecord(bytes))
+}
+
+export function encodeLinkResultRecord(value: LinkResultRecord): Buffer {
+  return encodeRecord(value, validateLinkResult)
+}
+
+export function decodeLinkResultRecord(bytes: Uint8Array): LinkResultRecord {
+  return validateLinkResult(parseRecord(bytes))
 }
 
 export function encodeControlFrame(record: Uint8Array): Buffer {
