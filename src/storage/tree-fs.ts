@@ -89,6 +89,15 @@ interface WalkResult {
   entries: WalkedEntry[]
 }
 
+export interface TreeIdentitySnapshot {
+  root: TreeIdentityStamp
+  entries: ReadonlyArray<{
+    kind: TreeEntry['kind']
+    path: string
+    identity: TreeIdentityStamp
+  }>
+}
+
 function treeError(code: ErrorCode, message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(code, message, cause)
 }
@@ -410,6 +419,7 @@ async function normalizeTreeMemberMode(
 ): Promise<void> {
   await verifyAnchors(anchors, storage, ERRORS.PROTOCOL_INVALID)
   let handle: StorageFileHandle | null = null
+  let operationError: unknown = null
   try {
     handle = await storage.open(target, safeFileOpenFlags('read'))
     const before = await handle.stat()
@@ -418,7 +428,10 @@ async function normalizeTreeMemberMode(
       (kind === 'file' ? !before.isFile() : !before.isDirectory()) ||
       !matchesTreeIdentity(before, expected)
     ) {
-      throw treeError(ERRORS.PROTOCOL_INVALID, 'Tree member changed before publication')
+      throw treeError(ERRORS.FILE_BUSY, 'Tree member changed before publication')
+    }
+    if (kind === 'file' && typeof before.nlink === 'number' && before.nlink > 1) {
+      throw treeError(ERRORS.INVALID_FILENAME, 'Tree entries cannot be hard links')
     }
     if (!modeCapable(handle)) {
       throw treeError(
@@ -430,7 +443,7 @@ async function normalizeTreeMemberMode(
       await handle.chmod(mode)
     } catch (error: unknown) {
       throw treeError(
-        ERRORS.UNSUPPORTED_STORAGE,
+        ERRORS.COMMIT_FAILED,
         'Storage adapter cannot normalize published artifact modes',
         error
       )
@@ -441,13 +454,24 @@ async function normalizeTreeMemberMode(
       (kind === 'file' ? !after.isFile() : !after.isDirectory()) ||
       !matchesTreeIdentity(after, expected)
     ) {
-      throw treeError(ERRORS.PROTOCOL_INVALID, 'Tree member changed during publication')
+      throw treeError(ERRORS.FILE_BUSY, 'Tree member changed during publication')
     }
     await handle.sync()
   } catch (error: unknown) {
-    throw coded(error, ERRORS.PROTOCOL_INVALID, 'Unable to normalize published tree mode')
+    operationError = error
+    throw coded(error, ERRORS.COMMIT_FAILED, 'Unable to normalize published tree mode')
   } finally {
-    if (handle) await handle.close()
+    if (handle) {
+      if (operationError !== null) {
+        await handle.close().catch(() => {})
+      } else {
+        try {
+          await handle.close()
+        } catch (error: unknown) {
+          throw treeError(ERRORS.COMMIT_FAILED, 'Unable to close published tree member', error)
+        }
+      }
+    }
   }
   await verifyAnchors(anchors, storage, ERRORS.PROTOCOL_INVALID)
 }
@@ -460,7 +484,7 @@ async function normalizeTreeMemberMode(
 export async function normalizeTreePublicationModes(
   treePath: string,
   storage: StorageAdapter
-): Promise<void> {
+): Promise<TreeIdentitySnapshot> {
   const { root, entries } = await walkIdentities(treePath, storage)
   const directories = new Map<string, Anchor>([['', root]])
   for (const entry of entries) {
@@ -525,6 +549,7 @@ export async function normalizeTreePublicationModes(
     )
   }
   await syncTreeDirectories(treePath, storage)
+  return snapshotTreeIdentities(await walkIdentities(treePath, storage))
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +609,38 @@ async function walkIdentities(treePath: string, storage: StorageAdapter): Promis
   entries.sort((left, right) => compareTreePaths(left.path, right.path))
   assertCanonicalTreeEntries(entries)
   return { root, entries }
+}
+
+function snapshotTreeIdentities(result: WalkResult): TreeIdentitySnapshot {
+  return {
+    root: {
+      dev: result.root.dev,
+      ino: result.root.ino,
+      size: 0
+    },
+    entries: result.entries.map(({ kind, path: entryPath, identity }) => ({
+      kind,
+      path: entryPath,
+      identity: { ...identity }
+    }))
+  }
+}
+
+function matchesIdentitySnapshot(result: WalkResult, expected: TreeIdentitySnapshot): boolean {
+  return (
+    result.root.dev === expected.root.dev &&
+    result.root.ino === expected.root.ino &&
+    result.entries.length === expected.entries.length &&
+    result.entries.every((entry, index) => {
+      const prior = expected.entries[index]
+      return (
+        prior !== undefined &&
+        entry.kind === prior.kind &&
+        entry.path === prior.path &&
+        sameStamp(entry.identity, prior.identity)
+      )
+    })
+  )
 }
 
 export async function walkTree(treePath: string, storage: StorageAdapter): Promise<TreeEntry[]> {
@@ -670,9 +727,13 @@ async function digestTreeFile(
  */
 export async function digestTree(
   treePath: string,
-  storage: StorageAdapter
+  storage: StorageAdapter,
+  expectedIdentities?: TreeIdentitySnapshot
 ): Promise<TreeDigestResult> {
   const first = await walkIdentities(treePath, storage)
+  if (expectedIdentities && !matchesIdentitySnapshot(first, expectedIdentities)) {
+    throw busy('Tree changed before digest')
+  }
   const directories = new Map<string, Anchor>([['', first.root]])
   for (const entry of first.entries) {
     if (entry.kind === 'directory') {

@@ -18,7 +18,7 @@ import {
   type CommitRecord
 } from '../../dist/storage/commit-journal.js'
 import { prepareStorageRecovery, recoverStorage } from '../../dist/storage/recovery.js'
-import type { StorageLayout } from '../../dist/storage/types.js'
+import type { StorageAdapter, StorageLayout } from '../../dist/storage/types.js'
 import {
   buildTarManifest,
   metadataFromManifest,
@@ -32,7 +32,7 @@ import {
   treeMetadataFromManifest
 } from '../../dist/tar-protocol/tree-manifest.js'
 import { createTempDir } from '../helpers/files.js'
-import { createStorage, type TestStorage } from '../helpers/storage.js'
+import { createStorage } from '../helpers/storage.js'
 import { writeTree } from '../helpers/trees.js'
 
 const OWNER = b4a.alloc(32, 7)
@@ -140,7 +140,10 @@ function commitRelease(
   return commits.commit(session, { replaceNames, release })
 }
 
-async function createHarness(t: Assert, storage: TestStorage = createStorage()): Promise<Harness> {
+async function createHarness(
+  t: Assert,
+  storage: StorageAdapter = createStorage()
+): Promise<Harness> {
   const layout = initLayout(await createTempDir(t))
   const sessions = new TarSessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
   await sessions.init()
@@ -986,6 +989,44 @@ test('a directory commit publishes by rename and persists a version 3 record', a
     (await harness.commits.list()).map((value) => value.name),
     ['0.18.1']
   )
+})
+
+test('directory publication fails closed when descriptor chmod is unavailable', async (t) => {
+  const base = createStorage()
+  const storage: StorageAdapter = {
+    ...base,
+    async open(target, flags, mode) {
+      const handle = await base.open(target, flags, mode)
+      const { chmod: _chmod, ...withoutChmod } = handle
+      return withoutChmod
+    }
+  }
+  const harness = await createHarness(t, storage)
+  const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+
+  await t.exception(() => harness.commits.commit(session), { code: ERRORS.UNSUPPORTED_STORAGE })
+  t.is(await exists(path.join(harness.layout.root, session.name)), false)
+})
+
+test('directory publication maps descriptor chmod failures to COMMIT_FAILED', async (t) => {
+  const base = createStorage()
+  const storage: StorageAdapter = {
+    ...base,
+    async open(target, flags, mode) {
+      const handle = await base.open(target, flags, mode)
+      return {
+        ...handle,
+        chmod: () => {
+          throw Object.assign(new Error('injected chmod failure'), { code: 'EIO' })
+        }
+      }
+    }
+  }
+  const harness = await createHarness(t, storage)
+  const session = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
+
+  await t.exception(() => harness.commits.commit(session), { code: ERRORS.COMMIT_FAILED })
+  t.is(await exists(path.join(harness.layout.root, session.name)), false)
 })
 
 test('a directory artifact is create-only and never changes kind', async (t) => {

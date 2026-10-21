@@ -40,7 +40,9 @@ export interface StorageFileHandle {
   stat(): Promise<StorageStats>
   /**
    * Optional because storage adapters that never publish payloads do not need
-   * mode changes. Publication fails closed when this capability is absent.
+   * mode changes. When provided, this must change the already-open file
+   * descriptor (`fchmod` semantics), never re-resolve the path. Publication
+   * fails closed when this capability is absent.
    */
   chmod?(mode: number): Promise<void>
   write(

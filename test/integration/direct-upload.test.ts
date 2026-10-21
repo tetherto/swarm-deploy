@@ -35,10 +35,7 @@ function restrictiveStorage(modeCapable = true): StorageAdapter {
         const { chmod: _chmod, ...withoutModeCapability } = handle
         return withoutModeCapability
       }
-      return {
-        ...handle,
-        chmod: (publicationMode: number) => fs.promises.chmod(target, publicationMode)
-      }
+      return handle
     }
   }
 }
