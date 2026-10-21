@@ -37,7 +37,7 @@ import {
   type TreeDigestEntry,
   type TreeEntry
 } from '../tar-protocol/tree.js'
-import { openSafeRegularFile, protectedDirectories } from './layout.js'
+import { openSafeRegularFile, protectedDirectories, safeFileOpenFlags } from './layout.js'
 import type {
   StorageAdapter,
   StorageFileHandle,
@@ -48,6 +48,8 @@ import type {
 
 const READ_BYTES = 64 * 1024
 const INTERNAL_NAME = '.swarm-deploy'
+const PUBLISHED_DIRECTORY_MODE = 0o755
+const PUBLISHED_FILE_MODE = 0o644
 
 export type TreePathState = 'MISSING' | 'DIRECTORY' | 'UNMANAGED'
 
@@ -85,6 +87,15 @@ interface WalkedEntry extends TreeEntry {
 interface WalkResult {
   root: Anchor
   entries: WalkedEntry[]
+}
+
+export interface TreeIdentitySnapshot {
+  root: TreeIdentityStamp
+  entries: ReadonlyArray<{
+    kind: TreeEntry['kind']
+    path: string
+    identity: TreeIdentityStamp
+  }>
 }
 
 function treeError(code: ErrorCode, message: string, cause: unknown = null): SwarmDeployError {
@@ -383,6 +394,169 @@ export async function syncTreeDirectories(
   }
 }
 
+function matchesTreeIdentity(actual: StorageStats, expected: TreeIdentityStamp | Anchor): boolean {
+  return actual.dev === expected.dev && actual.ino === expected.ino
+}
+
+function modeCapable(handle: StorageFileHandle): handle is StorageFileHandle & {
+  chmod(mode: number): Promise<void>
+} {
+  return typeof handle.chmod === 'function'
+}
+
+/**
+ * Changes a member's mode through an O_NOFOLLOW descriptor while every
+ * containing directory identity remains pinned. The descriptor is synchronized
+ * before it closes so its mode reaches durable storage before publication.
+ */
+async function normalizeTreeMemberMode(
+  target: string,
+  expected: TreeIdentityStamp | Anchor,
+  kind: 'file' | 'directory',
+  anchors: readonly Anchor[],
+  mode: number,
+  storage: StorageAdapter
+): Promise<void> {
+  await verifyAnchors(anchors, storage, ERRORS.PROTOCOL_INVALID)
+  let handle: StorageFileHandle | null = null
+  let operationError: unknown = null
+  try {
+    handle = await storage.open(target, safeFileOpenFlags('read'))
+    const before = await handle.stat()
+    if (
+      before.isSymbolicLink() ||
+      (kind === 'file' ? !before.isFile() : !before.isDirectory()) ||
+      !matchesTreeIdentity(before, expected)
+    ) {
+      throw treeError(ERRORS.FILE_BUSY, 'Tree member changed before publication')
+    }
+    if (kind === 'file' && typeof before.nlink === 'number' && before.nlink > 1) {
+      throw treeError(ERRORS.INVALID_FILENAME, 'Tree entries cannot be hard links')
+    }
+    if (!modeCapable(handle)) {
+      throw treeError(
+        ERRORS.UNSUPPORTED_STORAGE,
+        'Storage adapter cannot normalize published artifact modes'
+      )
+    }
+    try {
+      await handle.chmod(mode)
+    } catch (error: unknown) {
+      throw treeError(
+        ERRORS.COMMIT_FAILED,
+        'Storage adapter cannot normalize published artifact modes',
+        error
+      )
+    }
+    const after = await handle.stat()
+    if (
+      after.isSymbolicLink() ||
+      (kind === 'file' ? !after.isFile() : !after.isDirectory()) ||
+      !matchesTreeIdentity(after, expected)
+    ) {
+      throw treeError(ERRORS.FILE_BUSY, 'Tree member changed during publication')
+    }
+    await handle.sync()
+  } catch (error: unknown) {
+    operationError = error
+    throw coded(error, ERRORS.COMMIT_FAILED, 'Unable to normalize published tree mode')
+  } finally {
+    if (handle) {
+      if (operationError !== null) {
+        await handle.close().catch(() => {})
+      } else {
+        try {
+          await handle.close()
+        } catch (error: unknown) {
+          throw treeError(ERRORS.COMMIT_FAILED, 'Unable to close published tree member', error)
+        }
+      }
+    }
+  }
+  await verifyAnchors(anchors, storage, ERRORS.PROTOCOL_INVALID)
+}
+
+/**
+ * Applies canonical public modes to a verified, still-private tree. It only
+ * addresses members found by an identity-pinned walk and opens each through
+ * O_NOFOLLOW, so a symlink swap cannot redirect a mode change outside it.
+ */
+export async function normalizeTreePublicationModes(
+  treePath: string,
+  storage: StorageAdapter
+): Promise<TreeIdentitySnapshot> {
+  const { root, entries } = await walkIdentities(treePath, storage)
+  const expected = snapshotTreeIdentities({ root, entries })
+  const directories = new Map<string, Anchor>([['', root]])
+  for (const entry of entries) {
+    if (entry.kind === 'directory') {
+      directories.set(entry.path, {
+        path: path.join(root.path, ...entry.path.split('/')),
+        dev: entry.identity.dev,
+        ino: entry.identity.ino
+      })
+    }
+  }
+
+  const directoryAnchors = (entryPath: string): Anchor[] => {
+    const components = entryPath === '' ? [] : entryPath.split('/')
+    return Array.from({ length: components.length + 1 }, (_, depth) => {
+      const anchor = directories.get(components.slice(0, depth).join('/'))
+      if (!anchor) {
+        throw treeError(ERRORS.PROTOCOL_INVALID, 'Tree directory changed before publication')
+      }
+      return anchor
+    })
+  }
+  const fileAnchors = (entryPath: string): Anchor[] => {
+    const components = entryPath.split('/')
+    return Array.from({ length: components.length }, (_, depth) => {
+      const anchor = directories.get(components.slice(0, depth).join('/'))
+      if (!anchor) {
+        throw treeError(ERRORS.PROTOCOL_INVALID, 'Tree directory changed before publication')
+      }
+      return anchor
+    })
+  }
+
+  await normalizeTreeMemberMode(
+    root.path,
+    root,
+    'directory',
+    directoryAnchors(''),
+    PUBLISHED_DIRECTORY_MODE,
+    storage
+  )
+  for (const entry of entries) {
+    if (entry.kind !== 'directory') continue
+    await normalizeTreeMemberMode(
+      path.join(root.path, ...entry.path.split('/')),
+      entry.identity,
+      'directory',
+      directoryAnchors(entry.path),
+      PUBLISHED_DIRECTORY_MODE,
+      storage
+    )
+  }
+  for (const entry of entries) {
+    if (entry.kind !== 'file') continue
+    await normalizeTreeMemberMode(
+      path.join(root.path, ...entry.path.split('/')),
+      entry.identity,
+      'file',
+      fileAnchors(entry.path),
+      PUBLISHED_FILE_MODE,
+      storage
+    )
+  }
+  await syncTreeDirectories(treePath, storage)
+  const normalized = await walkIdentities(treePath, storage)
+  if (!matchesIdentitySnapshot(normalized, expected)) {
+    throw treeError(ERRORS.FILE_BUSY, 'Tree changed during publication mode normalization')
+  }
+  return snapshotTreeIdentities(normalized)
+}
+
 // ---------------------------------------------------------------------------
 // Walking and digesting
 // ---------------------------------------------------------------------------
@@ -440,6 +614,38 @@ async function walkIdentities(treePath: string, storage: StorageAdapter): Promis
   entries.sort((left, right) => compareTreePaths(left.path, right.path))
   assertCanonicalTreeEntries(entries)
   return { root, entries }
+}
+
+function snapshotTreeIdentities(result: WalkResult): TreeIdentitySnapshot {
+  return {
+    root: {
+      dev: result.root.dev,
+      ino: result.root.ino,
+      size: 0
+    },
+    entries: result.entries.map(({ kind, path: entryPath, identity }) => ({
+      kind,
+      path: entryPath,
+      identity: { ...identity }
+    }))
+  }
+}
+
+function matchesIdentitySnapshot(result: WalkResult, expected: TreeIdentitySnapshot): boolean {
+  return (
+    result.root.dev === expected.root.dev &&
+    result.root.ino === expected.root.ino &&
+    result.entries.length === expected.entries.length &&
+    result.entries.every((entry, index) => {
+      const prior = expected.entries[index]
+      return (
+        prior !== undefined &&
+        entry.kind === prior.kind &&
+        entry.path === prior.path &&
+        sameStamp(entry.identity, prior.identity)
+      )
+    })
+  )
 }
 
 export async function walkTree(treePath: string, storage: StorageAdapter): Promise<TreeEntry[]> {
@@ -526,9 +732,13 @@ async function digestTreeFile(
  */
 export async function digestTree(
   treePath: string,
-  storage: StorageAdapter
+  storage: StorageAdapter,
+  expectedIdentities?: TreeIdentitySnapshot
 ): Promise<TreeDigestResult> {
   const first = await walkIdentities(treePath, storage)
+  if (expectedIdentities && !matchesIdentitySnapshot(first, expectedIdentities)) {
+    throw busy('Tree changed before digest')
+  }
   const directories = new Map<string, Anchor>([['', first.root]])
   for (const entry of first.entries) {
     if (entry.kind === 'directory') {

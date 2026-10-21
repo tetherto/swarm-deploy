@@ -12,6 +12,7 @@ import {
   createTreeSubdirectory,
   digestTree,
   inspectTreePath,
+  normalizeTreePublicationModes,
   openTreeFile,
   removeTree,
   syncTreeDirectories,
@@ -23,7 +24,7 @@ import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createTempDir } from '../helpers/files.js'
 import { createMemoryStorage } from '../helpers/memory-storage.js'
 import { createStorage, type StorageOperationHook, type TestStorage } from '../helpers/storage.js'
-import type { StorageStats } from '../../dist/storage/types.js'
+import type { StorageAdapter, StorageStats } from '../../dist/storage/types.js'
 import { writeTree } from '../helpers/trees.js'
 
 test('the layout creates and protects the private links and trash directories', async (t) => {
@@ -514,4 +515,123 @@ test('removal returns true only when the original tree path is gone and the pare
   })
   const error = await rejection(() => removeTree(again, layout.trash, storage))
   t.is(error.code, ERRORS.CLEANUP_FAILED)
+})
+
+test('publication mode normalization rejects a member swap before descriptor chmod', async (t) => {
+  const root = await createTempDir(t)
+  const member = path.join(root, 'member.bin')
+  const planted = `${member}.planted`
+  await writeTree(root, { 'member.bin': 'verified' })
+  await fs.promises.chmod(member, 0o600)
+  let swapped = false
+  const storage = createStorage({
+    beforeOperation: async (name, target) => {
+      if (!swapped && name === 'open' && target === member) {
+        swapped = true
+        await fs.promises.rename(member, `${member}.verified`)
+        await fs.promises.writeFile(member, 'planted', { mode: 0o600 })
+        await fs.promises.rename(member, planted)
+        await fs.promises.rename(planted, member)
+      }
+    }
+  })
+
+  await t.exception(() => normalizeTreePublicationModes(root, storage), { code: ERRORS.FILE_BUSY })
+  t.ok(swapped)
+  t.is((await fs.promises.lstat(member)).mode & 0o777, 0o600)
+})
+
+test('publication mode normalization rejects a same-content member swap after descriptor chmod', async (t) => {
+  const root = await createTempDir(t)
+  const outside = await createTempDir(t)
+  const member = path.join(root, 'member.bin')
+  await writeTree(root, { 'member.bin': 'verified' })
+  await fs.promises.chmod(member, 0o600)
+  let swapped = false
+  const storage = createStorage({
+    afterOperation: async (name, target) => {
+      if (!swapped && name === 'chmod' && target === member) {
+        swapped = true
+        await fs.promises.rename(member, path.join(outside, 'verified.bin'))
+        await fs.promises.writeFile(member, 'verified', { mode: 0o600 })
+      }
+    }
+  })
+
+  await t.exception(() => normalizeTreePublicationModes(root, storage), { code: ERRORS.FILE_BUSY })
+  t.ok(swapped)
+  t.is((await fs.promises.lstat(member)).mode & 0o777, 0o600)
+})
+
+test('directory publication mode normalization preserves UNSUPPORTED_STORAGE when close also fails', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const tree = path.join(layout.staging, 'release.tree')
+  await writeTree(tree, { 'a.bin': 'payload' })
+  const base = createStorage()
+  const storage: StorageAdapter = {
+    ...base,
+    async open(target, flags, mode) {
+      const handle = await base.open(target, flags, mode)
+      const { chmod: _chmod, ...withoutChmod } = handle
+      return {
+        ...withoutChmod,
+        close: async () => {
+          await handle.close()
+          throw failure('ECLOSE')
+        }
+      }
+    }
+  }
+
+  await t.exception(() => normalizeTreePublicationModes(tree, storage), {
+    code: ERRORS.UNSUPPORTED_STORAGE
+  })
+  await t.exception(() => fs.promises.lstat(path.join(layout.root, 'release')), { code: 'ENOENT' })
+})
+
+test('directory publication mode normalization rejects descriptor chmod failures without publishing', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const tree = path.join(layout.staging, 'release.tree')
+  await writeTree(tree, { 'a.bin': 'payload' })
+  const base = createStorage()
+  const storage: StorageAdapter = {
+    ...base,
+    async open(target, flags, mode) {
+      const handle = await base.open(target, flags, mode)
+      return {
+        ...handle,
+        chmod: () => {
+          throw failure('EIO')
+        }
+      }
+    }
+  }
+
+  await t.exception(() => normalizeTreePublicationModes(tree, storage), {
+    code: ERRORS.COMMIT_FAILED
+  })
+  await t.exception(() => fs.promises.lstat(path.join(layout.root, 'release')), { code: 'ENOENT' })
+})
+
+test('publication mode normalization refuses a hard-linked regular file before chmod', async (t) => {
+  const root = await createTempDir(t)
+  const outside = await createTempDir(t)
+  const member = path.join(root, 'member.bin')
+  await writeTree(root, { 'member.bin': 'payload' })
+  await fs.promises.chmod(member, 0o600)
+  let linked = false
+  const storage = createStorage({
+    beforeOperation: async (name, target) => {
+      if (!linked && name === 'open' && target === member) {
+        linked = true
+        await fs.promises.link(member, path.join(outside, 'alias.bin'))
+      }
+    }
+  })
+
+  await t.exception(() => normalizeTreePublicationModes(root, storage), {
+    code: ERRORS.INVALID_FILENAME
+  })
+  t.ok(linked)
+  t.is((await fs.promises.lstat(member)).mode & 0o777, 0o600)
 })
