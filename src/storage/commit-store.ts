@@ -54,7 +54,13 @@ import type {
   ReplacementJournal,
   ReplacementPhase
 } from './commit-journal.js'
-import { digestTree, inspectTreePath, removeTree, type TreePathState } from './tree-fs.js'
+import {
+  digestTree,
+  inspectTreePath,
+  normalizeTreePublicationModes,
+  removeTree,
+  type TreePathState
+} from './tree-fs.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
 
 interface AbortSignalLike {
@@ -722,6 +728,49 @@ class CommitStore {
     )
   }
 
+  /**
+   * Makes a verified staging inode public through its O_NOFOLLOW descriptor,
+   * while the staging directory identity is pinned. This runs before linking
+   * the inode into the visible artifact root.
+   */
+  async _normalizeFilePublicationMode(
+    stagingPath: string,
+    expectedIdentity: FileIdentity
+  ): Promise<void> {
+    await withSafeDirectoryIdentity(this.layout.staging, this.storage, async () => {
+      let handle: StorageFileHandle | null = null
+      try {
+        handle = await openSafeRegularFile(stagingPath, 'read', this.storage)
+        const before = await handle.stat()
+        if (!identitiesEqual(fileIdentity(before), expectedIdentity)) {
+          throw storageError('Staging file changed before publication')
+        }
+        if (typeof handle.chmod !== 'function') {
+          throw new SwarmDeployError(
+            ERRORS.UNSUPPORTED_STORAGE,
+            'Storage adapter cannot normalize published artifact modes'
+          )
+        }
+        try {
+          await handle.chmod(0o644)
+        } catch (error: unknown) {
+          throw new SwarmDeployError(
+            ERRORS.UNSUPPORTED_STORAGE,
+            'Storage adapter cannot normalize published artifact modes',
+            error
+          )
+        }
+        const after = await handle.stat()
+        if (!identitiesEqual(fileIdentity(after), expectedIdentity)) {
+          throw storageError('Staging file changed during publication')
+        }
+        await handle.sync()
+      } finally {
+        if (handle) await handle.close()
+      }
+    })
+  }
+
   async _removeAbortedPublication(
     record: CommitRecord,
     expectedIdentity: FileIdentity
@@ -1087,7 +1136,15 @@ class CommitStore {
     const stagingPath = this._stagingPath(record.transferId)
     const finalPath = this._finalPath(record.name)
 
-    const stagingDigest = await digestExactFile(stagingPath, record.size, this.storage, true)
+    let stagingDigest = await digestExactFile(stagingPath, record.size, this.storage, true)
+    if (
+      stagingDigest === null ||
+      !digestMatches(stagingDigest.digest, b4a.from(record.sha256, 'hex'))
+    ) {
+      throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Staging file checksum mismatch')
+    }
+    await this._normalizeFilePublicationMode(stagingPath, stagingDigest.identity)
+    stagingDigest = await digestExactFile(stagingPath, record.size, this.storage, true)
     if (
       stagingDigest === null ||
       !digestMatches(stagingDigest.digest, b4a.from(record.sha256, 'hex'))
@@ -1205,6 +1262,15 @@ class CommitStore {
       digested.entryCount !== record.entryCount ||
       digested.payloadBytes !== record.size ||
       !digestMatches(digested.treeSha256, b4a.from(record.sha256, 'hex'))
+    ) {
+      throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Staging tree checksum mismatch')
+    }
+    await normalizeTreePublicationModes(treePath, this.storage)
+    const normalized = await digestTree(treePath, this.storage)
+    if (
+      normalized.entryCount !== record.entryCount ||
+      normalized.payloadBytes !== record.size ||
+      !digestMatches(normalized.treeSha256, b4a.from(record.sha256, 'hex'))
     ) {
       throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Staging tree checksum mismatch')
     }

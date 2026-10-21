@@ -2,6 +2,14 @@
 
 All notable changes to this package are documented here.
 
+## Unreleased
+
+- Normalize verified published artifact permissions before they become visible:
+  directory roots and members are `0755`, and regular files (including
+  single-file artifacts) are `0644`, independent of restrictive staging modes
+  or the server process umask. Storage adapters without descriptor mode support
+  now fail closed before publication.
+
 ## 0.3.0
 
 - Add authenticated client-managed symlinks: one-argument

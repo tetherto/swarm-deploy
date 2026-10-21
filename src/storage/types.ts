@@ -38,6 +38,11 @@ export interface StorageStatFs {
 
 export interface StorageFileHandle {
   stat(): Promise<StorageStats>
+  /**
+   * Optional because storage adapters that never publish payloads do not need
+   * mode changes. Publication fails closed when this capability is absent.
+   */
+  chmod?(mode: number): Promise<void>
   write(
     bytes: Uint8Array,
     offset: number,

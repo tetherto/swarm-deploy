@@ -13,9 +13,39 @@ import {
   regenerateTarSuffix
 } from '../../dist/tar-protocol/manifest.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
+import type { StorageAdapter } from '../../dist/storage/types.js'
 import { createTempDir } from '../helpers/files.js'
 import { createStorage } from '../helpers/storage.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
+
+function restrictiveStorage(modeCapable = true): StorageAdapter {
+  const storage = createStorage()
+  return {
+    ...storage,
+    mkdir(target, options) {
+      return storage.mkdir(target, { ...options, mode: 0o700 })
+    },
+    async open(target, flags, mode) {
+      const creates =
+        typeof flags === 'string'
+          ? flags.includes('w') || flags.includes('x')
+          : (flags & (fs.constants.O_CREAT ?? 0o100)) !== 0
+      const handle = await storage.open(target, flags, creates ? 0o600 : mode)
+      if (!modeCapable) {
+        const { chmod: _chmod, ...withoutModeCapability } = handle
+        return withoutModeCapability
+      }
+      return {
+        ...handle,
+        chmod: (publicationMode: number) => fs.promises.chmod(target, publicationMode)
+      }
+    }
+  }
+}
+
+function mode(stat: { mode: number }): number {
+  return stat.mode & 0o777
+}
 
 test('direct server-key upload commits only after an explicit final result', async (t) => {
   const testnet = await createLocalTestnet(t)
@@ -441,4 +471,91 @@ test('a client promotes a committed directory through an authenticated manual li
   })
   t.is(await fs.promises.readlink(path.join(storage, 'current')), 'release-1')
   t.is((await client.link('release-1', 'current')).status, 'UNCHANGED')
+})
+
+test('publication normalizes restrictive staging modes for files and directory artifacts', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 131)
+  const clientSeed = b4a.alloc(32, 132)
+  const storage = await createTempDir(t)
+  const sourceRoot = await createTempDir(t)
+  const directory = path.join(sourceRoot, 'release')
+  const file = path.join(sourceRoot, 'artifact.txt')
+  await fs.promises.mkdir(path.join(directory, 'nested'), { recursive: true })
+  await fs.promises.writeFile(path.join(directory, 'root.txt'), 'root payload')
+  await fs.promises.writeFile(path.join(directory, 'nested', 'child.txt'), 'nested payload')
+  await fs.promises.writeFile(file, 'single payload')
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: storage,
+    storage: restrictiveStorage(),
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 16 * 1024,
+    minFreeBytes: 0,
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  t.is((await client.upload(directory)).status, 'COMMITTED')
+  t.is((await client.upload(file)).status, 'COMMITTED')
+
+  for (const target of [path.join(storage, 'release'), path.join(storage, 'release', 'nested')]) {
+    t.is(mode(await fs.promises.lstat(target)), 0o755, `${target} is publicly traversable`)
+  }
+  for (const target of [
+    path.join(storage, 'release', 'root.txt'),
+    path.join(storage, 'release', 'nested', 'child.txt'),
+    path.join(storage, 'artifact.txt')
+  ]) {
+    t.is(mode(await fs.promises.lstat(target)), 0o644, `${target} is publicly readable`)
+  }
+})
+
+test('a storage adapter without publication mode support fails closed only when publishing', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 141)
+  const clientSeed = b4a.alloc(32, 142)
+  const storage = await createTempDir(t)
+  const input = path.join(await createTempDir(t), 'artifact.txt')
+  await fs.promises.writeFile(input, 'payload')
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: storage,
+    storage: restrictiveStorage(false),
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  const commitFailures: string[] = []
+  server.on('commit', (event) => {
+    if (event.status === 'failed' && event.reason) commitFailures.push(event.reason)
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+
+  await server.listen()
+  await t.exception(client.upload(input))
+  t.alike(commitFailures, [ERRORS.UNSUPPORTED_STORAGE])
+  await t.exception(() => fs.promises.lstat(path.join(storage, 'artifact.txt')), { code: 'ENOENT' })
 })

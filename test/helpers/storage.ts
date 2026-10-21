@@ -27,6 +27,7 @@ export type StorageOperationName =
   | 'close'
   | 'read'
   | 'stat'
+  | 'chmod'
   | 'truncate'
   | 'write'
   | 'sync'
@@ -53,6 +54,7 @@ export interface CreateStorageOptions {
 
 export interface TestStorageFileHandle extends StorageFileHandle {
   fd: number
+  chmod(mode: number): Promise<void>
   truncate(length?: number): Promise<void>
 }
 
@@ -178,6 +180,12 @@ export function createStorage({
           await beforeOperation('stat', filePath)
           const result = await handle.stat()
           await afterOperation('stat', filePath)
+          return result
+        },
+        chmod: async (mode: number): Promise<void> => {
+          await beforeOperation('chmod', filePath, mode)
+          const result = await handle.chmod(mode)
+          await afterOperation('chmod', filePath, mode)
           return result
         },
         truncate: async (length?: number): Promise<void> => {
