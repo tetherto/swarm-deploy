@@ -2,7 +2,7 @@
 
 All notable changes to this package are documented here.
 
-## Unreleased
+## 0.3.1
 
 - Normalize verified published artifact permissions before they become visible:
   directory roots and members are `0755`, and regular files (including
