@@ -486,6 +486,7 @@ export async function normalizeTreePublicationModes(
   storage: StorageAdapter
 ): Promise<TreeIdentitySnapshot> {
   const { root, entries } = await walkIdentities(treePath, storage)
+  const expected = snapshotTreeIdentities({ root, entries })
   const directories = new Map<string, Anchor>([['', root]])
   for (const entry of entries) {
     if (entry.kind === 'directory') {
@@ -549,7 +550,11 @@ export async function normalizeTreePublicationModes(
     )
   }
   await syncTreeDirectories(treePath, storage)
-  return snapshotTreeIdentities(await walkIdentities(treePath, storage))
+  const normalized = await walkIdentities(treePath, storage)
+  if (!matchesIdentitySnapshot(normalized, expected)) {
+    throw treeError(ERRORS.FILE_BUSY, 'Tree changed during publication mode normalization')
+  }
+  return snapshotTreeIdentities(normalized)
 }
 
 // ---------------------------------------------------------------------------

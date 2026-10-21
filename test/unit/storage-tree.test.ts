@@ -541,6 +541,28 @@ test('publication mode normalization rejects a member swap before descriptor chm
   t.is((await fs.promises.lstat(member)).mode & 0o777, 0o600)
 })
 
+test('publication mode normalization rejects a same-content member swap after descriptor chmod', async (t) => {
+  const root = await createTempDir(t)
+  const outside = await createTempDir(t)
+  const member = path.join(root, 'member.bin')
+  await writeTree(root, { 'member.bin': 'verified' })
+  await fs.promises.chmod(member, 0o600)
+  let swapped = false
+  const storage = createStorage({
+    afterOperation: async (name, target) => {
+      if (!swapped && name === 'chmod' && target === member) {
+        swapped = true
+        await fs.promises.rename(member, path.join(outside, 'verified.bin'))
+        await fs.promises.writeFile(member, 'verified', { mode: 0o600 })
+      }
+    }
+  })
+
+  await t.exception(() => normalizeTreePublicationModes(root, storage), { code: ERRORS.FILE_BUSY })
+  t.ok(swapped)
+  t.is((await fs.promises.lstat(member)).mode & 0o777, 0o600)
+})
+
 test('directory publication mode normalization preserves UNSUPPORTED_STORAGE when close also fails', async (t) => {
   const layout = initLayout(await createTempDir(t))
   const tree = path.join(layout.staging, 'release.tree')
