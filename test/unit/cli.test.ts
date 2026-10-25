@@ -269,6 +269,38 @@ test('CLI prints stable link failures without raw server messages', async (t) =>
   t.absent(stderr.text().includes(secret))
 })
 
+test('CLI prints a failed link hook as HOOK_FAILED without raw server messages', async (t) => {
+  const secret = 'publisher token sk-secret'
+  class Client {
+    constructor(_options: ClientOptions) {}
+    link() {
+      return Promise.reject(new SwarmDeployError(ERRORS.HOOK_FAILED, secret))
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  const stderr = output()
+  t.is(
+    await main(
+      ['link', '--server-key', b4a.toString(SERVER_KEY, 'hex'), 'release-1.2.3', 'current'],
+      { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+      {
+        Client: Client as unknown as new (
+          options: ClientOptions
+        ) => import('../../dist/client.js').Client,
+        stdout: stdout.stream,
+        stderr: stderr.stream
+      }
+    ),
+    1
+  )
+  t.is(stdout.text(), '')
+  t.is(stderr.text(), `${ERRORS.HOOK_FAILED}\n`)
+  t.absent(stderr.text().includes(secret))
+})
+
 test('CLI rejects unsafe link arguments as configuration errors', async (t) => {
   const stderr = output()
   const clientSeed = b4a.toString(CLIENT_SEED, 'hex')
@@ -1019,6 +1051,31 @@ test('CLI resolves a relative --hooks path against the current working directory
   t.alike(Object.keys(result.options?.hooks || {}), ['afterCommit'])
 })
 
+test('CLI loads an afterLink-only hooks module from ESM named, ESM default, and CommonJS', async (t) => {
+  const root = await createTempDir(t)
+  const record = (name: string) => `globalThis.${HOOK_LOG}.push('${name}')`
+  const modules: [string, string, string][] = [
+    ['link.mjs', `export async function afterLink () { ${record('mjs:link')} }\n`, 'mjs:link'],
+    [
+      'link-default.mjs',
+      `export default { afterLink: async () => { ${record('default:link')} } }\n`,
+      'default:link'
+    ],
+    ['link.cjs', `module.exports = { afterLink () { ${record('cjs:link')} } }\n`, 'cjs:link']
+  ]
+  for (const [file, source, expected] of modules) {
+    await fs.promises.writeFile(path.join(root, file), source)
+    const log = hookLog()
+    const result = await runServerCli(root, ['--hooks', file], { cwd: root })
+    t.is(result.code, 0, file)
+    const hooks = result.options?.hooks
+    t.alike(Object.keys(hooks || {}), ['afterLink'], `${file} hook names`)
+    t.ok(Object.isFrozen(hooks), `${file} snapshot is frozen`)
+    await hooks?.afterLink?.({} as never)
+    t.alike(log, [expected], `${file} callback`)
+  }
+})
+
 test('CLI rejects unusable hook modules as startup configuration errors', async (t) => {
   const root = await createTempDir(t)
   const secret = 'hook-module-secret-text'
@@ -1036,6 +1093,9 @@ test('CLI rejects unusable hook modules as startup configuration errors', async 
     'throws-code-getter.mjs': `throw { get code () { throw new Error('${secret}') } }\n`,
     'not-function.cjs': `module.exports = { beforeCommit: '${secret}' }\n`,
     'not-function.mjs': `export default { afterCommit: 42 }\n`,
+    'link-not-function.cjs': `module.exports = { afterLink: '${secret}', onFailure () {} }\n`,
+    'link-not-function.mjs': `export const afterLink = '${secret}'\nexport default { afterLink () {} }\n`,
+    'link-typo-only.cjs': `module.exports = { afterLinks () {}, helper: 1 }\n`,
     'primitive.cjs': `module.exports = '${secret}'\n`,
     'null.cjs': 'module.exports = null\n',
     'array.cjs': `module.exports = [() => {}]\n`,

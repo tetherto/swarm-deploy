@@ -745,7 +745,8 @@ function linkErrorMessage(err: unknown): string {
     (err.code === ERRORS.LINK_NOT_ALLOWED ||
       err.code === ERRORS.LINK_TARGET_NOT_FOUND ||
       err.code === ERRORS.LINK_CONFLICT ||
-      err.code === ERRORS.LINK_FAILED)
+      err.code === ERRORS.LINK_FAILED ||
+      err.code === ERRORS.HOOK_FAILED)
   ) {
     return err.code
   }

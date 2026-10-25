@@ -6,6 +6,7 @@ import {
   parseAllowlist,
   parsePublicKey,
   type AfterCommitContext,
+  type AfterLinkContext,
   type ArtifactKind,
   type BeforeCommitContext,
   type ClientLinkEvent,
@@ -16,6 +17,10 @@ import {
   type HookArtifact,
   type HookFailureContext,
   type HookFailurePhase,
+  type HookLink,
+  type HookLinkMode,
+  type HookLinkStatus,
+  type HookLinkTrigger,
   type RetentionEvent,
   type ReleaseCoordinates,
   type ServerHooks,
@@ -81,7 +86,16 @@ const rejectedServerLinkEvent: ServerLinkEvent = {
   reason: 'LINK_TARGET_NOT_FOUND'
 }
 const mappedServerLinkEvent: ServerEventMap['link'] = serverLinkEvent
-void [rejectedServerLinkEvent, mappedServerLinkEvent]
+const failedHookServerLinkEvent: ServerLinkEvent = {
+  fingerprint: '0123456789ab',
+  target: 'release-1.2.3',
+  name: 'current',
+  status: 'failed',
+  reason: 'HOOK_FAILED',
+  result: 'LINKED'
+}
+const hookResult: 'LINKED' | 'UNCHANGED' | undefined = failedHookServerLinkEvent.result
+void [rejectedServerLinkEvent, mappedServerLinkEvent, hookResult]
 
 function readArtifact(artifact: HookArtifact): void {
   const name: string = artifact.name
@@ -95,6 +109,15 @@ function readArtifact(artifact: HookArtifact): void {
   const series: string | undefined = release?.series
   const version: string | undefined = release?.version
   void [name, kind, size, sha256, transferId, entryCount, sourceParent, release, series, version]
+}
+
+function readLink(link: HookLink): void {
+  const name: string = link.name
+  const target: string = link.target
+  const mode: HookLinkMode = link.mode
+  const path: string = link.path
+  const targetPath: string = link.targetPath
+  void [name, target, mode, path, targetPath]
 }
 
 const kinds: ArtifactKind[] = ['file', 'directory']
@@ -156,6 +179,14 @@ const hooks = {
     const already: boolean = context.alreadyCommitted
     void [path, resumed, already]
   },
+  afterLink(context: AfterLinkContext) {
+    readArtifact(context.artifact)
+    readLink(context.link)
+    const status: HookLinkStatus = context.status
+    const trigger: HookLinkTrigger = context.trigger
+    void [status, trigger]
+    return Promise.resolve()
+  },
   onFailure(context: HookFailureContext) {
     readArtifact(context.artifact)
     const phase: HookFailurePhase = context.phase
@@ -163,7 +194,8 @@ const hooks = {
     const resumed: boolean = context.resumed
     const already: boolean = context.alreadyCommitted
     const error: unknown = context.error
-    void [phase, path, resumed, already, error]
+    const link: HookLink | undefined = context.link
+    void [phase, path, resumed, already, error, link]
     return Promise.resolve()
   }
 } satisfies ServerHooks
@@ -201,7 +233,8 @@ const phases: HookFailurePhase[] = [
   'verification',
   'beforeCommit',
   'commit',
-  'afterCommit'
+  'afterCommit',
+  'afterLink'
 ]
 
 void client
@@ -283,12 +316,29 @@ const badHookSignatures = {
   afterCommit(context: HookFailureContext) {
     void context
   },
+  // @ts-expect-error afterLink must not require an incompatible context.
+  afterLink(context: HookFailureContext) {
+    void context
+  },
   // @ts-expect-error onFailure must return void or a promise of void.
   onFailure(context: HookFailureContext) {
     return context.phase
   }
 } satisfies ServerHooks
 void badHookSignatures
+// @ts-expect-error Link hook statuses are a closed set.
+const badLinkStatus: HookLinkStatus = 'CREATED'
+// @ts-expect-error Link hook triggers are a closed set.
+const badLinkTrigger: HookLinkTrigger = 'retention'
+// @ts-expect-error Link hook modes are a closed set.
+const badLinkMode: HookLinkMode = 'unmanaged'
+void [badLinkStatus, badLinkTrigger, badLinkMode]
+// @ts-expect-error Link hook contexts never expose key material.
+const linkSeed = ({} as AfterLinkContext).seed
+void linkSeed
+// @ts-expect-error The durable link outcome is LINKED or UNCHANGED.
+const badLinkResult: ServerLinkEvent['result'] = 'FAILED'
+void badLinkResult
 // @ts-expect-error Hook artifacts are immutable descriptions without a staging path.
 const artifactPath = ({} as HookArtifact).path
 void artifactPath

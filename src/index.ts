@@ -21,10 +21,15 @@ export {
 } from './identity.js'
 export type {
   AfterCommitContext,
+  AfterLinkContext,
   BeforeCommitContext,
   HookArtifact,
   HookFailureContext,
   HookFailurePhase,
+  HookLink,
+  HookLinkMode,
+  HookLinkStatus,
+  HookLinkTrigger,
   ServerHooks
 } from './hooks.js'
 export { fixedSeriesKey, type ReleaseCoordinates, type VersionGranularity } from './release.js'

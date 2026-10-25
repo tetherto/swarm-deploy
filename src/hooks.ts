@@ -4,7 +4,7 @@ import type { ReleaseCoordinates } from './release.js'
 import type { ArtifactKind } from './types.js'
 
 export type HookFailurePhase =
-  'offer' | 'transfer' | 'verification' | 'beforeCommit' | 'commit' | 'afterCommit'
+  'offer' | 'transfer' | 'verification' | 'beforeCommit' | 'commit' | 'afterCommit' | 'afterLink'
 
 /** Immutable, secret-free description of the artifact a hook is observing. */
 export interface HookArtifact {
@@ -36,24 +36,67 @@ export interface AfterCommitContext {
   alreadyCommitted: boolean
 }
 
+/** Who owns a managed link: a server rule, or an explicit client request. */
+export type HookLinkMode = 'automatic' | 'manual'
+
+/**
+ * `LINKED` when the link was created or repointed (or its ownership record
+ * repaired), `UNCHANGED` when it already pointed at the target.
+ */
+export type HookLinkStatus = 'LINKED' | 'UNCHANGED'
+
+/**
+ * What asked for the link: an upload (fresh or already committed) whose
+ * artifact an automatic rule selected, or an explicit link request.
+ */
+export type HookLinkTrigger = 'upload' | 'request'
+
+/** Immutable, secret-free description of the managed link a hook is observing. */
+export interface HookLink {
+  /** The link's basename in the storage root. */
+  name: string
+  /** The basename of the committed artifact the link points at. */
+  target: string
+  mode: HookLinkMode
+  /** Absolute path of the link itself, a symbolic link in the storage root. */
+  path: string
+  /** Absolute path of the committed target artifact. */
+  targetPath: string
+}
+
+export interface AfterLinkContext {
+  link: HookLink
+  /** The committed artifact the link was set to point at. */
+  artifact: HookArtifact
+  status: HookLinkStatus
+  trigger: HookLinkTrigger
+}
+
 export interface HookFailureContext {
   artifact: HookArtifact
-  /** The best known absolute path, or `null` before one exists. */
+  /**
+   * The best known absolute path, or `null` before one exists. For
+   * `afterLink` it is the path of the link.
+   */
   path: string | null
   phase: HookFailurePhase
   resumed: boolean
   alreadyCommitted: boolean
   error: unknown
+  /** Present only when `phase` is `afterLink`. */
+  link?: HookLink
 }
 
 export interface ServerHooks {
   beforeCommit?(context: BeforeCommitContext): void | Promise<void>
   afterCommit?(context: AfterCommitContext): void | Promise<void>
+  afterLink?(context: AfterLinkContext): void | Promise<void>
   onFailure?(context: HookFailureContext): void | Promise<void>
 }
 
 const WRAPPED_CALLBACK_ERRORS = new WeakMap<SwarmDeployError, unknown>()
-const HOOK_NAMES = ['beforeCommit', 'afterCommit', 'onFailure'] as const
+/** Every callback name a hooks object or hooks module may carry. */
+export const HOOK_NAMES = ['beforeCommit', 'afterCommit', 'afterLink', 'onFailure'] as const
 
 /**
  * Validates and freezes caller hooks. Each property is read exactly once and no
@@ -137,5 +180,67 @@ export async function invokeHook<Context>(
     return await Promise.race([pending.then(() => 'completed' as const), aborted])
   } finally {
     release()
+  }
+}
+
+/** One place in a key's line of hooks. */
+export interface HookTurn {
+  /**
+   * Settles `'ready'` once every earlier turn for the key has been released,
+   * or `'aborted'` when the signal aborts first.
+   */
+  ready(signal: AbortSignalLike): Promise<'ready' | 'aborted'>
+  /** Hands the key to the next turn. Safe to call any number of times. */
+  release(): void
+}
+
+/**
+ * First-in, first-out lines of hooks, one per key. Hooks for one key start in
+ * reservation order and never overlap; different keys never wait on each other.
+ *
+ * This is deliberately not a lock around the work the hooks follow: callers
+ * reserve while they hold the lease that orders the underlying decisions, so
+ * the line matches decision order, and then wait for their turn outside it.
+ * Hook code therefore never runs under a storage lease.
+ */
+export class HookTurns {
+  private readonly tails = new Map<string, Promise<void>>()
+
+  /** Keys that still have a pending turn; a drained line is dropped. */
+  get size(): number {
+    return this.tails.size
+  }
+
+  /** Queues behind every earlier turn for `key`. Synchronous, so reservation order is call order. */
+  reserve(key: string): HookTurn {
+    const previous = this.tails.get(key) ?? Promise.resolve()
+    let open = (): void => {}
+    const released = new Promise<void>((resolve) => {
+      open = resolve
+    })
+    const tail = previous.then(() => released)
+    this.tails.set(key, tail)
+    let done = false
+    return {
+      ready: async (signal) => {
+        let remove = (): void => {}
+        const aborted = new Promise<'aborted'>((resolve) => {
+          remove = onAbort(signal, () => resolve('aborted'))
+        })
+        try {
+          return await Promise.race([previous.then(() => 'ready' as const), aborted])
+        } finally {
+          remove()
+        }
+      },
+      release: () => {
+        if (done) return
+        done = true
+        open()
+        void tail.then(() => {
+          if (this.tails.get(key) === tail) this.tails.delete(key)
+        })
+      }
+    }
   }
 }

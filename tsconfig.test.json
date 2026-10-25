@@ -34,6 +34,7 @@
     "test/unit/commit-recovery.test.ts",
     "test/integration/direct-upload.test.ts",
     "test/integration/source-parent-optout.test.ts",
-    "test/integration/behavior-observability.test.ts"
+    "test/integration/behavior-observability.test.ts",
+    "test/integration/link-hooks.test.ts"
   ]
 }
