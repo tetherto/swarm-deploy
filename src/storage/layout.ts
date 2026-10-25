@@ -73,14 +73,34 @@ export async function assertSafeFile(
   return stat
 }
 
-export function initLayout(storageDir: string): StorageLayout {
+export const INTERNAL_DIRECTORY_NAME = '.swarm-deploy'
+export const RESET_PENDING_NAME = 'reset-pending.json'
+
+/** Refuse recovery against metadata only partly moved by an interrupted reset. */
+export async function assertNoPendingStorageReset(
+  layout: StorageLayout,
+  storage: StorageAdapter = fs.promises
+): Promise<void> {
+  try {
+    await storage.lstat(path.join(layout.internal, RESET_PENDING_NAME))
+  } catch (error: unknown) {
+    if (errorCode(error) === 'ENOENT') return
+    throw error
+  }
+  throw storageError(
+    'Storage reset is incomplete; finish reset-storage --apply before starting the server'
+  )
+}
+
+/** Computes every layout path without touching the filesystem. */
+export function resolveLayout(storageDir: string): StorageLayout {
   if (typeof storageDir !== 'string' || storageDir.length === 0) {
     throw storageError('Invalid storage directory')
   }
 
   const root = path.resolve(storageDir)
-  const internal = path.join(root, '.swarm-deploy')
-  const layout = {
+  const internal = path.join(root, INTERNAL_DIRECTORY_NAME)
+  return {
     root,
     internal,
     staging: path.join(internal, 'staging'),
@@ -92,6 +112,11 @@ export function initLayout(storageDir: string): StorageLayout {
     trash: path.join(internal, 'trash'),
     lock: path.join(internal, 'lock')
   }
+}
+
+export function initLayout(storageDir: string): StorageLayout {
+  const layout = resolveLayout(storageDir)
+  const { root, internal } = layout
 
   assertDirectorySync(root)
   assertDirectorySync(internal)
@@ -131,7 +156,11 @@ function currentPid(): number {
   return process.pid
 }
 
-function defaultIsProcessAlive(pid: number): boolean {
+/**
+ * Existence check only: a live PID proves nothing about which program owns
+ * it, so callers must never treat it as proof of storage-root ownership.
+ */
+export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
@@ -139,6 +168,8 @@ function defaultIsProcessAlive(pid: number): boolean {
     return errorCode(error) === 'EPERM'
   }
 }
+
+const defaultIsProcessAlive = isProcessAlive
 
 function noFollowFlag() {
   if (fs.constants?.O_NOFOLLOW !== undefined) return fs.constants.O_NOFOLLOW
@@ -339,6 +370,32 @@ async function readLockOwner(lockPath: string, storage: StorageAdapter): Promise
     throw storageError('Malformed storage lock', error)
   } finally {
     if (handle) await handle.close()
+  }
+}
+
+export type StorageLockState =
+  | { status: 'free' }
+  | { status: 'held'; pid: number; startedAt: number; token: string }
+  | { status: 'malformed' }
+  | { status: 'unsafe' }
+
+/**
+ * Reads the published lock without acquiring or retiring it. `malformed` is a
+ * lock directory whose owner record cannot be parsed; `unsafe` is a lock path
+ * that is not a plain directory. Either may hide a live owner, so reset must refuse both states.
+ */
+export async function inspectStorageLock(
+  layout: StorageLayout,
+  storage: StorageAdapter = fs.promises
+): Promise<StorageLockState> {
+  try {
+    const owner = await readLockOwner(layout.lock, storage)
+    return owner === null ? { status: 'free' } : { status: 'held', ...owner }
+  } catch (error: unknown) {
+    if (!(error instanceof SwarmDeployError)) throw error
+    if (error.message.startsWith('Unsafe storage directory')) return { status: 'unsafe' }
+    if (error.message === 'Malformed storage lock') return { status: 'malformed' }
+    throw error
   }
 }
 

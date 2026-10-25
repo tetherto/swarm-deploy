@@ -2,6 +2,32 @@
 
 All notable changes to this package are documented here.
 
+## Unreleased
+
+- Add `swarm-deploy reset-storage --storage <dir> [--apply [--wait <ms>]]`. Without `--apply` it is a read-only preview of the
+  private state under one storage root: commit records and how many have no
+  payload, sessions, journals, staging, publications, the managed-link ledger,
+  trash, lock residue, earlier archives, and the visible payloads and symlinks
+  that would remain. With `--apply` it takes the storage lock, renames those
+  directories and lock residue into
+  `.swarm-deploy/archive/reset-<timestamp>-<random>/` with a `reset.json`
+  marker, recreates them empty, and releases the lock. Nothing is copied or
+  deleted; an archive is restored by moving it back.
+- The reset never signals a process. A live lock holder makes `--apply` fail
+  closed with exit `1`; `--wait` polls until the holder releases the lock, a
+  holder whose PID is gone is retired automatically. Live and unreadable
+  locks cannot be bypassed by a PID override.
+- The report states what still blocks a true fresh start: remaining payloads
+  keep their names (`FILE_EXISTS`) and remaining symlinks lose their ownership
+  record (`LINK_CONFLICT`). `fresh start: yes` is printed only for a root with
+  nothing visible left. Unsafe roots, symlinked internal paths, filesystem
+  roots, and uninitialized roots are rejected with exit `2` before any change.
+- Block server recovery after an interrupted reset until a reset retry
+  completes, reject symlink ancestors, and refresh retained-file reporting
+  after waiting for exclusive access.
+- Export `resolveLayout`, `inspectStorageLock`, and `isProcessAlive` from the
+  storage layout module for the reset; existing lock behaviour is unchanged.
+
 ## 0.3.1
 
 - Normalize verified published artifact permissions before they become visible:

@@ -1,0 +1,767 @@
+/// <reference path="../types/brittle.d.ts" />
+/// <reference path="../types/third-party.d.ts" />
+
+import test, { type Assert } from 'brittle'
+import b4a from 'b4a'
+import fs from '#fs'
+import path from '#path'
+import process from '#process'
+import { main, USAGE } from '../../dist/cli.js'
+import { Client, ERRORS, Server, keyPairFromSeed, type SymlinkRule } from '../../dist/index.js'
+import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
+import { inspectStorageReset, resetStorage } from '../../dist/storage/reset.js'
+import type { StorageLayout } from '../../dist/storage/types.js'
+import { createTempDir } from '../helpers/files.js'
+import { createStorage, type StorageOperationName } from '../helpers/storage.js'
+import { createLocalTestnet } from '../helpers/testnet.js'
+
+type CliIo = NonNullable<Parameters<typeof main>[2]>
+
+const ID_A = 'a1'.repeat(32)
+const ID_B = 'b2'.repeat(32)
+const ID_C = 'c3'.repeat(32)
+const TOKEN = 'd4'.repeat(32)
+const MUTATIONS = new Set<StorageOperationName>([
+  'mkdir',
+  'writeFile',
+  'rename',
+  'link',
+  'symlink',
+  'unlink',
+  'rmdir',
+  'rm',
+  'write',
+  'sync',
+  'truncate',
+  'chmod'
+])
+
+function output() {
+  let text = ''
+  return {
+    stream: {
+      write(value: string) {
+        text += value
+      }
+    },
+    text: () => text
+  }
+}
+
+function commitRecord(transferId: string, name: string, size: number): string {
+  return JSON.stringify({
+    version: 1,
+    name,
+    size,
+    sha256: '00'.repeat(32),
+    committedAt: 1,
+    uploaderFingerprint: '11'.repeat(32),
+    transferId
+  })
+}
+
+function lockOwner(pid: number, startedAt: number, token = TOKEN): string {
+  return JSON.stringify({ pid, startedAt, token })
+}
+
+async function writeLock(layout: StorageLayout, body: string): Promise<void> {
+  await fs.promises.mkdir(layout.lock, { mode: 0o700 })
+  await fs.promises.writeFile(path.join(layout.lock, 'owner.json'), body)
+}
+
+/** A root with one record per metadata class, as left behind by a deleted payload. */
+async function seedStorage(t: Assert): Promise<{ root: string; layout: StorageLayout }> {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const write = (target: string, body: string) => fs.promises.writeFile(target, body)
+  await write(path.join(root, 'kept.txt'), 'kept payload')
+  await write(path.join(root, 'notes.md'), 'operator notes')
+  await fs.promises.symlink('kept.txt', path.join(root, 'current'))
+  await write(path.join(layout.commits, `${ID_A}.json`), commitRecord(ID_A, 'kept.txt', 12))
+  await write(path.join(layout.commits, `${ID_B}.json`), commitRecord(ID_B, 'deleted.txt', 7))
+  await write(path.join(layout.sessions, `${ID_C}.json`), '{"version":3}')
+  await write(path.join(layout.staging, `${ID_C}.tar.part`), 'partial')
+  await write(path.join(layout.journals, `${ID_B}.json`), '{"version":1}')
+  await write(path.join(layout.publications, `${ID_B}.part`), 'publication')
+  await write(
+    path.join(layout.links, `${ID_A}.json`),
+    JSON.stringify({
+      version: 2,
+      mode: 'manual',
+      name: 'current',
+      target: 'kept.txt',
+      transferId: ID_A,
+      targetKind: 'file'
+    })
+  )
+  await fs.promises.mkdir(path.join(layout.trash, `${ID_C}.tree`))
+  await write(path.join(layout.trash, `${ID_C}.tree`, 'leftover.bin'), 'trash')
+  await fs.promises.mkdir(`${layout.lock}.retired-${TOKEN}`)
+  await write(`${layout.lock}.retired-${TOKEN}/owner.json`, lockOwner(1, 1))
+  await write(path.join(layout.internal, 'README-notes.txt'), 'unrelated operator file')
+  return { root, layout }
+}
+
+async function snapshot(directory: string, base = directory): Promise<string[]> {
+  const lines: string[] = []
+  for (const name of (await fs.promises.readdir(directory)).sort()) {
+    const full = path.join(directory, name)
+    const stat = await fs.promises.lstat(full)
+    const relative = full.slice(base.length + 1)
+    if (stat.isSymbolicLink()) lines.push(`${relative} -> ${await fs.promises.readlink(full)}`)
+    else if (stat.isDirectory()) {
+      lines.push(`${relative}/`)
+      lines.push(...(await snapshot(full, base)))
+    } else lines.push(`${relative} ${stat.size}`)
+  }
+  return lines
+}
+
+function recordingStorage() {
+  const mutations: string[] = []
+  const storage = createStorage({
+    beforeOperation(name, target, ...rest) {
+      const creating =
+        name === 'open' &&
+        (typeof rest[0] === 'string'
+          ? rest[0].includes('w') || rest[0].includes('x') || rest[0].includes('a')
+          : ((rest[0] as number) & (fs.constants.O_CREAT ?? 0o100)) !== 0)
+      if (MUTATIONS.has(name) || creating) mutations.push(`${name} ${target}`)
+    }
+  })
+  return { storage, mutations }
+}
+
+async function runReset(args: string[], io: Partial<CliIo> = {}) {
+  const stdout = output()
+  const stderr = output()
+  const code = await main(
+    ['reset-storage', ...args],
+    {},
+    {
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      ...io
+    }
+  )
+  return {
+    code,
+    stdout: stdout.text(),
+    stderr: stderr.text(),
+    lines: stdout
+      .text()
+      .split('\n')
+      .filter((line) => line.length > 0)
+  }
+}
+
+function has(lines: string[], expected: string): boolean {
+  return lines.includes(expected)
+}
+
+async function exists(target: string): Promise<boolean> {
+  try {
+    await fs.promises.lstat(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function readMarker(archive: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await fs.promises.readFile(path.join(archive, 'reset.json'), 'utf8'))
+}
+
+function archivePath(lines: string[]): string {
+  const line = lines.find((candidate) => candidate.startsWith('archive: '))
+  if (!line) throw new Error('archive line missing')
+  return line.slice('archive: '.length)
+}
+
+test('reset-storage preview reports metadata left behind by a manual payload deletion without mutating storage', async (t) => {
+  const { root } = await seedStorage(t)
+  const before = await snapshot(root)
+  const { storage, mutations } = recordingStorage()
+
+  const result = await runReset(['--storage', root], { storage })
+  t.is(result.code, 0)
+  t.is(result.stderr, '')
+  t.alike(result.lines, [
+    `storage: ${root}`,
+    'lock: free',
+    'commits: 2 records (1 missing payloads)',
+    'staging: 1 entries',
+    'sessions: 1 entries',
+    'journals: 1 entries',
+    'publications: 1 entries',
+    'links: 1 records',
+    'trash: 1 entries',
+    'obsolete locks: 1',
+    'archives: 0',
+    'unknown internal entries: 1 (README-notes.txt); left in place',
+    'remaining payloads: 2 (kept.txt, notes.md)',
+    'remaining symlinks: 1 (current)',
+    'fresh start: no',
+    'note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually',
+    'note: remaining symlinks have no ownership record after the reset; a --symlink rule or link request for that name fails closed with LINK_CONFLICT until you remove them manually',
+    'result: preview only, nothing changed; re-run with --apply to archive this metadata'
+  ])
+  t.alike(mutations, [], 'preview performs no mutating storage operation')
+  t.alike(await snapshot(root), before)
+
+  const report = await inspectStorageReset({ storageDir: root })
+  t.alike(report.commits.missingPayloads, ['deleted.txt'])
+  t.is(report.applied, false)
+  t.is(report.archive, null)
+})
+
+test('reset-storage --apply archives every metadata class, recreates empty directories, and preserves unrelated files and earlier archives', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const earlier = path.join(layout.internal, 'archive', 'reset-19700101T000000000Z-00000000')
+  await fs.promises.mkdir(earlier, { recursive: true })
+  await fs.promises.writeFile(
+    path.join(earlier, 'reset.json'),
+    JSON.stringify({ version: 1, status: 'completed', moved: ['commits'] })
+  )
+  await fs.promises.mkdir(path.join(earlier, 'commits'))
+  await fs.promises.writeFile(path.join(earlier, 'commits', 'old.json'), '{}')
+  const earlierBefore = await snapshot(earlier)
+  const visibleBefore = (await snapshot(root)).filter((line) => !line.startsWith('.swarm-deploy'))
+
+  const result = await runReset(['--storage', root, '--apply'])
+  t.is(result.code, 0, result.stderr)
+  const archive = archivePath(result.lines)
+  t.ok(archive.startsWith(path.join(layout.internal, 'archive', 'reset-')))
+  t.ok(has(result.lines, 'commits: 2 records (1 missing payloads)'))
+  t.ok(has(result.lines, 'archives: 2'))
+  t.ok(has(result.lines, 'fresh start: no'))
+  t.ok(
+    has(result.lines, 'result: metadata archived; the next server start begins with empty metadata')
+  )
+
+  for (const name of [
+    'staging',
+    'sessions',
+    'commits',
+    'journals',
+    'publications',
+    'links',
+    'trash'
+  ] as const) {
+    t.alike(await fs.promises.readdir(layout[name]), [], `${name} is empty`)
+  }
+  t.alike(await snapshot(archive), [
+    'commits/',
+    `commits/${ID_A}.json ${commitRecord(ID_A, 'kept.txt', 12).length}`,
+    `commits/${ID_B}.json ${commitRecord(ID_B, 'deleted.txt', 7).length}`,
+    'journals/',
+    `journals/${ID_B}.json 13`,
+    'links/',
+    `links/${ID_A}.json ${(await fs.promises.readFile(path.join(archive, 'links', `${ID_A}.json`))).byteLength}`,
+    'locks/',
+    `locks/lock.retired-${TOKEN}/`,
+    `locks/lock.retired-${TOKEN}/owner.json ${lockOwner(1, 1).length}`,
+    'publications/',
+    `publications/${ID_B}.part 11`,
+    `reset.json ${(await fs.promises.lstat(path.join(archive, 'reset.json'))).size}`,
+    'sessions/',
+    `sessions/${ID_C}.json 13`,
+    'staging/',
+    `staging/${ID_C}.tar.part 7`,
+    'trash/',
+    `trash/${ID_C}.tree/`,
+    `trash/${ID_C}.tree/leftover.bin 5`
+  ])
+  const marker = await readMarker(archive)
+  t.is(marker.status, 'completed')
+  t.is(marker.root, root)
+  t.alike(marker.moved, [
+    'staging',
+    'sessions',
+    'commits',
+    'journals',
+    'publications',
+    'links',
+    'trash',
+    `locks/lock.retired-${TOKEN}`
+  ])
+  t.is(
+    await fs.promises.readFile(path.join(layout.internal, 'README-notes.txt'), 'utf8'),
+    'unrelated operator file'
+  )
+  t.alike(await snapshot(earlier), earlierBefore, 'earlier archive is untouched')
+  t.alike(
+    (await snapshot(root)).filter((line) => !line.startsWith('.swarm-deploy')),
+    visibleBefore,
+    'visible payloads and symlinks are untouched'
+  )
+  const internal = await fs.promises.readdir(layout.internal)
+  t.absent(internal.includes('lock'), 'the reset released its lock')
+  t.absent(
+    internal.some((name) => name.startsWith('lock.')),
+    'the reset leaves no lock residue of its own'
+  )
+
+  const preview = await runReset(['--storage', root])
+  t.is(preview.code, 0)
+  t.ok(has(preview.lines, 'commits: 0 records'))
+  t.ok(has(preview.lines, 'obsolete locks: 0'))
+  t.ok(has(preview.lines, 'archives: 2'))
+})
+
+test('repeated resets each create a new archive and keep every previous one', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const first = await runReset(['--storage', root, '--apply'])
+  t.is(first.code, 0, first.stderr)
+  const firstArchive = archivePath(first.lines)
+  const firstSnapshot = await snapshot(firstArchive)
+
+  await fs.promises.writeFile(path.join(layout.commits, `${ID_C}.json`), commitRecord(ID_C, 'x', 1))
+  const second = await runReset(['--storage', root, '--apply'])
+  t.is(second.code, 0, second.stderr)
+  const secondArchive = archivePath(second.lines)
+  t.not(secondArchive, firstArchive)
+  t.ok(has(second.lines, 'commits: 1 records (1 missing payloads)'))
+  t.ok(has(second.lines, 'archives: 2'))
+  t.alike(await snapshot(firstArchive), firstSnapshot, 'first archive is preserved')
+  t.ok(await exists(path.join(secondArchive, 'commits', `${ID_C}.json`)))
+  t.is((await readMarker(secondArchive)).status, 'completed')
+  t.alike(await fs.promises.readdir(layout.commits), [])
+})
+
+test('reset-storage refuses a live lock without mutation and completes with --wait once the holder releases', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const release = await acquireStorageLock(layout)
+  const before = await snapshot(root)
+
+  const preview = await runReset(['--storage', root])
+  t.is(preview.code, 0)
+  t.ok(
+    preview.lines.some((line) => line.startsWith(`lock: held by pid ${process.pid} (lock age `)),
+    preview.stdout
+  )
+
+  const { storage, mutations } = recordingStorage()
+  const refused = await runReset(['--storage', root, '--apply'], { storage })
+  t.is(refused.code, 1)
+  t.ok(
+    refused.stderr.startsWith(`Storage is locked by pid ${process.pid} (lock age `),
+    refused.stderr
+  )
+  t.ok(refused.stderr.includes('stop that server and retry, or wait for it with --wait'))
+  t.alike(mutations, [], 'a refused reset never mutates storage')
+  t.alike(await snapshot(root), before)
+
+  const waiting = runReset(['--storage', root, '--apply', '--wait', '10000'], {
+    pollInterval: 10
+  })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  t.ok(await exists(layout.lock), 'the reset keeps waiting while the lock is held')
+  await release()
+  const completed = await waiting
+  t.is(completed.code, 0, completed.stderr)
+  t.ok(has(completed.lines, `lock: held by pid ${process.pid} (lock age 0s)`))
+  t.is((await readMarker(archivePath(completed.lines))).status, 'completed')
+  t.absent(await exists(layout.lock))
+
+  const timedOut = await (async () => {
+    const again = await acquireStorageLock(layout)
+    t.teardown(() => again())
+    return runReset(['--storage', root, '--apply', '--wait', '30'], { pollInterval: 10 })
+  })()
+  t.is(timedOut.code, 1)
+  t.ok(timedOut.stderr.startsWith('Storage is locked by pid'))
+})
+
+test('reset-storage retires dead holders and refuses live or unreadable locks without an override', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const dead = 4_000_000
+  const deadToken = 'f6'.repeat(32)
+  await writeLock(layout, lockOwner(dead, Date.now() - 60_000, deadToken))
+  const isProcessAlive = (pid: number) => pid !== dead
+
+  const preview = await runReset(['--storage', root], { isProcessAlive })
+  t.is(preview.code, 0)
+  t.ok(
+    preview.lines.some((line) =>
+      /^lock: stale, pid 4000000 is not running \(lock age (59|60|61)s\); will be retired$/.test(
+        line
+      )
+    ),
+    preview.stdout
+  )
+
+  const retired = await runReset(['--storage', root, '--apply'], { isProcessAlive })
+  t.is(retired.code, 0, retired.stderr)
+  const archive = archivePath(retired.lines)
+  t.alike(
+    (await fs.promises.readdir(path.join(archive, 'locks'))).sort(),
+    [`lock.retired-${TOKEN}`, `lock.retired-${deadToken}`].sort(),
+    'the dead holder lock is retired and archived with the older residue'
+  )
+  t.absent(await exists(layout.lock))
+
+  // A reused PID: the recorded PID is alive (this process) but is not a server for this root.
+  await writeLock(layout, lockOwner(process.pid, Date.now(), 'e5'.repeat(32)))
+  const reused = await runReset(['--storage', root, '--apply'])
+  t.is(reused.code, 1)
+  t.ok(reused.stderr.startsWith(`Storage is locked by pid ${process.pid}`), reused.stderr)
+  t.ok(await exists(layout.lock), 'a live PID is never treated as stale by itself')
+
+  const beforeOverride = await snapshot(root)
+  const asserted = await runReset([
+    '--storage',
+    root,
+    '--apply',
+    '--stale-pid',
+    String(process.pid)
+  ])
+  t.is(asserted.code, 2)
+  t.alike(await snapshot(root), beforeOverride, 'no option bypasses a live lock')
+
+  await fs.promises.rm(layout.lock, { recursive: true })
+  await writeLock(layout, '{not json')
+  await fs.promises.rm(layout.sessions, { recursive: true })
+  const beforeMalformed = await snapshot(root)
+  const malformed = await runReset(['--storage', root])
+  t.is(malformed.code, 0)
+  t.ok(
+    has(
+      malformed.lines,
+      'lock: unreadable; reset refused until the server is stopped and its lock reconciled'
+    )
+  )
+  const refused = await runReset(['--storage', root, '--apply'])
+  t.is(refused.code, 1)
+  t.ok(refused.stderr.includes('Storage lock is unreadable'))
+  t.alike(await snapshot(root), beforeMalformed, 'unreadable ownership never permits mutations')
+})
+
+test('reset-storage rejects unsafe roots and symlink escapes before touching anything', async (t) => {
+  const scratch = await createTempDir(t)
+
+  const missing = path.join(scratch, 'missing')
+  for (const args of [[], ['--apply']]) {
+    const result = await runReset(['--storage', missing, ...args])
+    t.is(result.code, 2)
+    t.ok(result.stderr.startsWith('Missing storage directory'), result.stderr)
+    t.absent(await exists(missing), 'a missing root is never created')
+  }
+
+  const plain = path.join(scratch, 'plain')
+  await fs.promises.mkdir(plain)
+  const uninitialized = await runReset(['--storage', plain, '--apply'])
+  t.is(uninitialized.code, 2)
+  t.is(uninitialized.stderr, `Not an initialized storage root: ${plain}\n`)
+  t.alike(await fs.promises.readdir(plain), [], 'no internal directory is created')
+
+  const filesystemRoot = await runReset(['--storage', '/', '--apply'])
+  t.is(filesystemRoot.code, 2)
+  t.is(filesystemRoot.stderr, 'Refusing to reset a filesystem root: /\n')
+
+  const { root, layout } = await seedStorage(t)
+  const before = await snapshot(root)
+  const rootLink = path.join(scratch, 'root-link')
+  await fs.promises.symlink(root, rootLink)
+  const viaRootLink = await runReset(['--storage', rootLink, '--apply'])
+  t.is(viaRootLink.code, 2)
+  t.ok(viaRootLink.stderr.startsWith('Unsafe storage directory'), viaRootLink.stderr)
+  t.alike(await snapshot(root), before)
+
+  const parentLink = path.join(scratch, 'parent-link')
+  await fs.promises.symlink(path.dirname(root), parentLink)
+  const viaAncestor = await runReset([
+    '--storage',
+    path.join(parentLink, path.basename(root)),
+    '--apply'
+  ])
+  t.is(viaAncestor.code, 2)
+  t.alike(await snapshot(root), before, 'symlink ancestors cannot redirect a reset')
+
+  const internalAsName = await runReset(['--storage', layout.internal, '--apply'])
+  t.is(internalAsName.code, 2)
+  t.ok(internalAsName.stderr.startsWith('Refusing to reset an internal directory'))
+  t.alike(await snapshot(root), before)
+
+  const escaped = path.join(scratch, 'escaped')
+  await fs.promises.mkdir(escaped)
+  await fs.promises.writeFile(path.join(escaped, 'precious.json'), 'outside')
+  const outsideBefore = await snapshot(escaped)
+  await fs.promises.rm(layout.commits, { recursive: true })
+  await fs.promises.symlink(escaped, layout.commits)
+  for (const args of [[], ['--apply']]) {
+    const result = await runReset(['--storage', root, ...args])
+    t.is(result.code, 2)
+    t.is(result.stderr, `Unsafe storage directory: ${layout.commits}\n`)
+  }
+  t.alike(await snapshot(escaped), outsideBefore, 'the symlink target is untouched')
+  t.absent(await exists(path.join(layout.internal, 'archive')), 'no archive is created')
+  await fs.promises.unlink(layout.commits)
+  await fs.promises.mkdir(layout.commits)
+
+  await fs.promises.symlink(escaped, layout.lock)
+  const unsafeLock = await runReset(['--storage', root])
+  t.is(unsafeLock.code, 0)
+  t.ok(has(unsafeLock.lines, 'lock: unsafe path; the reset refuses to proceed'))
+  const unsafeLockApply = await runReset(['--storage', root, '--apply'])
+  t.is(unsafeLockApply.code, 2)
+  t.is(unsafeLockApply.stderr, `Unsafe storage lock path: ${layout.lock}\n`)
+  t.alike(await snapshot(escaped), outsideBefore)
+  await fs.promises.unlink(layout.lock)
+
+  const internalLink = path.join(scratch, 'internal-link')
+  await fs.promises.mkdir(internalLink)
+  await fs.promises.symlink(layout.internal, path.join(internalLink, '.swarm-deploy'))
+  const viaInternalLink = await runReset(['--storage', internalLink, '--apply'])
+  t.is(viaInternalLink.code, 2)
+  t.ok(viaInternalLink.stderr.startsWith('Unsafe storage directory'))
+  t.absent(await exists(path.join(layout.internal, 'archive')))
+
+  for (const args of [
+    ['--storage', root, '--wait', '5'],
+    ['--storage', root, '--stale-pid', '5'],
+    ['--storage', root, 'extra'],
+    ['--apply'],
+    ['--storage', root, '--apply', '--wait', '0'],
+    ['--storage', root, '--apply', '--apply']
+  ]) {
+    const result = await runReset(args)
+    t.is(result.code, 2, args.join(' '))
+    t.ok(result.stderr.includes(USAGE), args.join(' '))
+  }
+  t.ok(USAGE.includes('swarm-deploy reset-storage --storage <dir> [--apply'))
+})
+
+test('an interrupted reset leaves a recoverable in-progress archive and a re-run completes it', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  let tripped = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (name === 'rename' && target === layout.journals && !tripped) {
+        tripped = true
+        throw new Error('Injected rename failure')
+      }
+    }
+  })
+
+  const interrupted = await runReset(['--storage', root, '--apply'], { storage })
+  t.is(interrupted.code, 1)
+  t.is(interrupted.stderr, 'Injected rename failure\n')
+  const archives = await fs.promises.readdir(path.join(layout.internal, 'archive'))
+  t.is(archives.length, 1)
+  const first = path.join(layout.internal, 'archive', archives[0])
+  const marker = await readMarker(first)
+  t.is(marker.status, 'in-progress')
+  t.alike(marker.moved, ['staging', 'sessions', 'commits'])
+  t.is(marker.failed, 'Injected rename failure')
+  t.ok(await exists(path.join(first, 'commits', `${ID_A}.json`)))
+  t.alike(await fs.promises.readdir(layout.commits), [], 'moved directories are recreated empty')
+  t.alike(await fs.promises.readdir(layout.journals), [`${ID_B}.json`], 'unmoved metadata stays')
+  t.alike(await fs.promises.readdir(layout.links), [`${ID_A}.json`])
+  t.absent(await exists(layout.lock), 'the lock is released after a failure')
+  t.ok(
+    await exists(path.join(layout.internal, 'reset-pending.json')),
+    'startup stays blocked after interruption'
+  )
+
+  const preview = await runReset(['--storage', root])
+  t.is(preview.code, 0)
+  t.ok(has(preview.lines, 'archives: 1 (1 interrupted)'))
+  t.ok(has(preview.lines, 'commits: 0 records'))
+  t.ok(has(preview.lines, 'journals: 1 entries'))
+
+  const firstBefore = await snapshot(first)
+  const completed = await runReset(['--storage', root, '--apply'], { storage })
+  t.is(completed.code, 0, completed.stderr)
+  const second = archivePath(completed.lines)
+  t.not(second, first)
+  t.alike((await readMarker(second)).moved, [
+    'staging',
+    'sessions',
+    'commits',
+    'journals',
+    'publications',
+    'links',
+    'trash',
+    `locks/lock.retired-${TOKEN}`
+  ])
+  t.ok(await exists(path.join(second, 'journals', `${ID_B}.json`)))
+  t.ok(await exists(path.join(second, 'links', `${ID_A}.json`)))
+  t.alike(await snapshot(first), firstBefore, 'the interrupted archive is preserved as-is')
+  t.ok(has(completed.lines, 'archives: 2 (1 interrupted)'))
+  t.absent(
+    await exists(path.join(layout.internal, 'reset-pending.json')),
+    'successful retry clears the startup guard'
+  )
+
+  // A server starts on the reset root even with the interrupted archive present.
+  await fs.promises.rm(layout.sessions, { recursive: true })
+  const testnet = await createLocalTestnet(t)
+  const server = new Server({
+    seed: b4a.alloc(32, 41),
+    storageDir: root,
+    allowedKeys: [keyPairFromSeed(b4a.alloc(32, 42)).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => server.close())
+  await server.listen()
+  t.ok(await exists(layout.sessions), 'the server recreates a directory a crash left missing')
+  await server.close()
+})
+
+test('a reset after manual payload deletion unblocks a fresh re-upload and link, while retained payloads and symlinks still conflict', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 151)
+  const clientSeed = b4a.alloc(32, 152)
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const inputs = await createTempDir(t)
+  const release = path.join(inputs, 'release-1')
+  await fs.promises.writeFile(release, 'release one')
+  const failures: string[] = []
+  const createServer = (symlinks: SymlinkRule[] = [{ selector: '/^release-\\d+$/' }]) => {
+    const server = new Server({
+      seed: serverSeed,
+      storageDir: root,
+      allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+      maxFileBytes: 1024,
+      maxStagingBytes: 4096,
+      minFreeBytes: 0,
+      dht: testnet.createNode(),
+      symlinks
+    })
+    server.on('failure', (event) => failures.push(event.reason))
+    return server
+  }
+  // A post-commit link conflict is reported on the server; the client only
+  // learns that its upload did not finish cleanly.
+  const expectLinkConflict = async (): Promise<void> => {
+    failures.length = 0
+    await t.exception(() => client.upload(release))
+    t.alike(failures, [ERRORS.LINK_CONFLICT])
+  }
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: keyPairFromSeed(serverSeed).publicKey,
+    connectTimeout: 5_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => client.close())
+
+  const first = createServer()
+  await first.listen()
+  t.is((await client.upload(release)).status, 'COMMITTED')
+  t.is((await client.link('release-1', 'current')).status, 'LINKED')
+  await first.close()
+
+  // The operator deletes the payload by hand. The commit record, the manual
+  // link ledger entry, and the now-dangling symlink all remain.
+  await fs.promises.unlink(path.join(root, 'release-1'))
+  const dangling = await runReset(['--storage', root])
+  t.is(dangling.code, 0)
+  t.ok(has(dangling.lines, 'commits: 1 records (1 missing payloads)'))
+  t.ok(has(dangling.lines, 'links: 1 records'))
+  t.ok(has(dangling.lines, 'remaining payloads: 0'))
+  t.ok(has(dangling.lines, 'remaining symlinks: 1 (current)'))
+  t.ok(has(dangling.lines, 'fresh start: no'))
+
+  // Without a reset, the stale manual ledger entry blocks a server that now
+  // wants `current` as an automatic link: the upload commits, then fails.
+  const automatic = createServer([{ selector: '/^release-\\d+$/', name: 'current' }])
+  await automatic.listen()
+  await expectLinkConflict()
+  await automatic.close()
+  t.ok(await exists(path.join(root, 'release-1')), 'the blocked upload still committed')
+
+  // A reset archives the ledger, but the committed payload and the dangling
+  // symlink remain, and the report says so.
+  const reset = await resetStorage({ storageDir: root })
+  t.is(reset.applied, true)
+  t.is(reset.freshStart, false)
+  t.alike(reset.remaining.payloads, ['release-1'])
+  t.alike(reset.remaining.symlinks, ['current'])
+  t.is(reset.links.records, 1)
+
+  // The retained payload keeps its name occupied for a fresh upload.
+  const retained = createServer()
+  await retained.listen()
+  await t.exception(() => client.upload(release), { code: ERRORS.FILE_EXISTS })
+  await retained.close()
+
+  // With the payload removed by hand but the symlink kept, the name is free
+  // again, while the unrecorded symlink still blocks the automatic link.
+  await fs.promises.unlink(path.join(root, 'release-1'))
+  const partial = await runReset(['--storage', root, '--apply'])
+  t.is(partial.code, 0, partial.stderr)
+  t.ok(has(partial.lines, 'remaining payloads: 0'))
+  t.ok(has(partial.lines, 'remaining symlinks: 1 (current)'))
+  t.ok(has(partial.lines, 'fresh start: no'))
+  const unrecorded = createServer([{ selector: '/^release-\\d+$/', name: 'current' }])
+  await unrecorded.listen()
+  await expectLinkConflict()
+  await unrecorded.close()
+
+  // Removing every visible entry by hand makes the next reset a true fresh start.
+  await fs.promises.unlink(path.join(root, 'release-1'))
+  await fs.promises.unlink(path.join(root, 'current'))
+  const fresh = await runReset(['--storage', root, '--apply'])
+  t.is(fresh.code, 0, fresh.stderr)
+  t.ok(has(fresh.lines, 'remaining payloads: 0'))
+  t.ok(has(fresh.lines, 'remaining symlinks: 0'))
+  t.ok(has(fresh.lines, 'fresh start: yes'))
+  t.absent(fresh.lines.some((line) => line.startsWith('note:')))
+  const last = createServer([
+    { selector: '/^release-\\d+$/', name: 'current' },
+    { selector: '/^release-\\d+$/' }
+  ])
+  t.teardown(() => last.close())
+  await last.listen()
+  t.is((await client.upload(release)).status, 'COMMITTED')
+  t.is(await fs.promises.readlink(path.join(root, 'current')), 'release-1')
+  t.is((await client.link('release-1', 'promoted')).status, 'LINKED')
+  t.is(await fs.promises.readlink(path.join(root, 'promoted')), 'release-1')
+  t.is(await fs.promises.readFile(path.join(root, 'release-1'), 'utf8'), 'release one')
+  t.is((await fs.promises.readdir(path.join(layout.internal, 'archive'))).length, 3)
+})
+
+test('reset waits for an upload to finish and reports the payload that now remains', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  const release = await acquireStorageLock(layout)
+  t.teardown(release)
+  const waiting = runReset(['--storage', root, '--apply', '--wait', '10000'], { pollInterval: 10 })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  await fs.promises.writeFile(path.join(root, 'finished-while-waiting'), 'payload')
+  await release()
+  const result = await waiting
+  t.is(result.code, 0, result.stderr)
+  t.ok(has(result.lines, 'fresh start: no'))
+  t.ok(has(result.lines, 'remaining payloads: 1 (finished-while-waiting)'))
+})
+
+test('server refuses to recover or serve a storage root with an incomplete reset', async (t) => {
+  const root = await createTempDir(t)
+  const layout = initLayout(root)
+  await fs.promises.writeFile(path.join(layout.internal, 'reset-pending.json'), '{}')
+  const testnet = await createLocalTestnet(t)
+  const server = new Server({
+    seed: b4a.alloc(32, 43),
+    storageDir: root,
+    allowedKeys: [keyPairFromSeed(b4a.alloc(32, 44)).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => server.close())
+  let recovered = false
+  server.on('recovery', () => {
+    recovered = true
+  })
+  await t.exception(() => server.listen(), { code: ERRORS.PROTOCOL_INVALID })
+  t.absent(recovered, 'no recovery runs against partly archived metadata')
+  t.ok(await exists(path.join(layout.internal, 'reset-pending.json')))
+})
