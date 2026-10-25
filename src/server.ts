@@ -1366,8 +1366,10 @@ export class Server extends EventEmitter {
   /**
    * Whether the post-commit retention pass waits for the hooks that follow a
    * commit. Either one defers it: `afterCommit` so its callback still finds
-   * the artifact, and `afterLink` so the commit's own link reconciliation (and
-   * therefore the `LINKED` it reports) happens before a retention pass could do it.
+   * the artifact, and `afterLink` so this commit's own link reconciliation runs
+   * before this commit's retention pass does. That narrows, but does not remove,
+   * the chance that the link already moved: another commit's retention or
+   * reconciliation can do it first, and the hook then sees `UNCHANGED`.
    */
   private defersPostCommitRetention(): boolean {
     return this.hooks.afterCommit !== undefined || this.hooks.afterLink !== undefined

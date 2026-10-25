@@ -2,6 +2,10 @@
 // artifact each link currently publishes in $SWARM_DEPLOY_PUBLISH_DIR/<link>.json.
 // Replace `publish` with a real deployment step; keep the validation and the idempotency.
 // Diagnostics go to stderr, and a non-zero exit makes the server answer HOOK_FAILED.
+// Node-only: hooks.mjs runs this file with the Node executable. Finish well inside its
+// 20 s PUBLISH_TIMEOUT. After that the hook has failed, this process gets SIGTERM (then
+// SIGKILL 5 s later), and the next publication of the same link waits until it has exited,
+// so stop writing as soon as SIGTERM arrives.
 import fs from 'node:fs/promises'
 import path from 'node:path'
 

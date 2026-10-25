@@ -343,7 +343,10 @@ a fixed message.
 
 `afterLink` publishes a durable link. It receives
 `{ link, artifact, status, trigger }`, where `link` is
-`{ name, target, mode, path, targetPath }`, `status` is `LINKED` or `UNCHANGED`,
+`{ name, target, mode, path, targetPath }`, `status` is `LINKED` or `UNCHANGED`
+(the link decision this call observed, not proof of publication: another
+commit's retention or reconciliation may have moved the link first, and a manual
+ownership-metadata refresh for the same target is `UNCHANGED`),
 and `trigger` is `upload` (one call per automatic link that points at the
 uploaded artifact, after `afterCommit`) or `request` (one call for an explicit
 link request). It runs for `UNCHANGED` too, so a retry after a failed hook
@@ -360,7 +363,12 @@ decision and the link or target may already have changed. For one link name the
 server starts hooks in the order the link decisions were made (a place in an
 in-memory first-in, first-out line is reserved under the lease) and never runs
 two at once; different links run concurrently. The line does not survive a
-restart and is unbounded in time because there is no hook timeout.
+restart and is unbounded in time because there is no hook timeout. A client
+waits for its answer for at most its idle timeout, which covers everything the
+server does first (commit, `afterCommit`, every `afterLink` call in sequence,
+hooks queued ahead for the same link, retention); if it expires first the
+client reports `UPLOAD_IDLE_TIMEOUT` instead of `HOOK_FAILED` while the server
+still finishes the hooks.
 
 After a `HOOK_FAILED` answer is written the server ends its write side and
 destroys the connection when the peer closes it or after a 5-second grace

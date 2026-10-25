@@ -40,8 +40,14 @@ export interface AfterCommitContext {
 export type HookLinkMode = 'automatic' | 'manual'
 
 /**
- * `LINKED` when the link was created or repointed (or its ownership record
- * repaired), `UNCHANGED` when it already pointed at the target.
+ * The link decision this call observed, never proof that anything was published.
+ * `LINKED` when this call created or repointed the link, or repaired an automatic
+ * link's ownership record; `UNCHANGED` when the link already pointed at the target.
+ * An earlier attempt, another commit's retention pass or reconciliation, or a
+ * concurrent request may have moved the link first, so a fresh upload or request
+ * can still see `UNCHANGED`, and a manual ownership-metadata refresh for the same
+ * target is `UNCHANGED` too. Decide what to publish from your own record of the
+ * link name and artifact transfer ID.
  */
 export type HookLinkStatus = 'LINKED' | 'UNCHANGED'
 

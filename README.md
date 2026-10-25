@@ -285,9 +285,12 @@ one-argument `--symlink` rule. Success prints exactly:
 managed link already points at that target; the operation is idempotent.
 
 When the server has an `afterLink` hook, success is printed only after the hook
-returns. If the hook fails, the command exits `1` and prints `HOOK_FAILED`; the
-link itself has already changed, and running the same command again is safe and
-re-runs the hook (see [Link publication hooks](#link-publication-hooks)).
+returns, for as long as `--idle-timeout` allows. If the hook fails, the command
+exits `1` and prints `HOOK_FAILED`; the link itself has already changed, and
+running the same command again is safe and re-runs the hook. A hook slower than
+`--idle-timeout` makes the command fail with a timeout instead, though the
+server still finishes the hook (see
+[Link publication hooks](#link-publication-hooks)).
 
 ### `reset-storage`
 
@@ -747,9 +750,11 @@ that same pass. The exact ordering depends on hooks:
   `onFailure`-only servers do not defer.
 - An `afterLink` hook defers the pass the same way, after `afterCommit` (when
   both are configured) and after every `afterLink` call for the upload has
-  succeeded. Deferring also guarantees that the commit's own link
-  reconciliation, not an earlier retention pass, moves an automatic link, so the
-  hook sees it as `LINKED`. An explicit link request never runs retention.
+  succeeded. Deferring makes this commit's own link reconciliation run before
+  this commit's retention pass, which narrows but does not remove the chance
+  that the link has already moved (another commit's retention pass or
+  reconciliation can do it first, and the hook then sees `UNCHANGED`). An
+  explicit link request never runs retention.
 - The final path exists when `afterCommit` begins in the sequential server
   flow, including for an out-of-window release, and for replacement commits
   (a replaced artifact's history record is also present). It is not a lock:
@@ -1181,12 +1186,15 @@ seeds, and TAR bytes:
 - `artifact`: the committed artifact the link was set to point at, shaped like
   every other hook artifact. For a request it is read from the durable commit
   record, so it has no `sourceParent`.
-- `status`: `LINKED` when this call created or repointed the link (or repaired
-  its ownership record), `UNCHANGED` when it already pointed at the target. It
-  describes the link, not the publication: an earlier attempt, or a retention
-  pass, may have made the change, so `UNCHANGED` must never be read as "already
-  published". Decide that from your own record of `link.name` and
-  `artifact.transferId`.
+- `status`: the link decision this call observed, never proof of publication.
+  `LINKED` when this call created or repointed the link, or repaired an
+  automatic link's ownership record; `UNCHANGED` when the link already pointed
+  at the target. An earlier attempt, another commit's retention pass or
+  reconciliation, or a concurrent request may have moved the link first, so a
+  fresh upload or request can still see `UNCHANGED`, and a manual
+  ownership-metadata refresh for the same target is `UNCHANGED` too. Neither
+  value says whether anything was published: decide that from your own record
+  of `link.name` and `artifact.transferId`.
 - `trigger`: `upload` or `request`.
 
 **What the server guarantees.**
@@ -1197,6 +1205,20 @@ seeds, and TAR bytes:
   stable, sanitized `HOOK_FAILED` (fixed message; the raw exception never
   leaves the server and is passed only to `onFailure`). A link request carries
   it as the ordinary `FAILED` result code, so existing clients need no change.
+  The caller sees that code only while it is still waiting; see the time budget
+  below.
+- **Time budget.** The server sets no hook deadline. A client waits for its
+  answer for at most its idle timeout (60 seconds by default, 5 minutes at most:
+  `--idle-timeout`, `ClientOptions.idleTimeout`), and that one wait covers
+  everything the server does before it answers. For an upload that is
+  verification and commit, `afterCommit`, every `afterLink` call for the upload
+  one after another (one per automatic link the artifact moved), hooks queued
+  ahead for the same link, and the deferred retention pass; for a link request,
+  the queue ahead and the hook. If the client's wait expires first it reports
+  `UPLOAD_IDLE_TIMEOUT` instead of `HOOK_FAILED` and closes the connection. The
+  server still runs its hooks, and the artifact and link stay durable, so a
+  retry is safe. Set the client idle timeout above the worst-case total, and
+  make publishers fail on their own well before it.
 - **The answer is delivered.** After writing a `HOOK_FAILED` answer the server
   ends its side of the stream and keeps the connection for up to 5 seconds, so
   the client reads the code instead of a connection reset. This applies to every
@@ -1248,8 +1270,19 @@ target, trigger, and status (never callback text); and `onFailure` with
 `phase: 'afterLink'`, the `link`, and the raw exception. Automatic links
 emit no `link` event, so an upload reports through the other three.
 
-A runnable example that hands each link to a publisher script over stdin
-without a shell is in [`examples/link-publisher`](examples/link-publisher).
+A runnable, Node-only example is in
+[`examples/link-publisher`](examples/link-publisher). It uses
+`node:child_process` and the global `process`, so it does not run on Bare
+(library hooks themselves work on Node and Bare). It hands each link to a
+publisher over stdin without a shell. `SWARM_DEPLOY_PUBLISHER` names a
+JavaScript module file that the example runs with the current Node
+executable; it is not an arbitrary executable. Each call has a 20-second
+deadline: the publisher then gets `SIGTERM` and, 5 seconds later, `SIGKILL`, and
+the call always rejects with a timeout, even if the publisher exits zero after
+`SIGTERM`. It settles only once that child has exited, so an abandoned
+publisher cannot write over the next publication of the same link, and a call
+takes at most 25 seconds. The example's header shows how to size the client
+idle timeout for several sequential calls (25 seconds each).
 
 ### onFailure
 

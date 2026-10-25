@@ -22,6 +22,13 @@ import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
 const SERVER_SEED = b4a.alloc(32, 0xd1)
 const CLIENT_SEED = b4a.alloc(32, 0xd2)
 
+type RunPublisher = (
+  command: string,
+  args: string[],
+  input: string,
+  options?: { timeout?: number; killGrace?: number }
+) => Promise<void>
+
 function gate(): { wait: Promise<void>; open(): void } {
   let open = (): void => {}
   const wait = new Promise<void>((resolve) => {
@@ -259,4 +266,83 @@ test('the link-publisher example publishes each link change through a no-shell p
   process.env.SWARM_DEPLOY_PUBLISH_DIR = published
   t.is((await client.link('app-1.tar', 'beta')).status, 'UNCHANGED')
   t.is((await read('beta')).link, 'beta', 'the retry published the change the failure missed')
+})
+
+test('the link-publisher example rejects at its deadline whatever the publisher does and ends the child', async (t) => {
+  if (typeof Bare !== 'undefined') {
+    t.pass('the example spawns a Node child process')
+    return
+  }
+  const { pathToFileURL } = require('node:url') as typeof import('node:url')
+  const example = path.resolve(__dirname, '../../examples/link-publisher/hooks.mjs')
+  const loaded: { runPublisher: RunPublisher } = await import(pathToFileURL(example).href)
+  const { runPublisher } = loaded
+  const work = await createTempDir(t)
+  const node = process.execPath
+  const pids: number[] = []
+  t.teardown(() => {
+    // Hygiene only: a regression that leaves a child running must not outlive the test.
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {}
+    }
+  })
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as { code?: string }).code !== 'ESRCH'
+    }
+  }
+  // Each script gets a file path as argv[1]; the long-running ones write their pid there
+  // only after installing their SIGTERM handler.
+  const pidFile = (name: string): string => path.join(work, name)
+  const readPid = async (name: string): Promise<number> => {
+    const pid = Number(await fs.promises.readFile(pidFile(name), 'utf8'))
+    pids.push(pid)
+    return pid
+  }
+  const hang = (handler: string): string =>
+    `process.on('SIGTERM',${handler});require('fs').writeFileSync(process.argv[1],String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`
+  const echo =
+    "let d='';process.stdin.on('data',(c)=>{d+=c});process.stdin.on('end',()=>{require('fs').writeFileSync(process.argv[1],d)})"
+  const generous = { timeout: 10_000, killGrace: 1_000 }
+  const late = `process.on('SIGTERM',()=>setTimeout(()=>{require('fs').writeFileSync(process.argv[2],'old');process.exit(0)},100));require('fs').writeFileSync(process.argv[1],String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`
+  const timings = { timeout: 1_500, killGrace: 1_000 }
+  const publish = (script: string, name: string, ...rest: string[]): Promise<void> =>
+    runPublisher(node, ['-e', script, pidFile(name), ...rest], 'payload', timings)
+
+  await runPublisher(node, ['-e', echo, pidFile('received')], 'payload', generous)
+  const received = await fs.promises.readFile(pidFile('received'), 'utf8')
+  t.is(received, 'payload', 'a clean exit resolves and the publisher read its input')
+
+  await t.exception(publish('process.exit(3)', 'fails'), /exited with 3/)
+
+  // Catches SIGTERM and exits zero: still a timeout failure, and the child is gone by then.
+  let started = Date.now()
+  await t.exception(publish(hang('()=>process.exit(0)'), 'exits'), /timed out/)
+  t.ok(Date.now() - started >= timings.timeout - 100, 'it waited for the deadline')
+  t.ok(Date.now() - started < timings.timeout + 1_000, 'it settled right after SIGTERM')
+  t.absent(alive(await readPid('exits')), 'the child had exited when the call settled')
+
+  // Ignores SIGTERM: the call settles only after SIGKILL, bounded by the grace period.
+  started = Date.now()
+  await t.exception(publish(hang('()=>{}'), 'ignores'), /timed out/)
+  const waited = Date.now() - started
+  t.ok(waited >= timings.timeout + timings.killGrace - 100, 'it waited for the escalation')
+  t.ok(waited < timings.timeout + timings.killGrace + 2_000, 'the escalation is bounded')
+  t.absent(alive(await readPid('ignores')), 'SIGKILL had ended the child when the call settled')
+
+  // Writes late on SIGTERM: it has finished writing before the call settles, so the next
+  // publication of the same link cannot be overwritten afterwards.
+  const result = pidFile('result')
+  await t.exception(publish(late, 'late', result), /timed out/)
+  const settledWith = await fs.promises.readFile(result, 'utf8')
+  t.is(settledWith, 'old', 'the old publisher had finished writing when the call settled')
+  await fs.promises.writeFile(result, 'new')
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  const finalContents = await fs.promises.readFile(result, 'utf8')
+  t.is(finalContents, 'new', 'a stopped publisher cannot overwrite the next publication')
 })
