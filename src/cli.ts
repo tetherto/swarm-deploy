@@ -25,6 +25,7 @@ import {
   inspectStorageReset,
   resetStorage,
   METADATA_DIRECTORIES,
+  type ArchiveHoldings,
   type StorageResetReport
 } from './storage/reset.js'
 
@@ -948,6 +949,15 @@ function formatLockState(lock: StorageResetReport['lock']): string {
   return 'unsafe path; the reset refuses to proceed'
 }
 
+/** Names the metadata directories an archive holds and counts its lock residue entries. */
+function describeHoldings(held: ArchiveHoldings): string {
+  const parts = [...held.directories]
+  if (held.lockEntries > 0) {
+    parts.push(`${held.lockEntries} lock residue ${held.lockEntries === 1 ? 'entry' : 'entries'}`)
+  }
+  return parts.length > 0 ? parts.join(', ') : 'nothing'
+}
+
 /** One `key: value` line per fact, so operators and scripts can read the same output. */
 function formatResetReport(report: StorageResetReport): string[] {
   const lines = [`storage: ${report.root}`, `lock: ${formatLockState(report.lock)}`]
@@ -983,8 +993,7 @@ function formatResetReport(report: StorageResetReport): string[] {
   // An interrupted marker can lag the archive, so name what it physically holds.
   for (const archive of report.archives) {
     if (archive.status === 'completed') continue
-    const held = archive.held.length > 0 ? archive.held.join(', ') : 'nothing'
-    lines.push(`interrupted archive: ${archive.name} holds ${held}`)
+    lines.push(`interrupted archive: ${archive.name} holds ${describeHoldings(archive.held)}`)
   }
   if (report.unknownInternal.length > 0) {
     lines.push(
@@ -1011,8 +1020,9 @@ function formatResetReport(report: StorageResetReport): string[] {
   }
   if (report.applied) {
     if (report.resumed !== null) {
-      const held = report.resumed.length > 0 ? report.resumed.join(', ') : 'nothing'
-      lines.push(`resumed: yes; the interrupted archive already held ${held}`)
+      lines.push(
+        `resumed: yes; the interrupted archive already held ${describeHoldings(report.resumed)}`
+      )
     }
     lines.push(`archive: ${report.archive}`)
     lines.push('result: metadata archived; the next server start begins with empty metadata')

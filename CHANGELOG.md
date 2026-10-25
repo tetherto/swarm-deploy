@@ -28,9 +28,17 @@ All notable changes to this package are documented here.
 - A retry after an interrupted reset, including a crash or power loss that
   skips error handling, resumes the archive the pending marker names instead of
   creating a second one. Progress is reconciled from what the archive holds,
-  `reset.json` records an `attempts` list, and a retry fails closed when the
-  archive and the live directory both hold data or the named archive is gone.
-  One reset always ends as one archive, so restoring it restores everything.
+  and a retry fails closed when the archive and the live directory both hold
+  data or the named archive is gone. One reset always ends as one archive, so
+  restoring it restores everything.
+- Keep the archive marker bounded. `reset.json` is version 2: it names the
+  metadata directories, summarizes lock residue as a count and a SHA-256 of the
+  sorted names, and keeps the first attempt, the newest 16 attempts, and a total
+  count with failure text clipped. A marker therefore stays readable after any
+  number of stopped servers or retries, instead of becoming unreadable once its
+  lock list outgrew the reader. Version 1 markers stay readable at the shared
+  metadata size bound, a retry that resumes one first preserves it verbatim as
+  `reset.v1.json`, and the preview counts lock residue rather than listing it.
 - Document that `reset-storage` must run as the server's operating-system user:
   applying it as another user, such as `root`, leaves metadata the service
   cannot use. The command does not enforce this.

@@ -324,9 +324,9 @@ With `--apply` the command takes the storage lock, moves
 `.swarm-deploy/staging`, `sessions`, `commits`, `journals`, `publications`,
 `links`, and `trash` plus retired or abandoned lock directories into
 `.swarm-deploy/archive/reset-<timestamp>-<random>/`, recreates the seven
-directories empty, writes a `reset.json` marker with `status: "completed"`
-and the list of moved entries, releases the lock, and prints the same report
-followed by `archive: <path>`. Every move is a rename inside the storage root,
+directories empty, writes a `reset.json` marker with `status: "completed"`,
+releases the lock, and prints the same report followed by `archive: <path>`.
+Every move is a rename inside the storage root,
 so nothing is copied, nothing is deleted, and an archive is restored by
 stopping the server and moving its directories back over the empty ones.
 Each completed reset creates its own archive; earlier archives, unrecognised
@@ -370,17 +370,41 @@ server versions do not know this guard.
 Re-run `--apply` to finish. The retry resumes the archive the marker names
 instead of starting a second one: it reads what that archive physically holds,
 moves only the directories still live, recreates them empty, and rewrites
-`reset.json` with `status: "completed"`, the full `moved` list taken from the
-archive, and an `attempts` list with the start time and PID of the interrupted
-run and of each retry. The output then says `resumed: yes` and names what the
-archive already held. One reset therefore always ends as exactly one archive,
-and restoring that archive restores everything the reset moved.
+`reset.json` with `status: "completed"`. The output then says `resumed: yes`
+and names what the archive already held. One reset therefore always ends as
+exactly one archive, and restoring that archive restores everything the reset
+moved.
+
+`reset.json` is a bounded record, no matter how many retired locks a stopped
+server left behind or how many times a reset is retried. The restore evidence
+is the archive itself, and the marker keeps only a summary of it:
+
+- `version`: `2`. Version 1 markers stay readable.
+- `status`, `root`, `completedAt`, and the first attempt's `startedAt` and
+  `pid`.
+- `moved`: the metadata directories the archive holds, at most seven names.
+- `locks`: `count` and `sha256` for the retired and abandoned lock directories
+  in the archive's `locks/` directory. The names stay there; the digest is
+  over each sorted name followed by a newline, so
+  `ls <archive>/locks | LC_ALL=C sort | sha256sum` (`shasum -a 256` on macOS)
+  reproduces it and shows whether anything was removed from the archive by
+  hand.
+- `attempts` and `attemptCount`: the newest 16 attempts with their
+  `startedAt`, `pid`, and any `failed` reason clipped to 256 characters, and
+  the total number of attempts, which links an interrupted run to each retry.
+
+An archive written by an earlier build has a version 1 marker that listed every
+lock directory by name. It stays readable and a completed one is never touched.
+When a retry resumes an interrupted one, the original marker is first copied
+verbatim to `reset.v1.json` in the archive, so its full list is kept, and then
+`reset.json` is rewritten in the bounded format.
 
 While a reset is interrupted, trust the archive directory over `reset.json`:
-its `moved` list can lag the last move after a hard stop. The preview prints
+its counts can lag the last move after a hard stop. The preview prints
 `reset pending: yes (resumes archive <name>)` and, for each interrupted
 archive, `interrupted archive: <name> holds <entries>` read from the
-filesystem. The retry fails closed with exit `2` and moves nothing if the
+filesystem, with lock directories counted rather than listed. The retry fails
+closed with exit `2` and moves nothing if the
 archive and the live directory both hold data for the same entry, or if the
 pending marker names an archive that is missing, symlinked, or unreadable. In
 either case reconcile by hand, keeping the archive, and remove

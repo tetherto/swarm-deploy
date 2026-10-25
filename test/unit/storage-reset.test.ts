@@ -15,6 +15,7 @@ import {
 } from '../../dist/storage/layout.js'
 import { inspectStorageReset, resetStorage } from '../../dist/storage/reset.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
+import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createTempDir } from '../helpers/files.js'
 import { createStorage, type StorageOperationName } from '../helpers/storage.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
@@ -39,6 +40,19 @@ const MUTATIONS = new Set<StorageOperationName>([
   'truncate',
   'chmod'
 ])
+
+/** The documented lock digest: SHA-256 over each sorted name followed by a newline. */
+function digestOf(names: string[]): string {
+  const text = [...names]
+    .sort()
+    .map((name) => `${name}\n`)
+    .join('')
+  return b4a.toString(sodiumSha256(b4a.from(text)), 'hex')
+}
+
+function lockSummary(names: string[]): { count: number; sha256: string } {
+  return { count: names.length, sha256: digestOf(names) }
+}
 
 function output() {
   let text = ''
@@ -279,6 +293,7 @@ test('reset-storage --apply archives every metadata class, recreates empty direc
   const marker = await readMarker(archive)
   t.is(marker.status, 'completed')
   t.is(marker.root, root)
+  t.is(marker.version, 2)
   t.alike(marker.moved, [
     'staging',
     'sessions',
@@ -286,9 +301,9 @@ test('reset-storage --apply archives every metadata class, recreates empty direc
     'journals',
     'publications',
     'links',
-    'trash',
-    `locks/lock.retired-${TOKEN}`
+    'trash'
   ])
+  t.alike(marker.locks, lockSummary([`lock.retired-${TOKEN}`]))
   t.is(
     await fs.promises.readFile(path.join(layout.internal, 'README-notes.txt'), 'utf8'),
     'unrelated operator file'
@@ -557,7 +572,8 @@ test('an interrupted reset leaves a recoverable in-progress archive and a re-run
   const marker = await readMarker(first)
   t.is(marker.status, 'in-progress')
   t.alike(marker.moved, ['staging', 'sessions', 'commits'])
-  t.is(marker.failed, 'Injected rename failure')
+  t.alike(marker.locks, lockSummary([]))
+  t.is((marker.attempts as Array<{ failed?: string }>)[0]?.failed, 'Injected rename failure')
   t.ok(await exists(path.join(first, 'commits', `${ID_A}.json`)))
   t.alike(await fs.promises.readdir(layout.commits), [], 'moved directories are recreated empty')
   t.alike(await fs.promises.readdir(layout.journals), [`${ID_B}.json`], 'unmoved metadata stays')
@@ -594,7 +610,7 @@ test('an interrupted reset leaves a recoverable in-progress archive and a re-run
   t.alike(await fs.promises.readdir(path.join(layout.internal, 'archive')), archives)
   const finished = await readMarker(first)
   t.is(finished.status, 'completed')
-  t.absent('failed' in finished, 'a completed archive carries no stale failure')
+  t.absent('failed' in finished, 'no failure is recorded beside the attempts')
   t.alike(finished.moved, [
     'staging',
     'sessions',
@@ -602,11 +618,12 @@ test('an interrupted reset leaves a recoverable in-progress archive and a re-run
     'journals',
     'publications',
     'links',
-    'trash',
-    `locks/lock.retired-${TOKEN}`
+    'trash'
   ])
+  t.alike(finished.locks, lockSummary([`lock.retired-${TOKEN}`]))
   const attempts = (finished.attempts ?? []) as Array<{ pid: number; failed?: string }>
   t.is(attempts.length, 2, 'every attempt is recorded in the one archive')
+  t.is(finished.attemptCount, 2)
   t.is(attempts[0]?.failed, 'Injected rename failure')
   t.is(attempts[1]?.failed, undefined)
   t.ok(await exists(path.join(first, 'journals', `${ID_B}.json`)))
@@ -666,10 +683,15 @@ test('a retry after a hard stop resumes the pending archive, and that one archiv
   await fs.promises.rename(layout.staging, path.join(archive, 'staging'))
   await fs.promises.rename(layout.sessions, path.join(archive, 'sessions'))
   await fs.promises.mkdir(layout.staging)
-  await fs.promises.writeFile(
-    path.join(archive, 'reset.json'),
-    JSON.stringify({ version: 1, status: 'in-progress', root, startedAt: 1, pid: dead, moved: [] })
-  )
+  const legacyMarker = JSON.stringify({
+    version: 1,
+    status: 'in-progress',
+    root,
+    startedAt: 1,
+    pid: dead,
+    moved: []
+  })
+  await fs.promises.writeFile(path.join(archive, 'reset.json'), legacyMarker)
   await fs.promises.writeFile(
     path.join(layout.internal, 'reset-pending.json'),
     JSON.stringify({ kind: 'storage-reset', version: 1, archive: archiveId })
@@ -703,10 +725,17 @@ test('a retry after a hard stop resumes the pending archive, and that one archiv
 
   const marker = await readMarker(archive)
   t.is(marker.status, 'completed')
+  t.is(marker.version, 2, 'the retry upgrades a version 1 marker to the bounded format')
   t.alike(
     marker.moved,
-    [...METADATA, `locks/lock.retired-${TOKEN}`, `locks/lock.retired-${deadToken}`],
+    [...METADATA],
     'the completed marker is reconciled from what the archive holds, not from the stale marker'
+  )
+  t.alike(marker.locks, lockSummary([`lock.retired-${TOKEN}`, `lock.retired-${deadToken}`]))
+  t.is(
+    await fs.promises.readFile(path.join(archive, 'reset.v1.json'), 'utf8'),
+    legacyMarker,
+    'the original version 1 marker is kept verbatim'
   )
   const attempts = (marker.attempts ?? []) as Array<{ pid: number }>
   t.alike(
@@ -756,13 +785,16 @@ test('a retry after a stop between the completed marker and the guard removal fi
   t.ok(
     has(
       retry.lines,
-      `resumed: yes; the interrupted archive already held ${[...METADATA, `locks/lock.retired-${TOKEN}`].join(', ')}`
+      `resumed: yes; the interrupted archive already held ${[...METADATA, '1 lock residue entry'].join(', ')}`
     )
   )
   t.alike(await fs.promises.readdir(path.join(layout.internal, 'archive')), [archiveId])
   const marker = await readMarker(archive)
   t.is(marker.status, 'completed')
   t.is(((marker.attempts ?? []) as unknown[]).length, 2)
+  t.is(marker.attemptCount, 2)
+  t.alike(marker.locks, lockSummary([`lock.retired-${TOKEN}`]))
+  t.absent(await exists(path.join(archive, 'reset.v1.json')), 'a version 2 marker needs no copy')
   t.absent(await exists(path.join(layout.internal, 'reset-pending.json')))
   for (const name of METADATA) {
     t.alike(await fs.promises.readdir(layout[name]), [], `${name} stays empty`)
@@ -811,6 +843,294 @@ test('a resumed reset refuses conflicting live data or a missing archive without
   t.alike(await fs.promises.readdir(archives), [], 'no replacement archive hides the missing one')
   t.alike(await fs.promises.readdir(layout.journals), [`${ID_B}.json`], 'live metadata is kept')
   t.ok(await exists(path.join(layout.internal, 'reset-pending.json')))
+})
+
+/** The size the version 1 reader allowed; the old marker outgrew it near 185 lock entries. */
+const OLD_MARKER_LIMIT = 16 * 1024
+
+function retiredName(index: number): string {
+  return `lock.retired-${index.toString(16).padStart(64, '0')}`
+}
+
+/** Stopped servers leave `lock.retired-*` residue behind; this seeds `count` of it. */
+async function seedRetiredLocks(layout: StorageLayout, count: number): Promise<string[]> {
+  const names: string[] = []
+  for (let index = 1; index <= count; index++) {
+    const name = retiredName(index)
+    await fs.promises.mkdir(path.join(layout.internal, name))
+    await fs.promises.writeFile(path.join(layout.internal, name, 'owner.json'), lockOwner(1, 1))
+    names.push(name)
+  }
+  return names
+}
+
+async function markerSize(archive: string): Promise<number> {
+  return (await fs.promises.lstat(path.join(archive, 'reset.json'))).size
+}
+
+test('hundreds of retired locks keep the marker small, and an interrupted reset still resumes and completes', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const seeded = await seedRetiredLocks(layout, 300)
+  const allLocks = [`lock.retired-${TOKEN}`, ...seeded]
+  t.ok(allLocks.length >= 250)
+
+  let moves = 0
+  const failing = createStorage({
+    beforeOperation(name, target) {
+      if (
+        name === 'rename' &&
+        path.dirname(target) === layout.internal &&
+        path.basename(target).startsWith('lock.retired-') &&
+        ++moves === 220
+      ) {
+        throw new Error('Injected rename failure')
+      }
+    }
+  })
+  const interrupted = await runReset(['--storage', root, '--apply'], { storage: failing })
+  t.is(interrupted.code, 1)
+  t.is(interrupted.stderr, 'Injected rename failure\n')
+  const archives = await fs.promises.readdir(path.join(layout.internal, 'archive'))
+  t.is(archives.length, 1)
+  const archive = path.join(layout.internal, 'archive', archives[0])
+  const stopped = await readMarker(archive)
+  t.is(stopped.status, 'in-progress')
+  t.ok((await markerSize(archive)) < OLD_MARKER_LIMIT, 'the marker no longer grows with residue')
+  t.alike(stopped.moved, [...METADATA], 'the marker names directories, never every lock')
+  t.alike(
+    (stopped.locks as { count: number }).count,
+    219,
+    'the marker count is reconciled from the archive after the failure'
+  )
+  t.is((await fs.promises.readdir(path.join(archive, 'locks'))).length, 219)
+
+  const preview = await runReset(['--storage', root])
+  t.is(preview.code, 0, preview.stderr)
+  t.ok(has(preview.lines, 'archives: 1 (1 interrupted)'))
+  t.ok(
+    has(
+      preview.lines,
+      `interrupted archive: ${archives[0]} holds ${[...METADATA, '219 lock residue entries'].join(', ')}`
+    ),
+    'the preview summarizes lock residue instead of printing every name'
+  )
+  t.ok(has(preview.lines, 'obsolete locks: 82'))
+  t.ok(
+    preview.lines.every((line) => line.length < 600),
+    'no report line grows with residue'
+  )
+
+  const resumed = await runReset(['--storage', root, '--apply'])
+  t.is(resumed.code, 0, resumed.stderr)
+  t.is(archivePath(resumed.lines), archive)
+  t.ok(
+    has(
+      resumed.lines,
+      `resumed: yes; the interrupted archive already held ${[...METADATA, '219 lock residue entries'].join(', ')}`
+    )
+  )
+  t.alike(await fs.promises.readdir(path.join(layout.internal, 'archive')), archives)
+
+  const archivedLocks = (await fs.promises.readdir(path.join(archive, 'locks'))).sort()
+  t.alike(archivedLocks, [...allLocks].sort(), 'every retired lock is in the archive')
+  const marker = await readMarker(archive)
+  t.is(marker.status, 'completed')
+  t.is(marker.version, 2)
+  t.alike(marker.moved, [...METADATA])
+  t.alike(marker.locks, lockSummary(allLocks), 'the digest covers every lock name')
+  t.alike(marker.locks, lockSummary(archivedLocks), 'and matches the archive directory listing')
+  t.is(marker.attemptCount, 2)
+  t.ok((await markerSize(archive)) < OLD_MARKER_LIMIT)
+  t.absent(
+    (await fs.promises.readdir(layout.internal)).some((name) => name.startsWith('lock.')),
+    'no residue is left live'
+  )
+  t.absent(await exists(path.join(layout.internal, 'reset-pending.json')))
+
+  const completed = await inspectStorageReset({ storageDir: root })
+  t.is(completed.archives.length, 1)
+  t.is(completed.archives[0].status, 'completed', 'a completed archive is never reported unknown')
+  t.alike(completed.archives[0].held.lockEntries, 301)
+  const after = await runReset(['--storage', root])
+  t.ok(has(after.lines, 'archives: 1'), 'the completed archive is not listed as interrupted')
+  t.absent(after.lines.some((line) => line.startsWith('interrupted archive:')))
+  t.ok(has(after.lines, 'obsolete locks: 0'))
+})
+
+test('the attempt history stays bounded across many failed retries and keeps the first attempt', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const message = `Injected failure ${'x'.repeat(2_000)}`
+  let failures = 0
+  const failing = createStorage({
+    beforeOperation(name, target) {
+      if (name === 'rename' && target === layout.journals && failures < 20) {
+        failures++
+        throw new Error(message)
+      }
+    }
+  })
+  let firstStartedAt = -1
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    const result = await runReset(['--storage', root, '--apply'], { storage: failing })
+    t.is(result.code, 1, `attempt ${attempt} is interrupted`)
+    if (attempt === 1) {
+      const [name] = await fs.promises.readdir(path.join(layout.internal, 'archive'))
+      firstStartedAt = (await readMarker(path.join(layout.internal, 'archive', name)))
+        .startedAt as number
+    }
+  }
+  const [archiveId] = await fs.promises.readdir(path.join(layout.internal, 'archive'))
+  const archive = path.join(layout.internal, 'archive', archiveId)
+  const stopped = await readMarker(archive)
+  t.is(stopped.attemptCount, 20)
+  t.is((stopped.attempts as unknown[]).length, 16, 'only the newest attempts are kept')
+  t.ok((await markerSize(archive)) < OLD_MARKER_LIMIT, 'long failure text cannot outgrow the bound')
+  for (const attempt of stopped.attempts as Array<{ failed?: string }>) {
+    t.is(attempt.failed?.length, 256, 'each failure is clipped')
+    t.ok(attempt.failed?.endsWith('...'))
+  }
+
+  const done = await runReset(['--storage', root, '--apply'], { storage: failing })
+  t.is(done.code, 0, done.stderr)
+  t.is(archivePath(done.lines), archive)
+  const marker = await readMarker(archive)
+  t.is(marker.status, 'completed')
+  t.is(marker.attemptCount, 21)
+  const attempts = marker.attempts as Array<{ failed?: string }>
+  t.is(attempts.length, 16)
+  t.is(attempts.at(-1)?.failed, undefined, 'the final attempt succeeded')
+  t.is(marker.startedAt, firstStartedAt, 'the first attempt stays at the top level')
+  t.is(marker.pid, process.pid)
+})
+
+test('version 1 markers stay readable and are upgraded without losing their evidence', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const claimed = Array.from({ length: 400 }, (_, index) => `locks/${retiredName(index + 1)}`)
+
+  // An older completed reset whose marker listed every lock and outgrew the old limit.
+  const older = path.join(layout.internal, 'archive', 'reset-20250101T000000000Z-aaaaaaaa')
+  await fs.promises.mkdir(older, { recursive: true })
+  const olderMarker = JSON.stringify({
+    version: 1,
+    status: 'completed',
+    root,
+    startedAt: 1,
+    pid: 2,
+    moved: [...METADATA, ...claimed],
+    completedAt: 3
+  })
+  t.ok(olderMarker.length > OLD_MARKER_LIMIT)
+  await fs.promises.writeFile(path.join(older, 'reset.json'), olderMarker)
+
+  // An interrupted reset from the previous format: a long list, a folded failure,
+  // and a pending pointer, with only part of what it claims physically archived.
+  const dead = 4_000_002
+  const archiveId = 'reset-20260101T000000000Z-0badc0de'
+  const archive = path.join(layout.internal, 'archive', archiveId)
+  await fs.promises.mkdir(path.join(archive, 'locks', retiredName(1)), { recursive: true })
+  await fs.promises.rename(layout.staging, path.join(archive, 'staging'))
+  await fs.promises.mkdir(layout.staging)
+  const legacy = JSON.stringify({
+    version: 1,
+    status: 'in-progress',
+    root,
+    startedAt: 5,
+    pid: dead,
+    attempts: [
+      { startedAt: 5, pid: dead },
+      { startedAt: 9, pid: dead }
+    ],
+    moved: ['staging', ...claimed],
+    failed: 'old failure'
+  })
+  t.ok(legacy.length > OLD_MARKER_LIMIT)
+  await fs.promises.writeFile(path.join(archive, 'reset.json'), legacy)
+  await fs.promises.writeFile(
+    path.join(layout.internal, 'reset-pending.json'),
+    JSON.stringify({ kind: 'storage-reset', version: 1, archive: archiveId })
+  )
+
+  const preview = await runReset(['--storage', root])
+  t.is(preview.code, 0, preview.stderr)
+  t.ok(has(preview.lines, 'archives: 2 (1 interrupted)'), 'the large completed marker is readable')
+  t.ok(
+    has(preview.lines, `interrupted archive: ${archiveId} holds staging, 1 lock residue entry`),
+    'held entries come from the filesystem, not from the 400 claimed in the marker'
+  )
+
+  const retry = await runReset(['--storage', root, '--apply'])
+  t.is(retry.code, 0, retry.stderr)
+  t.is(archivePath(retry.lines), archive)
+  const marker = await readMarker(archive)
+  t.is(marker.version, 2)
+  t.is(marker.status, 'completed')
+  t.is(marker.root, root)
+  t.is(marker.startedAt, 5)
+  t.is(marker.pid, dead)
+  t.is(marker.attemptCount, 3)
+  const attempts = marker.attempts as Array<{ pid: number; failed?: string }>
+  t.alike(
+    attempts.map((attempt) => attempt.failed),
+    [undefined, 'old failure', undefined],
+    'the version 1 failure is folded into the attempt that failed'
+  )
+  t.alike(marker.moved, [...METADATA])
+  t.alike(marker.locks, lockSummary([retiredName(1), `lock.retired-${TOKEN}`]))
+  t.ok((await markerSize(archive)) < OLD_MARKER_LIMIT)
+  t.is(
+    await fs.promises.readFile(path.join(archive, 'reset.v1.json'), 'utf8'),
+    legacy,
+    'the full original marker, including all 400 claimed entries, is kept verbatim'
+  )
+  t.is(await fs.promises.readFile(path.join(older, 'reset.json'), 'utf8'), olderMarker)
+  t.absent(await exists(path.join(older, 'reset.v1.json')), 'completed archives are never touched')
+})
+
+test('a resumed reset refuses markers the writer never produces and changes nothing', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  let tripped = false
+  const failing = createStorage({
+    beforeOperation(name, target) {
+      if (name === 'rename' && target === layout.journals && !tripped) {
+        tripped = true
+        throw new Error('Injected rename failure')
+      }
+    }
+  })
+  t.is((await runReset(['--storage', root, '--apply'], { storage: failing })).code, 1)
+  const [archiveId] = await fs.promises.readdir(path.join(layout.internal, 'archive'))
+  const markerPath = path.join(layout.internal, 'archive', archiveId, 'reset.json')
+  const valid = JSON.parse(await fs.promises.readFile(markerPath, 'utf8')) as Record<
+    string,
+    unknown
+  >
+  const variants: Array<[string, Record<string, unknown>]> = [
+    ['an unknown version', { ...valid, version: 3 }],
+    ['an unknown status', { ...valid, status: 'done' }],
+    ['a non-string root', { ...valid, root: 7 }],
+    ['an empty attempt list', { ...valid, attempts: [] }],
+    ['a non-object attempt', { ...valid, attempts: ['x'] }],
+    ['an attempt without a PID', { ...valid, attempts: [{ startedAt: 1 }] }],
+    ['a count below the attempts kept', { ...valid, attemptCount: 0 }],
+    ['a fractional count', { ...valid, attemptCount: 1.5 }]
+  ]
+  for (const [label, marker] of variants) {
+    await fs.promises.writeFile(markerPath, JSON.stringify(marker))
+    const before = await snapshot(root)
+    const refused = await runReset(['--storage', root, '--apply'])
+    t.is(refused.code, 2, label)
+    t.is(
+      refused.stderr,
+      `Pending reset archive ${archiveId} has an unrecognized marker; reconcile it before resetting\n`,
+      label
+    )
+    t.alike(await snapshot(root), before, `${label} moves nothing`)
+  }
+
+  // A marker this tool wrote always reads back: restoring it lets the retry finish.
+  await fs.promises.writeFile(markerPath, JSON.stringify(valid))
+  const retry = await runReset(['--storage', root, '--apply'])
+  t.is(retry.code, 0, retry.stderr)
 })
 
 test('a reset after manual payload deletion unblocks a fresh re-upload and link, while retained payloads and symlinks still conflict', async (t) => {

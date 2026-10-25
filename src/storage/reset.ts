@@ -5,7 +5,8 @@ import path from '#path'
 import process from '#process'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
-import { readJson, writeAtomic } from './atomic-file.js'
+import { SodiumSha256 } from '../tar-protocol/hash.js'
+import { MAX_SESSION_METADATA_BYTES, readJson, writeAtomic } from './atomic-file.js'
 import { assertCommitRecord, MAX_COMMIT_METADATA_BYTES } from './commit-journal.js'
 import {
   INTERNAL_DIRECTORY_NAME,
@@ -33,8 +34,29 @@ export type MetadataDirectoryName = (typeof METADATA_DIRECTORIES)[number]
 
 export const ARCHIVE_DIRECTORY_NAME = 'archive'
 export const ARCHIVE_MARKER_NAME = 'reset.json'
+/** Verbatim copy of a version 1 marker, kept when a retry upgrades it to the bounded format. */
+export const ARCHIVE_LEGACY_MARKER_NAME = 'reset.v1.json'
 const ARCHIVE_LOCKS_NAME = 'locks'
-const MAX_MARKER_BYTES = 16 * 1024
+/** The pending pointer is fixed-size: a kind, a version, and one archive name. */
+const MAX_PENDING_BYTES = 16 * 1024
+/**
+ * Read bound for archive markers. Version 1 markers listed every lock residue
+ * entry and so grew without limit; the shared metadata bound keeps those
+ * readable while still capping allocation.
+ */
+const MAX_ARCHIVE_MARKER_BYTES = MAX_SESSION_METADATA_BYTES
+/**
+ * Write bound for archive markers. The capped fields below keep the worst case
+ * (a 4 KiB root and sixteen fully escaped failures) far inside this, so
+ * reaching it is a programming error, never an operating condition.
+ */
+const MAX_MARKER_WRITE_BYTES = 64 * 1024
+const MARKER_VERSION = 2
+/** Newest attempts kept in a marker; the first is the top-level `startedAt`/`pid`. */
+const MAX_ATTEMPTS_KEPT = 16
+const MAX_FAILURE_CHARS = 256
+/** Lock residue moves between marker writes; the archive itself is the exact record. */
+const LOCK_PROGRESS_BATCH = 32
 const MAX_LINK_RECORD_BYTES = 4 * 1024
 const DEFAULT_POLL_INTERVAL = 250
 const METADATA_RECORD = /^[0-9a-f]{64}\.json$/
@@ -63,13 +85,19 @@ export type ResetLockState =
   | { status: 'malformed' }
   | { status: 'unsafe' }
 
+/** What an archive physically holds. Lock residue is counted; its names stay in `locks/`. */
+export interface ArchiveHoldings {
+  directories: string[]
+  lockEntries: number
+}
+
 export interface ArchiveSummary {
   name: string
   path: string
   /** What the marker claims; an `in-progress` marker can lag the archive after a hard stop. */
   status: 'completed' | 'in-progress' | 'unknown'
   /** What the archive physically holds, read from the filesystem rather than the marker. */
-  held: string[]
+  held: ArchiveHoldings
 }
 
 export interface StorageResetReport {
@@ -93,8 +121,8 @@ export interface StorageResetReport {
   pendingArchive: string | null
   /** The archive this run created or resumed, when applied. */
   archive: string | null
-  /** Entries a resumed archive already held before this run; null when a new archive was made. */
-  resumed: string[] | null
+  /** What a resumed archive already held before this run; null when a new archive was made. */
+  resumed: ArchiveHoldings | null
 }
 
 interface Settings {
@@ -281,7 +309,7 @@ async function archiveStatus(
     const marker = await readJson(
       path.join(archive, ARCHIVE_MARKER_NAME),
       storage,
-      MAX_MARKER_BYTES
+      MAX_ARCHIVE_MARKER_BYTES
     )
     if (marker.status === 'completed') return 'completed'
     if (marker.status === 'in-progress') return 'in-progress'
@@ -289,23 +317,46 @@ async function archiveStatus(
   return 'unknown'
 }
 
+interface Holdings {
+  directories: string[]
+  /** Sorted names of the lock residue directories inside `locks/`. */
+  locks: string[]
+}
+
+const NO_HOLDINGS: Holdings = { directories: [], locks: [] }
+
+function summarize(held: Holdings): ArchiveHoldings {
+  return { directories: held.directories, lockEntries: held.locks.length }
+}
+
 /**
  * What an archive physically holds: the metadata directories and lock residue
- * moved into it, in archive order. This is the truth about a reset's progress;
- * the marker's `moved` list is only a record that a hard stop can leave behind.
+ * moved into it. This is the truth about a reset's progress; a marker is only
+ * a record of it that a hard stop can leave behind.
  */
-async function archiveContents(archive: string, storage: StorageAdapter): Promise<string[]> {
+async function archiveContents(archive: string, storage: StorageAdapter): Promise<Holdings> {
   const names = new Set(await storage.readdir(archive))
-  const held: string[] = METADATA_DIRECTORIES.filter((name) => names.has(name))
+  const held: Holdings = {
+    directories: METADATA_DIRECTORIES.filter((name) => names.has(name)),
+    locks: []
+  }
   if (names.has(ARCHIVE_LOCKS_NAME)) {
     const locks = path.join(archive, ARCHIVE_LOCKS_NAME)
     if (await safeDirectoryOrMissing(locks, storage)) {
-      for (const name of (await storage.readdir(locks)).sort()) {
-        held.push(`${ARCHIVE_LOCKS_NAME}/${name}`)
-      }
+      held.locks = (await storage.readdir(locks)).sort()
     }
   }
   return held
+}
+
+/**
+ * SHA-256 over each sorted lock residue name followed by a newline, so an
+ * operator can verify it with `ls locks | LC_ALL=C sort | sha256sum`.
+ */
+function lockDigest(names: string[]): string {
+  const hash = new SodiumSha256()
+  for (const name of names) hash.update(b4a.from(`${name}\n`))
+  return b4a.toString(hash.digest(), 'hex')
 }
 
 async function listArchives(
@@ -323,7 +374,7 @@ async function listArchives(
       name,
       path: full,
       status: await archiveStatus(full, storage),
-      held: await archiveContents(full, storage).catch(() => [])
+      held: summarize(await archiveContents(full, storage).catch(() => NO_HOLDINGS))
     })
   }
   return archives
@@ -340,7 +391,7 @@ async function readPendingReset(
   const file = path.join(layout.internal, RESET_PENDING_NAME)
   if ((await lstatOrNull(file, storage)) === null) return { present: false, archive: null }
   try {
-    const marker = await readJson(file, storage, MAX_MARKER_BYTES)
+    const marker = await readJson(file, storage, MAX_PENDING_BYTES)
     if (
       marker.kind === 'storage-reset' &&
       marker.version === 1 &&
@@ -470,18 +521,6 @@ function archiveName(now: number): string {
   return `reset-${stamp}-${randomSuffix()}`
 }
 
-async function writeMarker(
-  archive: string,
-  marker: Record<string, unknown>,
-  storage: StorageAdapter
-): Promise<void> {
-  await writeAtomic(
-    path.join(archive, ARCHIVE_MARKER_NAME),
-    b4a.from(JSON.stringify(marker)),
-    storage
-  )
-}
-
 interface Attempt {
   startedAt: number
   pid: number
@@ -489,20 +528,132 @@ interface Attempt {
 }
 
 /**
+ * Everything a retry needs from an archive marker. The marker is bounded by
+ * construction: the full per-entry evidence lives in the archive itself, and
+ * the marker keeps only the first attempt, the newest few, and a total count.
+ */
+interface MarkerState {
+  root: string
+  startedAt: number
+  pid: number
+  attempts: Attempt[]
+  attemptCount: number
+}
+
+function isSafeCount(value: unknown, minimum: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum
+}
+
+function clip(reason: string): string {
+  return reason.length > MAX_FAILURE_CHARS ? `${reason.slice(0, MAX_FAILURE_CHARS - 3)}...` : reason
+}
+
+function parseAttempt(value: unknown): Attempt | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const { startedAt, pid, failed } = value as Record<string, unknown>
+  if (!isSafeCount(startedAt, 0) || !isSafeCount(pid, 1)) return null
+  if (failed === undefined) return { startedAt, pid }
+  return typeof failed === 'string' ? { startedAt, pid, failed: clip(failed) } : null
+}
+
+/**
+ * Reads a marker this tool wrote, in the bounded version 2 shape or the
+ * version 1 shape (whose `moved` list held every lock residue entry and whose
+ * latest failure sat beside `attempts`). Returns null for anything else, which
+ * every caller treats as unsafe. Nothing is carried over except these fields.
+ */
+function parseMarker(raw: Record<string, unknown>): MarkerState | null {
+  if (raw.version !== 1 && raw.version !== MARKER_VERSION) return null
+  if (raw.status !== 'in-progress' && raw.status !== 'completed') return null
+  const { root, startedAt, pid } = raw
+  if (typeof root !== 'string' || !isSafeCount(startedAt, 0) || !isSafeCount(pid, 1)) return null
+  let attempts: Attempt[]
+  if (raw.attempts === undefined) {
+    attempts = [{ startedAt, pid }]
+  } else {
+    if (!Array.isArray(raw.attempts) || raw.attempts.length === 0) return null
+    attempts = []
+    for (const entry of raw.attempts) {
+      const attempt = parseAttempt(entry)
+      if (attempt === null) return null
+      attempts.push(attempt)
+    }
+  }
+  const last = attempts.length - 1
+  if (typeof raw.failed === 'string' && attempts[last].failed === undefined) {
+    attempts[last] = { ...attempts[last], failed: clip(raw.failed) }
+  }
+  const attemptCount = raw.attemptCount === undefined ? attempts.length : raw.attemptCount
+  if (!isSafeCount(attemptCount, attempts.length)) return null
+  return { root, startedAt, pid, attempts: attempts.slice(-MAX_ATTEMPTS_KEPT), attemptCount }
+}
+
+function nextAttempt(state: MarkerState, attempt: Attempt): MarkerState {
+  return {
+    ...state,
+    attempts: [...state.attempts, attempt].slice(-MAX_ATTEMPTS_KEPT),
+    attemptCount: state.attemptCount + 1
+  }
+}
+
+function failLatest(state: MarkerState, reason: string): MarkerState {
+  const last = state.attempts.length - 1
+  return {
+    ...state,
+    attempts: state.attempts.map((attempt, index) =>
+      index === last ? { ...attempt, failed: clip(reason) } : attempt
+    )
+  }
+}
+
+/**
+ * Writes the bounded marker. `moved` names only the metadata directories, at
+ * most seven; lock residue is summarized by a count and a digest of its names,
+ * which stay physically in the archive's `locks/` directory.
+ */
+async function writeMarker(
+  archive: string,
+  state: MarkerState,
+  status: 'in-progress' | 'completed',
+  held: Holdings,
+  storage: StorageAdapter,
+  completedAt?: number
+): Promise<void> {
+  const bytes = b4a.from(
+    JSON.stringify({
+      version: MARKER_VERSION,
+      status,
+      root: state.root,
+      startedAt: state.startedAt,
+      pid: state.pid,
+      attemptCount: state.attemptCount,
+      attempts: state.attempts,
+      moved: held.directories,
+      locks: { count: held.locks.length, sha256: lockDigest(held.locks) },
+      ...(completedAt === undefined ? {} : { completedAt })
+    })
+  )
+  if (bytes.byteLength > MAX_MARKER_WRITE_BYTES) {
+    throw storageError('Reset marker exceeds its size bound')
+  }
+  await writeAtomic(path.join(archive, ARCHIVE_MARKER_NAME), bytes, storage)
+}
+
+/**
  * Opens the archive a pending reset names so the retry continues it. The archive
- * must be a plain directory with a marker this version wrote; anything else
- * means an operator changed it and the retry fails closed rather than starting
- * a second archive that would hide where the first one's data went.
+ * must be a plain directory with a marker this tool wrote; anything else means
+ * an operator changed it and the retry fails closed rather than starting a
+ * second archive that would hide where the first one's data went.
  */
 async function openPendingArchive(
   archive: string,
   storage: StorageAdapter
-): Promise<Record<string, unknown>> {
+): Promise<{ raw: Record<string, unknown>; state: MarkerState }> {
   const name = path.basename(archive)
-  let marker: Record<string, unknown>
+  let raw: Record<string, unknown>
   try {
     await assertSafeDirectory(archive, storage)
-    marker = await readJson(path.join(archive, ARCHIVE_MARKER_NAME), storage, MAX_MARKER_BYTES)
+    raw = await readJson(path.join(archive, ARCHIVE_MARKER_NAME), storage, MAX_ARCHIVE_MARKER_BYTES)
   } catch (error: unknown) {
     throw storageError(
       `Pending reset archive ${name} is missing or unreadable; restore it or reconcile ` +
@@ -510,37 +661,25 @@ async function openPendingArchive(
       error
     )
   }
-  if (marker.version !== 1 || (marker.status !== 'in-progress' && marker.status !== 'completed')) {
+  const state = parseMarker(raw)
+  if (state === null) {
     throw storageError(
       `Pending reset archive ${name} has an unrecognized marker; reconcile it before resetting`
     )
   }
-  return marker
+  return { raw, state }
 }
 
-/** The marker of a continued archive: ancestry kept as attempts, progress taken from disk. */
-function resumeMarker(
-  prior: Record<string, unknown>,
-  attempt: Attempt,
-  held: string[]
-): Record<string, unknown> {
-  const recorded: Attempt[] = Array.isArray(prior.attempts)
-    ? (prior.attempts as Attempt[])
-    : [{ startedAt: Number(prior.startedAt), pid: Number(prior.pid) }]
-  const attempts = recorded.map((earlier, index) =>
-    index === recorded.length - 1 && typeof prior.failed === 'string'
-      ? { ...earlier, failed: prior.failed }
-      : earlier
-  )
-  const next: Record<string, unknown> = {
-    ...prior,
-    status: 'in-progress',
-    attempts: [...attempts, attempt],
-    moved: held
-  }
-  delete next.failed
-  delete next.completedAt
-  return next
+/** Keeps a version 1 marker's full entry list before the bounded format replaces it. */
+async function preserveLegacyMarker(
+  archive: string,
+  raw: Record<string, unknown>,
+  storage: StorageAdapter
+): Promise<void> {
+  if (raw.version !== 1) return
+  const file = path.join(archive, ARCHIVE_LEGACY_MARKER_NAME)
+  if ((await lstatOrNull(file, storage)) !== null) return
+  await writeAtomic(file, b4a.from(JSON.stringify(raw)), storage)
 }
 
 /**
@@ -551,7 +690,7 @@ function resumeMarker(
  */
 async function archiveMetadata(
   settings: Settings
-): Promise<{ archive: string; resumed: string[] | null }> {
+): Promise<{ archive: string; resumed: ArchiveHoldings | null }> {
   const { layout, storage, clock, pid } = settings
   const archives = path.join(layout.internal, ARCHIVE_DIRECTORY_NAME)
   if (!(await safeDirectoryOrMissing(archives, storage))) {
@@ -565,15 +704,17 @@ async function archiveMetadata(
   const startedAt = clock.now()
   const attempt: Attempt = { startedAt, pid }
   let archive: string
-  let marker: Record<string, unknown>
-  let resumed: string[] | null = null
+  let state: MarkerState
+  let held: Holdings = NO_HOLDINGS
+  let resumed: ArchiveHoldings | null = null
   if (pending.archive !== null) {
     archive = path.join(archives, pending.archive)
     const prior = await openPendingArchive(archive, storage)
-    resumed = await archiveContents(archive, storage)
+    held = await archiveContents(archive, storage)
+    resumed = summarize(held)
     // Refuse before moving anything if the archive and the live directory both hold data.
     for (const name of METADATA_DIRECTORIES) {
-      if (!resumed.includes(name)) continue
+      if (!held.directories.includes(name)) continue
       await assertSafeDirectory(path.join(archive, name), storage)
       if (
         (await safeDirectoryOrMissing(layout[name], storage)) &&
@@ -585,21 +726,14 @@ async function archiveMetadata(
         )
       }
     }
-    marker = resumeMarker(prior, attempt, resumed)
-    await writeMarker(archive, marker, storage)
+    await preserveLegacyMarker(archive, prior.raw, storage)
+    state = nextAttempt(prior.state, attempt)
+    await writeMarker(archive, state, 'in-progress', held, storage)
   } else {
     archive = path.join(archives, archiveName(startedAt))
     await storage.mkdir(archive, { mode: 0o700 })
-    marker = {
-      version: 1,
-      status: 'in-progress',
-      root: layout.root,
-      startedAt,
-      pid,
-      attempts: [attempt],
-      moved: []
-    }
-    await writeMarker(archive, marker, storage)
+    state = { root: layout.root, startedAt, pid, attempts: [attempt], attemptCount: 1 }
+    await writeMarker(archive, state, 'in-progress', held, storage)
     await syncDirectory(archives, storage)
     await writeAtomic(
       pendingFile,
@@ -611,14 +745,14 @@ async function archiveMetadata(
     await syncDirectory(layout.internal, storage)
   }
   const recordProgress = async (): Promise<void> => {
-    marker.moved = await archiveContents(archive, storage)
-    await writeMarker(archive, marker, storage)
+    held = await archiveContents(archive, storage)
+    await writeMarker(archive, state, 'in-progress', held, storage)
   }
   try {
     for (const name of METADATA_DIRECTORIES) {
       const source = layout[name]
       let live = await safeDirectoryOrMissing(source, storage)
-      if (live && !(resumed ?? []).includes(name)) {
+      if (live && !held.directories.includes(name)) {
         await storage.rename(source, path.join(archive, name))
         live = false
         await recordProgress()
@@ -627,28 +761,29 @@ async function archiveMetadata(
       await syncDirectory(layout.internal, storage)
     }
     const locks = path.join(archive, ARCHIVE_LOCKS_NAME)
+    let sinceRecord = 0
     for (const name of (await storage.readdir(layout.internal)).sort()) {
       if (!OBSOLETE_LOCK.test(name)) continue
       if (!(await safeDirectoryOrMissing(locks, storage))) {
         await storage.mkdir(locks, { mode: 0o700 })
       }
       await storage.rename(path.join(layout.internal, name), path.join(locks, name))
-      await recordProgress()
+      // Residue is recorded in batches: the archive holds the exact list, so a
+      // marker that lags by one batch after a hard stop is reconciled, not trusted.
+      if (++sinceRecord % LOCK_PROGRESS_BATCH === 0) await recordProgress()
     }
     await syncDirectory(layout.internal, storage)
-    marker.moved = await archiveContents(archive, storage)
-    await writeMarker(
-      archive,
-      { ...marker, status: 'completed', completedAt: clock.now() },
-      storage
-    )
+    held = await archiveContents(archive, storage)
+    await writeMarker(archive, state, 'completed', held, storage, clock.now())
     await syncDirectory(archive, storage)
     await storage.unlink(pendingFile)
     await syncDirectory(layout.internal, storage)
   } catch (error: unknown) {
     const reason = error instanceof Error ? error.message : String(error)
-    const moved = await archiveContents(archive, storage).catch(() => marker.moved)
-    await writeMarker(archive, { ...marker, moved, failed: reason }, storage).catch(() => {})
+    const moved = await archiveContents(archive, storage).catch(() => held)
+    await writeMarker(archive, failLatest(state, reason), 'in-progress', moved, storage).catch(
+      () => {}
+    )
     throw error
   }
   return { archive, resumed }
@@ -677,7 +812,7 @@ export async function resetStorage(options: StorageResetOptions): Promise<Storag
     throw storageError(`Unsafe storage lock path: ${layout.lock}`)
   }
   const release = await acquireExclusive(settings)
-  let result: { archive: string; resumed: string[] | null }
+  let result: { archive: string; resumed: ArchiveHoldings | null }
   let before: StorageResetReport
   try {
     before = await inspect(settings)
