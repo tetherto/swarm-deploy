@@ -35,7 +35,7 @@ import { keyPairFromSeed } from './identity.js'
 import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
 import { LinkStore, type LinkReconcileResult } from './storage/link-store.js'
-import { acquireStorageLock, initLayout } from './storage/layout.js'
+import { acquireStorageLock, assertNoPendingStorageReset, initLayout } from './storage/layout.js'
 import { withRootLease } from './storage/root-coordinator.js'
 import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
 import {
@@ -1421,6 +1421,7 @@ export class Server extends EventEmitter {
     try {
       this.layout = initLayout(this.storageDir)
       this.releaseLock = await acquireStorageLock(this.layout, { storage: this.storage })
+      await assertNoPendingStorageReset(this.layout, this.storage)
       this.sessions = new SessionStore({
         layout: this.layout,
         maxStagingBytes: this.maxStagingBytes,

@@ -20,6 +20,14 @@ import {
   type ClientUploadResult
 } from './client.js'
 import type { DirectDhtNode } from './direct-dht.js'
+import type { StorageAdapter } from './storage/types.js'
+import {
+  inspectStorageReset,
+  resetStorage,
+  METADATA_DIRECTORIES,
+  type ArchiveHoldings,
+  type StorageResetReport
+} from './storage/reset.js'
 
 type Env = Record<string, string | undefined>
 type Output = { write(value: string): unknown }
@@ -39,9 +47,15 @@ type CliIo = {
   idleTimeout?: number
   /** Directory that relative `--hooks` paths resolve against; defaults to `process.cwd()`. */
   cwd?: string
+  /** Storage adapter for `reset-storage`; defaults to the runtime filesystem. */
+  storage?: StorageAdapter
+  /** Process liveness check for `reset-storage`; defaults to a signal-0 probe. */
+  isProcessAlive?: (pid: number) => boolean
+  /** Lock poll interval in milliseconds for `reset-storage --wait`. */
+  pollInterval?: number
 }
 
-const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload', 'link'])
+const COMMANDS = new Set(['keygen', 'public-key', 'server', 'upload', 'link', 'reset-storage'])
 const HELP_ARGS = new Set(['--help', '-h'])
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MAX_SEED_FILE_BYTES = 65
@@ -55,6 +69,7 @@ const USAGE = [
   '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module>]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] <file-or-directory>',
   '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <target> <link-name>',
+  '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]]',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
 ].join('\n')
@@ -913,6 +928,146 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
   return code
 }
 
+const RESET_LIST_LIMIT = 10
+
+function listNames(names: string[]): string {
+  if (names.length === 0) return ''
+  const shown = names.slice(0, RESET_LIST_LIMIT).join(', ')
+  const more = names.length - RESET_LIST_LIMIT
+  return ` (${shown}${more > 0 ? `, and ${more} more` : ''})`
+}
+
+function formatLockState(lock: StorageResetReport['lock']): string {
+  const age = (ms: number) => `${Math.round(ms / 1000)}s`
+  if (lock.status === 'free') return 'free'
+  if (lock.status === 'held') return `held by pid ${lock.pid} (lock age ${age(lock.ageMs)})`
+  if (lock.status === 'stale') {
+    return `stale, pid ${lock.pid} is not running (lock age ${age(lock.ageMs)}); will be retired`
+  }
+  if (lock.status === 'malformed') {
+    return 'unreadable; reset refused until the server is stopped and its lock reconciled'
+  }
+  return 'unsafe path; the reset refuses to proceed'
+}
+
+/** Names the metadata directories an archive holds and counts its lock residue entries. */
+function describeHoldings(held: ArchiveHoldings): string {
+  const parts = [...held.directories]
+  if (held.lockEntries > 0) {
+    parts.push(`${held.lockEntries} lock residue ${held.lockEntries === 1 ? 'entry' : 'entries'}`)
+  }
+  return parts.length > 0 ? parts.join(', ') : 'nothing'
+}
+
+/** One `key: value` line per fact, so operators and scripts can read the same output. */
+function formatResetReport(report: StorageResetReport): string[] {
+  const lines = [`storage: ${report.root}`, `lock: ${formatLockState(report.lock)}`]
+  if (report.resetPending) {
+    const archive =
+      report.pendingArchive === null ? '' : ` (resumes archive ${report.pendingArchive})`
+    lines.push(
+      `reset pending: yes${archive}; server startup is blocked until reset-storage --apply finishes`
+    )
+  }
+  const commitDetails: string[] = []
+  if (report.commits.missingPayloads.length > 0) {
+    commitDetails.push(`${report.commits.missingPayloads.length} missing payloads`)
+  }
+  if (report.commits.invalid > 0) commitDetails.push(`${report.commits.invalid} invalid`)
+  lines.push(
+    `commits: ${report.commits.records} records${commitDetails.length ? ` (${commitDetails.join(', ')})` : ''}`
+  )
+  for (const name of METADATA_DIRECTORIES) {
+    if (name === 'commits') continue
+    if (name === 'links') {
+      const invalid = report.links.invalid > 0 ? ` (${report.links.invalid} invalid)` : ''
+      lines.push(`links: ${report.links.records} records${invalid}`)
+      continue
+    }
+    lines.push(`${name}: ${report.metadata[name]} entries`)
+  }
+  lines.push(`obsolete locks: ${report.obsoleteLocks}`)
+  const interrupted = report.archives.filter((archive) => archive.status !== 'completed').length
+  lines.push(
+    `archives: ${report.archives.length}${interrupted ? ` (${interrupted} interrupted)` : ''}`
+  )
+  // An interrupted marker can lag the archive, so name what it physically holds.
+  for (const archive of report.archives) {
+    if (archive.status === 'completed') continue
+    lines.push(`interrupted archive: ${archive.name} holds ${describeHoldings(archive.held)}`)
+  }
+  if (report.unknownInternal.length > 0) {
+    lines.push(
+      `unknown internal entries: ${report.unknownInternal.length}${listNames(report.unknownInternal)}; left in place`
+    )
+  }
+  const { payloads, symlinks, other } = report.remaining
+  lines.push(`remaining payloads: ${payloads.length}${listNames(payloads)}`)
+  lines.push(`remaining symlinks: ${symlinks.length}${listNames(symlinks)}`)
+  if (other.length > 0) lines.push(`remaining other entries: ${other.length}${listNames(other)}`)
+  lines.push(`fresh start: ${report.freshStart ? 'yes' : 'no'}`)
+  if (payloads.length > 0) {
+    lines.push(
+      'note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually'
+    )
+  }
+  if (symlinks.length > 0) {
+    lines.push(
+      'note: remaining symlinks have no ownership record after the reset; a --symlink rule or link request for that name fails closed with LINK_CONFLICT until you remove them manually'
+    )
+  }
+  if (other.length > 0) {
+    lines.push('note: remaining other entries are unmanaged and keep their names occupied')
+  }
+  if (report.applied) {
+    if (report.resumed !== null) {
+      lines.push(
+        `resumed: yes; the interrupted archive already held ${describeHoldings(report.resumed)}`
+      )
+    }
+    lines.push(`archive: ${report.archive}`)
+    lines.push('result: metadata archived; the next server start begins with empty metadata')
+  } else {
+    lines.push(
+      'result: preview only, nothing changed; re-run with --apply to archive this metadata'
+    )
+  }
+  return lines
+}
+
+async function runResetStorage(args: string[], io: CliIo): Promise<number> {
+  const { options, flagOptions, positionals } = parseOptions(
+    args,
+    new Set(['--storage', '--apply', '--wait']),
+    new Set(),
+    new Set(),
+    new Set(['--apply'])
+  )
+  requirePositionals(positionals, 0, 'reset-storage does not accept positional arguments')
+  const storageDir = requireOption(options, '--storage')
+  const apply = flagOptions['--apply'] === true
+  if (!apply && options['--wait'] !== undefined) {
+    throw usageError('--wait requires --apply')
+  }
+  const wait =
+    options['--wait'] === undefined ? 0 : parsePositiveSafeInteger(options['--wait'], 'wait')
+  const resetOptions = {
+    storageDir,
+    wait,
+    storage: io.storage,
+    isProcessAlive: io.isProcessAlive,
+    pollInterval: io.pollInterval
+  }
+  let report: StorageResetReport
+  try {
+    report = apply ? await resetStorage(resetOptions) : await inspectStorageReset(resetOptions)
+  } catch (err) {
+    throw new CliError(errorMessage(err), exitCodeFor(err))
+  }
+  for (const line of formatResetReport(report)) writeLine(io.stdout, line)
+  return 0
+}
+
 async function dispatch(argv: string[], env: Env, io: CliIo): Promise<number> {
   if (argv.length === 1 && HELP_ARGS.has(argv[0])) {
     writeLine(io.stdout, USAGE)
@@ -933,6 +1088,7 @@ async function dispatch(argv: string[], env: Env, io: CliIo): Promise<number> {
   }
   if (command === 'server') return runServer(args, env, io)
   if (command === 'upload') return runUpload(args, env, io)
+  if (command === 'reset-storage') return runResetStorage(args, io)
   return runLink(args, env, io)
 }
 

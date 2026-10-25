@@ -11,6 +11,46 @@ All notable changes to this package are documented here.
 - **Fix.** After a `HOOK_FAILED` answer (any hook phase) the server now ends its write side and destroys the connection once the peer closes it, or after 5 seconds, instead of destroying it right behind the write. Over a real stream the immediate destroy could reset the connection before the client read the record, so the caller saw a connection reset instead of `HOOK_FAILED`. Other failure answers still close immediately and are unchanged.
 - Configuring `afterLink` defers the post-commit retention pass until the hooks succeed, like `afterCommit`, so the commit's own reconciliation reports the link as `LINKED`. Servers without `afterLink` are unchanged, including `afterCommit` ordering and its deferred retention.
 - Add the runnable `examples/link-publisher` hooks module and publisher, which pass each link change as one JSON document on stdin to a script started without a shell.
+- Add `swarm-deploy reset-storage --storage <dir> [--apply [--wait <ms>]]`. Without `--apply` it is a read-only preview of the
+  private state under one storage root: commit records and how many have no
+  payload, sessions, journals, staging, publications, the managed-link ledger,
+  trash, lock residue, earlier archives, and the visible payloads and symlinks
+  that would remain. With `--apply` it takes the storage lock, renames those
+  directories and lock residue into
+  `.swarm-deploy/archive/reset-<timestamp>-<random>/` with a `reset.json`
+  marker, recreates them empty, and releases the lock. Nothing is copied or
+  deleted; an archive is restored by moving it back.
+- The reset never signals a process. A live lock holder makes `--apply` fail
+  closed with exit `1`; `--wait` polls until the holder releases the lock, a
+  holder whose PID is gone is retired automatically. Live and unreadable
+  locks cannot be bypassed by a PID override.
+- The report states what still blocks a true fresh start: remaining payloads
+  keep their names (`FILE_EXISTS`) and remaining symlinks lose their ownership
+  record (`LINK_CONFLICT`). `fresh start: yes` is printed only for a root with
+  nothing visible left. Unsafe roots, symlinked internal paths, filesystem
+  roots, and uninitialized roots are rejected with exit `2` before any change.
+- Block server recovery after an interrupted reset until a reset retry
+  completes, reject symlink ancestors, and refresh retained-file reporting
+  after waiting for exclusive access.
+- A retry after an interrupted reset, including a crash or power loss that
+  skips error handling, resumes the archive the pending marker names instead of
+  creating a second one. Progress is reconciled from what the archive holds,
+  and a retry fails closed when the archive and the live directory both hold
+  data or the named archive is gone. One reset always ends as one archive, so
+  restoring it restores everything.
+- Keep the archive marker bounded. `reset.json` is version 2: it names the
+  metadata directories, summarizes lock residue as a count and a SHA-256 of the
+  sorted names, and keeps the first attempt, the newest 16 attempts, and a total
+  count with failure text clipped. A marker therefore stays readable after any
+  number of stopped servers or retries, instead of becoming unreadable once its
+  lock list outgrew the reader. Version 1 markers stay readable at the shared
+  metadata size bound, a retry that resumes one first preserves it verbatim as
+  `reset.v1.json`, and the preview counts lock residue rather than listing it.
+- Document that `reset-storage` must run as the server's operating-system user:
+  applying it as another user, such as `root`, leaves metadata the service
+  cannot use. The command does not enforce this.
+- Export `resolveLayout`, `inspectStorageLock`, and `isProcessAlive` from the
+  storage layout module for the reset; existing lock behaviour is unchanged.
 
 ## 0.3.1
 
