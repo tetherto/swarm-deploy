@@ -25,6 +25,15 @@ All notable changes to this package are documented here.
 - Block server recovery after an interrupted reset until a reset retry
   completes, reject symlink ancestors, and refresh retained-file reporting
   after waiting for exclusive access.
+- A retry after an interrupted reset, including a crash or power loss that
+  skips error handling, resumes the archive the pending marker names instead of
+  creating a second one. Progress is reconciled from what the archive holds,
+  `reset.json` records an `attempts` list, and a retry fails closed when the
+  archive and the live directory both hold data or the named archive is gone.
+  One reset always ends as one archive, so restoring it restores everything.
+- Document that `reset-storage` must run as the server's operating-system user:
+  applying it as another user, such as `root`, leaves metadata the service
+  cannot use. The command does not enforce this.
 - Export `resolveLayout`, `inspectStorageLock`, and `isProcessAlive` from the
   storage layout module for the reset; existing lock behaviour is unchanged.
 

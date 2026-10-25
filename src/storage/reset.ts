@@ -38,6 +38,7 @@ const MAX_MARKER_BYTES = 16 * 1024
 const MAX_LINK_RECORD_BYTES = 4 * 1024
 const DEFAULT_POLL_INTERVAL = 250
 const METADATA_RECORD = /^[0-9a-f]{64}\.json$/
+const ARCHIVE_NAME = /^reset-[0-9TZ]+-[0-9a-f]+$/
 /** Lock residue no running server can own: retired tombstones and abandoned candidates. */
 const OBSOLETE_LOCK = /^lock\.(?:retired|candidate)-[0-9a-f]+$/
 
@@ -65,7 +66,10 @@ export type ResetLockState =
 export interface ArchiveSummary {
   name: string
   path: string
+  /** What the marker claims; an `in-progress` marker can lag the archive after a hard stop. */
   status: 'completed' | 'in-progress' | 'unknown'
+  /** What the archive physically holds, read from the filesystem rather than the marker. */
+  held: string[]
 }
 
 export interface StorageResetReport {
@@ -85,8 +89,12 @@ export interface StorageResetReport {
   /** True only when nothing visible remains, so the next server really starts empty. */
   freshStart: boolean
   resetPending: boolean
-  /** The archive this run created, when applied. */
+  /** The archive an interrupted reset left pending, which the next apply resumes. */
+  pendingArchive: string | null
+  /** The archive this run created or resumed, when applied. */
   archive: string | null
+  /** Entries a resumed archive already held before this run; null when a new archive was made. */
+  resumed: string[] | null
 }
 
 interface Settings {
@@ -281,6 +289,25 @@ async function archiveStatus(
   return 'unknown'
 }
 
+/**
+ * What an archive physically holds: the metadata directories and lock residue
+ * moved into it, in archive order. This is the truth about a reset's progress;
+ * the marker's `moved` list is only a record that a hard stop can leave behind.
+ */
+async function archiveContents(archive: string, storage: StorageAdapter): Promise<string[]> {
+  const names = new Set(await storage.readdir(archive))
+  const held: string[] = METADATA_DIRECTORIES.filter((name) => names.has(name))
+  if (names.has(ARCHIVE_LOCKS_NAME)) {
+    const locks = path.join(archive, ARCHIVE_LOCKS_NAME)
+    if (await safeDirectoryOrMissing(locks, storage)) {
+      for (const name of (await storage.readdir(locks)).sort()) {
+        held.push(`${ARCHIVE_LOCKS_NAME}/${name}`)
+      }
+    }
+  }
+  return held
+}
+
 async function listArchives(
   layout: StorageLayout,
   storage: StorageAdapter
@@ -292,9 +319,38 @@ async function listArchives(
     const full = path.join(directory, name)
     const stat = await lstatOrNull(full, storage)
     if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) continue
-    archives.push({ name, path: full, status: await archiveStatus(full, storage) })
+    archives.push({
+      name,
+      path: full,
+      status: await archiveStatus(full, storage),
+      held: await archiveContents(full, storage).catch(() => [])
+    })
   }
   return archives
+}
+
+/**
+ * Reads the pending-reset marker. `archive` is null when the marker exists but
+ * is not one this version wrote, which every caller must treat as unsafe.
+ */
+async function readPendingReset(
+  layout: StorageLayout,
+  storage: StorageAdapter
+): Promise<{ present: boolean; archive: string | null }> {
+  const file = path.join(layout.internal, RESET_PENDING_NAME)
+  if ((await lstatOrNull(file, storage)) === null) return { present: false, archive: null }
+  try {
+    const marker = await readJson(file, storage, MAX_MARKER_BYTES)
+    if (
+      marker.kind === 'storage-reset' &&
+      marker.version === 1 &&
+      typeof marker.archive === 'string' &&
+      ARCHIVE_NAME.test(marker.archive)
+    ) {
+      return { present: true, archive: marker.archive }
+    }
+  } catch {}
+  return { present: true, archive: null }
 }
 
 async function lockState(settings: Settings): Promise<ResetLockState> {
@@ -328,6 +384,7 @@ async function inspect(settings: Settings): Promise<StorageResetReport> {
     else unknownInternal.push(name)
   }
   const remaining = await inspectRoot(layout, storage)
+  const pending = await readPendingReset(layout, storage)
   return {
     root: layout.root,
     applied: false,
@@ -339,11 +396,12 @@ async function inspect(settings: Settings): Promise<StorageResetReport> {
     unknownInternal,
     archives: await listArchives(layout, storage),
     remaining,
-    resetPending:
-      (await lstatOrNull(path.join(layout.internal, RESET_PENDING_NAME), storage)) !== null,
+    resetPending: pending.present,
+    pendingArchive: pending.archive,
     freshStart:
       remaining.payloads.length + remaining.symlinks.length + remaining.other.length === 0,
-    archive: null
+    archive: null,
+    resumed: null
   }
 }
 
@@ -424,82 +482,176 @@ async function writeMarker(
   )
 }
 
-async function archiveMetadata(settings: Settings): Promise<string> {
+interface Attempt {
+  startedAt: number
+  pid: number
+  failed?: string
+}
+
+/**
+ * Opens the archive a pending reset names so the retry continues it. The archive
+ * must be a plain directory with a marker this version wrote; anything else
+ * means an operator changed it and the retry fails closed rather than starting
+ * a second archive that would hide where the first one's data went.
+ */
+async function openPendingArchive(
+  archive: string,
+  storage: StorageAdapter
+): Promise<Record<string, unknown>> {
+  const name = path.basename(archive)
+  let marker: Record<string, unknown>
+  try {
+    await assertSafeDirectory(archive, storage)
+    marker = await readJson(path.join(archive, ARCHIVE_MARKER_NAME), storage, MAX_MARKER_BYTES)
+  } catch (error: unknown) {
+    throw storageError(
+      `Pending reset archive ${name} is missing or unreadable; restore it or reconcile ` +
+        `${RESET_PENDING_NAME} by hand before resetting`,
+      error
+    )
+  }
+  if (marker.version !== 1 || (marker.status !== 'in-progress' && marker.status !== 'completed')) {
+    throw storageError(
+      `Pending reset archive ${name} has an unrecognized marker; reconcile it before resetting`
+    )
+  }
+  return marker
+}
+
+/** The marker of a continued archive: ancestry kept as attempts, progress taken from disk. */
+function resumeMarker(
+  prior: Record<string, unknown>,
+  attempt: Attempt,
+  held: string[]
+): Record<string, unknown> {
+  const recorded: Attempt[] = Array.isArray(prior.attempts)
+    ? (prior.attempts as Attempt[])
+    : [{ startedAt: Number(prior.startedAt), pid: Number(prior.pid) }]
+  const attempts = recorded.map((earlier, index) =>
+    index === recorded.length - 1 && typeof prior.failed === 'string'
+      ? { ...earlier, failed: prior.failed }
+      : earlier
+  )
+  const next: Record<string, unknown> = {
+    ...prior,
+    status: 'in-progress',
+    attempts: [...attempts, attempt],
+    moved: held
+  }
+  delete next.failed
+  delete next.completedAt
+  return next
+}
+
+/**
+ * Archives the metadata, or resumes the archive an interrupted reset left
+ * pending. Every move is a rename, so after a hard stop each directory is
+ * either still live or already inside the archive; progress is therefore
+ * reconciled from what the archive holds, never trusted from the marker.
+ */
+async function archiveMetadata(
+  settings: Settings
+): Promise<{ archive: string; resumed: string[] | null }> {
   const { layout, storage, clock, pid } = settings
   const archives = path.join(layout.internal, ARCHIVE_DIRECTORY_NAME)
   if (!(await safeDirectoryOrMissing(archives, storage))) {
     await storage.mkdir(archives, { mode: 0o700 })
   }
-  const pending = path.join(layout.internal, RESET_PENDING_NAME)
-  if ((await lstatOrNull(pending, storage)) !== null) {
-    const prior = await readJson(pending, storage, MAX_MARKER_BYTES)
-    if (
-      prior.kind !== 'storage-reset' ||
-      prior.version !== 1 ||
-      typeof prior.archive !== 'string' ||
-      !/^reset-[0-9TZ]+-[0-9a-f]+$/.test(prior.archive)
-    ) {
-      throw storageError('Unrecognized pending reset marker; reconcile it before resetting')
-    }
+  const pendingFile = path.join(layout.internal, RESET_PENDING_NAME)
+  const pending = await readPendingReset(layout, storage)
+  if (pending.present && pending.archive === null) {
+    throw storageError('Unrecognized pending reset marker; reconcile it before resetting')
   }
   const startedAt = clock.now()
-  const archive = path.join(archives, archiveName(startedAt))
-  await storage.mkdir(archive, { mode: 0o700 })
-  const marker: Record<string, unknown> = {
-    version: 1,
-    status: 'in-progress',
-    root: layout.root,
-    startedAt,
-    pid,
-    moved: [] as string[]
+  const attempt: Attempt = { startedAt, pid }
+  let archive: string
+  let marker: Record<string, unknown>
+  let resumed: string[] | null = null
+  if (pending.archive !== null) {
+    archive = path.join(archives, pending.archive)
+    const prior = await openPendingArchive(archive, storage)
+    resumed = await archiveContents(archive, storage)
+    // Refuse before moving anything if the archive and the live directory both hold data.
+    for (const name of METADATA_DIRECTORIES) {
+      if (!resumed.includes(name)) continue
+      await assertSafeDirectory(path.join(archive, name), storage)
+      if (
+        (await safeDirectoryOrMissing(layout[name], storage)) &&
+        (await storage.readdir(layout[name])).length > 0
+      ) {
+        throw storageError(
+          `Reset archive ${pending.archive} already holds ${name} but the live ${name} ` +
+            'directory is not empty; reconcile the two by hand before resetting'
+        )
+      }
+    }
+    marker = resumeMarker(prior, attempt, resumed)
+    await writeMarker(archive, marker, storage)
+  } else {
+    archive = path.join(archives, archiveName(startedAt))
+    await storage.mkdir(archive, { mode: 0o700 })
+    marker = {
+      version: 1,
+      status: 'in-progress',
+      root: layout.root,
+      startedAt,
+      pid,
+      attempts: [attempt],
+      moved: []
+    }
+    await writeMarker(archive, marker, storage)
+    await syncDirectory(archives, storage)
+    await writeAtomic(
+      pendingFile,
+      b4a.from(
+        JSON.stringify({ kind: 'storage-reset', version: 1, archive: path.basename(archive) })
+      ),
+      storage
+    )
+    await syncDirectory(layout.internal, storage)
   }
-  await writeMarker(archive, marker, storage)
-  await syncDirectory(archives, storage)
-  await writeAtomic(
-    pending,
-    b4a.from(
-      JSON.stringify({ kind: 'storage-reset', version: 1, archive: path.basename(archive) })
-    ),
-    storage
-  )
-  await syncDirectory(layout.internal, storage)
-  const moved: string[] = []
-  marker.moved = moved
+  const recordProgress = async (): Promise<void> => {
+    marker.moved = await archiveContents(archive, storage)
+    await writeMarker(archive, marker, storage)
+  }
   try {
     for (const name of METADATA_DIRECTORIES) {
       const source = layout[name]
-      if (await safeDirectoryOrMissing(source, storage)) {
+      let live = await safeDirectoryOrMissing(source, storage)
+      if (live && !(resumed ?? []).includes(name)) {
         await storage.rename(source, path.join(archive, name))
-        moved.push(name)
+        live = false
+        await recordProgress()
       }
-      await storage.mkdir(source, { mode: 0o700 })
+      if (!live) await storage.mkdir(source, { mode: 0o700 })
       await syncDirectory(layout.internal, storage)
     }
-    let locks: string | null = null
+    const locks = path.join(archive, ARCHIVE_LOCKS_NAME)
     for (const name of (await storage.readdir(layout.internal)).sort()) {
       if (!OBSOLETE_LOCK.test(name)) continue
-      if (locks === null) {
-        locks = path.join(archive, ARCHIVE_LOCKS_NAME)
+      if (!(await safeDirectoryOrMissing(locks, storage))) {
         await storage.mkdir(locks, { mode: 0o700 })
       }
       await storage.rename(path.join(layout.internal, name), path.join(locks, name))
-      moved.push(`${ARCHIVE_LOCKS_NAME}/${name}`)
+      await recordProgress()
     }
     await syncDirectory(layout.internal, storage)
+    marker.moved = await archiveContents(archive, storage)
     await writeMarker(
       archive,
-      { ...marker, status: 'completed', completedAt: clock.now(), moved },
+      { ...marker, status: 'completed', completedAt: clock.now() },
       storage
     )
     await syncDirectory(archive, storage)
-    await storage.unlink(pending)
+    await storage.unlink(pendingFile)
     await syncDirectory(layout.internal, storage)
   } catch (error: unknown) {
     const reason = error instanceof Error ? error.message : String(error)
+    const moved = await archiveContents(archive, storage).catch(() => marker.moved)
     await writeMarker(archive, { ...marker, moved, failed: reason }, storage).catch(() => {})
     throw error
   }
-  return archive
+  return { archive, resumed }
 }
 
 /** Read-only inspection of a storage root: never creates, moves, or locks anything. */
@@ -525,11 +677,11 @@ export async function resetStorage(options: StorageResetOptions): Promise<Storag
     throw storageError(`Unsafe storage lock path: ${layout.lock}`)
   }
   const release = await acquireExclusive(settings)
-  let archive: string
+  let result: { archive: string; resumed: string[] | null }
   let before: StorageResetReport
   try {
     before = await inspect(settings)
-    archive = await archiveMetadata(settings)
+    result = await archiveMetadata(settings)
   } finally {
     await releaseExclusive(settings, release)
   }
@@ -537,8 +689,10 @@ export async function resetStorage(options: StorageResetOptions): Promise<Storag
     ...before,
     lock: preview.lock,
     resetPending: false,
+    pendingArchive: null,
     applied: true,
     archives: await listArchives(layout, storage),
-    archive
+    archive: result.archive,
+    resumed: result.resumed
   }
 }

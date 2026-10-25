@@ -952,7 +952,11 @@ function formatLockState(lock: StorageResetReport['lock']): string {
 function formatResetReport(report: StorageResetReport): string[] {
   const lines = [`storage: ${report.root}`, `lock: ${formatLockState(report.lock)}`]
   if (report.resetPending) {
-    lines.push('reset pending: yes; server startup is blocked until reset-storage --apply finishes')
+    const archive =
+      report.pendingArchive === null ? '' : ` (resumes archive ${report.pendingArchive})`
+    lines.push(
+      `reset pending: yes${archive}; server startup is blocked until reset-storage --apply finishes`
+    )
   }
   const commitDetails: string[] = []
   if (report.commits.missingPayloads.length > 0) {
@@ -976,6 +980,12 @@ function formatResetReport(report: StorageResetReport): string[] {
   lines.push(
     `archives: ${report.archives.length}${interrupted ? ` (${interrupted} interrupted)` : ''}`
   )
+  // An interrupted marker can lag the archive, so name what it physically holds.
+  for (const archive of report.archives) {
+    if (archive.status === 'completed') continue
+    const held = archive.held.length > 0 ? archive.held.join(', ') : 'nothing'
+    lines.push(`interrupted archive: ${archive.name} holds ${held}`)
+  }
   if (report.unknownInternal.length > 0) {
     lines.push(
       `unknown internal entries: ${report.unknownInternal.length}${listNames(report.unknownInternal)}; left in place`
@@ -1000,6 +1010,10 @@ function formatResetReport(report: StorageResetReport): string[] {
     lines.push('note: remaining other entries are unmanaged and keep their names occupied')
   }
   if (report.applied) {
+    if (report.resumed !== null) {
+      const held = report.resumed.length > 0 ? report.resumed.join(', ') : 'nothing'
+      lines.push(`resumed: yes; the interrupted archive already held ${held}`)
+    }
     lines.push(`archive: ${report.archive}`)
     lines.push('result: metadata archived; the next server start begins with empty metadata')
   } else {

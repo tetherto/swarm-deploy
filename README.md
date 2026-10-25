@@ -329,8 +329,9 @@ and the list of moved entries, releases the lock, and prints the same report
 followed by `archive: <path>`. Every move is a rename inside the storage root,
 so nothing is copied, nothing is deleted, and an archive is restored by
 stopping the server and moving its directories back over the empty ones.
-Each run creates a new archive; earlier archives, unrecognised files inside
-`.swarm-deploy/`, and everything visible in the root are left untouched.
+Each completed reset creates its own archive; earlier archives, unrecognised
+files inside `.swarm-deploy/`, and everything visible in the root are left
+untouched.
 
 What the reset does not do, and the report says so:
 
@@ -358,13 +359,55 @@ Startup recovery already drops a commit record whose payload is gone, so a
 missing payload alone does not need a reset. The reset is for clearing the
 rest of the private state at once, with an archive to fall back on.
 
-An interrupted `--apply` leaves a recoverable archive and a
-`.swarm-deploy/reset-pending.json` marker. This version of the server refuses
-startup while that marker exists, before metadata recovery. Stop any service
-supervisor before maintenance; older server versions do not know this guard.
-Re-run `--apply` to archive the remaining metadata and clear the guard. The
-preview identifies pending resets and older incomplete archives. Keep all
-archives from an interrupted reset together for recovery.
+An interrupted `--apply` leaves a partly filled archive and a
+`.swarm-deploy/reset-pending.json` marker that names it. This holds for a
+crash, kill, or power loss as well as for an error, because every move is a
+single rename and the archive directory itself is the record of what moved.
+This version of the server refuses startup while that marker exists, before
+metadata recovery. Stop any service supervisor before maintenance; older
+server versions do not know this guard.
+
+Re-run `--apply` to finish. The retry resumes the archive the marker names
+instead of starting a second one: it reads what that archive physically holds,
+moves only the directories still live, recreates them empty, and rewrites
+`reset.json` with `status: "completed"`, the full `moved` list taken from the
+archive, and an `attempts` list with the start time and PID of the interrupted
+run and of each retry. The output then says `resumed: yes` and names what the
+archive already held. One reset therefore always ends as exactly one archive,
+and restoring that archive restores everything the reset moved.
+
+While a reset is interrupted, trust the archive directory over `reset.json`:
+its `moved` list can lag the last move after a hard stop. The preview prints
+`reset pending: yes (resumes archive <name>)` and, for each interrupted
+archive, `interrupted archive: <name> holds <entries>` read from the
+filesystem. The retry fails closed with exit `2` and moves nothing if the
+archive and the live directory both hold data for the same entry, or if the
+pending marker names an archive that is missing, symlinked, or unreadable. In
+either case reconcile by hand, keeping the archive, and remove
+`reset-pending.json` only once the metadata is in the state you want. Archives
+from other resets are never modified or deleted.
+
+Run `reset-storage` as the same operating-system user that runs the server.
+`--apply` recreates the metadata directories, the archive, and its marker with
+that user's ownership and mode `0700`. Applied as `root` (for example with plain
+`sudo`) to a root owned by a service account, it leaves metadata the service
+cannot read or write, and the server cannot start. Run the preview as the
+service user too, so it sees the permissions the server will. With a service
+account named `artifacts` (replace it with yours):
+
+```sh
+sudo -u artifacts -- swarm-deploy reset-storage --storage /srv/artifacts
+sudo -u artifacts -- swarm-deploy reset-storage --storage /srv/artifacts --apply --wait 60000
+```
+
+Use the full path to `swarm-deploy` if it is not on that account's `PATH`. The
+command does not check which user runs it. If it was applied as the wrong user,
+stop the service, return ownership of the internal directory, and start it
+again:
+
+```sh
+sudo chown -R artifacts:artifacts /srv/artifacts/.swarm-deploy
+```
 
 The report is refreshed after acquiring the lock, so an upload completed while
 `--wait` was waiting appears among the retained payloads.

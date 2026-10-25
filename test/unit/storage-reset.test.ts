@@ -8,7 +8,11 @@ import path from '#path'
 import process from '#process'
 import { main, USAGE } from '../../dist/cli.js'
 import { Client, ERRORS, Server, keyPairFromSeed, type SymlinkRule } from '../../dist/index.js'
-import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
+import {
+  acquireStorageLock,
+  assertNoPendingStorageReset,
+  initLayout
+} from '../../dist/storage/layout.js'
 import { inspectStorageReset, resetStorage } from '../../dist/storage/reset.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import { createTempDir } from '../helpers/files.js'
@@ -567,15 +571,31 @@ test('an interrupted reset leaves a recoverable in-progress archive and a re-run
   const preview = await runReset(['--storage', root])
   t.is(preview.code, 0)
   t.ok(has(preview.lines, 'archives: 1 (1 interrupted)'))
+  t.ok(
+    has(
+      preview.lines,
+      `reset pending: yes (resumes archive ${archives[0]}); server startup is blocked until reset-storage --apply finishes`
+    )
+  )
+  t.ok(has(preview.lines, `interrupted archive: ${archives[0]} holds staging, sessions, commits`))
   t.ok(has(preview.lines, 'commits: 0 records'))
   t.ok(has(preview.lines, 'journals: 1 entries'))
 
   const firstBefore = await snapshot(first)
   const completed = await runReset(['--storage', root, '--apply'], { storage })
   t.is(completed.code, 0, completed.stderr)
-  const second = archivePath(completed.lines)
-  t.not(second, first)
-  t.alike((await readMarker(second)).moved, [
+  t.is(archivePath(completed.lines), first, 'the retry resumes the interrupted archive')
+  t.ok(
+    has(
+      completed.lines,
+      'resumed: yes; the interrupted archive already held staging, sessions, commits'
+    )
+  )
+  t.alike(await fs.promises.readdir(path.join(layout.internal, 'archive')), archives)
+  const finished = await readMarker(first)
+  t.is(finished.status, 'completed')
+  t.absent('failed' in finished, 'a completed archive carries no stale failure')
+  t.alike(finished.moved, [
     'staging',
     'sessions',
     'commits',
@@ -585,10 +605,16 @@ test('an interrupted reset leaves a recoverable in-progress archive and a re-run
     'trash',
     `locks/lock.retired-${TOKEN}`
   ])
-  t.ok(await exists(path.join(second, 'journals', `${ID_B}.json`)))
-  t.ok(await exists(path.join(second, 'links', `${ID_A}.json`)))
-  t.alike(await snapshot(first), firstBefore, 'the interrupted archive is preserved as-is')
-  t.ok(has(completed.lines, 'archives: 2 (1 interrupted)'))
+  const attempts = (finished.attempts ?? []) as Array<{ pid: number; failed?: string }>
+  t.is(attempts.length, 2, 'every attempt is recorded in the one archive')
+  t.is(attempts[0]?.failed, 'Injected rename failure')
+  t.is(attempts[1]?.failed, undefined)
+  t.ok(await exists(path.join(first, 'journals', `${ID_B}.json`)))
+  t.ok(await exists(path.join(first, 'links', `${ID_A}.json`)))
+  for (const line of firstBefore.filter((entry) => !entry.startsWith('reset.json'))) {
+    t.ok((await snapshot(first)).includes(line), `${line} is still archived`)
+  }
+  t.ok(has(completed.lines, 'archives: 1'))
   t.absent(
     await exists(path.join(layout.internal, 'reset-pending.json')),
     'successful retry clears the startup guard'
@@ -610,6 +636,181 @@ test('an interrupted reset leaves a recoverable in-progress archive and a re-run
   await server.listen()
   t.ok(await exists(layout.sessions), 'the server recreates a directory a crash left missing')
   await server.close()
+})
+
+const METADATA = [
+  'staging',
+  'sessions',
+  'commits',
+  'journals',
+  'publications',
+  'links',
+  'trash'
+] as const
+
+test('a retry after a hard stop resumes the pending archive, and that one archive restores the whole reset', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const original: Record<string, string[]> = {}
+  for (const name of METADATA) original[name] = await snapshot(layout[name])
+  const visibleBefore = (await snapshot(root)).filter((line) => !line.startsWith('.swarm-deploy'))
+
+  // The state of a process killed mid-reset before any error handling ran:
+  // staging and sessions are already inside the archive, staging was recreated
+  // but sessions was not, the marker still says nothing moved, and the dead
+  // process never released its lock.
+  const dead = 4_000_001
+  const deadToken = 'f7'.repeat(32)
+  const archiveId = 'reset-20260101T000000000Z-0badc0de'
+  const archive = path.join(layout.internal, 'archive', archiveId)
+  await fs.promises.mkdir(archive, { recursive: true })
+  await fs.promises.rename(layout.staging, path.join(archive, 'staging'))
+  await fs.promises.rename(layout.sessions, path.join(archive, 'sessions'))
+  await fs.promises.mkdir(layout.staging)
+  await fs.promises.writeFile(
+    path.join(archive, 'reset.json'),
+    JSON.stringify({ version: 1, status: 'in-progress', root, startedAt: 1, pid: dead, moved: [] })
+  )
+  await fs.promises.writeFile(
+    path.join(layout.internal, 'reset-pending.json'),
+    JSON.stringify({ kind: 'storage-reset', version: 1, archive: archiveId })
+  )
+  await writeLock(layout, lockOwner(dead, Date.now() - 5_000, deadToken))
+  const isProcessAlive = (pid: number) => pid !== dead
+
+  const preview = await runReset(['--storage', root], { isProcessAlive })
+  t.is(preview.code, 0, preview.stderr)
+  t.ok(
+    has(
+      preview.lines,
+      `reset pending: yes (resumes archive ${archiveId}); server startup is blocked until reset-storage --apply finishes`
+    )
+  )
+  t.ok(has(preview.lines, `interrupted archive: ${archiveId} holds staging, sessions`))
+  t.ok(has(preview.lines, 'archives: 1 (1 interrupted)'))
+  t.ok(preview.lines.some((line) => line.startsWith(`lock: stale, pid ${dead} is not running`)))
+  await t.exception(() => assertNoPendingStorageReset(layout), { code: ERRORS.PROTOCOL_INVALID })
+
+  const retry = await runReset(['--storage', root, '--apply'], { isProcessAlive })
+  t.is(retry.code, 0, retry.stderr)
+  t.is(archivePath(retry.lines), archive, 'the retry continues the archive that holds the data')
+  t.ok(has(retry.lines, 'resumed: yes; the interrupted archive already held staging, sessions'))
+  t.alike(
+    await fs.promises.readdir(path.join(layout.internal, 'archive')),
+    [archiveId],
+    'no second archive is created'
+  )
+  t.ok(has(retry.lines, 'archives: 1'))
+
+  const marker = await readMarker(archive)
+  t.is(marker.status, 'completed')
+  t.alike(
+    marker.moved,
+    [...METADATA, `locks/lock.retired-${TOKEN}`, `locks/lock.retired-${deadToken}`],
+    'the completed marker is reconciled from what the archive holds, not from the stale marker'
+  )
+  const attempts = (marker.attempts ?? []) as Array<{ pid: number }>
+  t.alike(
+    attempts.map((attempt) => attempt.pid),
+    [dead, process.pid],
+    'the interrupted attempt and the retry are linked in one marker'
+  )
+  for (const name of METADATA) {
+    t.alike(await fs.promises.readdir(layout[name]), [], `${name} is empty after the retry`)
+  }
+  t.absent(await exists(path.join(layout.internal, 'reset-pending.json')))
+  t.absent(await exists(layout.lock))
+  await assertNoPendingStorageReset(layout)
+  t.alike(
+    (await snapshot(root)).filter((line) => !line.startsWith('.swarm-deploy')),
+    visibleBefore,
+    'visible payloads and symlinks are untouched'
+  )
+
+  // Restoring this one archive recovers every metadata class, including the
+  // directories moved before the interruption.
+  for (const name of METADATA) {
+    const held = await exists(path.join(archive, name))
+    t.ok(held, `${name} is in the archive that the pending marker names`)
+    if (!held) continue
+    await fs.promises.rmdir(layout[name])
+    await fs.promises.rename(path.join(archive, name), layout[name])
+    t.alike(await snapshot(layout[name]), original[name], `${name} is restored exactly`)
+  }
+  t.is(await fs.promises.readFile(path.join(layout.staging, `${ID_C}.tar.part`), 'utf8'), 'partial')
+})
+
+test('a retry after a stop between the completed marker and the guard removal finishes without a new archive', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  const first = await runReset(['--storage', root, '--apply'])
+  t.is(first.code, 0, first.stderr)
+  const archive = archivePath(first.lines)
+  const archiveId = path.basename(archive)
+  await fs.promises.writeFile(
+    path.join(layout.internal, 'reset-pending.json'),
+    JSON.stringify({ kind: 'storage-reset', version: 1, archive: archiveId })
+  )
+
+  const retry = await runReset(['--storage', root, '--apply'])
+  t.is(retry.code, 0, retry.stderr)
+  t.is(archivePath(retry.lines), archive)
+  t.ok(
+    has(
+      retry.lines,
+      `resumed: yes; the interrupted archive already held ${[...METADATA, `locks/lock.retired-${TOKEN}`].join(', ')}`
+    )
+  )
+  t.alike(await fs.promises.readdir(path.join(layout.internal, 'archive')), [archiveId])
+  const marker = await readMarker(archive)
+  t.is(marker.status, 'completed')
+  t.is(((marker.attempts ?? []) as unknown[]).length, 2)
+  t.absent(await exists(path.join(layout.internal, 'reset-pending.json')))
+  for (const name of METADATA) {
+    t.alike(await fs.promises.readdir(layout[name]), [], `${name} stays empty`)
+  }
+  t.ok(await exists(path.join(archive, 'commits', `${ID_A}.json`)))
+})
+
+test('a resumed reset refuses conflicting live data or a missing archive without changing anything', async (t) => {
+  const { root, layout } = await seedStorage(t)
+  let tripped = false
+  const failing = createStorage({
+    beforeOperation(name, target) {
+      if (name === 'rename' && target === layout.journals && !tripped) {
+        tripped = true
+        throw new Error('Injected rename failure')
+      }
+    }
+  })
+  t.is((await runReset(['--storage', root, '--apply'], { storage: failing })).code, 1)
+  const archives = path.join(layout.internal, 'archive')
+  const [archiveId] = await fs.promises.readdir(archives)
+
+  // Live data appears in a directory the archive already holds.
+  const intruder = path.join(layout.commits, 'intruder.json')
+  await fs.promises.writeFile(intruder, 'new data')
+  const before = await snapshot(root)
+  const conflict = await runReset(['--storage', root, '--apply'])
+  t.is(conflict.code, 2)
+  t.is(
+    conflict.stderr,
+    `Reset archive ${archiveId} already holds commits but the live commits directory is not empty; reconcile the two by hand before resetting\n`
+  )
+  t.alike(await snapshot(root), before, 'a refused retry moves nothing')
+  t.ok(await exists(path.join(layout.internal, 'reset-pending.json')))
+
+  // The archive the pending marker names was removed by hand.
+  await fs.promises.unlink(intruder)
+  const scratch = await createTempDir(t)
+  await fs.promises.rename(path.join(archives, archiveId), path.join(scratch, archiveId))
+  const missing = await runReset(['--storage', root, '--apply'])
+  t.is(missing.code, 2)
+  t.ok(
+    missing.stderr.startsWith(`Pending reset archive ${archiveId} is missing or unreadable;`),
+    missing.stderr
+  )
+  t.alike(await fs.promises.readdir(archives), [], 'no replacement archive hides the missing one')
+  t.alike(await fs.promises.readdir(layout.journals), [`${ID_B}.json`], 'live metadata is kept')
+  t.ok(await exists(path.join(layout.internal, 'reset-pending.json')))
 })
 
 test('a reset after manual payload deletion unblocks a fresh re-upload and link, while retained payloads and symlinks still conflict', async (t) => {
