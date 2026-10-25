@@ -105,8 +105,10 @@ export function runPublisher(
       force = setTimeout(() => child.kill('SIGKILL'), killGrace)
     }, timeout)
     // Without a pid nothing ever started. Any later 'error' (a signal that could not be
-    // delivered) leaves the child running, so we keep waiting for it to exit.
-    child.once('error', (error) => {
+    // delivered) leaves the child running, so we keep waiting for it to exit. The listener
+    // stays attached: SIGTERM and then SIGKILL can both be refused, and an 'error' with no
+    // listener would throw and take the whole server down.
+    child.on('error', (error) => {
       if (child.pid === undefined) settle(error)
     })
     child.once('exit', (code, signal) => {

@@ -346,3 +346,71 @@ test('the link-publisher example rejects at its deadline whatever the publisher 
   const finalContents = await fs.promises.readFile(result, 'utf8')
   t.is(finalContents, 'new', 'a stopped publisher cannot overwrite the next publication')
 })
+
+// Run in a separate Node process: it replaces `spawn` in `node:child_process` with a fake
+// child whose every signal is refused (an 'error' event, as when the kill gets EPERM), so
+// nothing leaks into the main test runner.
+const REFUSED_SIGNALS = `
+const { EventEmitter } = require('node:events')
+const cp = require('node:child_process')
+const kills = []
+let child
+cp.spawn = () => {
+  child = new EventEmitter()
+  child.pid = 4242
+  child.stdin = { on() {}, end() {} }
+  child.kill = (signal) => {
+    kills.push(signal)
+    setImmediate(() => child.emit('error', Object.assign(new Error('kill EPERM'), { code: 'EPERM' })))
+    return false
+  }
+  return child
+}
+require('node:module').syncBuiltinESMExports()
+process.on('uncaughtException', (error) => {
+  console.log(JSON.stringify({ uncaught: error.message }))
+  process.exit(2)
+})
+import(process.argv[1]).then(async ({ runPublisher }) => {
+  let outcome = 'pending'
+  const call = runPublisher('publisher', [], 'input', { timeout: 50, killGrace: 50 }).then(
+    () => { outcome = 'resolved' },
+    (error) => { outcome = error.message }
+  )
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  const before = { kills: kills.slice(), outcome }
+  child.emit('exit', 0, null)
+  await call
+  console.log(JSON.stringify({ before, after: outcome }))
+})
+`
+
+test('the link-publisher example survives refused signals and stays pending until the child exits', async (t) => {
+  if (typeof Bare !== 'undefined') {
+    t.pass('the example spawns a Node child process')
+    return
+  }
+  const { pathToFileURL } = require('node:url') as typeof import('node:url')
+  const { execFile } = require('node:child_process') as typeof import('node:child_process')
+  const example = path.resolve(__dirname, '../../examples/link-publisher/hooks.mjs')
+  const { error, stdout } = await new Promise<{ error: Error | null; stdout: string }>(
+    (resolve) => {
+      execFile(
+        process.execPath,
+        ['-e', REFUSED_SIGNALS, pathToFileURL(example).href],
+        { timeout: 15_000 },
+        (failure, out) => resolve({ error: failure, stdout: out })
+      )
+    }
+  )
+  const report = JSON.parse(stdout) as {
+    uncaught?: string
+    before: { kills: string[]; outcome: string }
+    after: string
+  }
+  t.absent(report.uncaught, 'a refused signal raises no unhandled error')
+  t.is(error, null, 'the process exits normally')
+  t.alike(report.before.kills, ['SIGTERM', 'SIGKILL'], 'it escalated although both were refused')
+  t.is(report.before.outcome, 'pending', 'the hook stays pending while the child is still running')
+  t.is(report.after, 'publisher timed out after 50 ms', 'a later exit, even zero, is a timeout')
+})
