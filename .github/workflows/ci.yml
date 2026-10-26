@@ -13,8 +13,8 @@ jobs:
     name: Build, types, lint, package
     runs-on: ubuntu-latest
     steps:
-      - uses: holepunchto/actions/checkout@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
-      - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/checkout@v1
+      - uses: holepunchto/actions/setup-node@v1
         with:
           version: 24.x
       - run: npm install
@@ -22,7 +22,7 @@ jobs:
       - run: npm run lint
       - run: npm run test:property
       - run: npm run test:release-tag
-      - uses: holepunchto/actions/setup-bare@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/setup-bare@v1
       - run: bare --version
       - run: npm run test:package
 
@@ -36,8 +36,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         node: [22.x, 24.x]
     steps:
-      - uses: holepunchto/actions/checkout@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
-      - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/checkout@v1
+      - uses: holepunchto/actions/setup-node@v1
         with:
           version: ${{ matrix.node }}
       - run: npm install
@@ -52,11 +52,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: holepunchto/actions/checkout@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
-      - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/checkout@v1
+      - uses: holepunchto/actions/setup-node@v1
         with:
           version: 24.x
       - run: npm install
-      - uses: holepunchto/actions/setup-bare@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/setup-bare@v1
       - run: bare --version
       - run: npm run test:bare
