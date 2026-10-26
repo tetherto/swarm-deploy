@@ -284,6 +284,165 @@ one-argument `--symlink` rule. Success prints exactly:
 `LINKED` means the link was created or repointed. `UNCHANGED` means the same
 managed link already points at that target; the operation is idempotent.
 
+### `reset-storage`
+
+```sh
+swarm-deploy reset-storage --storage <directory>
+swarm-deploy reset-storage --storage <directory> --apply [--wait <milliseconds>]
+```
+
+Archives every piece of private server state under one storage root so the
+next server start begins with empty metadata. Use it after deleting committed
+payloads by hand, or whenever leftover sessions, journals, staging files, the
+managed-link ledger, trash, or lock residue should stop influencing a server.
+It needs no seed and never contacts the network.
+
+Without `--apply` the command is a read-only preview: it creates, moves,
+locks, and deletes nothing, and prints one `key: value` line per fact:
+
+```text
+storage: /srv/artifacts
+lock: free
+commits: 3 records (2 missing payloads)
+staging: 1 entries
+sessions: 1 entries
+journals: 0 entries
+publications: 0 entries
+links: 1 records
+trash: 0 entries
+obsolete locks: 2
+archives: 0
+remaining payloads: 1 (app-2.4.1.tar.gz)
+remaining symlinks: 1 (latest)
+fresh start: no
+note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually
+note: remaining symlinks have no ownership record after the reset; a --symlink rule or link request for that name fails closed with LINK_CONFLICT until you remove them manually
+result: preview only, nothing changed; re-run with --apply to archive this metadata
+```
+
+With `--apply` the command takes the storage lock, moves
+`.swarm-deploy/staging`, `sessions`, `commits`, `journals`, `publications`,
+`links`, and `trash` plus retired or abandoned lock directories into
+`.swarm-deploy/archive/reset-<timestamp>-<random>/`, recreates the seven
+directories empty, writes a `reset.json` marker with `status: "completed"`,
+releases the lock, and prints the same report followed by `archive: <path>`.
+Every move is a rename inside the storage root,
+so nothing is copied, nothing is deleted, and an archive is restored by
+stopping the server and moving its directories back over the empty ones.
+Each completed reset creates its own archive; earlier archives, unrecognised
+files inside `.swarm-deploy/`, and everything visible in the root are left
+untouched.
+
+What the reset does not do, and the report says so:
+
+- It never removes visible payloads, `history-*` files, directories, or
+  symlinks from the root. A remaining payload keeps its name occupied, so a
+  fresh upload of that name returns `FILE_EXISTS`. A remaining symlink loses
+  its ownership record, so an automatic `--symlink` rule or a `link` request
+  for that name fails closed with `LINK_CONFLICT`. `fresh start: yes` is
+  printed only when the root holds nothing besides `.swarm-deploy/`; remove
+  leftovers by hand before or after the reset to get there.
+- It never signals a process. The lock records only a PID, and a PID proves
+  nothing about which program owns it, so the reset cannot verify that a live
+  holder is the server for this exact root. A live holder makes `--apply`
+  fail closed with exit `1` and the PID. Stop that server yourself (the CLI
+  server shuts down cleanly on `SIGINT` or `SIGTERM`) and re-run, or pass
+  `--wait <milliseconds>` so the reset polls until the holder releases the
+  lock, then proceeds with exclusive access. A holder whose PID no longer
+  exists is retired and archived automatically.
+- A live PID can belong to an unrelated process after a crash. The command
+  cannot prove that, and offers no PID override. An unreadable lock also
+  refuses reset because it may hide a live server. Stop the service and
+  reconcile its lock before trying again.
+
+Startup recovery already drops a commit record whose payload is gone, so a
+missing payload alone does not need a reset. The reset is for clearing the
+rest of the private state at once, with an archive to fall back on.
+
+An interrupted `--apply` leaves a partly filled archive and a
+`.swarm-deploy/reset-pending.json` marker that names it. This holds for a
+crash, kill, or power loss as well as for an error, because every move is a
+single rename and the archive directory itself is the record of what moved.
+This version of the server refuses startup while that marker exists, before
+metadata recovery. Stop any service supervisor before maintenance; older
+server versions do not know this guard.
+
+Re-run `--apply` to finish. The retry resumes the archive the marker names
+instead of starting a second one: it reads what that archive physically holds,
+moves only the directories still live, recreates them empty, and rewrites
+`reset.json` with `status: "completed"`. The output then says `resumed: yes`
+and names what the archive already held. One reset therefore always ends as
+exactly one archive, and restoring that archive restores everything the reset
+moved.
+
+`reset.json` is a bounded record, no matter how many retired locks a stopped
+server left behind or how many times a reset is retried. The restore evidence
+is the archive itself, and the marker keeps only a summary of it:
+
+- `version`: `2`. Version 1 markers stay readable.
+- `status`, `root`, `completedAt`, and the first attempt's `startedAt` and
+  `pid`.
+- `moved`: the metadata directories the archive holds, at most seven names.
+- `locks`: `count` and `sha256` for the retired and abandoned lock directories
+  in the archive's `locks/` directory. The names stay there; the digest is
+  over each sorted name followed by a newline, so
+  `ls <archive>/locks | LC_ALL=C sort | sha256sum` (`shasum -a 256` on macOS)
+  reproduces it and shows whether anything was removed from the archive by
+  hand.
+- `attempts` and `attemptCount`: the newest 16 attempts with their
+  `startedAt`, `pid`, and any `failed` reason clipped to 256 characters, and
+  the total number of attempts, which links an interrupted run to each retry.
+
+An archive written by an earlier build has a version 1 marker that listed every
+lock directory by name. It stays readable and a completed one is never touched.
+When a retry resumes an interrupted one, the original marker is first copied
+verbatim to `reset.v1.json` in the archive, so its full list is kept, and then
+`reset.json` is rewritten in the bounded format.
+
+While a reset is interrupted, trust the archive directory over `reset.json`:
+its counts can lag the last move after a hard stop. The preview prints
+`reset pending: yes (resumes archive <name>)` and, for each interrupted
+archive, `interrupted archive: <name> holds <entries>` read from the
+filesystem, with lock directories counted rather than listed. The retry fails
+closed with exit `2` and moves nothing if the
+archive and the live directory both hold data for the same entry, or if the
+pending marker names an archive that is missing, symlinked, or unreadable. In
+either case reconcile by hand, keeping the archive, and remove
+`reset-pending.json` only once the metadata is in the state you want. Archives
+from other resets are never modified or deleted.
+
+Run `reset-storage` as the same operating-system user that runs the server.
+`--apply` recreates the metadata directories, the archive, and its marker with
+that user's ownership and mode `0700`. Applied as `root` (for example with plain
+`sudo`) to a root owned by a service account, it leaves metadata the service
+cannot read or write, and the server cannot start. Run the preview as the
+service user too, so it sees the permissions the server will. With a service
+account named `artifacts` (replace it with yours):
+
+```sh
+sudo -u artifacts -- swarm-deploy reset-storage --storage /srv/artifacts
+sudo -u artifacts -- swarm-deploy reset-storage --storage /srv/artifacts --apply --wait 60000
+```
+
+Use the full path to `swarm-deploy` if it is not on that account's `PATH`. The
+command does not check which user runs it. If it was applied as the wrong user,
+stop the service, return ownership of the internal directory, and start it
+again:
+
+```sh
+sudo chown -R artifacts:artifacts /srv/artifacts/.swarm-deploy
+```
+
+The report is refreshed after acquiring the lock, so an upload completed while
+`--wait` was waiting appears among the retained payloads.
+
+A symlinked storage root or ancestor, a symlinked `.swarm-deploy/`, a metadata
+directory replaced by a symlink or file, a filesystem root, a missing root, or
+a root without `.swarm-deploy/` is rejected before any metadata is moved. Use
+the canonical storage path (for example `/private/tmp` rather than macOS's
+`/tmp` alias). A malformed pending-reset marker is also refused for manual
+reconciliation.
+
 ### Seed sources
 
 Server, upload, and link commands accept exactly one of:
@@ -305,10 +464,12 @@ tooling logs is acceptable.
 
 ### CLI exit codes
 
-- `0`: the upload committed or was already committed, or the link is linked or
-  unchanged.
-- `1`: upload, network, protocol, storage, cleanup, or runtime failure.
-- `2`: usage or configuration error.
+- `0`: the upload committed or was already committed, the link is linked or
+  unchanged, or the storage reset preview or apply finished.
+- `1`: upload, network, protocol, storage, cleanup, or runtime failure,
+  including a storage reset refused because a running server holds the lock.
+- `2`: usage or configuration error, including an unsafe or uninitialized
+  storage root.
 
 ## CI uploader example
 
@@ -367,7 +528,8 @@ verification are protected from expiry.
 
 The storage root contains visible current and historical artifacts plus the
 reserved `.swarm-deploy/` internal directory. Do not modify that directory
-while the server is running.
+while the server is running. `.swarm-deploy/archive/` holds the archives
+written by [`reset-storage`](#reset-storage); the server ignores it.
 
 Names are create-only by default:
 
@@ -1331,6 +1493,10 @@ succeeding. Import `ERRORS` rather than matching exception messages.
 - Alert on nonzero CLI exits and failed authentication, recovery, verification,
   commit, retention, and cleanup events.
 - Never edit `.swarm-deploy/` while the server is running.
+- To start a storage root over, stop the server, preview with
+  `swarm-deploy reset-storage --storage <dir>`, remove leftover visible
+  payloads and symlinks by hand if a true empty start is wanted, then run it
+  again with `--apply`; see [`reset-storage`](#reset-storage).
 - Stop the server cleanly before backing up or restoring the complete storage
   root.
 - Publish stored artifacts through a separately configured artifact service or
