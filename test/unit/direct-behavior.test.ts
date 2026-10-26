@@ -13,6 +13,7 @@ import {
   Server,
   SwarmDeployError,
   type AfterCommitContext,
+  type AfterLinkContext,
   type BeforeCommitContext,
   type HookFailureContext,
   type ServerHooks,
@@ -2238,4 +2239,555 @@ test('a link reconciliation failure after a durable commit is retried as already
   retry.finishInput()
   await waitFor(() => statuses(retry).includes('ALREADY_COMMITTED'))
   t.is(await fs.promises.readlink(path.join(server.storageDir, 'latest')), '0.18.1')
+})
+
+type LinkFrame = { v: number; status: string; code?: string }
+
+function linkRequest(node: FakeServerNode, target: string, name: string): FakeSocket {
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(encodeControlFrame(encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })))
+  socket.finishInput()
+  return socket
+}
+
+function linkFrame(socket: FakeSocket): LinkFrame {
+  return decodeLinkResultRecord(socket.writes[0].subarray(4)) as LinkFrame
+}
+
+function settled(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 50))
+}
+
+function deadline<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<T>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 5_000)
+    })
+  ]).finally(() => clearTimeout(timer))
+}
+
+async function waitForLinkTarget(file: string, expected: string): Promise<void> {
+  const started = Date.now()
+  for (;;) {
+    const target = await fs.promises.readlink(file).catch(() => null)
+    if (target === expected) return
+    if (Date.now() - started > 5_000) throw new Error(`Timed out waiting for link to ${expected}`)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+/** The number of link names that still have a place reserved in their hook line. */
+function reservedHookLines(server: Server): number {
+  return (server as unknown as { linkHookTurns: { size: number } }).linkHookTurns.size
+}
+
+test('afterLink holds an explicit link result until the hook returns and sees the durable link', async (t) => {
+  const held = gate()
+  const contexts: AfterLinkContext[] = []
+  const targets: string[] = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    hooks: {
+      afterLink: async (context) => {
+        contexts.push(context)
+        targets.push(await fs.promises.readlink(context.link.path))
+        await held.wait
+      }
+    }
+  })
+  const input = await manifest(t, 'release-1', 'first')
+  const metadata = metadataFromManifest(input.manifest)
+  await uploadAll(node, input)
+
+  const socket = linkRequest(node, 'release-1', 'current')
+  await waitFor(() => contexts.length === 1)
+  await settled()
+  t.is(socket.writes.length, 0, 'the client hears nothing while the hook runs')
+  t.alike(targets, ['release-1'], 'the link is already durable when the hook runs')
+
+  held.open()
+  await waitFor(() => socket.writes.length === 1)
+  t.alike(linkFrame(socket), { v: 1, status: 'LINKED' })
+
+  const root = path.resolve(server.storageDir)
+  const [context] = contexts
+  t.alike(context.link, {
+    name: 'current',
+    target: 'release-1',
+    mode: 'manual',
+    path: path.join(root, 'current'),
+    targetPath: path.join(root, 'release-1')
+  })
+  t.alike(context.artifact, {
+    name: 'release-1',
+    kind: 'file',
+    size: metadata.fileSize,
+    sha256: metadata.fileSha256,
+    transferId: metadata.transferId
+  })
+  t.is(context.status, 'LINKED')
+  t.is(context.trigger, 'request')
+  t.ok(
+    Object.isFrozen(context) && Object.isFrozen(context.link) && Object.isFrozen(context.artifact)
+  )
+  const serialized = JSON.stringify(context)
+  for (const secret of [SERVER_SEED, CLIENT_SEED, keyPairFromSeed(SERVER_SEED).secretKey]) {
+    t.absent(serialized.includes(b4a.toString(secret, 'hex')), 'no key material in the context')
+  }
+  await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('afterLink describes a committed directory target with its entry count and release', async (t) => {
+  const contexts: AfterLinkContext[] = []
+  const { node } = await createServer(t, {
+    artifactPatterns: ['{version}'],
+    symlinks: [{ selector: '/^\\d+\\.\\d+\\.\\d+$/' }],
+    hooks: { afterLink: (context) => void contexts.push(context) }
+  })
+  const built = await treeManifest(t, '0.18.1', { 'a/b.bin': 'bb', 'a/empty/': '', 'z.bin': 'z' })
+  const upload = new FakeSocket(CLIENT_KEY)
+  node.accept(upload)
+  upload.feed(treeMetadataFrame(built.manifest))
+  upload.feed(built.tar)
+  upload.finishInput()
+  await waitFor(() => statuses(upload).includes('COMMITTED'))
+
+  t.alike((await linkAll(node, '0.18.1', 'current')).result, { v: 1, status: 'LINKED' })
+  const metadata = treeMetadataFromManifest(built.manifest)
+  t.alike(contexts[0].artifact, {
+    name: '0.18.1',
+    kind: 'directory',
+    size: metadata.payloadBytes,
+    sha256: metadata.treeSha256,
+    transferId: metadata.transferId,
+    entryCount: 4,
+    release: { series: fixedSeriesKey('{version}'), version: '0.18.1' }
+  })
+})
+
+test('a failing afterLink answers HOOK_FAILED without its message, keeps the link, and stays observable', async (t) => {
+  const injected = new Error('publisher token sk-secret rejected')
+  const ref: { current: FakeSocket | null } = { current: null }
+  const failures: Array<{ writes: number | undefined; context: HookFailureContext }> = []
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      afterLink: () => {
+        throw injected
+      },
+      onFailure: (context) => void failures.push({ writes: ref.current?.writes.length, context })
+    }
+  })
+  const events: Array<{ status: string; reason?: string; result?: string }> = []
+  const failureReasons: string[] = []
+  server.on('link', (event) =>
+    events.push({ status: event.status, reason: event.reason, result: event.result })
+  )
+  server.on('failure', (event) => failureReasons.push(event.reason))
+  const input = await manifest(t, 'release-1', 'first')
+  const metadata = metadataFromManifest(input.manifest)
+  await uploadAll(node, input)
+
+  const socket = linkRequest(node, 'release-1', 'current')
+  ref.current = socket
+  await waitFor(() => failures.length === 1)
+
+  t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED })
+  t.is(socket.writes.length, 1, 'exactly one terminal record, never a success')
+  t.absent(b4a.toString(socket.writes[0]).includes('sk-secret'), 'callback text stays off the wire')
+  t.is(failures[0].writes, 1, 'the client is answered before onFailure runs')
+  t.is(
+    await fs.promises.readlink(path.join(server.storageDir, 'current')),
+    'release-1',
+    'a publishing failure does not roll the durable link back'
+  )
+
+  const failure = failures[0].context
+  t.is(failure.phase, 'afterLink')
+  t.is(failure.error, injected, 'onFailure receives the raw callback exception')
+  t.is(failure.path, path.join(path.resolve(server.storageDir), 'current'))
+  t.is(failure.resumed, false)
+  t.is(failure.alreadyCommitted, true)
+  t.is(failure.artifact.transferId, metadata.transferId)
+  t.alike(failure.link, {
+    name: 'current',
+    target: 'release-1',
+    mode: 'manual',
+    path: path.join(path.resolve(server.storageDir), 'current'),
+    targetPath: path.join(path.resolve(server.storageDir), 'release-1')
+  })
+
+  t.alike(events, [{ status: 'failed', reason: ERRORS.HOOK_FAILED, result: 'LINKED' }])
+  t.alike(failureReasons, [ERRORS.HOOK_FAILED])
+  t.ok(
+    logs.some(
+      (entry) =>
+        entry.message === 'Link hook failed' &&
+        entry.name === 'current' &&
+        entry.target === 'release-1' &&
+        entry.trigger === 'request' &&
+        entry.reason === ERRORS.HOOK_FAILED
+    ),
+    'the failed publication is logged with its link identity'
+  )
+  t.absent(JSON.stringify(logs).includes('sk-secret'), 'the log never carries callback text')
+  await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('retrying an unchanged link re-runs afterLink so a failed publication can be retried', async (t) => {
+  const calls: string[] = []
+  let failures = 1
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    hooks: {
+      afterLink: ({ status, link }) => {
+        calls.push(`${link.name}:${status}`)
+        if (failures-- > 0) throw new Error('publish failed')
+      }
+    }
+  })
+  const events: string[] = []
+  server.on('link', (event) => events.push(`${event.status}:${event.result}`))
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+
+  const failed = linkRequest(node, 'release-1', 'current')
+  await waitFor(() => failed.writes.length === 1)
+  t.alike(linkFrame(failed), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED })
+
+  const retry = linkRequest(node, 'release-1', 'current')
+  await waitFor(() => retry.writes.length === 1)
+  t.alike(linkFrame(retry), { v: 1, status: 'UNCHANGED' })
+  const repeated = linkRequest(node, 'release-1', 'current')
+  await waitFor(() => repeated.writes.length === 1)
+  t.alike(linkFrame(repeated), { v: 1, status: 'UNCHANGED' })
+
+  t.alike(
+    calls,
+    ['current:LINKED', 'current:UNCHANGED', 'current:UNCHANGED'],
+    'every request reaches the hook, so a publisher can be retried without changing the link'
+  )
+  t.alike(events, ['failed:LINKED', 'unchanged:undefined', 'unchanged:undefined'])
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
+})
+
+test('afterLink never runs for unauthorized, disallowed, missing, or conflicting link requests', async (t) => {
+  const calls: string[] = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterLink: () => void calls.push('afterLink'),
+      onFailure: () => void calls.push('onFailure')
+    }
+  })
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  await uploadAll(node, await manifest(t, 'release-2', 'second'))
+  await fs.promises.writeFile(path.join(server.storageDir, 'operator'), 'operator')
+  calls.length = 0
+
+  const cases: Array<[string, string, string]> = [
+    ['other-1', 'current', ERRORS.LINK_NOT_ALLOWED],
+    ['release-1', 'release-1', ERRORS.LINK_NOT_ALLOWED],
+    ['release-1', 'latest', ERRORS.LINK_NOT_ALLOWED],
+    ['release-9', 'current', ERRORS.LINK_TARGET_NOT_FOUND],
+    ['release-1', 'release-2', ERRORS.LINK_CONFLICT],
+    ['release-1', 'operator', ERRORS.LINK_CONFLICT]
+  ]
+  for (const [target, name, expected] of cases) {
+    const result = await linkAll(node, target, name)
+    t.is(result.result.code, expected, `${target} -> ${name}`)
+  }
+
+  const stranger = new FakeSocket(b4a.alloc(32, 0xee))
+  node.accept(stranger)
+  t.is(stranger.destroyed, true, 'the firewall drops an unlisted key')
+  const unlisted = new FakeSocket(b4a.alloc(32, 0xed))
+  unlisted.on('error', () => {})
+  const receive = (server as unknown as { receive(socket: FakeSocket): Promise<void> }).receive
+  await receive.call(server, unlisted)
+  unlisted.feed(
+    encodeControlFrame(
+      encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'release-1', name: 'current' })
+    )
+  )
+  unlisted.finishInput()
+  await settled()
+  t.is(unlisted.destroyed, true, 'the server itself rejects an unlisted key')
+  t.is(unlisted.writes.length, 0)
+  t.is(stranger.writes.length, 0)
+  t.alike(calls, [], 'no hook, including onFailure, runs for a request that never changed a link')
+  await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'current')), {
+    code: 'ENOENT'
+  })
+  t.is(reservedHookLines(server), 0)
+})
+
+test('afterLink follows afterCommit for an automatic link an upload moved and holds COMMITTED', async (t) => {
+  const order: string[] = []
+  const contexts: AfterLinkContext[] = []
+  const held = gate()
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterCommit: ({ artifact }) => void order.push(`afterCommit:${artifact.name}`),
+      afterLink: async (context) => {
+        contexts.push(context)
+        order.push(`afterLink:${context.link.name}->${context.link.target}:${context.status}`)
+        await held.wait
+      }
+    }
+  })
+  const first = await manifest(t, 'release-1', 'first')
+  const metadata = metadataFromManifest(first.manifest)
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(metadataFrame(first.manifest))
+  await waitFor(() => statuses(socket).includes('ACCEPT'))
+  socket.feed(first.tar)
+  socket.finishInput()
+  await waitFor(() => contexts.length === 1)
+  await settled()
+  t.alike(statuses(socket), ['ACCEPT'], 'COMMITTED is withheld until afterLink returns')
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'latest')), 'release-1')
+
+  held.open()
+  await waitFor(() => isTerminal(socket))
+  t.is(statuses(socket).at(-1), 'COMMITTED')
+  t.alike(order, ['afterCommit:release-1', 'afterLink:latest->release-1:LINKED'])
+  t.alike(contexts[0].artifact, {
+    name: 'release-1',
+    kind: 'file',
+    size: metadata.fileSize,
+    sha256: metadata.fileSha256,
+    transferId: metadata.transferId,
+    ...(metadata.sourceParent === undefined ? {} : { sourceParent: metadata.sourceParent })
+  })
+  t.is(contexts[0].link.mode, 'automatic')
+  t.is(contexts[0].link.path, path.join(path.resolve(server.storageDir), 'latest'))
+  t.is(contexts[0].trigger, 'upload')
+  t.ok(Object.isFrozen(contexts[0]) && Object.isFrozen(contexts[0].link))
+
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await uploadAll(node, await manifest(t, 'release-2', 'second'))
+  t.is(order.at(-1), 'afterLink:latest->release-2:LINKED', 'a repoint is published too')
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'latest')), 'release-2')
+
+  order.length = 0
+  await uploadAll(node, await manifest(t, 'notes.txt', 'notes'))
+  t.alike(order, ['afterCommit:notes.txt'], 'an artifact outside every rule moves no link')
+  await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('a failing automatic-link hook keeps the artifact and link, and a retry reruns it as UNCHANGED', async (t) => {
+  let failing = true
+  const injected = new Error('deploy failed')
+  const calls: Array<{ hook: string; context: unknown }> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterCommit: (context) => void calls.push({ hook: 'afterCommit', context }),
+      afterLink: (context) => {
+        calls.push({ hook: 'afterLink', context })
+        if (failing) throw injected
+      },
+      onFailure: (context) => void calls.push({ hook: 'onFailure', context })
+    }
+  })
+  const events: string[] = []
+  server.on('failure', (event) => events.push(event.reason))
+  const input = await manifest(t, 'release-1', 'first')
+  const metadata = metadataFromManifest(input.manifest)
+
+  const first = await uploadAll(node, input)
+  t.is(statuses(first).at(-1), 'FAILED')
+  t.is(finalCode(first), ERRORS.HOOK_FAILED)
+  t.absent(statuses(first).includes('COMMITTED'))
+  t.alike(events, [ERRORS.HOOK_FAILED])
+  t.is(
+    b4a.toString(await fs.promises.readFile(path.join(server.storageDir, 'release-1'))),
+    'first',
+    'the artifact stays committed'
+  )
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'latest')), 'release-1')
+  await waitFor(() => calls.some((call) => call.hook === 'onFailure'))
+  t.alike(
+    calls.map((call) => call.hook),
+    ['afterCommit', 'afterLink', 'onFailure']
+  )
+  const failure = calls[2].context as HookFailureContext
+  t.is(failure.phase, 'afterLink')
+  t.is(failure.error, injected)
+  t.is(failure.path, path.join(path.resolve(server.storageDir), 'latest'))
+  t.is(failure.link?.name, 'latest')
+  t.is(failure.link?.target, 'release-1')
+  t.is(failure.artifact.transferId, metadata.transferId)
+  t.is(failure.alreadyCommitted, false)
+
+  failing = false
+  calls.length = 0
+  const retry = reconnect(node, input)
+  await waitFor(() => isTerminal(retry))
+  t.alike(statuses(retry), ['ALREADY_COMMITTED'])
+  t.alike(
+    calls.map((call) => call.hook),
+    ['afterCommit', 'afterLink']
+  )
+  t.is((calls[0]?.context as AfterCommitContext | undefined)?.alreadyCommitted, true)
+  const rerun = calls.find((call) => call.hook === 'afterLink')
+  const rerunContext = rerun?.context as AfterLinkContext | undefined
+  t.is(rerunContext?.status, 'UNCHANGED', 'the link was already durable')
+  t.is(rerunContext?.trigger, 'upload')
+  t.is(rerunContext?.artifact.transferId, metadata.transferId)
+  await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('afterLink does not run when afterCommit fails, and the link line stays free for the retry', async (t) => {
+  let failing = true
+  const calls: string[] = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterCommit: () => {
+        calls.push('afterCommit')
+        if (failing) throw new Error('deploy failed')
+      },
+      afterLink: () => void calls.push('afterLink')
+    }
+  })
+  const input = await manifest(t, 'release-1', 'first')
+  const first = await uploadAll(node, input)
+  t.is(finalCode(first), ERRORS.HOOK_FAILED)
+  t.alike(calls, ['afterCommit'])
+  await waitFor(() => reservedHookLines(server) === 0)
+
+  failing = false
+  const retry = reconnect(node, input)
+  await waitFor(() => isTerminal(retry))
+  t.alike(statuses(retry), ['ALREADY_COMMITTED'])
+  t.alike(calls, ['afterCommit', 'afterCommit', 'afterLink'])
+})
+
+test('an afterLink-only server defers post-commit retention until the hook succeeds', async (t) => {
+  const order: string[] = []
+  const seen: string[] = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterLink: ({ status }) => {
+        order.push('afterLink')
+        seen.push(status)
+      }
+    }
+  })
+  server.on('retention', (event) => {
+    if (event.trigger === 'post-commit') order.push('retention:post-commit')
+  })
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  t.alike(order, ['afterLink', 'retention:post-commit'])
+  t.alike(seen, ['LINKED'], 'the commit itself moved the link, not an earlier retention pass')
+})
+
+test('a pending afterLink holds no storage lease, and one link runs its hooks in decision order', async (t) => {
+  const held = gate()
+  const started: string[] = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^r\\d$/' }],
+    hooks: {
+      afterLink: async ({ link }) => {
+        started.push(`${link.name}->${link.target}`)
+        if (link.target === 'r1') await held.wait
+      }
+    }
+  })
+  for (const name of ['r1', 'r2', 'r3', 'r4']) {
+    t.absent(finalCode(await uploadAll(node, await manifest(t, name, 'aa'))), name)
+  }
+  const first = linkRequest(node, 'r1', 'current')
+  await waitFor(() => started.length === 1)
+
+  const { retention } = server as unknown as {
+    retention: { run(options: { trigger: 'manual' }): Promise<unknown> }
+  }
+  await deadline(retention.run({ trigger: 'manual' }), 'a retention pass')
+  const other = linkRequest(node, 'r2', 'other')
+  await deadline(
+    waitFor(() => other.writes.length === 1),
+    'a link with another name'
+  )
+  t.alike(linkFrame(other), { v: 1, status: 'LINKED' })
+
+  const second = linkRequest(node, 'r3', 'current')
+  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r3')
+  await settled()
+  t.alike(started, ['current->r1', 'other->r2'], 'the repoint is durable but its hook waits')
+  t.is(first.writes.length, 0)
+  t.is(second.writes.length, 0)
+
+  held.open()
+  await waitFor(() => first.writes.length === 1 && second.writes.length === 1)
+  t.alike(started, ['current->r1', 'other->r2', 'current->r3'])
+  t.alike(linkFrame(first), { v: 1, status: 'LINKED' })
+  t.alike(linkFrame(second), { v: 1, status: 'LINKED' })
+  await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('retention can remove the previous target while its afterLink is still pending', async (t) => {
+  const held = gate()
+  const contexts: AfterLinkContext[] = []
+  const { server, node } = await createServer(t, {
+    maxStorageBytes: 4,
+    symlinks: [{ selector: '/^r\\d$/' }],
+    hooks: {
+      afterLink: async (context) => {
+        contexts.push(context)
+        if (context.link.target === 'r1') await held.wait
+      }
+    }
+  })
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r1', 'aa'))))
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r2', 'bb'))))
+  const first = linkRequest(node, 'r1', 'current')
+  await waitFor(() => contexts.length === 1)
+  const second = linkRequest(node, 'r2', 'current')
+  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r2')
+
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r3', 'cc'))))
+  await t.exception(() => fs.promises.lstat(contexts[0].link.targetPath), { code: 'ENOENT' })
+  t.is(contexts[0].link.target, 'r1', 'the pending hook still describes its own decision')
+
+  held.open()
+  await waitFor(() => first.writes.length === 1 && second.writes.length === 1)
+  t.alike(linkFrame(second), { v: 1, status: 'LINKED' })
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'r2')
+})
+
+test('closing the server aborts a pending afterLink and a queued one and frees the hook line', async (t) => {
+  let started = 0
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^r\\d$/' }],
+    hooks: {
+      afterLink: () => {
+        started++
+        return new Promise<void>(() => {})
+      }
+    }
+  })
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r1', 'aa'))))
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r2', 'bb'))))
+  const first = linkRequest(node, 'r1', 'current')
+  await waitFor(() => started === 1)
+  const second = linkRequest(node, 'r2', 'current')
+  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r2')
+  await settled()
+  t.is(started, 1, 'the queued hook has not started')
+
+  await deadline(server.close(), 'the server to close')
+  t.is(started, 1, 'closing never starts the queued hook')
+  t.is(reservedHookLines(server), 0)
+  t.is(first.destroyed, true)
+  t.is(second.destroyed, true)
 })

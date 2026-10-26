@@ -284,6 +284,14 @@ one-argument `--symlink` rule. Success prints exactly:
 `LINKED` means the link was created or repointed. `UNCHANGED` means the same
 managed link already points at that target; the operation is idempotent.
 
+When the server has an `afterLink` hook, success is printed only after the hook
+returns, for as long as `--idle-timeout` allows. If the hook fails, the command
+exits `1` and prints `HOOK_FAILED`; the link itself has already changed, and
+running the same command again is safe and re-runs the hook. A hook slower than
+`--idle-timeout` makes the command fail with a timeout instead, though the
+server still finishes the hook (see
+[Link publication hooks](#link-publication-hooks)).
+
 ### `reset-storage`
 
 ```sh
@@ -731,8 +739,8 @@ that is older than the retained window (for example version `1.0.0` when
 `maxVersions` is `2` and `3.x` and `2.x` exist) is committed and then removed in
 that same pass. The exact ordering depends on hooks:
 
-- Without an `afterCommit` hook, the post-commit pass runs immediately after the
-  commit becomes durable, before `COMMITTED` is sent.
+- Without an `afterCommit` or `afterLink` hook, the post-commit pass runs
+  immediately after the commit becomes durable, before `COMMITTED` is sent.
 - With an `afterCommit` hook, the post-commit pass is deferred. Order:
   commit (the pre-commit quota and age checks still run first), `afterCommit`
   with the final path and sidecar present, and only after the callback
@@ -740,19 +748,26 @@ that same pass. The exact ordering depends on hooks:
   Because the deferred pass runs before the terminal reply, a slow retention
   pass delays `COMMITTED` or `ALREADY_COMMITTED`. `beforeCommit`-only and
   `onFailure`-only servers do not defer.
+- An `afterLink` hook defers the pass the same way, after `afterCommit` (when
+  both are configured) and after every `afterLink` call for the upload has
+  succeeded. Deferring makes this commit's own link reconciliation run before
+  this commit's retention pass, which narrows but does not remove the chance
+  that the link has already moved (another commit's retention pass or
+  reconciliation can do it first, and the hook then sees `UNCHANGED`). An
+  explicit link request never runs retention.
 - The final path exists when `afterCommit` begins in the sequential server
   flow, including for an out-of-window release, and for replacement commits
   (a replaced artifact's history record is also present). It is not a lock:
   a concurrent commit's retention pass, a scheduled retention pass, or a manual
   retention pass can remove the file while the callback runs. A hook that needs stable bytes should open or
   copy the file promptly at the start of the callback.
-- If `afterCommit` throws, no post-commit pass runs for that connection. The
-  artifact and its record stay, and the server remembers in memory that this
-  transfer still owes a pass. An immediate retry normally reaches
-  `ALREADY_COMMITTED`, runs `afterCommit` again with the existing path, and runs
-  the owed pass only after that call succeeds. A failing already-committed
-  `afterCommit` likewise skips the pass and keeps the transfer owed. See the
-  retry caveat below.
+- If `afterCommit` (or `afterLink`) throws, no post-commit pass runs for that
+  connection. The artifact and its record stay, and the server remembers in
+  memory that this transfer still owes a pass. An immediate retry normally
+  reaches `ALREADY_COMMITTED`, runs `afterCommit` again with the existing path,
+  and runs the owed pass only after the hooks succeed. A failing
+  already-committed `afterCommit` likewise skips the pass and keeps the
+  transfer owed. See the retry caveat below.
 - An ordinary duplicate offer — one whose `afterCommit` already succeeded, or
   that this process never committed — still calls `afterCommit` with
   `alreadyCommitted: true`, but starts **no** retention pass. Only a connection
@@ -848,6 +863,21 @@ complete pre-upgrade storage backup (including visible links and
 
 `swarm-deploy link` requires an upgraded server; v0.2.0 does not recognize
 link control requests.
+
+#### Link hooks and compatibility
+
+`afterLink` is optional and adds no wire format, persisted state, or dependency.
+A failed hook reaches every client as the existing stable `HOOK_FAILED` code in
+the ordinary `FAILED` link result (or upload final or admission record), which
+older clients already decode, so clients need no upgrade. Only the CLI
+differs: `swarm-deploy link` prints `HOOK_FAILED` from this version on, and an
+older CLI prints a generic message for the same failure. A server without
+`afterLink` behaves exactly as before, including `afterCommit` ordering and its
+deferred retention. Configuring `afterLink` defers the post-commit retention
+pass the same way `afterCommit` does (see
+[Artifact patterns and rotation](#artifact-patterns-and-rotation)). Nothing
+needs rolling back: removing the hook returns the server to the previous
+behavior.
 
 #### Overlapping retries now get `FILE_BUSY`
 
@@ -978,8 +1008,10 @@ A safe promotion workflow is:
    tested artifact.
 
 The explicit link operation is a control request, not an upload. It supports
-files and directories, is idempotent, and does not invoke deployment hooks.
-`symlinks` requires `StorageAdapter.symlink` and `readlink`; the Node and Bare
+files and directories and is idempotent. It runs none of the upload hooks
+(`beforeCommit`, `afterCommit`), but a server with an `afterLink` hook runs it
+after the link is durable and before the result is returned; see
+[Link publication hooks](#link-publication-hooks). `symlinks` requires `StorageAdapter.symlink` and `readlink`; the Node and Bare
 default adapters provide them; a custom adapter without symlink rules stays
 source-compatible.
 
@@ -999,8 +1031,14 @@ seeds, secret keys, TAR bytes, or session material.
   `path` is the committed directory tree. Its failure fails the upload even
   though the artifact is already stored. When it is configured, post-commit
   rotation is deferred until it succeeds (see "Immediate effect" above).
+- `afterLink(context)`: after a managed link is durable, before the terminal
+  success reply: for an upload, after `afterCommit` succeeded and for each
+  automatic link now pointing at the uploaded artifact; for an explicit link
+  request, after the request passed every policy check. Its failure fails the
+  upload or link request though the artifact and link are already stored. See
+  [Link publication hooks](#link-publication-hooks).
 - `onFailure(context)`: once per failed connection whose metadata was decoded,
-  after the client has been answered.
+  and once per failed `afterLink`, after the client has been answered.
 
 Callbacks may return `void` or a promise, are called with no receiver, and
 receive a frozen context. The artifact is
@@ -1013,9 +1051,10 @@ come from decoded offer metadata, not yet from verified content.
 | -------------- | ---------------------------------------------------------------------------- |
 | `beforeCommit` | `path` (verified staging file or tree), `resumed`, `alreadyCommitted: false` |
 | `afterCommit`  | `path` (committed artifact), `resumed`, `alreadyCommitted`                   |
+| `afterLink`    | `link`, `status`, `trigger`                                                  |
 | `onFailure`    | `path` (`string \| null`), `phase`, `resumed`, `alreadyCommitted`, `error`   |
 
-`resumed` is `true` when the server admitted the connection as `RESUME` or
+`onFailure` also receives `link` when `phase` is `afterLink`. `resumed` is `true` when the server admitted the connection as `RESUME` or
 `VERIFIED`. Closing the server aborts the wait; a callback that outlives the
 abort continues detached and its later result is ignored.
 
@@ -1028,8 +1067,8 @@ Only the already-committed path holds no upload slot. Write callbacks that
 finish or throw; bounded hook timeout and anti-spam controls are tracked in
 issue #8.
 
-The **lifecycle** hooks `beforeCommit` and `afterCommit` never run concurrently
-for one transfer. Once a transfer ID authenticates, that connection owns it for
+The **lifecycle** hooks `beforeCommit`, `afterCommit` and, for an upload,
+`afterLink` never run concurrently for one transfer. Once a transfer ID authenticates, that connection owns it for
 the whole verify/commit sequence; a second connection offering the same transfer
 ID — fresh, resumed, verified, or already committed — is rejected with
 `FILE_BUSY` before any lifecycle hook runs, and that rejection is reported to
@@ -1056,7 +1095,9 @@ Fresh upload:
 3. `beforeCommit` (`resumed: false`).
 4. Commit.
 5. `afterCommit` (`resumed: false`, `alreadyCommitted: false`).
-6. `COMMITTED`.
+6. `afterLink` for each automatic link that now points at the artifact (only
+   when an `afterLink` hook is configured and a rule selected the artifact).
+7. `COMMITTED`.
 
 Partial resume (`RESUME`): the same steps, with `resumed: true` in both hooks.
 
@@ -1067,11 +1108,18 @@ after `beforeCommit` returned but before the commit finished.
 
 Already committed: identical content is detected during offer inspection, so
 there is no transfer, verification, or `beforeCommit`. The server calls
-`afterCommit` with `resumed: false` and `alreadyCommitted: true`, then replies
+`afterCommit` with `resumed: false` and `alreadyCommitted: true`, then
+`afterLink` for each automatic link that currently points at the artifact
+(status `UNCHANGED` unless this run repaired the link), then replies
 `ALREADY_COMMITTED`. A deferred retention pass follows only when this process
-committed that transfer and its `afterCommit` has not yet succeeded. This path
-is reached only while the artifact still exists; see the
+committed that transfer and its hooks have not yet succeeded. This path is
+reached only while the artifact still exists; see the
 [retry caveat](#artifact-patterns-and-rotation).
+
+Explicit link request: the request passes every policy check, the link is
+created, kept, or repointed durably, and then `afterLink` runs
+(`trigger: 'request'`, no upload hook). Only after it returns does the client
+receive `LINKED` or `UNCHANGED`.
 
 Failure sequences:
 
@@ -1088,20 +1136,164 @@ Failure sequences:
 - `afterCommit` throws on an already-committed retry: the offer is rejected with
   `HOOK_FAILED` and a later retry repeats `afterCommit`, subject to the same
   retry caveat.
-- A failure after both hooks succeeded (for example the terminal reply cannot be
+- `afterLink` throws on a fresh or resumed upload: the artifact **and the link
+  stay durable**, the session is retired, and the client receives
+  `HOOK_FAILED`; `onFailure` runs (`phase: 'afterLink'`, `link` set, `path` the
+  link). A retry takes the already-committed path and calls `afterCommit` again
+  (`alreadyCommitted: true`) and then `afterLink` with `status: 'UNCHANGED'`.
+  A failing `afterLink` on an already-committed retry rejects the offer with
+  `HOOK_FAILED` and a later retry repeats it.
+- `afterLink` throws on an explicit link request: the link stays as decided, the
+  client receives a `FAILED` link result with `HOOK_FAILED`, and `onFailure`
+  runs. The same request again returns `UNCHANGED` once the hook succeeds.
+- A failure after every hook succeeded (for example the terminal reply cannot be
   written) does not call `onFailure`.
 
 Retries therefore can call hooks more than once for one transfer. **Make hooks
-idempotent and key external side effects on `artifact.transferId`.** Treat
-`afterCommit` as at-least-once: record the transfer ID when the deployment step
-finishes and skip repeated calls.
+idempotent and key external side effects on `artifact.transferId`** (and, for
+`afterLink`, on the link name too). Treat `afterCommit` and `afterLink` as
+at-least-once: record the transfer ID when the deployment step finishes and skip
+repeated calls.
+
+### Link publication hooks
+
+`afterLink` is for publishing a link: telling another system that the link
+`latest` now means a given artifact. It runs after the link is durable and
+exactly for these causes:
+
+- **Upload** (`trigger: 'upload'`). A fresh, resumed, verified-reconnect, or
+  already-committed upload of an artifact that an _automatic_ rule currently
+  selects. There is one call per automatic link that points at that artifact,
+  in rule order, after `afterCommit` succeeded. An upload no rule selects
+  moves no link and calls no `afterLink`.
+- **Request** (`trigger: 'request'`). An explicit `Client.link` or
+  `swarm-deploy link` that passed every policy check and found a durable link
+  state. There is one call.
+
+It never runs for a request that is unauthorized, not allowed, targets a
+missing artifact, or conflicts with an artifact or unmanaged path: those
+fail before any link changes and run no hook, including `onFailure`. It also
+does not run when a manual link's target is re-uploaded or replaced, or when
+startup, scheduled, manual, or commit retention reconciliation changes a link;
+only an upload or a link request does.
+
+The context is `{ link, artifact, status, trigger }`, frozen and free of keys,
+seeds, and TAR bytes:
+
+- `link`: `{ name, target, mode, path, targetPath }`. `mode` is `automatic` or
+  `manual`; `path` is the absolute path of the symlink and `targetPath` the
+  absolute path of the committed target.
+- `artifact`: the committed artifact the link was set to point at, shaped like
+  every other hook artifact. For a request it is read from the durable commit
+  record, so it has no `sourceParent`.
+- `status`: the link decision this call observed, never proof of publication.
+  `LINKED` when this call created or repointed the link, or repaired an
+  automatic link's ownership record; `UNCHANGED` when the link already pointed
+  at the target. An earlier attempt, another commit's retention pass or
+  reconciliation, or a concurrent request may have moved the link first, so a
+  fresh upload or request can still see `UNCHANGED`, and a manual
+  ownership-metadata refresh for the same target is `UNCHANGED` too. Neither
+  value says whether anything was published: decide that from your own record
+  of `link.name` and `artifact.transferId`.
+- `trigger`: `upload` or `request`.
+
+**What the server guarantees.**
+
+- **Nothing succeeds before the hook does.** A client never receives
+  `COMMITTED`, `ALREADY_COMMITTED`, `LINKED`, or `UNCHANGED` until the
+  applicable `afterLink` calls returned. A throw reaches the caller as the
+  stable, sanitized `HOOK_FAILED` (fixed message; the raw exception never
+  leaves the server and is passed only to `onFailure`). A link request carries
+  it as the ordinary `FAILED` result code, so existing clients need no change.
+  The caller sees that code only while it is still waiting; see the time budget
+  below.
+- **Time budget.** The server sets no hook deadline. A client waits for its
+  answer for at most its idle timeout (60 seconds by default, 5 minutes at most:
+  `--idle-timeout`, `ClientOptions.idleTimeout`), and that one wait covers
+  everything the server does before it answers. For an upload that is
+  verification and commit, `afterCommit`, every `afterLink` call for the upload
+  one after another (one per automatic link the artifact moved), hooks queued
+  ahead for the same link, and the deferred retention pass; for a link request,
+  the queue ahead and the hook. If the client's wait expires first it reports
+  `UPLOAD_IDLE_TIMEOUT` instead of `HOOK_FAILED` and closes the connection. The
+  server still runs its hooks, and the artifact and link stay durable, so a
+  retry is safe. Set the client idle timeout above the worst-case total, and
+  make publishers fail on their own well before it.
+- **The answer is delivered.** After writing a `HOOK_FAILED` answer the server
+  ends its side of the stream and keeps the connection for up to 5 seconds, so
+  the client reads the code instead of a connection reset. This applies to every
+  `HOOK_FAILED` answer, including `beforeCommit` and `afterCommit`. Other
+  failure answers are still followed by an immediate close, as before, so on a
+  real network a client may see a reset rather than their stable code.
+- **No rollback.** The link is made durable before the hook runs and a failed
+  hook never undoes it, nor the committed artifact. After `HOOK_FAILED` the
+  link points where the request asked, unless a later request has moved it.
+- **Safe retry.** Repeating the same link request returns `UNCHANGED` and runs
+  the hook again, and repeating the upload takes the already-committed path
+  and runs the hooks again, so a failed publication is retried without
+  changing the link. The first attempt reports `HOOK_FAILED` and the retry
+  reports `UNCHANGED`: the result describes the link.
+- **Repeatable.** Every cause above can call the hook more than once for the
+  same link and artifact. Write hooks that are idempotent, identify the work by
+  `link.name` plus `artifact.transferId` (and `link.target`), and treat the
+  context as at-least-once.
+- **No lease across hook code.** Hook code runs after the storage-root lease is
+  released, so a slow or failing hook never blocks commits, retention, other
+  links, or recovery, and a hook that calls back into the server cannot
+  deadlock on it.
+- **Per-link order.** For one link name, hooks start in the order the durable
+  link decisions were made and never overlap, so within one running server a
+  slow publication of an older decision cannot overtake the publication of a
+  newer one. Hooks for different links run concurrently. An upload takes its
+  place when it reconciles the link, so it holds that place while its
+  `afterCommit` runs. The ordering is in memory: it is not a transaction with
+  your publisher and does not survive a restart, and a hook that never returns
+  delays later hooks for that link (and their clients, until the client's idle
+  timeout) and keeps its own connection open, because there is no hook
+  timeout. A hook must not wait for another link request or upload that
+  involves the same link name on its own server, since that one is queued
+  behind it.
+
+**What it does not guarantee.** The hook runs after the lease is released, so the
+context is the snapshot of one decision, not live state. By the time it runs,
+another request may have repointed `link.path`, and a retention pass may have
+removed `targetPath` if the link no longer pins it. Open or copy what you need
+promptly, treat a missing `targetPath` or a changed `readlink(link.path)` as
+"superseded", and let the newer decision's own call publish the final state.
+Link removal has no hook because there is no unlink request.
+
+**Observing a failure.** A failed `afterLink` is reported on the server as: a
+`link` event with `status: 'failed'`, `reason: 'HOOK_FAILED'` and `result`
+(`LINKED` or `UNCHANGED`, the durable outcome) for a link request; a `failure`
+event with `HOOK_FAILED`; a `Link hook failed` warning with the link name,
+target, trigger, and status (never callback text); and `onFailure` with
+`phase: 'afterLink'`, the `link`, and the raw exception. Automatic links
+emit no `link` event, so an upload reports through the other three.
+
+A runnable, Node-only example is in
+[`examples/link-publisher`](examples/link-publisher). It uses
+`node:child_process` and the global `process`, so it does not run on Bare
+(library hooks themselves work on Node and Bare). It hands each link to a
+publisher over stdin without a shell. `SWARM_DEPLOY_PUBLISHER` names a
+JavaScript module file that the example runs with the current Node
+executable; it is not an arbitrary executable. Each call has a 20-second
+deadline: the publisher then gets `SIGTERM` and, 5 seconds later, `SIGKILL`, and
+the call always rejects with a timeout, even if the publisher exits zero after
+`SIGTERM`. It settles only once that child has exited, so an abandoned
+publisher cannot write over the next publication of the same link, and a call
+takes at most 25 seconds. The example's header shows how to size the client
+idle timeout for several sequential calls (25 seconds each).
 
 ### onFailure
 
 `phase` is one of `offer`, `transfer`, `verification`, `beforeCommit`, `commit`,
-or `afterCommit`. `offer` covers every failure before a staging path exists:
-metadata or transfer-ID problems, unmatched patterns, file-size, capacity and
-destination rejections, and inspection errors.
+`afterCommit`, or `afterLink`. `offer` covers every failure before a staging
+path exists: metadata or transfer-ID problems, unmatched patterns, file-size,
+capacity and destination rejections, and inspection errors. `afterLink` is the
+only phase that can also come from a connection with no upload: a failed
+`afterLink` on an explicit link request reports it, with `resumed: false`,
+`alreadyCommitted: true`, and the target's durable commit record as `artifact`.
+Failed link requests that never changed a link do not call `onFailure`.
 
 An `offer`-phase context is built from decoded metadata **before** the transfer
 ID is authenticated, and it is also reported when that authentication is exactly
@@ -1111,8 +1303,8 @@ Use them for logging and alerting only; never as audit records or idempotency
 keys. Every later phase runs after authentication, so only `offer` carries this
 caveat.
 
-`error` is the original failure. For an exception thrown by `beforeCommit` or
-`afterCommit`, hooks receive the **raw thrown value** (not a wrapper) because
+`error` is the original failure. For an exception thrown by `beforeCommit`,
+`afterCommit`, or `afterLink`, hooks receive the **raw thrown value** (not a wrapper) because
 hooks are trusted. The client and server events see only the stable wire code
 `HOOK_FAILED` with a fixed message, so callback text never reaches the wire. Other
 failures arrive as `SwarmDeployError` (or raw storage errors).
@@ -1127,6 +1319,7 @@ original failure.
 | `transfer`; fresh-upload `verification`                            | `<storage>/.swarm-deploy/staging/<transferId>.tar.part` |
 | `beforeCommit`, `commit`; `verification` of a `VERIFIED` reconnect | `<storage>/.swarm-deploy/staging/<transferId>.part`     |
 | `afterCommit` (including already committed)                        | `<storage>/<name>`                                      |
+| `afterLink`                                                        | `<storage>/<link-name>`                                 |
 
 ### Hook modules
 
@@ -1139,6 +1332,11 @@ CommonJS examples:
 export async function afterCommit({ artifact, path, alreadyCommitted }) {
   // Idempotent: keyed by artifact.transferId.
   await deploy(artifact.transferId, path)
+}
+
+export async function afterLink({ link, artifact, status }) {
+  // Repeatable: publish "link.name means artifact.transferId" once, skip repeats.
+  await publish(link.name, artifact.transferId, status)
 }
 
 export function onFailure({ phase, artifact, error }) {
@@ -1160,9 +1358,9 @@ module.exports = {
 
 Loader rules:
 
-- Only the own properties `beforeCommit`, `afterCommit`, and `onFailure` are
-  read. Other exports (helpers, configuration) are ignored, including a
-  harmless non-object default export.
+- Only the own properties `beforeCommit`, `afterCommit`, `afterLink`, and
+  `onFailure` are read. Other exports (helpers, configuration) are ignored,
+  including a harmless non-object default export.
 - Named exports take precedence over callbacks on a default export object; a
   named export set to `undefined` does not override it.
 - A hook name that is present must be a function, the callbacks must be plain
@@ -1174,7 +1372,7 @@ Loader rules:
   trusted.
 
 `ServerOptions.hooks` is stricter: it must be a hook object whose own keys are
-only the three callbacks, every callback a function. Unknown keys and
+only the four callbacks, every callback a function. Unknown keys and
 non-function values throw `PROTOCOL_INVALID`. The object is snapshotted at
 construction, so later mutation has no effect.
 
@@ -1273,8 +1471,9 @@ Optional operational limits and policies:
 - `hooks?: ServerHooks | null`; see [Deployment hooks](#deployment-hooks).
 
 The root package exports the `ServerHooks`, `BeforeCommitContext`,
-`AfterCommitContext`, `HookFailureContext`, `HookFailurePhase`, `HookArtifact`,
-`ReleaseCoordinates`, and `VersionGranularity` types:
+`AfterCommitContext`, `AfterLinkContext`, `HookFailureContext`,
+`HookFailurePhase`, `HookArtifact`, `HookLink`, `HookLinkMode`, `HookLinkStatus`,
+`HookLinkTrigger`, `ReleaseCoordinates`, and `VersionGranularity` types:
 
 ```ts
 import type { ServerHooks } from 'swarm-deploy'
@@ -1282,6 +1481,9 @@ import type { ServerHooks } from 'swarm-deploy'
 const hooks: ServerHooks = {
   async afterCommit({ artifact, path, alreadyCommitted }) {
     // Idempotent: skip work already recorded for artifact.transferId.
+  },
+  async afterLink({ link, artifact, status, trigger }) {
+    // Repeatable: skip when link.name already publishes artifact.transferId.
   },
   onFailure({ phase, path, error }) {
     console.error(phase, path, error)
@@ -1389,7 +1591,10 @@ Server events:
   `versionDeleted`, and `storageDeleted` counters.
 - `link`: one terminal manual-link outcome with `target`, `name`, client
   fingerprint, and status `linked`, `unchanged`, `rejected`, or `failed`.
-  Rejected and failed outcomes also include a stable `reason`.
+  Rejected and failed outcomes also include a stable `reason`. A failed
+  `afterLink` hook is `failed` with reason `HOOK_FAILED` and `result`
+  (`LINKED` or `UNCHANGED`), the durable outcome the link had already reached.
+  Automatic links emit no `link` event.
 - `failure`: stable failure code and peer fingerprint.
 - `listening`: local server-key fingerprint.
 - `close`: closed or failed outcome.
@@ -1462,9 +1667,11 @@ try {
 }
 ```
 
-`HOOK_FAILED` is the stable code for a failed `beforeCommit` or `afterCommit`
-callback. Its message is fixed and the original exception is available only as
-`cause` and to `onFailure`.
+`HOOK_FAILED` is the stable code for a failed `beforeCommit`, `afterCommit`, or
+`afterLink` callback. Its message is fixed and the original exception is
+available only as `cause` and to `onFailure`. For `afterCommit` and
+`afterLink` the artifact (and, for `afterLink`, the link) is already durable
+when the code is reported, so a retry is safe and does not undo it.
 
 Stable codes include authentication and server-key rejection, invalid
 configuration and protocol records, file and staging limits, disk reserve,

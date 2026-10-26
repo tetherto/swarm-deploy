@@ -239,10 +239,10 @@ limit is best-effort when one exceeds it.
 
 Retention runs before a commit's link step and again after the commit becomes
 durable, so rotation may remove an artifact that falls outside the retained
-window immediately after it is committed. When an `afterCommit` hook is
-configured the post-commit pass is deferred: the order is commit, `afterCommit`,
-then the post-commit pass only after the callback succeeded, then the terminal
-`COMMITTED` or `ALREADY_COMMITTED` reply. The deferred pass therefore runs before
+window immediately after it is committed. When an `afterCommit` or `afterLink`
+hook is configured the post-commit pass is deferred: the order is commit,
+`afterCommit`, `afterLink`, then the post-commit pass only after the callbacks
+succeeded, then the terminal `COMMITTED` or `ALREADY_COMMITTED` reply. The deferred pass therefore runs before
 that reply, and a slow retention pass can delay it. When `afterCommit` begins in
 the sequential server flow, the final path and sidecar exist, including for
 out-of-window releases and for replacement commits and their history. This is
@@ -261,8 +261,9 @@ the same ceiling as `maxConnections`; a persistently failing hook that reaches
 the bound evicts the oldest owed transfer first. Eviction is deterministic and
 loses nothing durable: the artifact stays committed and its rotation falls back
 to the next startup, scheduled, or commit-triggered pass.
-Servers without an `afterCommit` hook (including `beforeCommit`-only and
-`onFailure`-only) run the pass immediately after the commit. Pre-commit quota and
+Servers without an `afterCommit` or `afterLink` hook (including
+`beforeCommit`-only and `onFailure`-only) run the pass immediately after the
+commit. Pre-commit quota and
 age checks are never deferred, and post-commit retention failures remain
 non-fatal. Because no persistent hook-pending marker exists, any intervening
 retention pass (startup after a restart, scheduled or manual cleanup, or a
@@ -281,8 +282,8 @@ CLI exit code 2.
 
 ### Hooks
 
-A server may be configured with `beforeCommit`, `afterCommit`, and `onFailure`
-callbacks. Direct `ServerOptions.hooks` accepts only a hook object whose own keys
+A server may be configured with `beforeCommit`, `afterCommit`, `afterLink`, and
+`onFailure` callbacks. Direct `ServerOptions.hooks` accepts only a hook object whose own keys
 are those names and whose values are functions; it is snapshotted at
 construction. The CLI `--hooks` option loads a module before the server listens,
 selecting only those names (named exports win over a default object; one
@@ -319,13 +320,18 @@ lifecycle hooks may overlap that callback. Each connection still invokes
 Observable order:
 
 - fresh or partially resumed upload: offer, ACCEPT or RESUME, TAR receipt,
-  verification, `beforeCommit`, commit, `afterCommit`, `COMMITTED`;
+  verification, `beforeCommit`, commit, `afterCommit`, `afterLink` for each
+  automatic link now pointing at the artifact, `COMMITTED`;
 - verified reconnect (`VERIFIED`): re-read of the verified staging file,
-  `beforeCommit` with `resumed: true`, commit, `afterCommit`, `COMMITTED`;
+  `beforeCommit` with `resumed: true`, commit, `afterCommit`, `afterLink`,
+  `COMMITTED`;
 - already committed: `afterCommit` with `alreadyCommitted: true` and
-  `resumed: false`, then the deferred retention pass only when this process
-  still owes one for that transfer, then `ALREADY_COMMITTED`, with no
-  verification or `beforeCommit`.
+  `resumed: false`, `afterLink` for each automatic link pointing at the
+  artifact, then the deferred retention pass only when this process still owes
+  one for that transfer, then `ALREADY_COMMITTED`, with no verification or
+  `beforeCommit`;
+- explicit link request: policy checks, the durable link mutation, `afterLink`
+  with `trigger: 'request'`, then the `LINKED` or `UNCHANGED` result.
 
 A `beforeCommit` failure prevents commit mutation and leaves the verified
 session resumable. An `afterCommit` failure leaves the artifact durably
@@ -335,15 +341,52 @@ path, so both callbacks may run more than once for a transfer ID and must be
 idempotent. A callback exception becomes the stable wire code `HOOK_FAILED` with
 a fixed message.
 
+`afterLink` publishes a durable link. It receives
+`{ link, artifact, status, trigger }`, where `link` is
+`{ name, target, mode, path, targetPath }`, `status` is `LINKED` or `UNCHANGED`
+(the link decision this call observed, not proof of publication: another
+commit's retention or reconciliation may have moved the link first, and a manual
+ownership-metadata refresh for the same target is `UNCHANGED`),
+and `trigger` is `upload` (one call per automatic link that points at the
+uploaded artifact, after `afterCommit`) or `request` (one call for an explicit
+link request). It runs for `UNCHANGED` too, so a retry after a failed hook
+re-runs it, and it is at-least-once: hooks must be idempotent on link name plus
+artifact transfer ID. No success is sent before it returns, and a failure is
+`HOOK_FAILED` (a `FAILED` link result, upload final record, or admission
+`REJECTED` record) without rolling back the link or artifact. It does not run
+for a rejected or unauthorized link, for a manual link whose target is replaced,
+or for reconciliation done by startup or retention.
+
+The hook runs after the storage-root lease is released, so it never blocks other
+work and cannot deadlock on it; consequently its context is a snapshot of one
+decision and the link or target may already have changed. For one link name the
+server starts hooks in the order the link decisions were made (a place in an
+in-memory first-in, first-out line is reserved under the lease) and never runs
+two at once; different links run concurrently. The line does not survive a
+restart and is unbounded in time because there is no hook timeout. A client
+waits for its answer for at most its idle timeout, which covers everything the
+server does first (commit, `afterCommit`, every `afterLink` call in sequence,
+hooks queued ahead for the same link, retention); if it expires first the
+client reports `UPLOAD_IDLE_TIMEOUT` instead of `HOOK_FAILED` while the server
+still finishes the hooks.
+
+After a `HOOK_FAILED` answer is written the server ends its write side and
+destroys the connection when the peer closes it or after a 5-second grace
+period, so the peer reads the stable code rather than a stream reset. Other
+failure answers are followed by an immediate destroy.
+
 `onFailure` runs at most once per connection after metadata was decoded and the
-failure was sent, unless both gating hooks already succeeded. Its context phase
-is `offer`, `transfer`, `verification`, `beforeCommit`, `commit`, or
-`afterCommit`; its `error` is the raw callback exception for hook failures and
-the original error otherwise. Its path is `null` for `offer`; the `.tar.part`
-staging file during transfer and for fresh-upload verification; the extracted
-`.part` staging file for `beforeCommit`, `commit`, and verified-reconnect
-verification; and the final path for `afterCommit`. An `onFailure` exception is
-logged as a secondary warning and never replaces the original failure.
+failure was sent, unless every gating hook already succeeded; it also runs once
+for a failed `afterLink` on a link request, after the client was answered. Its
+context phase is `offer`, `transfer`, `verification`, `beforeCommit`, `commit`,
+`afterCommit`, or `afterLink`; its `error` is the raw callback exception for hook
+failures and the original error otherwise. Its path is `null` for `offer`; the
+`.tar.part` staging file during transfer and for fresh-upload verification; the
+extracted `.part` staging file for `beforeCommit`, `commit`, and
+verified-reconnect verification; the final path for `afterCommit`; and the link
+path for `afterLink`, whose context also carries `link`. An `onFailure`
+exception is logged as a secondary warning and never replaces the original
+failure.
 
 An `offer`-phase context is assembled from decoded metadata before the transfer
 ID is authenticated, and is reported even when that authentication is the
@@ -507,7 +550,9 @@ storage-root lease it then resolves the target from current commit records,
 rejects missing and history targets, snapshots current artifact and automatic
 link names, and performs the namespace check and mutation. The lease serializes
 the decision and mutation with commit, recovery, retention, and other link
-requests.
+requests. It is released before any `afterLink` hook runs, and the result record
+is written only after that hook returns; a hook failure is the `FAILED` result
+with code `HOOK_FAILED`, which every existing client already decodes.
 
 The target must be a current managed top-level file or directory. The
 destination name cannot be the target, an automatic name, or a managed artifact

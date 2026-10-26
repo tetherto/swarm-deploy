@@ -1,8 +1,7 @@
 import path from '#path'
 import { ERRORS, SwarmDeployError } from './errors.js'
-import { snapshotHooks, type ServerHooks } from './hooks.js'
+import { HOOK_NAMES, snapshotHooks, type ServerHooks } from './hooks.js'
 
-const HOOK_NAMES = ['beforeCommit', 'afterCommit', 'onFailure'] as const
 const HOOK_EXTENSIONS = ['.js', '.mjs', '.cjs']
 
 function rejected(modulePath: string, reason: string): SwarmDeployError {
@@ -65,8 +64,9 @@ function defaultHooks(namespace: Record<string, unknown>): Record<string, unknow
 
 /**
  * Loads a JavaScript hooks module (`.js`, `.mjs` or `.cjs`) and returns the
- * validated, frozen hook snapshot. Only `beforeCommit`, `afterCommit` and
- * `onFailure` are picked, by own property name; other exports are ignored.
+ * validated, frozen hook snapshot. Only `beforeCommit`, `afterCommit`,
+ * `afterLink` and `onFailure` are picked, by own property name; other exports
+ * are ignored.
  * Defined named exports take precedence over the default export's callbacks. Every failure is a fixed-message configuration
  * error that never includes module content.
  */

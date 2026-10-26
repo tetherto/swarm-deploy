@@ -80,12 +80,21 @@ async function additionalFixture(
   return { metadata: metadataFromManifest(manifest), archive: await tar(manifest) }
 }
 
+// A deadlock watchdog, not a performance bound. The awaited work does real filesystem
+// I/O with fsync, which can take well over a second on a loaded CI runner. What the tests
+// assert is ordering (this work finishes while the other session's verification is still
+// gated); the deadline only turns a genuine hang into a failure instead of a stuck job.
+const DEADLOCK_WATCHDOG = 5_000
+
 function promptly<T>(promise: Promise<T>, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   return Promise.race([
     promise,
     new Promise<T>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 250)
+      timer = setTimeout(
+        () => reject(new Error(`Timed out waiting for ${label}`)),
+        DEADLOCK_WATCHDOG
+      )
     })
   ]).finally(() => clearTimeout(timer))
 }
