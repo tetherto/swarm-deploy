@@ -13,8 +13,11 @@ client promotions. Back to the [README](../README.md).
 
 Related guides: the [CLI reference](cli.md) for `--symlink` and
 `swarm-deploy link`, [deployment hooks](hooks.md) for `afterLink`,
-[artifact patterns and rotation](artifact-patterns.md) for how linked targets
-are pinned against retention, the [runtime API](api.md) for `Client.link`, and
+[artifact patterns and rotation](artifact-patterns.md) for the retention stages
+and post-commit rotation ordering (the rule that pins link targets against
+retention is under
+[Selection and ownership rules](#selection-and-ownership-rules)), the
+[runtime API](api.md) for `Client.link`, and
 [Managed-link rollback warning](operations.md#managed-link-rollback-warning).
 
 ## Configuring managed links
