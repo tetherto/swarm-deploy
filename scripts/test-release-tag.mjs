@@ -4,19 +4,22 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const validator = fileURLToPath(new URL('./validate-release-tag.mjs', import.meta.url))
-const workflow = fs.readFileSync(
-  new URL('../.github/workflows/publish.yml', import.meta.url),
-  'utf8'
-)
+const readWorkflow = (file) =>
+  fs.readFileSync(new URL(`../.github/workflows/${file}`, import.meta.url), 'utf8')
+const workflow = readWorkflow('publish.yml')
+const workflows = [
+  { file: 'ci.yml', source: readWorkflow('ci.yml') },
+  { file: 'publish.yml', source: workflow }
+]
 const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-const reviewedAction = '146b86c4d0237c124df06ecc992ddf2c585b3405'
+const holepunchRef = 'v1'
 const versionMatch = /^(\d+)\.(\d+)\.(\d+)$/.exec(packageJson.version)
 assert.ok(versionMatch, `package version is not stable semver: ${packageJson.version}`)
 const [, major, minor, patch] = versionMatch
+const scalar = (value) => value.replace(/\s+#.*$/, '').replace(/^['"]|['"]$/g, '')
 
 function parsePublishJob(source) {
   const lines = source.split('\n')
-  const scalar = (value) => value.replace(/\s+#.*$/, '').replace(/^['"]|['"]$/g, '')
   const jobStart = lines.indexOf('  publish:')
   assert.notEqual(jobStart, -1, 'publish job is missing')
   const stepsStart = lines.indexOf('    steps:', jobStart)
@@ -94,11 +97,24 @@ assert.deepEqual(
   ['git fetch --no-tags origin main', 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main'],
   JSON.stringify(publish.steps)
 )
-assert.ok(
-  publish.steps.some((step) => step.uses === `holepunchto/actions/publish@${reviewedAction}`)
-)
+for (const { file, source } of workflows) {
+  const holepunchUses = source
+    .split('\n')
+    .map((line) => /^\s*(?:-\s+)?uses:\s*(.*)$/.exec(line))
+    .filter(Boolean)
+    .map((match) => scalar(match[1]))
+    .filter((value) => value.startsWith('holepunchto/'))
+  assert.ok(holepunchUses.length > 0, `${file} does not use holepunchto/actions`)
+  for (const value of holepunchUses) {
+    assert.match(
+      value,
+      new RegExp(`^holepunchto/actions/[a-z][a-z-]*@${holepunchRef}$`),
+      `${file} must use the supported holepunchto/actions@${holepunchRef} pointer: ${value}`
+    )
+  }
+}
+assert.ok(publish.steps.some((step) => step.uses === `holepunchto/actions/publish@${holepunchRef}`))
 assert.ok(!publish.steps.some((step) => step.run === 'npm publish'))
-assert.ok(!publish.steps.some((step) => step.uses === 'holepunchto/actions/publish@v1'))
 for (const duplicate of [
   'npm run test:node',
   'npm run test:bare',
@@ -114,8 +130,8 @@ for (const duplicate of [
 }
 
 const policy = [
-  { uses: `holepunchto/actions/checkout@${reviewedAction}` },
-  { uses: `holepunchto/actions/setup-node@${reviewedAction}` },
+  { uses: `holepunchto/actions/checkout@${holepunchRef}` },
+  { uses: `holepunchto/actions/setup-node@${holepunchRef}` },
   { name: 'Validate release tag', run: 'node scripts/validate-release-tag.mjs' },
   { name: 'Verify tagged commit is on main' },
   { run: 'npm install' },
@@ -123,7 +139,7 @@ const policy = [
   { run: 'npm run test:types' },
   { run: 'npm run validate:package' },
   { run: 'npm run test:package' },
-  { uses: `holepunchto/actions/publish@${reviewedAction}` }
+  { uses: `holepunchto/actions/publish@${holepunchRef}` }
 ]
 assert.equal(publish.steps.length, policy.length)
 for (let index = 0; index < policy.length; index++) {

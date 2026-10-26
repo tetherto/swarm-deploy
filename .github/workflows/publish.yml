@@ -23,10 +23,10 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: holepunchto/actions/checkout@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/checkout@v1
         with:
           fetch-depth: 0
-      - uses: holepunchto/actions/setup-node@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/setup-node@v1
         with:
           version: 24.x
           registry-url: https://registry.npmjs.org
@@ -44,4 +44,4 @@ jobs:
       - run: npm run test:types
       - run: npm run validate:package
       - run: npm run test:package
-      - uses: holepunchto/actions/publish@146b86c4d0237c124df06ecc992ddf2c585b3405 # v1
+      - uses: holepunchto/actions/publish@v1

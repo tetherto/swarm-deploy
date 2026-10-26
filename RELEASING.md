@@ -12,9 +12,9 @@ Releases are immutable npm versions published by the tag-triggered GitHub Action
 ## Preflight
 
 1. Update `package.json` to the new SemVer version and update `CHANGELOG.md`.
-   Confirm the README and CLI examples use direct `--server-key` uploads and
-   repeatable static `--allow-key` server configuration; topics and discovery
-   are not release interfaces.
+   Confirm the README, the guides in `docs/`, and the CLI examples use direct
+   `--server-key` uploads and repeatable static `--allow-key` server
+   configuration; topics and discovery are not release interfaces.
 2. From a clean checkout, run:
 
    ```sh
@@ -52,11 +52,18 @@ swarm-deploy --help
 PR/main CI is the full test authority. The tag workflow verifies the exact
 stable tag and package version, confirms the tagged commit is on `main`, builds
 the untracked `dist/`, and validates the package before delegating to
-`holepunchto/actions/publish` at
-`146b86c4d0237c124df06ecc992ddf2c585b3405`. That composite action currently
-references `create-release@v1` internally and publishes with
-`npm publish --ignore-scripts` and creates the GitHub release, so the workflow
-must build `dist/` before invoking it.
+`holepunchto/actions/publish@v1`.
+
+Both workflows use the supported `holepunchto/actions/*@v1` pointer, which the
+Holepunch maintainers control, instead of commit SHAs. The
+`npm run test:release-tag` check requires exactly `@v1` on every Holepunch
+action reference. Pinning a parent action to a SHA does not pin the actions it calls: the old
+pinned `publish` referenced `create-release@v1`, which no longer exists at
+`v1`, and the `v0.4.0` publish run failed during action setup. `publish@v1` is
+an alias for `publish-npm@v1`, which publishes to npm with scripts ignored,
+packs the tarballs, and then invokes `create-github-release@v1`, so the
+workflow must build `dist/` before invoking it. Because the pointer moves,
+that behavior can change without a change in this repository.
 
 Roll the package into one canary client/server pair first. Confirm `ready`, authentication, offer, progress, verification, commit, recovery, scrub, retention, and cleanup diagnostics before broader rollout.
 

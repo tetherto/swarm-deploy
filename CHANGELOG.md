@@ -4,6 +4,12 @@ All notable changes to this package are documented here.
 
 ## Unreleased
 
+## 0.4.1
+
+- Release fix only; there is no runtime, API, or wire change. The `v0.4.0` publish workflow failed during action setup because its SHA-pinned `holepunchto/actions/publish` referenced `create-release@v1`, which no longer exists at `v1`. The `v0.4.0` tag is left as it is; use 0.4.1, which carries the 0.4.0 changes below.
+- The CI and publish workflows now use the supported `holepunchto/actions/*@v1` pointer instead of commit SHAs, and publishing goes through the `publish@v1` alias. `npm run test:release-tag` now requires `@v1` on every Holepunch action reference. Tag and package validation, the `main` ancestry check, build-before-publish, the package checks, the `npm` environment, and OIDC provenance are unchanged.
+- Documentation: the README is now a short entry point (features, requirements, install, identity model, quick start, and links). The detailed CLI, runtime API, operations and storage, artifact pattern, managed symlink, and hooks references moved to guides under `docs/` on GitHub, which the npm package does not include; the README links to them by URL. The protocol specification is unchanged.
+
 ## 0.4.0
 
 - Add the optional `afterLink` server hook (`ServerOptions.hooks`, and `--hooks <module>` modules) so a link change can be published. It runs after a managed link is durable, for an upload that moved an automatic link (after `afterCommit`, once per link that now points at the uploaded artifact, including an already-committed retry) and for an explicit `Client.link` / `swarm-deploy link` that passed every policy check. Its context is the secret-free, frozen `{ link: { name, target, mode, path, targetPath }, artifact, status, trigger }`, exported as `AfterLinkContext`, `HookLink`, `HookLinkMode`, `HookLinkStatus` and `HookLinkTrigger`.
