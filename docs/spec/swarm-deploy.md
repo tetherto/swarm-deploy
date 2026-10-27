@@ -559,9 +559,28 @@ destination name cannot be the target, an automatic name, or a managed artifact
 name. A missing destination may be created; an existing destination may be
 changed only when its valid ownership record says it is manual and its visible
 symlink still points to the recorded or requested relative sibling basename.
-A regular file, directory, unrecorded symlink, changed symlink, automatic
-record, foreign record, or other occupied unmanaged path fails closed and is
-never replaced, moved, or deleted.
+A regular file, directory, changed symlink, automatic record, foreign record, or
+other occupied unmanaged path fails closed and is never replaced, moved, or
+deleted.
+
+The one exception is an existing symlink with no ownership record at the
+requested name. After every check above has passed for the requested target, an
+explicit manual request takes it over: the server re-checks that the symlink is
+unchanged (same literal, same inode where the adapter reports one) and still
+unrecorded, atomically renames a private sibling-target symlink over it, and
+then writes a manual record that names only the requested artifact. The first
+takeover returns `LINKED`, even if the old literal already read as the target;
+repeats return `UNCHANGED`. The old literal is only compared as text and is never
+resolved, so any value (relative, absolute, outside the root, dangling, a chain,
+or a self-reference) is replaced without touching what it named, and no commit
+metadata is created for it. If the destination became a file, a directory, a
+different symlink, or gained a record before the swap, the request fails with
+`LINK_CONFLICT`. The adapter has no compare-and-swap rename, so a writer outside
+the server that edits the root between the re-check and the rename is not
+excluded. A crash after the swap and before the record leaves a symlink at the
+requested target, which the same request takes over again on retry. Automatic
+reconciliation and startup never take over an unrecorded symlink, and a record
+that is automatic, version 1, malformed, or foreign is not unrecorded.
 
 `LINKED` means the link was created, repointed, or its crash-residual state was
 completed. `UNCHANGED` means the durable manual ownership already selects the

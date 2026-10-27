@@ -438,6 +438,13 @@ test('a client promotes a committed directory through an authenticated manual li
   const source = path.join(await createTempDir(t), 'release-1')
   await fs.promises.mkdir(source)
   await fs.promises.writeFile(path.join(source, 'nested.bin'), 'directory payload')
+  // A hand-made website link from before the root was managed: it points outside the
+  // root, beside an unmanaged legacy directory that is not a managed artifact.
+  const outside = await createTempDir(t)
+  await fs.promises.writeFile(path.join(outside, 'outside.txt'), 'outside payload')
+  await fs.promises.mkdir(path.join(storage, 'legacy-site'))
+  await fs.promises.writeFile(path.join(storage, 'legacy-site', 'legacy.bin'), 'legacy payload')
+  await fs.promises.symlink(outside, path.join(storage, 'latest'))
   const server = new Server({
     seed: serverSeed,
     storageDir: storage,
@@ -468,6 +475,21 @@ test('a client promotes a committed directory through an authenticated manual li
   })
   t.is(await fs.promises.readlink(path.join(storage, 'current')), 'release-1')
   t.is((await client.link('release-1', 'current')).status, 'UNCHANGED')
+
+  // The same authenticated request takes over the unrecorded symlink at `latest`.
+  t.alike(await client.link('release-1', 'latest'), {
+    target: 'release-1',
+    name: 'latest',
+    status: 'LINKED'
+  })
+  t.is(await fs.promises.readlink(path.join(storage, 'latest')), 'release-1')
+  t.is((await client.link('release-1', 'latest')).status, 'UNCHANGED')
+  t.alike(await fs.promises.readdir(outside), ['outside.txt'], 'the old target is untouched')
+  t.is(await fs.promises.readFile(path.join(outside, 'outside.txt'), 'utf8'), 'outside payload')
+  t.is(
+    await fs.promises.readFile(path.join(storage, 'legacy-site', 'legacy.bin'), 'utf8'),
+    'legacy payload'
+  )
 })
 
 test('publication normalizes restrictive staging modes for files and directory artifacts', async (t) => {

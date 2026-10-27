@@ -6,7 +6,11 @@ import fs from '#fs'
 import path from '#path'
 import { ERRORS } from '../../dist/errors.js'
 import { initLayout } from '../../dist/storage/layout.js'
-import { LinkStore, type ManagedSymlinkRecord } from '../../dist/storage/link-store.js'
+import {
+  LinkStore,
+  type ManagedSymlinkRecord,
+  type ManualLinkOptions
+} from '../../dist/storage/link-store.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import type { DesiredLink } from '../../dist/symlinks.js'
 import type { StorageAdapter, StorageLayout } from '../../dist/storage/types.js'
@@ -464,13 +468,6 @@ test('manual linking fails closed for automatic, v1, unmanaged, and reserved des
   )
   t.is(await fs.promises.readlink(path.join(layout.root, 'latest')), 'release-1')
 
-  await fs.promises.symlink('release-1', path.join(layout.root, 'unrecorded'))
-  await t.exception(
-    () => links.linkManual(desired('unrecorded', 'release-2', '2'.repeat(64)), options),
-    { code: ERRORS.LINK_CONFLICT }
-  )
-  t.is(await fs.promises.readlink(path.join(layout.root, 'unrecorded')), 'release-1')
-
   await fs.promises.writeFile(path.join(layout.root, 'operator'), 'operator file')
   await t.exception(
     () => links.linkManual(desired('operator', 'release-2', '2'.repeat(64)), options),
@@ -553,4 +550,286 @@ test('manual links preserve file and directory target kinds across crash converg
     { status: 'LINKED' }
   )
   t.is(await fs.promises.readlink(path.join(layout.root, 'file-current')), 'file-1')
+})
+
+const LATEST_ID = '1'.repeat(64)
+const NEXT_ID = '2'.repeat(64)
+
+/** Manual request options: `0.20.1` and `0.20.2` are managed, every other sibling is legacy. */
+function manual(): ManualLinkOptions {
+  return {
+    managedArtifactNames: new Set(['0.20.1', '0.20.2']),
+    automaticLinkNames: new Set<string>()
+  }
+}
+
+function latestPath(layout: StorageLayout): string {
+  return path.join(layout.root, 'latest')
+}
+
+async function clearLatest(layout: StorageLayout): Promise<void> {
+  await fs.promises.rm(latestPath(layout), { force: true, recursive: true })
+  await fs.promises.rm(recordFile(layout, 'latest'), { force: true })
+}
+
+function requestLatest(links: LinkStore, target = '0.20.1', id = LATEST_ID) {
+  return links.linkManual(desired('latest', target, id), manual())
+}
+
+test('a manual link takes over an unrecorded symlink without ever following its old target', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['0.20.0', '0.20.1', '0.20.2'])
+  const kept = path.join(layout.root, '0.20.0', 'keep.txt')
+  await fs.promises.writeFile(kept, 'legacy payload')
+  await fs.promises.symlink('0.20.0', path.join(layout.root, '0.19.5'))
+  const outside = await createTempDir(t)
+  await fs.promises.writeFile(path.join(outside, 'keep.txt'), 'outside payload')
+
+  const literals = [
+    '0.20.0',
+    './0.20.0/',
+    path.join(layout.root, '0.20.0'),
+    outside,
+    '../escape',
+    'no-such-target',
+    '0.19.5',
+    'latest',
+    '0.20.1',
+    './0.20.1',
+    path.join(layout.root, '0.20.1')
+  ]
+  for (const literal of literals) {
+    await fs.promises.symlink(literal, latestPath(layout))
+    t.alike(await requestLatest(links), { status: 'LINKED' }, literal)
+    t.is(await fs.promises.readlink(latestPath(layout)), '0.20.1', `${literal} is replaced`)
+    t.alike(await links.read('latest'), {
+      version: 2,
+      mode: 'manual',
+      name: 'latest',
+      target: '0.20.1',
+      transferId: LATEST_ID,
+      targetKind: 'directory'
+    } satisfies ManagedSymlinkRecord)
+    t.alike(await requestLatest(links), { status: 'UNCHANGED' }, `${literal} is ordinary after`)
+    t.alike(await fs.promises.readdir(layout.publications), [])
+    t.alike(
+      (await links.list()).map((record) => record.name),
+      ['latest'],
+      'nothing is recorded for the old target'
+    )
+    await clearLatest(layout)
+  }
+
+  t.is(await fs.promises.readFile(kept, 'utf8'), 'legacy payload')
+  t.alike(await fs.promises.readdir(outside), ['keep.txt'], 'the outside directory is untouched')
+  t.is(await fs.promises.readlink(path.join(layout.root, '0.19.5')), '0.20.0')
+  await t.exception(() => fs.promises.lstat(path.join(path.dirname(layout.root), 'escape')), {
+    code: 'ENOENT'
+  })
+
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  await requestLatest(links)
+  t.alike(await requestLatest(links, '0.20.2', NEXT_ID), { status: 'LINKED' })
+  t.is(await fs.promises.readlink(latestPath(layout)), '0.20.2', 'later repoints are ordinary')
+})
+
+test('takeover never replaces a file or directory and keeps every ownership check', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['0.20.0', '0.20.1', 'rogue'])
+  const request = (): Promise<unknown> => requestLatest(links)
+
+  await fs.promises.writeFile(latestPath(layout), 'operator file')
+  await t.exception(request, { code: ERRORS.LINK_CONFLICT })
+  t.is(await fs.promises.readFile(latestPath(layout), 'utf8'), 'operator file')
+  await clearLatest(layout)
+
+  await fs.promises.mkdir(latestPath(layout))
+  await fs.promises.writeFile(path.join(latestPath(layout), 'inside'), 'kept')
+  await t.exception(request, { code: ERRORS.LINK_CONFLICT })
+  t.is(await fs.promises.readFile(path.join(latestPath(layout), 'inside'), 'utf8'), 'kept')
+  await clearLatest(layout)
+
+  const record = (overrides: Record<string, unknown>): string =>
+    JSON.stringify({
+      version: 2,
+      mode: 'manual',
+      name: 'latest',
+      target: '0.20.1',
+      transferId: LATEST_ID,
+      targetKind: 'directory',
+      ...overrides
+    })
+  const cases: Array<[string, string, string]> = [
+    ['foreign record', record({ name: 'other' }), ERRORS.LINK_FAILED],
+    ['malformed record', '{not json', ERRORS.LINK_FAILED],
+    ['unknown version', record({ version: 3 }), ERRORS.LINK_FAILED],
+    ['automatic record', record({ mode: 'automatic' }), ERRORS.LINK_CONFLICT]
+  ]
+  for (const [label, contents, code] of cases) {
+    await fs.promises.symlink('0.20.0', latestPath(layout))
+    await fs.promises.writeFile(recordFile(layout, 'latest'), contents)
+    await t.exception(request, { code }, label)
+    t.is(await fs.promises.readlink(latestPath(layout)), '0.20.0', `${label}: link untouched`)
+    t.is(await fs.promises.readFile(recordFile(layout, 'latest'), 'utf8'), contents)
+    await clearLatest(layout)
+  }
+
+  await fs.promises.symlink('0.20.1', latestPath(layout))
+  await request()
+  await fs.promises.unlink(latestPath(layout))
+  await fs.promises.symlink('rogue', latestPath(layout))
+  await t.exception(request, { code: ERRORS.LINK_CONFLICT }, 'an owned link changed externally')
+  t.is(await fs.promises.readlink(latestPath(layout)), 'rogue')
+})
+
+test('an unrecorded symlink changed after inspection is never overwritten', async (t) => {
+  let swap: (() => Promise<void>) | null = null
+  const { links, layout } = await createStore(t, {
+    async beforeOperation(name, target) {
+      if (name === 'symlink' && target.includes('.link-') && swap !== null) {
+        const run = swap
+        swap = null
+        await run()
+      }
+    }
+  })
+  await mkdirs(layout, ['0.20.0', '0.20.1'])
+  await fs.promises.writeFile(path.join(layout.root, '0.20.0', 'keep.txt'), 'legacy payload')
+  const request = (): Promise<unknown> => requestLatest(links)
+
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  swap = async () => {
+    await fs.promises.unlink(latestPath(layout))
+    await fs.promises.symlink('rogue', latestPath(layout))
+  }
+  await t.exception(request, { code: ERRORS.LINK_CONFLICT }, 'another symlink won the race')
+  t.is(await fs.promises.readlink(latestPath(layout)), 'rogue')
+  t.is(await links.read('latest'), null)
+  t.alike(await fs.promises.readdir(layout.publications), [], 'the temporary link is removed')
+  await clearLatest(layout)
+
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  swap = async () => {
+    await fs.promises.unlink(latestPath(layout))
+    await fs.promises.writeFile(latestPath(layout), 'operator file')
+  }
+  await t.exception(request, { code: ERRORS.LINK_CONFLICT }, 'a file won the race')
+  t.is(await fs.promises.readFile(latestPath(layout), 'utf8'), 'operator file')
+  t.is(await links.read('latest'), null)
+  await clearLatest(layout)
+
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  swap = async () => {
+    await fs.promises.unlink(latestPath(layout))
+    await fs.promises.mkdir(latestPath(layout))
+  }
+  await t.exception(request, { code: ERRORS.LINK_CONFLICT }, 'a directory won the race')
+  t.ok((await fs.promises.lstat(latestPath(layout))).isDirectory())
+  await clearLatest(layout)
+
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  const owner = JSON.stringify({
+    version: 2,
+    mode: 'manual',
+    name: 'latest',
+    target: '0.20.0',
+    transferId: NEXT_ID,
+    targetKind: 'directory'
+  })
+  swap = () => fs.promises.writeFile(recordFile(layout, 'latest'), owner)
+  await t.exception(request, { code: ERRORS.LINK_CONFLICT }, 'an ownership record appeared')
+  t.is(await fs.promises.readlink(latestPath(layout)), '0.20.0', 'the new owner keeps its link')
+  t.is(await fs.promises.readFile(recordFile(layout, 'latest'), 'utf8'), owner)
+  t.is(
+    await fs.promises.readFile(path.join(layout.root, '0.20.0', 'keep.txt'), 'utf8'),
+    'legacy payload'
+  )
+})
+
+test('takeover refuses a symlink whose identity changed even when its text did not', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const base = createStorage()
+  let looks = 0
+  const storage: StorageAdapter = {
+    ...base,
+    async lstat(target) {
+      const stat = await base.lstat(target)
+      if (target !== latestPath(layout) || ++looks < 2) return stat
+      return {
+        dev: stat.dev,
+        ino: Number(stat.ino) + 1,
+        size: stat.size,
+        isSymbolicLink: () => stat.isSymbolicLink(),
+        isDirectory: () => stat.isDirectory(),
+        isFile: () => stat.isFile()
+      }
+    }
+  }
+  const links = new LinkStore({ layout, storage })
+  await mkdirs(layout, ['0.20.0', '0.20.1'])
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  await t.exception(() => requestLatest(links), { code: ERRORS.LINK_CONFLICT })
+  t.is(await fs.promises.readlink(latestPath(layout)), '0.20.0')
+  t.is(await links.read('latest'), null)
+})
+
+test('a crash after the swap is taken over again by the same explicit request', async (t) => {
+  const retries: Array<['0.20.1' | '0.20.2', string]> = [
+    ['0.20.1', LATEST_ID],
+    ['0.20.2', NEXT_ID]
+  ]
+  for (const [retryTarget, retryId] of retries) {
+    let crash = true
+    let recordPath = ''
+    const { links, layout } = await createStore(t, {
+      beforeOperation(name, _source, ...rest) {
+        if (crash && name === 'rename' && rest[0] === recordPath) {
+          throw new Error('injected crash before the ownership record')
+        }
+      }
+    })
+    recordPath = recordFile(layout, 'latest')
+    await mkdirs(layout, ['0.20.0', '0.20.1', '0.20.2'])
+    await fs.promises.writeFile(path.join(layout.root, '0.20.0', 'keep.txt'), 'legacy payload')
+    await fs.promises.symlink('0.20.0', latestPath(layout))
+
+    await t.exception(() => requestLatest(links), { code: ERRORS.LINK_FAILED })
+    t.is(await fs.promises.readlink(latestPath(layout)), '0.20.1', 'the swap is visible')
+    t.is(await links.read('latest'), null, 'but nothing is recorded yet')
+    t.alike(await fs.promises.readdir(layout.publications), [])
+
+    crash = false
+    t.alike(
+      await requestLatest(links, retryTarget, retryId),
+      { status: 'LINKED' },
+      `retry for ${retryTarget}`
+    )
+    t.is(await fs.promises.readlink(latestPath(layout)), retryTarget)
+    t.is((await links.read('latest'))?.target, retryTarget)
+    t.alike(await requestLatest(links, retryTarget, retryId), { status: 'UNCHANGED' })
+    t.is(
+      await fs.promises.readFile(path.join(layout.root, '0.20.0', 'keep.txt'), 'utf8'),
+      'legacy payload'
+    )
+  }
+})
+
+test('a failure before the swap leaves the legacy link and payload exactly as they were', async (t) => {
+  let fail = true
+  const { links, layout } = await createStore(t, {
+    beforeOperation(name, target) {
+      if (fail && name === 'symlink' && target.includes('.link-')) {
+        throw new Error('injected temporary link failure')
+      }
+    }
+  })
+  await mkdirs(layout, ['0.20.0', '0.20.1'])
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  await t.exception(() => requestLatest(links), { code: ERRORS.LINK_FAILED })
+  t.is(await fs.promises.readlink(latestPath(layout)), '0.20.0')
+  t.is(await links.read('latest'), null)
+  t.ok((await fs.promises.lstat(path.join(layout.root, '0.20.0'))).isDirectory())
+
+  fail = false
+  t.alike(await requestLatest(links), { status: 'LINKED' })
 })

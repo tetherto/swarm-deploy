@@ -76,9 +76,34 @@ Manual targets must be current managed top-level files or directories, must
 match a one-argument rule, and cannot be history names. Manual link names are
 safe top-level basenames and cannot equal the target, an automatic link name,
 or any managed artifact name. A missing destination may be created, and an
-existing manual managed link may be repointed. An unmanaged file, directory,
-unrecorded symlink, changed symlink, or foreign ownership record is never
-replaced, moved, or deleted: the operation fails closed.
+existing manual managed link may be repointed.
+
+**Taking over an existing symlink.** An explicit manual request may also take
+over a symlink at the requested name that has no ownership record, for example
+one created by hand before the storage root was managed. It happens only after
+the target and name pass every check above: the symlink itself is replaced
+atomically by the requested link and a manual ownership record is written. The
+first such request returns `LINKED`, even if the old link already read as the
+target, and repeats return `UNCHANGED`. The old link is never followed, so
+whatever it pointed at (an older legacy directory, a dangling, absolute, or
+outside path, another symlink) is neither inspected, modified, nor imported, and
+no commit metadata is invented for it. Only symlinks are taken over.
+
+Everything else still fails closed and is never replaced, moved, or deleted: an
+unmanaged file or directory, a symlink whose ownership record is automatic,
+version 1, malformed, or foreign, a manual link that was changed externally
+since it was recorded, and any automatic link name. Automatic rules and server
+startup never take over an unrecorded symlink.
+
+Immediately before the swap the server re-checks that the destination is still
+the same symlink (same text, and same inode where the storage reports one) with
+no ownership record, and fails closed otherwise. That is not an atomic
+compare-and-swap, which the storage adapter does not offer: a process that edits
+the storage root while the server runs can still have its change replaced in
+that window, so do not edit a running server's storage root. If the server stops
+after the swap and before the record is written, repeat the same request: it
+takes the link over again and returns `LINKED`. A failing `afterLink` hook
+leaves the taken-over link in place, and the retry returns `UNCHANGED`.
 
 Manual links retain their selected target across restart and automatic
 reconciliation. Removing their authorization rule prevents future requests

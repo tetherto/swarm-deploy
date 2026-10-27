@@ -1013,7 +1013,7 @@ function formatResetReport(report: StorageResetReport): string[] {
   }
   if (symlinks.length > 0) {
     lines.push(
-      'note: remaining symlinks have no ownership record after the reset; a --symlink rule or link request for that name fails closed with LINK_CONFLICT until you remove them manually'
+      'note: remaining symlinks have no ownership record after the reset; an automatic --symlink rule for that name fails closed with LINK_CONFLICT until you remove them manually, while an explicit link request replaces them'
     )
   }
   if (other.length > 0) {
