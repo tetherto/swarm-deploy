@@ -178,7 +178,7 @@ remaining payloads: 1 (app-2.4.1.tar.gz)
 remaining symlinks: 1 (latest)
 fresh start: no
 note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually
-note: remaining symlinks have no ownership record after the reset; a --symlink rule or link request for that name fails closed with LINK_CONFLICT until you remove them manually
+note: remaining symlinks have no ownership record after the reset; an automatic --symlink rule for that name fails closed with LINK_CONFLICT until you remove them manually, while an explicit link request replaces them
 result: preview only, nothing changed; re-run with --apply to archive this metadata
 ```
 
@@ -200,8 +200,9 @@ What the reset does not do, and the report says so:
 - It never removes visible payloads, `history-*` files, directories, or
   symlinks from the root. A remaining payload keeps its name occupied, so a
   fresh upload of that name returns `FILE_EXISTS`. A remaining symlink loses
-  its ownership record, so an automatic `--symlink` rule or a `link` request
-  for that name fails closed with `LINK_CONFLICT`. `fresh start: yes` is
+  its ownership record, so an automatic `--symlink` rule for that name fails
+  closed with `LINK_CONFLICT`, while an explicit `link` request replaces it
+  (see [Managed symlinks](managed-links.md)). `fresh start: yes` is
   printed only when the root holds nothing besides `.swarm-deploy/`; remove
   leftovers by hand before or after the reset to get there.
 - It never signals a process. The lock records only a PID, and a PID proves

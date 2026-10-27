@@ -2791,3 +2791,70 @@ test('closing the server aborts a pending afterLink and a queued one and frees t
   t.is(first.destroyed, true)
   t.is(second.destroyed, true)
 })
+
+test('an authenticated link request replaces an unrecorded symlink and survives hook failure, restart, and retention', async (t) => {
+  const storageDir = await createTempDir(t)
+  const outside = await createTempDir(t)
+  await fs.promises.writeFile(path.join(outside, 'keep.txt'), 'outside payload')
+  for (const name of ['0.19.0', '0.20.0']) {
+    await fs.promises.mkdir(path.join(storageDir, name))
+    await fs.promises.writeFile(path.join(storageDir, name, 'legacy.bin'), name)
+  }
+  await fs.promises.mkdir(path.join(storageDir, 'docs'))
+  await fs.promises.writeFile(path.join(storageDir, 'operator'), 'operator file')
+  // A hand-made website link whose old target the server knows nothing about.
+  const latest = path.join(storageDir, 'latest')
+  await fs.promises.symlink(outside, latest)
+
+  let failing = true
+  const calls: string[] = []
+  const rules = [{ selector: '/^\\d+\\.\\d+\\.\\d+$/' }]
+  const first = await createServer(t, {
+    storageDir,
+    symlinks: rules,
+    hooks: {
+      afterLink: ({ link, status }) => {
+        calls.push(`${link.name}:${status}`)
+        if (failing) throw new Error('publish failed')
+      }
+    }
+  })
+  await uploadAll(first.node, await manifest(t, '0.20.1', 'aa'))
+  await uploadAll(first.node, await manifest(t, '0.20.2', 'bb'))
+
+  t.alike((await linkAll(first.node, '0.20.1', 'latest')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.HOOK_FAILED
+  })
+  t.is(await fs.promises.readlink(latest), '0.20.1', 'the replacement is durable')
+  failing = false
+  t.alike((await linkAll(first.node, '0.20.1', 'latest')).result, { v: 1, status: 'UNCHANGED' })
+  t.alike(calls, ['latest:LINKED', 'latest:UNCHANGED'], 'the retry reruns the hook')
+
+  t.alike((await linkAll(first.node, '0.20.1', 'operator')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_CONFLICT
+  })
+  t.alike((await linkAll(first.node, '0.20.1', 'docs')).result, {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_CONFLICT
+  })
+  t.is(await fs.promises.readFile(path.join(storageDir, 'operator'), 'utf8'), 'operator file')
+  t.ok((await fs.promises.lstat(path.join(storageDir, 'docs'))).isDirectory())
+  await first.server.close()
+
+  const restarted = await createServer(t, { storageDir, symlinks: rules, maxStorageBytes: 2 })
+  t.is(await fs.promises.readlink(latest), '0.20.1')
+  t.ok((await fs.promises.lstat(path.join(storageDir, '0.20.1'))).isFile(), 'the target is pinned')
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, '0.20.2')), { code: 'ENOENT' })
+  const relinked = await linkAll(restarted.node, '0.20.1', 'latest')
+  t.alike(relinked.result, { v: 1, status: 'UNCHANGED' }, 'ownership survived the restart')
+
+  t.alike(await fs.promises.readdir(outside), ['keep.txt'], 'the old target was never touched')
+  for (const name of ['0.19.0', '0.20.0']) {
+    t.is(await fs.promises.readFile(path.join(storageDir, name, 'legacy.bin'), 'utf8'), name)
+  }
+})

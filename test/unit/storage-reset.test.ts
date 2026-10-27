@@ -221,7 +221,7 @@ test('reset-storage preview reports metadata left behind by a manual payload del
     'remaining symlinks: 1 (current)',
     'fresh start: no',
     'note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually',
-    'note: remaining symlinks have no ownership record after the reset; a --symlink rule or link request for that name fails closed with LINK_CONFLICT until you remove them manually',
+    'note: remaining symlinks have no ownership record after the reset; an automatic --symlink rule for that name fails closed with LINK_CONFLICT until you remove them manually, while an explicit link request replaces them',
     'result: preview only, nothing changed; re-run with --apply to archive this metadata'
   ])
   t.alike(mutations, [], 'preview performs no mutating storage operation')

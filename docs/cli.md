@@ -175,8 +175,16 @@ one-argument `--symlink` rule. Success prints exactly:
 <link-name> -> <target> <LINKED|UNCHANGED>
 ```
 
-`LINKED` means the link was created or repointed. `UNCHANGED` means the same
-managed link already points at that target; the operation is idempotent.
+`LINKED` means the link was created, repointed, or taken over from an existing
+unmanaged symlink. `UNCHANGED` means the same managed link already points at
+that target; the operation is idempotent.
+
+If `<link-name>` is already a symlink that the server does not manage (for
+example one made by hand), the command replaces that symlink atomically with the
+requested link and the server owns it from then on; the first such run prints
+`LINKED`. The old link's former target is never followed or changed. A regular
+file or directory at that name is never replaced and fails with `LINK_CONFLICT`.
+See [Managed symlinks](managed-links.md#selection-and-ownership-rules).
 
 When the server has an `afterLink` hook, success is printed only after the hook
 returns, for as long as `--idle-timeout` allows. If the hook fails, the command

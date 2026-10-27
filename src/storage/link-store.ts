@@ -9,6 +9,7 @@ import { sodiumSha256 } from '../tar-protocol/hash.js'
 import type { DesiredLink } from '../symlinks.js'
 import type { ArtifactKind } from '../types.js'
 import { MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
+import { fileIdentity, identitiesEqual } from './commit-journal.js'
 import { withSafeDirectoryIdentity } from './layout.js'
 import { assertSymlinkCapable } from './tree-fs.js'
 import type { StorageAdapter, StorageLayout, StorageStats, SymlinkCapableStorage } from './types.js'
@@ -58,8 +59,21 @@ export interface LinkStoreOptions {
   storage?: StorageAdapter
 }
 
+/** `dev` and `ino` of a symlink itself, or `null` when the adapter does not report them. */
+type LinkIdentity = { dev: string; ino: string } | null
+
 type Destination =
-  { state: 'MISSING' } | { state: 'SYMLINK'; target: string } | { state: 'UNMANAGED' }
+  | { state: 'MISSING' }
+  | { state: 'SYMLINK'; target: string; identity: LinkIdentity }
+  | { state: 'UNMANAGED' }
+
+function identityOf(stat: StorageStats): LinkIdentity {
+  try {
+    return fileIdentity(stat)
+  } catch {
+    return null
+  }
+}
 
 function conflict(message: string): SwarmDeployError {
   return new SwarmDeployError(ERRORS.LINK_CONFLICT, message)
@@ -157,12 +171,21 @@ async function syncDirectory(directory: string, storage: SymlinkCapableStorage):
 /**
  * Owns every server-managed symlink in the storage root.
  *
- * A destination is replaceable only when a valid ownership record exists, the
- * visible destination is a symbolic link, and `readlink()` returns either the
- * recorded target or the desired target. Anything else is unmanaged: it is left
- * untouched and the operation fails closed. A link target is always exactly a
- * sibling basename, and `readlink()` output is only ever compared, never used
- * to build a path.
+ * Automatic reconciliation and every recorded link are replaceable only when a
+ * valid ownership record exists, the visible destination is a symbolic link, and
+ * `readlink()` returns either the recorded target or the desired target. Anything
+ * else is unmanaged: it is left untouched and the operation fails closed.
+ *
+ * The one exception is an explicit, authenticated manual request (`linkManual`)
+ * whose target has passed every policy check: a symlink at the requested name
+ * that has no ownership record at all is taken over by atomic replacement plus a
+ * manual record, whatever its old literal says. Regular files and directories,
+ * automatic, version 1, malformed, or foreign records, and a recorded link that
+ * changed externally are still never touched, and automatic reconciliation never
+ * takes anything over.
+ *
+ * A link target is always exactly a sibling basename, and `readlink()` output is
+ * only ever compared, never used to build a path or followed.
  */
 export class LinkStore {
   readonly layout: StorageLayout
@@ -252,7 +275,11 @@ export class LinkStore {
         throw error
       }
       if (!stat.isSymbolicLink()) return { state: 'UNMANAGED' as const }
-      return { state: 'SYMLINK' as const, target: await this.storage.readlink(finalPath) }
+      return {
+        state: 'SYMLINK' as const,
+        target: await this.storage.readlink(finalPath),
+        identity: identityOf(stat)
+      }
     })
   }
 
@@ -319,8 +346,16 @@ export class LinkStore {
     }).catch(() => {})
   }
 
-  /** Atomically swaps an owned link by renaming a private temporary link over it. */
-  private async replaceLink(link: DesiredLink, mode: LinkOwnershipMode): Promise<void> {
+  /**
+   * Atomically swaps a link by renaming a private temporary link over it.
+   * `beforeSwap` runs immediately before the rename, so a caller that does not
+   * yet own the destination can re-prove what it saw and fail closed.
+   */
+  private async replaceLink(
+    link: DesiredLink,
+    mode: LinkOwnershipMode,
+    beforeSwap?: () => Promise<void>
+  ): Promise<void> {
     const temporary = path.join(this.layout.publications, `.link-${randomSuffix()}`)
     try {
       await withSafeDirectoryIdentity(this.layout.publications, this.storage, () =>
@@ -329,6 +364,7 @@ export class LinkStore {
       await withSafeDirectoryIdentity(this.layout.publications, this.storage, () =>
         syncDirectory(this.layout.publications, this.storage)
       )
+      await beforeSwap?.()
       await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
         withSafeDirectoryIdentity(this.layout.publications, this.storage, () =>
           this.storage.rename(temporary, this.finalPath(link.name))
@@ -477,6 +513,79 @@ export class LinkStore {
     return result
   }
 
+  /** A visible entry's identity, `'missing'` when absent, or `null` when the adapter reports none. */
+  private entryIdentity(name: string): Promise<LinkIdentity | 'missing'> {
+    return withSafeDirectoryIdentity(this.layout.root, this.storage, async () => {
+      try {
+        return identityOf(await this.storage.lstat(this.finalPath(name)))
+      } catch (error: unknown) {
+        if (isMissing(error)) return 'missing' as const
+        throw error
+      }
+    })
+  }
+
+  /**
+   * Re-proves, immediately before a takeover swap, that the destination is still
+   * the unrecorded symlink that was inspected: same literal, same inode when the
+   * adapter reports one, and still no ownership record. Anything else (a file, a
+   * directory, another symlink, a new record) fails closed. The old literal is
+   * only compared as text, never resolved.
+   *
+   * Records are keyed by the exact spelling of a name, but on a case-insensitive
+   * volume `Latest` and `latest` are one directory entry, so a request for one
+   * spelling would otherwise miss the record of the other and replace a link that
+   * is recorded. Two filesystem-aware checks close that: the entry must be listed
+   * in the root under exactly the requested spelling, and no protected name that
+   * differs only in case may resolve to the same entry. Protected names are every
+   * recorded name (so an externally case-renamed recorded link is caught) and the
+   * configured automatic link names and managed artifact names passed in, which
+   * are reserved even before they have a record. Names that are genuinely distinct
+   * on a case-sensitive volume, including a recorded `latest` beside an unrecorded
+   * `Latest`, stay independent. If the adapter reports no inode identity and a
+   * protected case variant exists, independence cannot be proven and the request
+   * fails closed.
+   *
+   * This narrows the window but cannot close it: the adapter has no
+   * compare-and-swap rename, so a writer outside this process that changes the
+   * path between this check and the rename can still be replaced.
+   */
+  private async assertTakeoverStillSafe(
+    name: string,
+    seen: Destination,
+    reserved: Iterable<string>
+  ): Promise<void> {
+    if (seen.state !== 'SYMLINK') throw failure('Invalid takeover state')
+    const now = await this.classify(name)
+    if (
+      now.state !== 'SYMLINK' ||
+      now.target !== seen.target ||
+      (seen.identity !== null &&
+        now.identity !== null &&
+        !identitiesEqual(seen.identity, now.identity)) ||
+      (await this.readRecord(name)) !== null
+    ) {
+      throw conflict('Existing symlink changed while it was being taken over')
+    }
+    const entries = await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
+      this.storage.readdir(this.layout.root)
+    )
+    if (!entries.includes(name)) {
+      throw conflict('Existing symlink is another spelling of a different directory entry')
+    }
+    const protectedNames = new Set(reserved)
+    for (const record of await this.listRecords()) protectedNames.add(record.name)
+    const folded = name.toLowerCase()
+    for (const other of protectedNames) {
+      if (other === name || other.toLowerCase() !== folded) continue
+      const identity = await this.entryIdentity(other)
+      if (identity === 'missing') continue
+      if (identity === null || now.identity === null || identitiesEqual(identity, now.identity)) {
+        throw conflict('Existing symlink is a case variant of a protected managed name')
+      }
+    }
+  }
+
   private async convergeManual(
     link: DesiredLink,
     { managedArtifactNames, automaticLinkNames }: ManualLinkOptions
@@ -484,8 +593,10 @@ export class LinkStore {
     if (
       !managedArtifactNames ||
       typeof managedArtifactNames.has !== 'function' ||
+      typeof managedArtifactNames[Symbol.iterator] !== 'function' ||
       !automaticLinkNames ||
-      typeof automaticLinkNames.has !== 'function'
+      typeof automaticLinkNames.has !== 'function' ||
+      typeof automaticLinkNames[Symbol.iterator] !== 'function'
     ) {
       throw failure('Invalid manual link options')
     }
@@ -519,7 +630,19 @@ export class LinkStore {
       return { status: 'LINKED' }
     }
     if (record === null) {
-      throw conflict('Unrecorded symlink at a requested manual link name')
+      // An explicit manual request, whose target has passed every check above, takes
+      // over a symlink that has no ownership record: it is replaced atomically by the
+      // requested link and then recorded. The old link is never followed, so whatever
+      // it pointed at (a legacy directory, a dangling or foreign path) is left alone and
+      // never imported. Even a link that already reads as the target is replaced, so the
+      // visible text and the record agree for every later comparison. The swap comes
+      // first and the record second: a crash between them leaves a symlink at the
+      // requested target that this same request takes over again on retry.
+      const reserved = [...automaticLinkNames, ...managedArtifactNames]
+      await this.replaceLink(link, 'manual', () =>
+        this.assertTakeoverStillSafe(link.name, destination, reserved)
+      )
+      return { status: 'LINKED' }
     }
     if (destination.target !== record.target && destination.target !== link.target) {
       throw conflict('Managed link does not match its ownership record')
