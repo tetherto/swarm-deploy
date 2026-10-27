@@ -835,7 +835,7 @@ test('direct TAR verified staging commits and cleans both staging files', async 
   t.is(record.transferId, metadata.transferId)
 })
 
-test('post-commit cleanup warning identifies the uploader fingerprint', async (t) => {
+test('post-commit cleanup warning identifies the uploader by key ID', async (t) => {
   const { layout, metadata, archive } = await fixture(t)
   let failCleanup = true
   const warnings: Array<{ message: string; details: Record<string, unknown> }> = []
@@ -866,13 +866,16 @@ test('post-commit cleanup warning identifies the uploader fingerprint', async (t
     {
       message: 'Committed artifact cleanup remains pending',
       details: {
-        fingerprint: record.uploaderFingerprint,
+        uploaderKeyId: record.uploaderFingerprint,
         name: record.name,
         code: null,
         reason: 'interrupted staging cleanup'
       }
     }
   ])
+  // The log names the full public-key hash; the persisted record keeps its field name.
+  t.ok(/^[0-9a-f]{64}$/.test(record.uploaderFingerprint))
+  t.absent('fingerprint' in warnings[0]!.details)
 })
 
 test('direct TAR commits replace mutable files and retain history', async (t) => {

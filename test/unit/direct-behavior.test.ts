@@ -20,6 +20,7 @@ import {
   type ServerScheduler
 } from '../../dist/index.js'
 import { fixedSeriesKey } from '../../dist/release.js'
+import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import type {
   DirectDhtNode,
   DirectDhtServerHandle,
@@ -180,6 +181,11 @@ function fakeClientNode(socket: FakeSocket): DirectDhtNode {
       return Promise.resolve()
     }
   }
+}
+
+/** The 12-hex SHA-256 prefix of a public key, as logs and events identify a peer. */
+function publicKeyId(key: Uint8Array): string {
+  return b4a.toString(sodiumSha256(key), 'hex').slice(0, 12)
 }
 
 function code(error: unknown): unknown {
@@ -2428,6 +2434,7 @@ test('a failing afterLink answers HOOK_FAILED without its message, keeps the lin
     logs.some(
       (entry) =>
         entry.message === 'Link hook failed' &&
+        entry.publicKeyId === publicKeyId(CLIENT_KEY) &&
         entry.name === 'current' &&
         entry.target === 'release-1' &&
         entry.trigger === 'request' &&
@@ -2437,6 +2444,76 @@ test('a failing afterLink answers HOOK_FAILED without its message, keeps the lin
   )
   t.absent(JSON.stringify(logs).includes('sk-secret'), 'the log never carries callback text')
   await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('logger details name public-key hashes publicKeyId while events keep fingerprint', async (t) => {
+  const logs: Array<Record<string, unknown>> = []
+  const logger = {
+    info(message: string, details?: Record<string, unknown>) {
+      logs.push({ level: 'info', message, ...details })
+    },
+    warn(message: string, details?: Record<string, unknown>) {
+      logs.push({ level: 'warn', message, ...details })
+    }
+  }
+  let failBefore = true
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    logger,
+    hooks: {
+      beforeCommit: () => {
+        if (failBefore) throw new Error('deploy gate said no')
+      },
+      afterLink: () => {
+        throw new Error('publish failed')
+      },
+      onFailure: () => {
+        throw new Error('observer failed')
+      }
+    }
+  })
+  const failures: Array<Record<string, unknown>> = []
+  server.on('failure', (event) => failures.push({ ...event }))
+  const messages = (message: string): Array<Record<string, unknown>> =>
+    logs.filter((entry) => entry.message === message)
+
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  await waitFor(() => messages('Failure hook failed').length === 1)
+  failBefore = false
+  await uploadAll(node, await manifest(t, 'release-2', 'second'))
+  linkRequest(node, 'release-2', 'current')
+  const observed = (): boolean =>
+    messages('Link hook failed').length === 1 && messages('Failure hook failed').length === 2
+  await waitFor(observed)
+
+  const clientId = publicKeyId(CLIENT_KEY)
+  t.is(messages('Direct DHT server listening')[0].publicKeyId, publicKeyId(server.publicKey))
+  for (const message of ['Direct upload failed', 'Failure hook failed', 'Link hook failed']) {
+    t.ok(messages(message).length > 0, `${message} is logged`)
+    t.ok(
+      messages(message).every((entry) => entry.publicKeyId === clientId),
+      `${message} identifies the peer as publicKeyId`
+    )
+  }
+  t.ok(
+    logs.every((entry) => !('fingerprint' in entry)),
+    'no logger detail is named fingerprint'
+  )
+  t.ok(
+    messages('Failure hook failed').every((entry) => /^[0-9a-f]{12}$/.test(String(entry.transfer))),
+    'a transfer hash stays transfer'
+  )
+  t.ok(failures.length >= 2)
+  t.ok(
+    failures.every((event) => event.fingerprint === clientId),
+    'events keep their fingerprint field with the same ID'
+  )
+
+  const serialized = JSON.stringify(logs)
+  for (const secret of [SERVER_SEED, CLIENT_KEY, server.publicKey, server.storageDir]) {
+    const text = typeof secret === 'string' ? secret : b4a.toString(secret, 'hex')
+    t.absent(serialized.includes(text), 'no raw key, seed, or storage path in the log details')
+  }
 })
 
 test('retrying an unchanged link re-runs afterLink so a failed publication can be retried', async (t) => {

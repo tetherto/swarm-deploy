@@ -256,7 +256,7 @@ async function recoverStorage({
   for (const name of names.sort()) {
     if (!isJournalName(name)) {
       report(logger, 'warn', 'Ignoring unknown journal path', {
-        fingerprint: pathFingerprint(name)
+        pathId: pathFingerprint(name)
       })
       continue
     }

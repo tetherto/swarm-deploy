@@ -229,6 +229,68 @@ test('a corrupt directory journal is rejected instead of silently repaired', asy
   }
 })
 
+test('a stored release version is validated as canonical SemVer without build metadata', (t) => {
+  const max = '9007199254740991'
+  for (const version of [
+    '1.2.3',
+    '1.0.0-rc.1',
+    `${max}.${max}.${max}`,
+    '1.0.0-12345678901234567890'
+  ]) {
+    const record = assertCommitRecord(fileRecord({ release: { series: 'app', version } }))
+    t.is(record.release?.version, version, version)
+  }
+  t.is(assertCommitRecord(fileRecord({ release: { series: 'app' } })).release?.version, undefined)
+
+  for (const version of [
+    '1.2.3+build.1',
+    `${max}.0.0+b`,
+    '9007199254740992.0.0',
+    '0.9007199254740992.0',
+    '0.0.9007199254740992',
+    'v1.2.3',
+    ' 1.2.3 ',
+    '1.2',
+    '01.2.3',
+    '1.2.3-01',
+    '1.2.3-',
+    '1.2.3/x',
+    '1.2.3\\x',
+    `1.0.0-${'a'.repeat(95)}`,
+    '',
+    1,
+    null
+  ]) {
+    t.exception(
+      () => assertCommitRecord(fileRecord({ release: { series: 'app', version } })),
+      { code: ERRORS.PROTOCOL_INVALID, message: 'Invalid commit release version' },
+      JSON.stringify(version)
+    )
+  }
+})
+
+test('recovery treats a journal record with a non-canonical release version as corrupt', async (t) => {
+  const journal = (version: string): Record<string, unknown> => ({
+    version: 1,
+    state: 'committing',
+    transferId: ID,
+    attemptId: ATTEMPT,
+    sourceStagingIdentity: IDENTITY,
+    record: fileRecord({ release: { series: 'app', version } })
+  })
+  const good = await writeJournal(t, ID, journal('1.2.3-rc.1'))
+  const read = await readCommitJournal(ID, initLayout(good), createStorage())
+  t.is(read?.version, 1)
+  for (const version of ['1.2.3+build.1', '9007199254740992.0.0', 'v1.2.3']) {
+    const root = await writeJournal(t, ID, journal(version))
+    await t.exception(
+      () => readCommitJournal(ID, initLayout(root), createStorage()),
+      CorruptJournalError,
+      version
+    )
+  }
+})
+
 test('file and replacement journals read back unchanged', async (t) => {
   const file = {
     version: 1,
