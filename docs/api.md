@@ -211,7 +211,8 @@ contained and cannot change protocol correctness.
 Public peer and transfer correlation fields use 12-character SHA-256
 fingerprints. Events never expose seeds, secret keys, full remote public keys,
 TAR contents, or resumable session material. Internal storage warnings may
-include a full SHA-256 uploader fingerprint, but never the uploader key itself.
+include a full SHA-256 uploader hash (`uploaderKeyId`, see [Logging](#logging)),
+but never the uploader key itself.
 
 Server events:
 
@@ -282,6 +283,29 @@ interface Logger {
 Logger exceptions are ignored. Logger detail objects are diagnostic rather than
 a stable ingestion schema; use typed event payloads or `SwarmDeployError.code`
 for automation. Do not use fingerprints as credentials.
+
+Logger detail properties that hold a hash of a public key are named for what
+they identify, not `fingerprint`:
+
+- `publicKeyId`: the first 12 hex characters of the SHA-256 of a public key,
+  either the peer's or the server's own (`Direct DHT server listening`). It is
+  `invalid` when no valid peer key was available.
+- `uploaderKeyId`: the full 64-character SHA-256 of the uploader's public key,
+  as stored in the commit record (`Committed artifact cleanup remains pending`).
+- `pathId`: the first 12 hex characters of the SHA-256 of an unrecognized
+  journal file name (`Ignoring unknown journal path`), never the name itself.
+- `transfer`: the first 12 hex characters of the SHA-256 of a transfer ID. It is
+  not a public-key hash and keeps its name.
+
+`publicKeyId` and `uploaderKeyId` come from the same public key but differ in
+length: the first 12 characters of an `uploaderKeyId` are that uploader's
+`publicKeyId`. They are identifiers for correlation, never the key itself, a
+seed, or a filesystem path.
+
+The rename applies to logger details only. Event payloads and their exported
+types keep their `fingerprint` fields, and commit records keep the persisted
+`uploaderFingerprint` field, so no event consumer, wire message, or stored
+record changes.
 
 ## Errors
 

@@ -670,7 +670,7 @@ export class Server extends EventEmitter {
       } catch (error) {
         if (error instanceof SwarmDeployError && error.code === ERRORS.HOOK_FAILED) {
           this.logger.warn('Link hook failed', {
-            fingerprint: owner ? fingerprint(owner) : 'invalid',
+            publicKeyId: owner ? fingerprint(owner) : 'invalid',
             name: item.link.name,
             target: item.link.target,
             trigger: item.trigger,
@@ -826,7 +826,7 @@ export class Server extends EventEmitter {
       } else {
         reason = ERRORS.LINK_FAILED
       }
-      this.logger.warn('Direct link failed', { fingerprint: fingerprint(owner), reason })
+      this.logger.warn('Direct link failed', { publicKeyId: fingerprint(owner), reason })
       this.emitSafe('failure', { fingerprint: fingerprint(owner), reason })
       emitTerminal(
         rejected && reason !== ERRORS.LINK_FAILED ? 'rejected' : 'failed',
@@ -918,7 +918,7 @@ export class Server extends EventEmitter {
       await invokeHook(hook, context, this.signal)
     } catch {
       this.logger.warn('Failure hook failed', {
-        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
         transfer,
         phase: context.phase,
         reason: ERRORS.HOOK_FAILED
@@ -1291,7 +1291,7 @@ export class Server extends EventEmitter {
     } catch (error) {
       const reason = codeOf(error)
       this.logger.warn('Direct upload failed', {
-        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
         reason
       })
       this.emitSafe('failure', { fingerprint: owner ? fingerprint(owner) : 'invalid', reason })
@@ -1392,7 +1392,7 @@ export class Server extends EventEmitter {
       if (this.retention) await this.retention.afterCommit()
     } catch (error) {
       this.logger.warn('Post-commit retention failed', {
-        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
         reason: codeOf(error)
       })
     } finally {
@@ -1413,7 +1413,7 @@ export class Server extends EventEmitter {
       await this.sessions!.retireCommitted(transferId)
     } catch (error) {
       this.logger.warn('Committed session cleanup failed', {
-        fingerprint: owner ? fingerprint(owner) : 'invalid',
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
         reason: codeOf(error)
       })
     }
@@ -1519,7 +1519,7 @@ export class Server extends EventEmitter {
       await this.transport.listen()
       this.listening = true
       this.emitSafe('listening', { fingerprint: fingerprint(this.publicKey) })
-      this.logger.info('Direct DHT server listening', { fingerprint: fingerprint(this.publicKey) })
+      this.logger.info('Direct DHT server listening', { publicKeyId: fingerprint(this.publicKey) })
       return this
     } catch (error) {
       await this.dispose()

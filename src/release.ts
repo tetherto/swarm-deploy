@@ -1,6 +1,6 @@
 import b4a from 'b4a'
-import { SemVer, compare } from 'semver'
 import { validateBasename } from './files.js'
+import { compareStrictVersions, parseStrictVersion, type StrictVersion } from './semver.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 
 export type VersionGranularity = 'major' | 'minor'
@@ -126,29 +126,13 @@ function isSafeSeriesCapture(value: string): boolean {
   )
 }
 
-function validateStrictReleaseVersion(raw: string): SemVer | undefined {
-  if (raw.length === 0 || componentByteLength(raw) > MAX_RELEASE_COMPONENT_BYTES) {
-    return undefined
-  }
-  if (raw.trim() !== raw) return undefined
-  if (/^[vV]/.test(raw)) return undefined
-  if (/[/\\]/.test(raw)) return undefined
-  try {
-    const parsed = new SemVer(raw, { loose: false })
-    const core = raw.split('+', 1)[0]!
-    if (core !== parsed.version) return undefined
-    return parsed
-  } catch {
-    return undefined
-  }
-}
-
+/** A captured version may carry build metadata; the canonical form drops it. */
 function normalizeCapturedVersion(raw: string): string | undefined {
-  return validateStrictReleaseVersion(raw)?.version
+  return parseStrictVersion(raw)?.version
 }
 
-function parseReleaseVersion(raw: string): SemVer {
-  const parsed = validateStrictReleaseVersion(raw)
+function parseReleaseVersion(raw: string): StrictVersion {
+  const parsed = parseStrictVersion(raw)
   if (!parsed) throw new Error('Invalid release version')
   return parsed
 }
@@ -490,7 +474,7 @@ export class ReleaseMatcher {
 }
 
 export function compareReleaseVersions(left: string, right: string): number {
-  return compare(parseReleaseVersion(left), parseReleaseVersion(right))
+  return compareStrictVersions(parseReleaseVersion(left), parseReleaseVersion(right))
 }
 
 export function releaseVersionGroup(version: string, granularity: VersionGranularity): string {

@@ -10,6 +10,8 @@ import {
 } from '../../dist/release.js'
 import { validateBasename } from '../../dist/files.js'
 import { assertCommitRelease } from '../../dist/storage/commit-journal.js'
+// The internal SemVer helper's suite compiles and runs with this one.
+import './semver.test.js'
 
 test('release templates match basenames and immediate source parents in order', (t) => {
   const matcher = new ReleaseMatcher([
@@ -126,6 +128,85 @@ test('release helpers reject invalid strict SemVer inputs', (t) => {
   t.exception(() => compareReleaseVersions('1.0.0', 'not-semver'), /invalid/i)
   t.exception(() => releaseVersionGroup(' 1.0.0', 'major'), /invalid/i)
   t.exception(() => releaseVersionGroup('1.0.0', 'patch' as 'major'), /invalid/i)
+  t.exception(() => compareReleaseVersions('9007199254740992.0.0', '1.0.0'), /invalid/i)
+  t.exception(() => releaseVersionGroup('0.9007199254740992.0', 'minor'), /invalid/i)
+  t.exception(() => compareReleaseVersions('1.0.0', `1.0.0-${'a'.repeat(95)}`), /invalid/i)
+  t.exception(() => compareReleaseVersions('1.0.0/x', '1.0.0'), /invalid/i)
+})
+
+test('release versions at the safe-integer boundary compare and group exactly', (t) => {
+  const max = '9007199254740991'
+  t.is(compareReleaseVersions(`${max}.0.0`, '1.0.0') > 0, true)
+  t.is(compareReleaseVersions(`0.${max}.0`, `0.${max}.0+build`), 0)
+  t.is(compareReleaseVersions(`0.0.${max}`, `0.0.${max}-rc.1`) > 0, true)
+  t.is(releaseVersionGroup(`${max}.${max}.${max}`, 'major'), max)
+  t.is(releaseVersionGroup(`${max}.${max}.${max}-rc.1`, 'minor'), `${max}.${max}`)
+})
+
+test('prerelease numeric identifiers order numerically, including beyond 2^53', (t) => {
+  t.is(compareReleaseVersions('1.0.0-2', '1.0.0-10') < 0, true, 'numeric, not lexical')
+  t.is(compareReleaseVersions('1.0.0-10', '1.0.0-2') > 0, true)
+  t.is(compareReleaseVersions('1.0.0-99', '1.0.0-100') < 0, true)
+  t.is(compareReleaseVersions('1.0.0-1', '1.0.0-alpha') < 0, true, 'numeric below alphanumeric')
+
+  const low = '1.0.0-9007199254740992'
+  const high = '1.0.0-9007199254740993'
+  t.is(compareReleaseVersions(low, high), -1, 'identifiers beyond 2^53 stay distinct')
+  t.is(compareReleaseVersions(high, low), 1)
+  t.is(compareReleaseVersions(high, high), 0)
+  const wideLow = '1.0.0-12345678901234567890'
+  const wideHigh = '1.0.0-12345678901234567891'
+  t.is(compareReleaseVersions(wideLow, wideHigh), -1)
+  t.is(compareReleaseVersions(wideHigh, wideLow), 1)
+  t.is(compareReleaseVersions('1.0.0-99999999999999999999', '1.0.0-100000000000000000000'), -1)
+})
+
+test('release matcher canonicalizes captured versions and drops build metadata', (t) => {
+  const max = '9007199254740991'
+  const parent = new ReleaseMatcher(['{version}/{series}.tar.gz'])
+  t.alike(parent.match('api.tar.gz', '1.2.3-rc.1+build.5'), {
+    series: 'api',
+    version: '1.2.3-rc.1'
+  })
+  t.alike(parent.match('api.tar.gz', `${max}.0.0+b`), { series: 'api', version: `${max}.0.0` })
+  t.is(parent.match('api.tar.gz', '9007199254740992.0.0+b'), null)
+  t.is(parent.match('api.tar.gz', '1.2.3+'), null)
+  t.is(parent.match('api.tar.gz', 'v1.2.3+b'), null)
+  t.is(parent.match('api.tar.gz', '01.2.3+b'), null)
+
+  const basename = new ReleaseMatcher(['{series}-{version}.tar.gz'])
+  t.alike(basename.match(`app-${max}.${max}.${max}.tar.gz`), {
+    series: 'app',
+    version: `${max}.${max}.${max}`
+  })
+  t.is(basename.match('app-9007199254740992.0.0.tar.gz'), null)
+  t.is(basename.match('app-0.0.9007199254740993.tar.gz'), null)
+  t.is(basename.match('app-1.0.0-01.tar.gz'), null)
+})
+
+test('stored release versions stay canonical and reject build metadata', (t) => {
+  const max = '9007199254740991'
+  for (const version of ['1.2.3', `${max}.${max}.${max}`, '1.0.0-12345678901234567890']) {
+    t.execution(() => assertCommitRelease({ series: 'app', version }), version)
+  }
+  for (const version of [
+    '1.2.3+build.1',
+    `${max}.0.0+b`,
+    '9007199254740992.0.0',
+    '0.0.9007199254740993',
+    'v1.2.3',
+    ' 1.2.3',
+    '01.2.3',
+    '1.0.0-01',
+    '1.0.0/x',
+    `1.0.0-${'a'.repeat(95)}`
+  ]) {
+    t.exception(
+      () => assertCommitRelease({ series: 'app', version }),
+      /Invalid commit release version/,
+      version
+    )
+  }
 })
 
 test('release matcher rejects invalid templates at construction', (t) => {

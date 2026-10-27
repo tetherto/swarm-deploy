@@ -1,10 +1,10 @@
 import b4a from 'b4a'
 import { isMissing } from '../error-code.js'
 import path from '#path'
-import { SemVer } from 'semver'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
 import { historyName, isReservedHistoryName, validateBasename } from '../files.js'
+import { parseStrictVersion } from '../semver.js'
 import { assertSafeUint } from '../validation.js'
 import { MAX_TREE_ENTRIES } from '../tar-protocol/tree.js'
 import { MetadataFormatError, readJson } from './atomic-file.js'
@@ -153,21 +153,9 @@ export function assertCommitRelease(value: unknown): asserts value is CommitRele
     throw storageError('Invalid commit release series', error)
   }
   if (value.version === undefined) return
-  if (
-    typeof value.version !== 'string' ||
-    b4a.from(value.version).byteLength > 100 ||
-    value.version.trim() !== value.version ||
-    /^[vV]/.test(value.version) ||
-    /[/\\]/.test(value.version)
-  ) {
+  // A stored version is already canonical: build metadata never reaches the journal.
+  if (parseStrictVersion(value.version)?.version !== value.version) {
     throw storageError('Invalid commit release version')
-  }
-  try {
-    const parsed = new SemVer(value.version, { loose: false })
-    if (parsed.version !== value.version) throw storageError('Invalid commit release version')
-  } catch (error: unknown) {
-    if (error instanceof SwarmDeployError) throw error
-    throw storageError('Invalid commit release version', error)
   }
 }
 

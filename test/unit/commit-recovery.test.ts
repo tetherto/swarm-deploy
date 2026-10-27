@@ -19,6 +19,7 @@ import {
 } from '../../dist/storage/commit-journal.js'
 import { prepareStorageRecovery, recoverStorage } from '../../dist/storage/recovery.js'
 import type { StorageAdapter, StorageLayout } from '../../dist/storage/types.js'
+import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import {
   buildTarManifest,
   metadataFromManifest,
@@ -364,6 +365,28 @@ test('direct-TAR replacement recovery is idempotent after convergence', async (t
   t.is(second.length, 0)
   await assertCommittedReplacement(t, crash, commits, 'rerun')
   await sessions.close()
+})
+
+test('recovery logs an unknown journal path by pathId and never by its name', async (t) => {
+  const harness = await createHarness(t)
+  const name = 'operator-notes.json'
+  await fs.promises.writeFile(path.join(harness.layout.journals, name), 'not a journal')
+  const logs: Array<{ message: string; details: Record<string, unknown> }> = []
+
+  await recoverStorage({
+    layout: harness.layout,
+    sessionStore: harness.sessions,
+    commitStore: harness.commits,
+    logger: { warn: (message, details) => void logs.push({ message, details }) }
+  })
+
+  const pathId = b4a.toString(sodiumSha256(b4a.from(name)), 'hex').slice(0, 12)
+  const unknown = logs.filter((entry) => entry.message === 'Ignoring unknown journal path')
+  t.alike(
+    unknown.map((entry) => entry.details),
+    [{ pathId }]
+  )
+  t.absent(JSON.stringify(logs).includes(name), 'the file name never reaches the log')
 })
 
 test('commit release identity survives sidecars, replacement history, and A-B-A dedup', async (t) => {

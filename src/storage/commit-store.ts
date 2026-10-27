@@ -816,8 +816,10 @@ class CommitStore {
 
   _reportCleanupPending(record: CommitRecord, err: unknown): void {
     try {
+      // The full SHA-256 of the uploader's public key; the server's logs carry its first 12
+      // characters as `publicKeyId`.
       this.logger?.warn?.('Committed artifact cleanup remains pending', {
-        fingerprint: record.uploaderFingerprint,
+        uploaderKeyId: record.uploaderFingerprint,
         name: record.name,
         code: errorCode(err),
         reason: err instanceof Error ? err.message : String(err)

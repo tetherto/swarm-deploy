@@ -1,6 +1,6 @@
 {
   "name": "swarm-deploy",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Secure resumable artifact uploads over direct HyperDHT",
   "repository": {
     "type": "git",
@@ -85,14 +85,13 @@
     "bare-os": "^3.9.3",
     "bare-path": "^3.1.1",
     "bare-process": "^4.5.1",
+    "bare-semver": "^1.1.0",
     "hyperdht": "^6.33.2",
-    "semver": "^7.8.5",
     "sodium-native": "^5.1.0",
     "tar-stream": "3.2.1"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
-    "@types/semver": "^7.8.0",
     "bare-runtime": "^1.31.0",
     "brittle": "^4.1.0",
     "lunte": "^1.8.4",
