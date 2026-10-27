@@ -588,11 +588,13 @@ The same re-check therefore also requires the root listing to contain the entry
 under exactly the requested spelling, and compares the entry's inode identity
 with that of every protected name that differs only in case: each recorded name,
 each configured automatic link name (reserved even before it has a record), and
-each managed artifact name. If one resolves to the same entry, or identities are
-unavailable, the request fails with `LINK_CONFLICT` and nothing is replaced,
-which also covers a recorded link that was renamed in case outside the server.
-On a case-sensitive volume such names are distinct entries and remain
-independent.
+each managed artifact name. If one resolves to the same entry, the request fails
+with `LINK_CONFLICT` and nothing is replaced, which also covers a recorded link
+that was renamed in case outside the server. If such a protected case-variant
+name exists but the storage reports no inode identities, so that independence
+cannot be proven, the request also fails closed; missing identities do not block
+a takeover when no protected case variant exists. On a case-sensitive volume
+such names are distinct entries and remain independent.
 
 `LINKED` means the link was created, repointed, taken over from an unrecorded
 symlink, or its crash-residual state was completed. `UNCHANGED` means the
@@ -620,8 +622,10 @@ rewritten. Temporary links are swept and each operation is level-triggered, so
 a retry can complete either crash point without claiming an unmanaged path.
 An explicit manual takeover of an unrecorded symlink follows the replacement
 order (swap, then record). Its crash residue is an unrecorded symlink at the
-requested target, which only the same explicit manual request takes over again
-(it returns `LINKED`); automatic reconciliation and startup never claim it.
+requested target, which any explicit manual request that is otherwise allowed
+for that name (for the same or a different valid current managed target) takes
+over again (it returns `LINKED`); automatic reconciliation and startup never
+claim it.
 
 Automatic reconciliation ignores manual records and therefore never repoints
 or removes a manual link. Manual mutation rejects automatic records and
