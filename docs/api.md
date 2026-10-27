@@ -111,7 +111,8 @@ Optional operational limits and policies:
 The root package exports the `ServerHooks`, `BeforeCommitContext`,
 `AfterCommitContext`, `AfterLinkContext`, `HookFailureContext`,
 `HookFailurePhase`, `HookArtifact`, `HookLink`, `HookLinkMode`, `HookLinkStatus`,
-`HookLinkTrigger`, `ReleaseCoordinates`, and `VersionGranularity` types:
+`HookLinkTrigger`, `HookResult`, `HookResultValue`, `ReleaseCoordinates`, and
+`VersionGranularity` types:
 
 ```ts
 import type { ServerHooks } from 'swarm-deploy'
@@ -122,6 +123,7 @@ const hooks: ServerHooks = {
   },
   async afterLink({ link, artifact, status, trigger }) {
     // Repeatable: skip when link.name already publishes artifact.transferId.
+    // May return a JSON object for a caller that asked; see below.
   },
   onFailure({ phase, path, error }) {
     console.error(phase, path, error)
@@ -167,14 +169,40 @@ idempotent.
 
 ## Link results
 
-`Client.link(target, name)` resolves to:
+`Client.link(target, name, options?)` resolves to:
 
 ```ts
+interface ClientLinkOptions {
+  hookResult?: boolean // default false
+}
+
 interface ClientLinkResult {
   target: string
   name: string
   status: 'LINKED' | 'UNCHANGED'
+  hookResult?: HookResult // only when requested and the hook returned an object
 }
+```
+
+`hookResult: true` asks the server for what its `afterLink` hook returned, a
+plain JSON object (`HookResult`, with `HookResultValue` for its values) the hook
+author chose to report, such as an accepted submission's ID or evidence URL. It
+arrives only after the hook has resolved and is absent when the server has no
+hook or the hook returned nothing. It is data the hook reported, not proof that
+anything was published, and it is never placed in client events or logs. Without
+the option the request and the result are exactly what earlier versions
+exchanged. Unknown options and non-boolean values reject with `PROTOCOL_INVALID`
+before connecting. An opted-in request needs a server of version 0.5.0 or later;
+an older server rejects it, so the call fails rather than returning without the
+result. A server that sends a result nobody asked for, or a malformed one, fails
+the call with `PROTOCOL_INVALID`. See
+[Link publication hooks](hooks.md#link-publication-hooks) for the limits and what
+to put in the result.
+
+```ts
+const { status, hookResult } = await client.link('app-2.4.1.tar.gz', 'latest', {
+  hookResult: true
+})
 ```
 
 The client validates both names before connecting. Link operations share the

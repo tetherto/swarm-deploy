@@ -40,8 +40,9 @@ types. A runnable Node-only example is in
 - `onFailure(context)`: once per failed connection whose metadata was decoded,
   and once per failed `afterLink`, after the client has been answered.
 
-Callbacks may return `void` or a promise, are called with no receiver, and
-receive a frozen context. The artifact is
+Callbacks may return `void` or a promise (only `afterLink` may return data; see
+[Link publication hooks](#link-publication-hooks)), are called with no receiver,
+and receive a frozen context. The artifact is
 `{ name, kind, size, sha256, transferId, entryCount?, sourceParent?, release? }`,
 where `entryCount` is present only for directories and `release` is
 `{ series, version? }` when patterns are configured. These descriptive fields
@@ -264,6 +265,72 @@ removed `targetPath` if the link no longer pins it. Open or copy what you need
 promptly, treat a missing `targetPath` or a changed `readlink(link.path)` as
 "superseded", and let the newer decision's own call publish the final state.
 Link removal has no hook because there is no unlink request.
+
+**Returning a result to a link request.** `afterLink` may return a plain JSON
+object, or nothing. A caller that asks for it
+(`Client.link(target, name, { hookResult: true })`, or `swarm-deploy link --json`)
+receives it as `ClientLinkResult.hookResult`, in the same answer as `LINKED` or
+`UNCHANGED` and only after the hook has resolved. Use it to hand back what you
+choose to report about the work the hook started: an external job or submission
+ID, an evidence URL, a digest. Nothing is added from the context, the error, or
+the environment, and the server adds no store-specific logic.
+
+```ts
+const hooks: ServerHooks = {
+  async afterLink({ link, artifact }) {
+    const submission = await submitToStore(link.name, artifact.sha256) // your code
+    return { submissionId: submission.id, evidenceUrl: submission.url, accepted: true }
+  }
+}
+```
+
+- **Opt-in only.** An upload's automatic links, and a link request that did not
+  ask, ignore the return value and never read it, even if it is not valid. Such
+  callers see exactly what they saw before. A server without `afterLink`, and a
+  hook that returns nothing (`undefined`), send no result; `{}` is sent as an
+  empty object.
+- **What is accepted.** A plain object (an object literal or a null-prototype
+  object) whose values are strings, finite numbers, booleans, `null`, arrays,
+  and plain nested objects, at most 8 levels deep and at most 3 KiB (3072 bytes)
+  of compact JSON, so the answer fits one 4 KiB control record. Not accepted:
+  `undefined` (also inside objects and arrays), functions, symbols, BigInt,
+  `NaN` and `Infinity`, class instances such as `Date` and `Map`, `toJSON`
+  methods, getters, symbol keys, a `__proto__` key, cycles, and a return value
+  that is not an object (a string, number, array, or `null`). The exported
+  `HookResult` and `HookResultValue` types describe the shape; annotate the
+  return type as `HookResult` when branches return different object literals.
+- **A refused result is a failed hook.** When the caller asked, an unusable
+  result fails like a throw: the stable `HOOK_FAILED` with its fixed message, the
+  link left in place, and the same safe retry. `onFailure` receives an `Error`
+  that names the reason and the path inside the result (for example `too large`
+  or `unsupported function at $.run`), never a value. The server log carries no
+  result data either.
+- **At-least-once.** Every call, including the retry that reports `UNCHANGED`,
+  runs the hook again and returns that run's result, so return the same ID for
+  the same work, as you would for any idempotent hook.
+- **Who sees it.** The result goes to the authenticated client that asked, so
+  return only data that caller may see. Leave out credentials, tokens, and
+  internal paths; the library cannot tell them from other strings.
+
+The result is data transport, not proof. Three things are different:
+
+1. **Link status** (`LINKED` or `UNCHANGED`): the server's decision about the
+   symlink, as above.
+2. **What your hook reports**: for example that an external store accepted a
+   submission, with its ID. The library does not check it.
+3. **Final published status**: whether the store later published it. That happens
+   outside this call; verify it with your own tooling using the reported ID.
+
+Keep the hook to the fast step, such as submitting the job and returning its ID.
+The caller waits at most its idle timeout (5 minutes at most), and a store
+review such as Flathub's can take longer than that, so do not wait for
+publication inside the hook. The server keeps no queue, job store, or status
+page; a publisher that needs one keeps its own. Store clients are separate from
+this package.
+
+An opted-in request needs a server of version 0.5.0 or later. An older server
+rejects the request instead of answering it, so the call fails; it never returns
+without the result. Upgrade servers before clients that ask.
 
 **Observing a failure.** A failed `afterLink` is reported on the server as: a
 `link` event with `status: 'failed'`, `reason: 'HOOK_FAILED'` and `result`

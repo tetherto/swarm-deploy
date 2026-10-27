@@ -159,13 +159,15 @@ swarm-deploy link \
   --seed-file <seed-file> \
   --server-key <64-lower-hex> \
   [--idle-timeout <milliseconds>] \
+  [--json] \
   <target> <link-name>
 ```
 
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>`, or use
 `SWARM_DEPLOY_CLIENT_SEED`, exactly as for `upload`. `--server-key` pins the
 server identity, and `--idle-timeout` has the same 60-second default and
-inactivity semantics as upload.
+inactivity semantics as upload. `--json` takes no value and belongs to `link`
+alone; see [JSON output](#json-output).
 
 The command asks the authenticated server to point `<link-name>` at the
 existing managed file or directory `<target>`. The target must match a
@@ -194,6 +196,31 @@ running the same command again is safe and re-runs the hook. A hook slower than
 server still finishes the hook (see
 [Link publication hooks](hooks.md#link-publication-hooks)). The rules behind
 manual links are in [Managed symlinks](managed-links.md).
+
+### JSON output
+
+With `--json` the command asks the server for what its `afterLink` hook returned
+and prints one JSON object on one line instead of the text line:
+
+```json
+{
+  "target": "app-2.4.1.tar.gz",
+  "name": "latest",
+  "status": "LINKED",
+  "hookResult": { "submissionId": "sub-42" }
+}
+```
+
+`hookResult` is present only when the hook returned an object; otherwise the
+object has just `target`, `name`, and `status`. It is data the hook chose to
+report, such as an accepted submission's ID, not proof that anything was
+published; see [Link publication hooks](hooks.md#link-publication-hooks). A
+failure prints nothing on stdout, a stable code on stderr, and exits `1`, as
+without the flag, and diagnostics stay on stderr. `--idle-timeout` is still the
+whole time budget. Without `--json` the command asks for nothing and prints
+exactly the text line above. `--json` needs a server of version 0.5.0 or later:
+an older server rejects the request, so the command fails instead of printing a
+result without the data.
 
 ## `reset-storage`
 

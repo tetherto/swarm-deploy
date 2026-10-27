@@ -301,6 +301,139 @@ test('CLI prints a failed link hook as HOOK_FAILED without raw server messages',
   t.absent(stderr.text().includes(secret))
 })
 
+/** Runs `link` with a fake client that records how it was called and answers as told. */
+async function runLink(
+  args: string[],
+  answer: (target: string, name: string) => Promise<unknown>
+): Promise<{ code: number; stdout: string; stderr: string; calls: unknown[][] }> {
+  const calls: unknown[][] = []
+  class Client {
+    constructor(_options: ClientOptions) {}
+    link(...received: unknown[]) {
+      calls.push(received)
+      return answer(received[0] as string, received[1] as string)
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  const stderr = output()
+  const code = await main(
+    ['link', '--server-key', b4a.toString(SERVER_KEY, 'hex'), ...args],
+    { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+    {
+      Client: Client as unknown as new (
+        options: ClientOptions
+      ) => import('../../dist/client.js').Client,
+      stdout: stdout.stream,
+      stderr: stderr.stream
+    }
+  )
+  return { code, stdout: stdout.text(), stderr: stderr.text(), calls }
+}
+
+test('CLI link --json requests the hook result and prints one JSON object', async (t) => {
+  const reported = { submissionId: 'sub-42', state: 'accepted', evidence: ['u1'], retry: null }
+  const withResult = await runLink(['--json', 'release-1.2.3', 'current'], (target, name) =>
+    Promise.resolve({ target, name, status: 'LINKED' as const, hookResult: reported })
+  )
+  t.is(withResult.code, 0)
+  t.alike(withResult.calls, [['release-1.2.3', 'current', { hookResult: true }]])
+  t.is(
+    withResult.stdout,
+    '{"target":"release-1.2.3","name":"current","status":"LINKED","hookResult":{"submissionId":"sub-42","state":"accepted","evidence":["u1"],"retry":null}}\n'
+  )
+  t.is(withResult.stderr, '')
+
+  const without = await runLink(['release-1.2.3', 'current', '--json'], (target, name) =>
+    Promise.resolve({ target, name, status: 'UNCHANGED' as const })
+  )
+  t.is(without.code, 0)
+  t.is(
+    without.stdout,
+    '{"target":"release-1.2.3","name":"current","status":"UNCHANGED"}\n',
+    'no field when the hook returned nothing'
+  )
+  t.alike(without.calls, [['release-1.2.3', 'current', { hookResult: true }]])
+
+  const hex = 'ab'.repeat(32)
+  const hexNames = await runLink(['--json', hex, hex], (target, name) =>
+    Promise.resolve({ target, name, status: 'LINKED' as const })
+  )
+  t.is(hexNames.code, 0, 'canonical hex names stay allowed beside the flag')
+})
+
+test('CLI link without --json calls and prints exactly as before', async (t) => {
+  const plain = await runLink(['release-1.2.3', 'current'], (target, name) =>
+    Promise.resolve({
+      target,
+      name,
+      status: 'LINKED' as const,
+      hookResult: { ignored: 'without the flag' }
+    })
+  )
+  t.is(plain.code, 0)
+  t.alike(plain.calls, [['release-1.2.3', 'current']], 'a two-argument call: nothing is requested')
+  t.is(plain.stdout, 'current -> release-1.2.3 LINKED\n')
+  t.is(plain.stderr, '')
+})
+
+test('CLI link --json keeps failures as stderr diagnostics with no JSON on stdout', async (t) => {
+  const secret = 'publisher token sk-secret'
+  const failed = await runLink(['--json', 'release-1.2.3', 'current'], () =>
+    Promise.reject(new SwarmDeployError(ERRORS.HOOK_FAILED, secret))
+  )
+  t.is(failed.code, 1)
+  t.is(failed.stdout, '')
+  t.is(failed.stderr, `${ERRORS.HOOK_FAILED}\n`)
+
+  const rejected = await runLink(['--json', 'release-1.2.3', 'current'], () =>
+    Promise.reject(new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Direct stream closed'))
+  )
+  t.is(rejected.code, 1)
+  t.is(rejected.stdout, '')
+  t.ok(rejected.stderr.length > 0, 'an older server that cannot answer the opt-in is an error')
+})
+
+test('CLI --json belongs to link alone and is parsed as a strict flag', async (t) => {
+  const never = (): Promise<unknown> => Promise.reject(new Error('Link should not be attempted'))
+  for (const args of [
+    ['--json', '--json', 'release-1.2.3', 'current'],
+    ['--json=true', 'release-1.2.3', 'current'],
+    ['--json', 'true', 'release-1.2.3', 'current'],
+    ['--json', 'release-1.2.3'],
+    ['--json', 'release-1.2.3', 'current', 'extra'],
+    ['--jsno', 'release-1.2.3', 'current']
+  ]) {
+    const result = await runLink(args, never)
+    t.is(result.code, 2, args.join(' '))
+    t.is(result.stdout, '')
+    t.alike(result.calls, [], 'nothing is requested for a malformed command')
+  }
+
+  const key = b4a.toString(SERVER_KEY, 'hex')
+  const env = { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') }
+  for (const args of [
+    ['upload', '--server-key', key, '--json', 'artifact.txt'],
+    ['server', '--json'],
+    ['keygen', '--json', '--out', 'seed'],
+    ['public-key', '--json'],
+    ['reset-storage', '--json', '--storage', '.']
+  ]) {
+    const stderr = output()
+    t.is(await main(args, env, { stderr: stderr.stream }), 2, args[0])
+    t.ok(stderr.text().includes('Unknown option'), `${args[0]} does not accept --json`)
+  }
+
+  const [linkUsage, uploadUsage] = [
+    USAGE.split('\n').find((line) => line.startsWith('  swarm-deploy link')),
+    USAGE.split('\n').find((line) => line.startsWith('  swarm-deploy upload'))
+  ]
+  t.ok(linkUsage?.includes('[--json]'))
+  t.absent(uploadUsage?.includes('--json'))
+})
+
 test('CLI rejects unsafe link arguments as configuration errors', async (t) => {
   const stderr = output()
   const clientSeed = b4a.toString(CLIENT_SEED, 'hex')

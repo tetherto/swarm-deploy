@@ -8,6 +8,7 @@ import path from '#path'
 import { pack, type Header } from 'tar-stream'
 import { createAbortController } from '../../dist/abort.js'
 import { ERRORS } from '../../dist/errors.js'
+import { MAX_HOOK_RESULT_BYTES } from '../../dist/hook-result.js'
 import {
   assertMetadataTransferId,
   buildTarManifest,
@@ -353,6 +354,129 @@ test('link control records are exact, bounded, and distinct from upload metadata
     () => decodeLinkResultRecord(b4a.from(JSON.stringify({ v: 1, status: 'LINKED', x: 1 }))),
     { code: ERRORS.PROTOCOL_INVALID }
   )
+})
+
+test('a default link exchange keeps its exact pre-opt-in bytes', (t) => {
+  t.is(
+    b4a.toString(
+      encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'release-1.2.3', name: 'current' })
+    ),
+    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current"}'
+  )
+  for (const status of ['LINKED', 'UNCHANGED'] as const) {
+    t.is(b4a.toString(encodeLinkResultRecord({ v: 1, status })), `{"v":1,"status":"${status}"}`)
+  }
+  t.is(
+    b4a.toString(encodeLinkResultRecord({ v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED })),
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED"}'
+  )
+})
+
+test('the hook-result opt-in is a strict capability on the request and optional data on the result', (t) => {
+  const asked: LinkRequestRecord = {
+    v: 1,
+    kind: 'link',
+    target: 'release-1.2.3',
+    name: 'current',
+    hookResult: true
+  }
+  const askedBytes = encodeLinkRequestRecord(asked)
+  t.is(
+    b4a.toString(askedBytes),
+    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookResult":true}'
+  )
+  t.alike(decodeLinkRequestRecord(askedBytes), asked)
+  t.alike(decodeFirstControlRecord(askedBytes), asked)
+  t.exception(() => decodeAnyMetadataRecord(askedBytes), { code: ERRORS.PROTOCOL_INVALID })
+
+  // Only `true` opts in: `false` would be a second spelling of the default.
+  for (const hookResult of [false, 1, 0, 'true', null, {}, [], undefined]) {
+    const bad = { ...asked, hookResult } as unknown as LinkRequestRecord
+    t.exception(() => encodeLinkRequestRecord(bad), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  for (const body of [
+    '{"v":1,"kind":"link","target":"a","name":"b","hookResult":false}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookResult":"yes"}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookResult":true,"extra":1}',
+    '{"v":1,"kind":"link","target":"a","name":"b","results":true}'
+  ]) {
+    t.exception(() => decodeLinkRequestRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID })
+    t.exception(() => decodeFirstControlRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID })
+  }
+
+  const reported = { submissionId: 'sub-42', state: 'accepted', evidence: ['u1'], retry: null }
+  for (const status of ['LINKED', 'UNCHANGED'] as const) {
+    const record: LinkResultRecord = { v: 1, status, hookResult: reported }
+    const bytes = encodeLinkResultRecord(record)
+    t.is(
+      b4a.toString(bytes),
+      `{"v":1,"status":"${status}","hookResult":{"submissionId":"sub-42","state":"accepted","evidence":["u1"],"retry":null}}`
+    )
+    t.alike(decodeLinkResultRecord(bytes), record)
+  }
+  t.alike(
+    decodeLinkResultRecord(encodeLinkResultRecord({ v: 1, status: 'LINKED', hookResult: {} })),
+    { v: 1, status: 'LINKED', hookResult: {} },
+    'an empty object is a result; absence is how a hook that returned nothing is reported'
+  )
+})
+
+test('a link result record refuses malformed or misplaced hook-result data', (t) => {
+  const record = (hookResult: string, status = 'LINKED'): Buffer =>
+    b4a.from(`{"v":1,"status":"${status}","hookResult":${hookResult}}`)
+  for (const hookResult of [
+    'null',
+    '"text"',
+    '7',
+    'true',
+    '[]',
+    '[{"a":1}]',
+    '{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":{}}}}}}}}}',
+    '{"__proto__":{"admin":true}}',
+    `{"k":"${'x'.repeat(MAX_HOOK_RESULT_BYTES)}"}`
+  ]) {
+    t.exception(
+      () => decodeLinkResultRecord(record(hookResult)),
+      { code: ERRORS.PROTOCOL_INVALID },
+      hookResult.slice(0, 40)
+    )
+  }
+  // The deepest legal object, and one level more.
+  const deepest = '{"a":{"b":{"c":{"d":{"e":{"f":{"g":{}}}}}}}}'
+  t.execution(() => decodeLinkResultRecord(record(deepest)))
+
+  // A failure carries only its code, and no other field joins a success.
+  t.exception(() => decodeLinkResultRecord(record('{"a":1}', 'FAILED')), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(
+    () =>
+      decodeLinkResultRecord(
+        b4a.from('{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"a":1}}')
+      ),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  t.exception(
+    () => decodeLinkResultRecord(b4a.from('{"v":1,"status":"LINKED","hookResult":{},"x":1}')),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  t.exception(
+    () => decodeLinkResultRecord(b4a.from('{"v":1,"status":"LINKED","results":{"a":1}}')),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+
+  // Nothing unsafe is encoded either.
+  for (const hookResult of [null, 'x', [], { f: () => 1 }, { n: Number.NaN }, { big: 1n }]) {
+    t.exception(
+      () =>
+        encodeLinkResultRecord({
+          v: 1,
+          status: 'LINKED',
+          hookResult
+        } as unknown as LinkResultRecord),
+      { code: ERRORS.PROTOCOL_INVALID }
+    )
+  }
 })
 
 test('source parent is authenticated while legacy metadata keeps its transfer ID', async (t) => {

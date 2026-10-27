@@ -33,7 +33,12 @@ import {
   treeMetadataFromManifest,
   type TreeManifest
 } from './tar-protocol/tree-manifest.js'
-import { encodeLinkRequestRecord, type AnyMetadataRecord } from './tar-protocol/controls.js'
+import type { HookResult } from './hook-result.js'
+import {
+  encodeLinkRequestRecord,
+  type AnyMetadataRecord,
+  type LinkRequestRecord
+} from './tar-protocol/controls.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
 import type {
   ArtifactKind,
@@ -84,10 +89,26 @@ export interface UploadResult {
 }
 export type ClientUploadResult = UploadResult
 export type ClientLinkStatus = 'LINKED' | 'UNCHANGED'
+export interface ClientLinkOptions {
+  /**
+   * Ask the server to return what its `afterLink` hook returned, as
+   * `ClientLinkResult.hookResult`. Off by default, and then the request and
+   * its answer are exactly what earlier versions exchange. A server older than
+   * 0.5.0 rejects the opted-in request, so the call fails instead of returning
+   * without the result.
+   */
+  hookResult?: boolean
+}
 export interface ClientLinkResult {
   target: string
   name: string
   status: ClientLinkStatus
+  /**
+   * Present only when `ClientLinkOptions.hookResult` was set and the server's
+   * hook returned an object. Data the hook author chose to report, such as an
+   * accepted submission's ID or URL; it is not proof that anything was published.
+   */
+  hookResult?: HookResult
 }
 export interface ClientOfferEvent {
   status: 'offered' | 'accepted' | 'resumed' | 'reset' | 'rejected' | 'already-committed'
@@ -145,6 +166,21 @@ function duration(value: unknown, label: string, fallback: number): number {
     throw fail(ERRORS.PROTOCOL_INVALID, `Invalid ${label}`)
   }
   return actual as number
+}
+/** Whether the options ask for the hook's result; anything unexpected is refused. */
+function linkOptions(options: unknown): boolean {
+  if (options === undefined) return false
+  if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
+  }
+  if (Object.keys(options).some((name) => name !== 'hookResult')) {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
+  }
+  const wanted = (options as { hookResult?: unknown }).hookResult
+  if (wanted !== undefined && typeof wanted !== 'boolean') {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
+  }
+  return wanted === true
 }
 function codeOf(error: unknown): ErrorCode {
   return error instanceof SwarmDeployError &&
@@ -372,8 +408,20 @@ export class Client extends EventEmitter {
     this.emitSafe('result', { name: result.name, kind, status, final: true })
     return result
   }
-  private async performLink(target: string, name: string): Promise<ClientLinkResult> {
-    const request = { v: 1 as const, kind: 'link' as const, target, name }
+  private async performLink(
+    target: string,
+    name: string,
+    options?: ClientLinkOptions
+  ): Promise<ClientLinkResult> {
+    const wantsResult = linkOptions(options)
+    // Only an opted-in request carries the field, so the default stays the four-field record.
+    const request: LinkRequestRecord = {
+      v: 1 as const,
+      kind: 'link' as const,
+      target,
+      name,
+      ...(wantsResult ? { hookResult: true as const } : {})
+    }
     // Validate before opening a connection so malformed names never leave the client.
     encodeLinkRequestRecord(request)
     throwIfAborted(this.signal)
@@ -396,14 +444,19 @@ export class Client extends EventEmitter {
       endWrite(socket)
       const response = await reader.control(decodeDirectLinkResult, this.signal, this.idleTimeout)
       if (response.status === 'FAILED') throw fail(response.code, 'Server failed link request')
-      const result: ClientLinkResult = { target, name, status: response.status }
-      this.logger.info('Direct link completed', {
-        target: result.target,
-        name: result.name,
-        status: result.status
-      })
-      this.emitSafe('link', { ...result, final: true })
-      return result
+      if (!wantsResult && response.hookResult !== undefined) {
+        throw fail(ERRORS.PROTOCOL_INVALID, 'Server sent an unrequested hook result')
+      }
+      const status = response.status
+      // Neither the log nor the event carries the hook's data.
+      this.logger.info('Direct link completed', { target, name, status })
+      this.emitSafe('link', { target, name, status, final: true })
+      return {
+        target,
+        name,
+        status,
+        ...(response.hookResult === undefined ? {} : { hookResult: response.hookResult })
+      }
     } catch (error) {
       this.emitSafe('link', { target, name, status: codeOf(error), final: true })
       throw error
@@ -441,10 +494,10 @@ export class Client extends EventEmitter {
     )
     return operation
   }
-  link(target: string, name: string): Promise<ClientLinkResult> {
+  link(target: string, name: string, options?: ClientLinkOptions): Promise<ClientLinkResult> {
     if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Client is closed'))
     const operation = this.queue
-      .then(() => this.performLink(target, name))
+      .then(() => this.performLink(target, name, options))
       .catch((error: unknown) => {
         const reason = codeOf(error)
         this.emitSafe('failure', { fingerprint: fingerprint(this.serverPublicKey), reason })

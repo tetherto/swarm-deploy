@@ -68,7 +68,7 @@ const USAGE = [
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
   '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module>]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] <file-or-directory>',
-  '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] <target> <link-name>',
+  '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--json] <target> <link-name>',
   '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]]',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
@@ -754,6 +754,16 @@ function printLinkResult(result: ClientLinkResult, io: CliIo): number {
   return result.status === 'LINKED' || result.status === 'UNCHANGED' ? 0 : 1
 }
 
+/** One JSON object on stdout: the link outcome plus the hook's own data, when it returned any. */
+function printLinkJson(result: ClientLinkResult, io: CliIo): number {
+  const { target, name, status, hookResult } = result
+  writeLine(
+    io.stdout,
+    JSON.stringify({ target, name, status, ...(hookResult === undefined ? {} : { hookResult }) })
+  )
+  return status === 'LINKED' || status === 'UNCHANGED' ? 0 : 1
+}
+
 function linkErrorMessage(err: unknown): string {
   if (
     err instanceof SwarmDeployError &&
@@ -841,15 +851,16 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
 }
 
 async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, positionals } = parseOptions(
+  const { options, flagOptions, positionals } = parseOptions(
     args,
-    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout']),
+    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout', '--json']),
     new Set(),
     new Set(['--server-key', '--seed']),
-    new Set(),
+    new Set(['--json']),
     new Set(),
     true
   )
+  const json = flagOptions['--json'] === true
   const [target, name] = requirePositionals(positionals, 2, 'link requires a target and link name')
   try {
     encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })
@@ -911,8 +922,9 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
   let code = 0
   try {
     try {
-      const result = await client.link(target, name)
-      code = printLinkResult(result, io)
+      // Only --json asks the server for the hook's result; the plain call is unchanged.
+      if (json) code = printLinkJson(await client.link(target, name, { hookResult: true }), io)
+      else code = printLinkResult(await client.link(target, name), io)
     } catch (err) {
       runError = new CliError(linkErrorMessage(err), 1)
     }

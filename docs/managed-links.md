@@ -149,7 +149,10 @@ The explicit link operation is a control request, not an upload. It supports
 files and directories and is idempotent. It runs none of the upload hooks
 (`beforeCommit`, `afterCommit`), but a server with an `afterLink` hook runs it
 after the link is durable and before the result is returned; see
-[Link publication hooks](hooks.md#link-publication-hooks).
+[Link publication hooks](hooks.md#link-publication-hooks). A request can also ask
+for the JSON object the hook returned (`swarm-deploy link --json`, or
+`Client.link(target, name, { hookResult: true })`); that needs a server of
+version 0.5.0 or later.
 
 `symlinks` requires `StorageAdapter.symlink` and `readlink`; the Node and Bare
 default adapters provide them; a custom adapter without symlink rules stays

@@ -15,6 +15,7 @@ import { isReservedHistoryName, validateReplaceNames } from './files.js'
 import {
   callbackError,
   hookError,
+  hookResultOf,
   HookTurns,
   invokeHook,
   snapshotHooks,
@@ -28,9 +29,11 @@ import {
   type HookLinkMode,
   type HookLinkStatus,
   type HookLinkTrigger,
+  type HookOutcome,
   type HookTurn,
   type ServerHooks
 } from './hooks.js'
+import type { HookResult } from './hook-result.js'
 import { keyPairFromSeed } from './identity.js'
 import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
@@ -647,17 +650,25 @@ export class Server extends EventEmitter {
    * hook for its link has finished. No storage lease is held while hook code
    * runs. `begin` is told which call is starting so a caller can attribute a
    * failure. The first failure stops the rest; the caller releases the places.
+   *
+   * What a hook returns is read only when `collectResults` is set, which the
+   * explicit link request does when the client asked for it. It then comes back
+   * as a checked copy per call (`undefined` for a hook that returned nothing),
+   * and a value that is not a valid result fails that call like a throw. Without
+   * it the value is never touched, so no caller can be failed by it.
    */
   private async runLinkHooks(
     pending: readonly PendingLinkHook[],
     owner: Uint8Array | null,
-    begin: (item: PendingLinkHook) => void
-  ): Promise<void> {
+    begin: (item: PendingLinkHook) => void,
+    collectResults = false
+  ): Promise<Array<HookResult | undefined>> {
+    const results: Array<HookResult | undefined> = []
     for (const item of pending) {
       begin(item)
       if ((await item.turn.ready(this.signal)) === 'aborted') throw abortError()
       try {
-        await this.runHook<AfterLinkContext>(
+        const returned = await this.runHook<AfterLinkContext>(
           'afterLink',
           this.hooks.afterLink,
           Object.freeze({
@@ -667,6 +678,7 @@ export class Server extends EventEmitter {
             trigger: item.trigger
           })
         )
+        results.push(collectResults ? hookResultOf(returned) : undefined)
       } catch (error) {
         if (error instanceof SwarmDeployError && error.code === ERRORS.HOOK_FAILED) {
           this.logger.warn('Link hook failed', {
@@ -682,6 +694,7 @@ export class Server extends EventEmitter {
       }
       item.turn.release()
     }
+    return results
   }
 
   private setManagedLinkNames(records: readonly { name: string }[]): void {
@@ -778,12 +791,18 @@ export class Server extends EventEmitter {
         return { status: linked.status, pending }
       })
       state.durable = decided.status
+      let hookResult: HookResult | undefined
       if (decided.pending !== null) {
         const pending = decided.pending
         try {
-          await this.runLinkHooks([pending], owner, (item) => {
-            state.failed = item
-          })
+          ;[hookResult] = await this.runLinkHooks(
+            [pending],
+            owner,
+            (item) => {
+              state.failed = item
+            },
+            request.hookResult === true
+          )
         } finally {
           pending.turn.release()
         }
@@ -791,7 +810,9 @@ export class Server extends EventEmitter {
       resultWriteStarted = true
       await writeLinkResult(
         socket,
-        { v: 1, status: decided.status },
+        hookResult === undefined
+          ? { v: 1, status: decided.status }
+          : { v: 1, status: decided.status, hookResult },
         { signal: this.signal, timeout: this.idleTimeout }
       )
       emitTerminal(decided.status === 'LINKED' ? 'linked' : 'unchanged')
@@ -889,21 +910,25 @@ export class Server extends EventEmitter {
     }
   }
 
-  /** Runs a gating callback; only callback exceptions become HOOK_FAILED. */
+  /**
+   * Runs a gating callback; only callback exceptions become HOOK_FAILED. Returns
+   * what the callback returned, for the one caller that reads it.
+   */
   private async runHook<Context>(
     phase: 'beforeCommit' | 'afterCommit' | 'afterLink',
-    hook: ((context: Context) => void | Promise<void>) | undefined,
+    hook: ((context: Context) => unknown) | undefined,
     context: Context
-  ): Promise<void> {
-    if (hook === undefined) return
+  ): Promise<unknown> {
+    if (hook === undefined) return undefined
     throwIfAborted(this.signal)
-    let outcome: 'completed' | 'aborted'
+    let outcome: HookOutcome
     try {
       outcome = await invokeHook(hook, context, this.signal)
     } catch (cause) {
       throw hookError(phase, cause)
     }
-    if (outcome === 'aborted') throw abortError()
+    if (outcome.status === 'aborted') throw abortError()
+    return outcome.value
   }
 
   /** Runs onFailure once; its own failure is logged and never replaces the original. */

@@ -1,5 +1,6 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError, type ErrorCode } from '../errors.js'
+import { copyHookResult, type HookResult } from '../hook-result.js'
 import { MAX_TREE_ENTRIES } from './tree-path.js'
 import { deterministicTarSize, MAX_USTAR_FILE_BYTES, TAR_BLOCK_BYTES } from './ustar.js'
 
@@ -52,11 +53,21 @@ export interface LinkRequestRecord {
   kind: 'link'
   target: string
   name: string
+  /**
+   * Opt-in: asks the server to return what its `afterLink` hook returned. The
+   * field is sent only when `true`, so a default request keeps its exact
+   * four-field shape and an older strict server rejects an opted-in one.
+   */
+  hookResult?: true
 }
 
+/**
+ * `hookResult` appears only on an answer to a request that asked for it, and
+ * only when the hook returned an object.
+ */
 export type LinkResultRecord =
-  | { v: typeof CONTROL_VERSION; status: 'LINKED' }
-  | { v: typeof CONTROL_VERSION; status: 'UNCHANGED' }
+  | { v: typeof CONTROL_VERSION; status: 'LINKED'; hookResult?: HookResult }
+  | { v: typeof CONTROL_VERSION; status: 'UNCHANGED'; hookResult?: HookResult }
   | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode }
 
 /**
@@ -252,13 +263,18 @@ function validateAnyMetadata(value: unknown): AnyMetadataRecord {
     : validateMetadata(value)
 }
 
+const LINK_REQUEST_KEYS = ['v', 'kind', 'target', 'name']
+
 function validateLinkRequest(value: unknown): LinkRequestRecord {
   if (!isRecord(value)) throw invalid('Link request record must be an object')
-  exactKeys(value, ['v', 'kind', 'target', 'name'])
+  const asksForResult = Object.prototype.hasOwnProperty.call(value, 'hookResult')
+  exactKeys(value, asksForResult ? [...LINK_REQUEST_KEYS, 'hookResult'] : LINK_REQUEST_KEYS)
   assertVersion(value.v)
   if (value.kind !== 'link') throw invalid('Invalid control request kind')
   assertName(value.target)
   assertName(value.name)
+  // Only `true` opts in; `false` would be a second spelling of the default.
+  if (asksForResult && value.hookResult !== true) throw invalid('Invalid hook result request')
   return value as unknown as LinkRequestRecord
 }
 
@@ -307,7 +323,16 @@ function validateLinkResult(value: unknown): LinkResultRecord {
   if (!isRecord(value)) throw invalid('Link result record must be an object')
   assertVersion(value.v)
   if (value.status === 'LINKED' || value.status === 'UNCHANGED') {
-    exactKeys(value, ['v', 'status'])
+    const hasResult = Object.prototype.hasOwnProperty.call(value, 'hookResult')
+    exactKeys(value, hasResult ? ['v', 'status', 'hookResult'] : ['v', 'status'])
+    if (hasResult) {
+      try {
+        // Decoded input is a fresh parse, so the checked original is what is returned.
+        copyHookResult(value.hookResult)
+      } catch (error) {
+        throw invalid('Invalid hook result', error)
+      }
+    }
   } else if (value.status === 'FAILED') {
     exactKeys(value, ['v', 'status', 'code'])
     assertStableCode(value.code)
