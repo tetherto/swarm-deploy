@@ -175,8 +175,9 @@ one-argument `--symlink` rule. Success prints exactly:
 <link-name> -> <target> <LINKED|UNCHANGED>
 ```
 
-`LINKED` means the link was created or repointed. `UNCHANGED` means the same
-managed link already points at that target; the operation is idempotent.
+`LINKED` means the link was created, repointed, or taken over from an existing
+unmanaged symlink. `UNCHANGED` means the same managed link already points at
+that target; the operation is idempotent.
 
 If `<link-name>` is already a symlink that the server does not manage (for
 example one made by hand), the command replaces that symlink atomically with the

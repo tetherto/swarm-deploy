@@ -105,6 +105,20 @@ after the swap and before the record is written, repeat the same request: it
 takes the link over again and returns `LINKED`. A failing `afterLink` hook
 leaves the taken-over link in place, and the retry returns `UNCHANGED`.
 
+**Case-insensitive volumes.** Ownership records are keyed by the exact spelling
+of a link name, but on a case-insensitive filesystem (the default on macOS and
+Windows) `Latest` and `latest` are one directory entry. A request for another
+spelling of a recorded link, automatic or manual, is therefore never treated as
+an unrecorded symlink: before the swap the server requires the entry to be listed
+in the root under exactly the requested spelling and compares its inode with that
+of every protected name that differs only in case (each recorded link, each
+configured automatic link name even while its rule is dormant, and each managed
+artifact), and fails with `LINK_CONFLICT` if one resolves to the same entry. This
+also covers a recorded link that someone renamed in case outside the server, and
+it fails closed if the storage reports no inode identities while such a protected
+variant exists. On a case-sensitive filesystem, `latest` and `Latest` are
+distinct entries and stay independent.
+
 Manual links retain their selected target across restart and automatic
 reconciliation. Removing their authorization rule prevents future requests
 that need that rule but does not remove or rewrite the existing link.

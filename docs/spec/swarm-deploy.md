@@ -582,8 +582,21 @@ requested target, which the same request takes over again on retry. Automatic
 reconciliation and startup never take over an unrecorded symlink, and a record
 that is automatic, version 1, malformed, or foreign is not unrecorded.
 
-`LINKED` means the link was created, repointed, or its crash-residual state was
-completed. `UNCHANGED` means the durable manual ownership already selects the
+Ownership records are keyed by the exact spelling of a name, but on a
+case-insensitive volume names that differ only in case are one directory entry.
+The same re-check therefore also requires the root listing to contain the entry
+under exactly the requested spelling, and compares the entry's inode identity
+with that of every protected name that differs only in case: each recorded name,
+each configured automatic link name (reserved even before it has a record), and
+each managed artifact name. If one resolves to the same entry, or identities are
+unavailable, the request fails with `LINK_CONFLICT` and nothing is replaced,
+which also covers a recorded link that was renamed in case outside the server.
+On a case-sensitive volume such names are distinct entries and remain
+independent.
+
+`LINKED` means the link was created, repointed, taken over from an unrecorded
+symlink, or its crash-residual state was completed. `UNCHANGED` means the
+durable manual ownership already selects the
 requested target. The operation is idempotent: a retry after an acknowledged
 or ambiguous result converges to that target and returns `UNCHANGED` once the
 durable state already agrees. When a current target was replaced in place, an
@@ -605,6 +618,10 @@ is created. For replacement, a private sibling-target symlink is synchronized
 and atomically renamed over the proven owned destination before the record is
 rewritten. Temporary links are swept and each operation is level-triggered, so
 a retry can complete either crash point without claiming an unmanaged path.
+An explicit manual takeover of an unrecorded symlink follows the replacement
+order (swap, then record). Its crash residue is an unrecorded symlink at the
+requested target, which only the same explicit manual request takes over again
+(it returns `LINKED`); automatic reconciliation and startup never claim it.
 
 Automatic reconciliation ignores manual records and therefore never repoints
 or removes a manual link. Manual mutation rejects automatic records and
@@ -647,9 +664,14 @@ Stable manual-link failures are:
 
 - `LINK_NOT_ALLOWED`: self-link, target-policy, or automatic-name rejection;
 - `LINK_TARGET_NOT_FOUND`: no current managed target with that name;
-- `LINK_CONFLICT`: artifact-name collision or an unowned, changed, automatic,
-  or otherwise unmanaged destination;
-- `LINK_FAILED`: storage, transport-result, or other link-operation failure.
+- `LINK_CONFLICT`: artifact-name collision, or a destination that cannot be
+  taken over: a regular file or directory, a symlink with an automatic or
+  version 1 record, a recorded link that was changed externally, a symlink that
+  changed or gained a record during takeover, or a case variant of a recorded
+  link. An unrecorded symlink at the requested manual name is not a conflict; an
+  explicit manual request takes it over;
+- `LINK_FAILED`: storage, transport-result, or other link-operation failure,
+  including a malformed or foreign ownership record.
 
 `UNSUPPORTED_STORAGE` remains the construction-time failure when configured
 symlink policy needs an adapter without `symlink` and `readlink`.

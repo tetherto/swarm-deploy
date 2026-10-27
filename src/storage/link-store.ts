@@ -513,17 +513,48 @@ export class LinkStore {
     return result
   }
 
+  /** A visible entry's identity, `'missing'` when absent, or `null` when the adapter reports none. */
+  private entryIdentity(name: string): Promise<LinkIdentity | 'missing'> {
+    return withSafeDirectoryIdentity(this.layout.root, this.storage, async () => {
+      try {
+        return identityOf(await this.storage.lstat(this.finalPath(name)))
+      } catch (error: unknown) {
+        if (isMissing(error)) return 'missing' as const
+        throw error
+      }
+    })
+  }
+
   /**
    * Re-proves, immediately before a takeover swap, that the destination is still
    * the unrecorded symlink that was inspected: same literal, same inode when the
    * adapter reports one, and still no ownership record. Anything else (a file, a
    * directory, another symlink, a new record) fails closed. The old literal is
-   * only compared as text, never resolved. This narrows the window but cannot
-   * close it: the adapter has no compare-and-swap rename, so a writer outside
-   * this process that changes the path between this check and the rename can
-   * still be replaced.
+   * only compared as text, never resolved.
+   *
+   * Records are keyed by the exact spelling of a name, but on a case-insensitive
+   * volume `Latest` and `latest` are one directory entry, so a request for one
+   * spelling would otherwise miss the record of the other and replace a link that
+   * is recorded. Two filesystem-aware checks close that: the entry must be listed
+   * in the root under exactly the requested spelling, and no protected name that
+   * differs only in case may resolve to the same entry. Protected names are every
+   * recorded name (so an externally case-renamed recorded link is caught) and the
+   * configured automatic link names and managed artifact names passed in, which
+   * are reserved even before they have a record. Names that are genuinely distinct
+   * on a case-sensitive volume, including a recorded `latest` beside an unrecorded
+   * `Latest`, stay independent. If the adapter reports no inode identity and a
+   * protected case variant exists, independence cannot be proven and the request
+   * fails closed.
+   *
+   * This narrows the window but cannot close it: the adapter has no
+   * compare-and-swap rename, so a writer outside this process that changes the
+   * path between this check and the rename can still be replaced.
    */
-  private async assertUnrecordedSymlinkUnchanged(name: string, seen: Destination): Promise<void> {
+  private async assertTakeoverStillSafe(
+    name: string,
+    seen: Destination,
+    reserved: Iterable<string>
+  ): Promise<void> {
     if (seen.state !== 'SYMLINK') throw failure('Invalid takeover state')
     const now = await this.classify(name)
     if (
@@ -536,6 +567,23 @@ export class LinkStore {
     ) {
       throw conflict('Existing symlink changed while it was being taken over')
     }
+    const entries = await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
+      this.storage.readdir(this.layout.root)
+    )
+    if (!entries.includes(name)) {
+      throw conflict('Existing symlink is another spelling of a different directory entry')
+    }
+    const protectedNames = new Set(reserved)
+    for (const record of await this.listRecords()) protectedNames.add(record.name)
+    const folded = name.toLowerCase()
+    for (const other of protectedNames) {
+      if (other === name || other.toLowerCase() !== folded) continue
+      const identity = await this.entryIdentity(other)
+      if (identity === 'missing') continue
+      if (identity === null || now.identity === null || identitiesEqual(identity, now.identity)) {
+        throw conflict('Existing symlink is a case variant of a protected managed name')
+      }
+    }
   }
 
   private async convergeManual(
@@ -545,8 +593,10 @@ export class LinkStore {
     if (
       !managedArtifactNames ||
       typeof managedArtifactNames.has !== 'function' ||
+      typeof managedArtifactNames[Symbol.iterator] !== 'function' ||
       !automaticLinkNames ||
-      typeof automaticLinkNames.has !== 'function'
+      typeof automaticLinkNames.has !== 'function' ||
+      typeof automaticLinkNames[Symbol.iterator] !== 'function'
     ) {
       throw failure('Invalid manual link options')
     }
@@ -588,8 +638,9 @@ export class LinkStore {
       // visible text and the record agree for every later comparison. The swap comes
       // first and the record second: a crash between them leaves a symlink at the
       // requested target that this same request takes over again on retry.
+      const reserved = [...automaticLinkNames, ...managedArtifactNames]
       await this.replaceLink(link, 'manual', () =>
-        this.assertUnrecordedSymlinkUnchanged(link.name, destination)
+        this.assertTakeoverStillSafe(link.name, destination, reserved)
       )
       return { status: 'LINKED' }
     }

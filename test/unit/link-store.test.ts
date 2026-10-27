@@ -833,3 +833,200 @@ test('a failure before the swap leaves the legacy link and payload exactly as th
   fail = false
   t.alike(await requestLatest(links), { status: 'LINKED' })
 })
+
+/** Whether this volume treats names that differ only in case as one directory entry. */
+async function caseInsensitive(layout: StorageLayout): Promise<boolean> {
+  const probe = path.join(layout.root, 'case-probe')
+  await fs.promises.writeFile(probe, 'probe')
+  try {
+    await fs.promises.lstat(path.join(layout.root, 'CASE-PROBE'))
+    return true
+  } catch {
+    return false
+  } finally {
+    await fs.promises.rm(probe, { force: true })
+  }
+}
+
+test('a case variant of a recorded link never bypasses its ownership record', async (t) => {
+  for (const mode of ['automatic', 'manual'] as const) {
+    const { links, layout } = await createStore(t)
+    await mkdirs(layout, ['release-1', 'release-2'])
+    const options: ManualLinkOptions = {
+      managedArtifactNames: new Set(['release-1', 'release-2']),
+      automaticLinkNames: new Set<string>(mode === 'automatic' ? ['latest'] : [])
+    }
+    const converge = (): Promise<unknown> =>
+      mode === 'automatic'
+        ? links.reconcile([desired('latest', 'release-1', LATEST_ID)], new Set(['latest']))
+        : links.linkManual(desired('latest', 'release-1', LATEST_ID), options)
+    await converge()
+    const recorded = await links.read('latest')
+    const request = (): Promise<unknown> =>
+      links.linkManual(desired('Latest', 'release-2', NEXT_ID), options)
+
+    if (await caseInsensitive(layout)) {
+      await t.exception(request, { code: ERRORS.LINK_CONFLICT }, `${mode}: one entry, one owner`)
+      t.is(await fs.promises.readlink(latestPath(layout)), 'release-1')
+      t.alike(await links.read('latest'), recorded)
+      t.is(await links.read('Latest'), null, 'no second record for the same entry')
+      t.alike(await fs.promises.readdir(layout.publications), [])
+      await converge()
+      t.alike(await links.read('latest'), recorded, `${mode}: later convergence is undisturbed`)
+    } else {
+      t.alike(await request(), { status: 'LINKED' }, `${mode}: a distinct entry on this volume`)
+      t.is(await fs.promises.readlink(latestPath(layout)), 'release-1')
+      t.is(await fs.promises.readlink(path.join(layout.root, 'Latest')), 'release-2')
+      t.alike(await links.read('latest'), recorded)
+      t.is((await links.read('Latest'))?.target, 'release-2')
+    }
+  }
+})
+
+test('a case-only external rename of a recorded link keeps its record protected', async (t) => {
+  const { links, layout } = await createStore(t)
+  await mkdirs(layout, ['release-1', 'release-2'])
+  const options: ManualLinkOptions = {
+    managedArtifactNames: new Set(['release-1', 'release-2']),
+    automaticLinkNames: new Set<string>()
+  }
+  await links.linkManual(desired('latest', 'release-1', LATEST_ID), options)
+  const recorded = await links.read('latest')
+  await fs.promises.rename(latestPath(layout), path.join(layout.root, 'Latest'))
+  const request = (): Promise<unknown> =>
+    links.linkManual(desired('Latest', 'release-2', NEXT_ID), options)
+
+  if (await caseInsensitive(layout)) {
+    t.ok((await fs.promises.readdir(layout.root)).includes('Latest'), 'the entry is now `Latest`')
+    await t.exception(request, { code: ERRORS.LINK_CONFLICT })
+    t.is(await fs.promises.readlink(path.join(layout.root, 'Latest')), 'release-1')
+    t.alike(await links.read('latest'), recorded)
+    t.is(await links.read('Latest'), null)
+  } else {
+    t.alike(await request(), { status: 'LINKED' }, 'a distinct name on this volume')
+    t.is(await fs.promises.readlink(path.join(layout.root, 'Latest')), 'release-2')
+  }
+  t.alike(await fs.promises.readdir(layout.publications), [])
+})
+
+test('takeover needs no inode identities, but fails closed beside a case-variant record without them', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const base = createStorage()
+  const blind: StorageAdapter = {
+    ...base,
+    async lstat(target) {
+      const stat = await base.lstat(target)
+      if (!stat.isSymbolicLink()) return stat
+      return {
+        dev: Number.NaN,
+        ino: Number.NaN,
+        size: stat.size,
+        isSymbolicLink: () => true,
+        isDirectory: () => false,
+        isFile: () => false
+      }
+    }
+  }
+  const blindLinks = new LinkStore({ layout, storage: blind })
+  const links = new LinkStore({ layout, storage: base })
+  await mkdirs(layout, ['0.20.0', '0.20.1'])
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  t.alike(await requestLatest(blindLinks), { status: 'LINKED' }, 'the text checks still hold')
+  t.is(await fs.promises.readlink(latestPath(layout)), '0.20.1')
+
+  if (await caseInsensitive(layout)) {
+    t.pass('names differing in case are one entry on this volume; see the case-alias tests')
+    return
+  }
+  const variant = path.join(layout.root, 'Latest')
+  await fs.promises.symlink('0.20.0', variant)
+  await t.exception(() => blindLinks.linkManual(desired('Latest', '0.20.1', NEXT_ID), manual()), {
+    code: ERRORS.LINK_CONFLICT
+  })
+  t.is(await fs.promises.readlink(variant), '0.20.0', 'independence could not be proven')
+  t.alike(await links.linkManual(desired('Latest', '0.20.1', NEXT_ID), manual()), {
+    status: 'LINKED'
+  })
+  t.is(await fs.promises.readlink(variant), '0.20.1', 'identities prove them distinct')
+})
+
+test('a case variant of a configured automatic name or managed artifact name is never taken over', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const base = createStorage()
+  const blind: StorageAdapter = {
+    ...base,
+    async lstat(target) {
+      const stat = await base.lstat(target)
+      if (!stat.isSymbolicLink()) return stat
+      return {
+        dev: Number.NaN,
+        ino: Number.NaN,
+        size: stat.size,
+        isSymbolicLink: () => true,
+        isDirectory: () => false,
+        isFile: () => false
+      }
+    }
+  }
+  const links = new LinkStore({ layout, storage: base })
+  const blindLinks = new LinkStore({ layout, storage: blind })
+  const insensitive = await caseInsensitive(layout)
+  await mkdirs(layout, ['release-1', 'release-2', 'Build-1'])
+
+  // A hand-made `Latest` while the automatic `latest` rule is dormant: no record, no link.
+  const reservedOptions: ManualLinkOptions = {
+    managedArtifactNames: new Set(['release-1', 'release-2']),
+    automaticLinkNames: new Set(['latest'])
+  }
+  const variant = path.join(layout.root, 'Latest')
+  await fs.promises.symlink('release-1', variant)
+  const takeVariant = (): Promise<unknown> =>
+    links.linkManual(desired('Latest', 'release-2', NEXT_ID), reservedOptions)
+  if (insensitive) {
+    await t.exception(takeVariant, { code: ERRORS.LINK_CONFLICT }, 'the reserved automatic name')
+    t.is(await fs.promises.readlink(variant), 'release-1')
+    t.alike(await links.list(), [], 'nothing is recorded')
+  } else {
+    t.alike(await takeVariant(), { status: 'LINKED' }, 'a distinct name on this volume')
+    t.is(await fs.promises.readlink(variant), 'release-2')
+  }
+
+  // `Build-1` is a managed artifact directory; `build-1` is a hand-made symlink name.
+  const artifactOptions: ManualLinkOptions = {
+    managedArtifactNames: new Set(['release-2', 'Build-1']),
+    automaticLinkNames: new Set<string>()
+  }
+  const alias = path.join(layout.root, 'build-1')
+  const takeAlias = (store: LinkStore): Promise<unknown> =>
+    store.linkManual(desired('build-1', 'release-2', NEXT_ID), artifactOptions)
+  if (insensitive) {
+    await t.exception(() => takeAlias(links), { code: ERRORS.LINK_CONFLICT }, 'the artifact entry')
+  } else {
+    await fs.promises.symlink('release-1', alias)
+    await t.exception(() => takeAlias(blindLinks), { code: ERRORS.LINK_CONFLICT })
+    t.is(await fs.promises.readlink(alias), 'release-1', 'independence could not be proven')
+    t.alike(await takeAlias(links), { status: 'LINKED' }, 'identities prove them distinct')
+    t.is(await fs.promises.readlink(alias), 'release-2')
+  }
+  t.ok((await fs.promises.lstat(path.join(layout.root, 'Build-1'))).isDirectory())
+  t.alike(await fs.promises.readdir(layout.publications), [])
+})
+
+test('takeover requires the destination to be listed under exactly the requested spelling', async (t) => {
+  const layout = initLayout(await createTempDir(t))
+  const base = createStorage()
+  const storage: StorageAdapter = {
+    ...base,
+    async readdir(target) {
+      const names = await base.readdir(target)
+      return target === layout.root ? names.filter((name) => name !== 'latest') : names
+    }
+  }
+  const links = new LinkStore({ layout, storage })
+  await mkdirs(layout, ['0.20.0', '0.20.1'])
+  await fs.promises.symlink('0.20.0', latestPath(layout))
+  await t.exception(() => requestLatest(links), { code: ERRORS.LINK_CONFLICT })
+  t.is(await fs.promises.readlink(latestPath(layout)), '0.20.0')
+  t.is(await links.read('latest'), null)
+  t.alike(await fs.promises.readdir(layout.publications), [])
+})

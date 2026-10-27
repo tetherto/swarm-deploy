@@ -188,9 +188,11 @@ seeds, and TAR bytes:
   every other hook artifact. For a request it is read from the durable commit
   record, so it has no `sourceParent`.
 - `status`: the link decision this call observed, never proof of publication.
-  `LINKED` when this call created or repointed the link, or repaired an
-  automatic link's ownership record; `UNCHANGED` when the link already pointed
-  at the target. An earlier attempt, another commit's retention pass or
+  `LINKED` when this call created or repointed the link, took over an
+  unrecorded symlink (even one whose old text already read as the target, since
+  the swap is what established ownership), or repaired an automatic link's
+  ownership record; `UNCHANGED` when the link was already owned and already
+  pointed at the target. An earlier attempt, another commit's retention pass or
   reconciliation, or a concurrent request may have moved the link first, so a
   fresh upload or request can still see `UNCHANGED`, and a manual
   ownership-metadata refresh for the same target is `UNCHANGED` too. Neither
