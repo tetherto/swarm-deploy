@@ -100,10 +100,11 @@ interface RollbackJournal {
 /**
  * What `convergeManual` needs from a request that journals its change. `begin` is
  * awaited with the state the request found, right before its first change, and is
- * never called for a request that changes nothing. `withdraw` is called when
- * creating the link failed before any link existed; it puts the previous record
- * back only while the journal and the record are still this request's own, and
- * throws `LINK_FAILED`, changing nothing, otherwise.
+ * never called for a request that changes nothing. `withdraw` is called only when
+ * creating the link found an entry already there (`EEXIST`), so no link of the
+ * request's exists; it puts the previous record back only while the journal and
+ * the record are still this request's own, and throws `LINK_FAILED`, changing
+ * nothing, otherwise. Every other failure is left to the journal's own restore.
  */
 interface Journaling {
   begin(prior: { record: ManagedSymlinkRecord | null; destination: Destination }): Promise<void>
@@ -564,6 +565,13 @@ export class LinkStore {
    * record it replaced instead of deleting the name's record: with a previous
    * record on file, deleting it would leave a state the journal rightly refuses
    * to restore. It proves the journal and the record are still its own first.
+   *
+   * Only `EEXIST` says the link was not created: `symlink` never overwrites, so
+   * the entry it found was there before and is left alone. Any other failure may
+   * have been reported after the link appeared (revalidating the directory can
+   * fail once the call has succeeded), so a journaled request does not assume
+   * the link is absent: it keeps its record and journal and rethrows, and the
+   * caller's undo looks at what exists and restores it or fails closed.
    */
   private async createLink(
     link: DesiredLink,
@@ -576,12 +584,13 @@ export class LinkStore {
         this.storage.symlink(link.target, this.finalPath(link.name))
       )
     } catch (error: unknown) {
-      // A failed restore is not the conflict that caused it: it surfaces as itself.
-      if (withdraw) await withdraw()
-      else await this.removeRecord(link.name).catch(() => {})
       if (errorCode(error) === 'EEXIST') {
+        // A failed restore is not the conflict that caused it: it surfaces as itself.
+        if (withdraw) await withdraw()
+        else await this.removeRecord(link.name).catch(() => {})
         throw conflict('Unmanaged path at a configured managed link name')
       }
+      if (!withdraw) await this.removeRecord(link.name).catch(() => {})
       throw error
     }
     await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
@@ -781,7 +790,7 @@ export class LinkStore {
       journal: RollbackJournal | null
       /** The first write of the journal returned, so it is on disk. */
       durable: boolean
-      /** Creating the link failed and the previous record is back: nothing of ours remains. */
+      /** Another entry was already at the name and the previous record is back: nothing of ours remains. */
       undone: boolean
     } = { journal: null, durable: false, undone: false }
     try {
@@ -850,8 +859,8 @@ export class LinkStore {
       if (persisted === null) return
       if (persisted.token !== journal.token) throw failure('Rollback journal was replaced')
     }
-    // `undone`: the link was never created and the previous record is back, so the
-    // journal has nothing left to restore, whatever now sits at the link name.
+    // `undone`: the creation found somebody else's entry and the previous record is back, so
+    // the journal has nothing left to restore, and that entry is never ours to touch.
     if (held.undone) await this.removeOwnedJournal(journal)
     else await this.settle(journal)
   }

@@ -1617,8 +1617,8 @@ test('when the failed creation cannot be undone the answer is LINK_FAILED, and t
   const prior = PRIORS[1]
   const crash: Crash = { count: 0, at: null, dead: false }
 
-  // The symlink fails once and putting the previous record back fails twice (the immediate
-  // attempt and the retry through the journal), then storage is healthy.
+  // The symlink fails once and putting the previous record back fails once (the journal's
+  // restore, which is the only attempt), then storage is healthy.
   {
     let symlinkFailed = false
     let recordWrites = 0
@@ -1629,7 +1629,7 @@ test('when the failed creation cannot be undone the answer is LINK_FAILED, and t
           throw new Error('injected one-off symlink failure')
         }
         if (symlinkFailed && name === 'rename' && rest[0] === recordFile(where, 'latest')) {
-          if (++recordWrites <= 2) throw new Error('injected record write failure')
+          if (++recordWrites <= 1) throw new Error('injected record write failure')
         }
       }
     }))
@@ -1692,45 +1692,240 @@ test('a failed creation puts nothing back over a journal or record that is no lo
     ['an edited record under the request’s own journal', { journal: false, record: true }],
     ['a replaced journal over the request’s own record', { journal: true, record: false }]
   ]
+  // The failure is either a one-off one before anything exists, or an operator's file that
+  // wins the creation race (`EEXIST`), which is the case the request withdraws its record for.
+  const failures: Array<[string, boolean]> = [
+    ['a one-off failure', false],
+    ['a file winning the creation race', true]
+  ]
   for (const prior of [PRIORS[1], PRIORS[0]]) {
-    for (const [name, changes] of variants) {
-      const label = `${prior.label}, ${name}`
-      let failed = false
-      let journal = ''
-      const crash: Crash = { count: 0, at: null, dead: false }
-      const { layout, links } = await scenarioStore(t, prior, crash, (where) => ({
-        async beforeOperation(operation, target) {
-          if (operation !== 'symlink' || target !== latestPath(where) || failed) return
-          failed = true
-          if (changes.journal) {
-            const replaced = { ...(await readJournalFile(where)), token: 'f'.repeat(32) }
-            await fs.promises.writeFile(journalFile(where), JSON.stringify(replaced))
+    for (const [how, race] of failures) {
+      for (const [name, changes] of variants) {
+        const label = `${prior.label}, ${how}, ${name}`
+        let failed = false
+        let journal = ''
+        const crash: Crash = { count: 0, at: null, dead: false }
+        const { layout, links } = await scenarioStore(t, prior, crash, (where) => ({
+          async beforeOperation(operation, target) {
+            if (operation !== 'symlink' || target !== latestPath(where) || failed) return
+            failed = true
+            if (race) await fs.promises.writeFile(latestPath(where), 'operator file')
+            if (changes.journal) {
+              const replaced = { ...(await readJournalFile(where)), token: 'f'.repeat(32) }
+              await fs.promises.writeFile(journalFile(where), JSON.stringify(replaced))
+            }
+            if (changes.record) {
+              await fs.promises.writeFile(recordFile(where, 'latest'), JSON.stringify(foreign))
+            }
+            journal = await fs.promises.readFile(journalFile(where), 'utf8')
+            if (!race) throw Object.assign(new Error('injected EIO'), { code: 'EIO' })
           }
-          if (changes.record) {
-            await fs.promises.writeFile(recordFile(where, 'latest'), JSON.stringify(foreign))
-          }
-          journal = await fs.promises.readFile(journalFile(where), 'utf8')
-          throw Object.assign(new Error('injected EIO'), { code: 'EIO' })
+        }))
+        await t.exception(() => begin(links, prior), { code: ERRORS.LINK_FAILED }, label)
+        t.ok(failed, `${label}: the failure was injected`)
+        const intended: ManagedSymlinkRecord = {
+          ...foreign,
+          target: prior.target,
+          transferId: prior.id
         }
-      }))
-      await t.exception(() => begin(links, prior), { code: ERRORS.LINK_FAILED }, label)
-      t.ok(failed, `${label}: the failure was injected`)
-      const intended: ManagedSymlinkRecord = {
-        ...foreign,
-        target: prior.target,
-        transferId: prior.id
+        t.alike(
+          await observe(layout, links),
+          { link: race ? 'UNMANAGED' : null, record: changes.record ? foreign : intended },
+          `${label}: the record is exactly as found, not the previous one`
+        )
+        t.is(
+          await fs.promises.readFile(journalFile(layout), 'utf8'),
+          journal,
+          `${label}: the journal is left exactly as it was`
+        )
+        t.alike(await fs.promises.readdir(layout.publications), [], label)
       }
+    }
+  }
+})
+
+/** A storage failure that is not `EEXIST`, so it does not say whether anything was created. */
+const eio = (): Error => Object.assign(new Error('injected EIO'), { code: 'EIO' })
+
+test('a creation that fails after the link appeared is undone through the journal, or keeps it', async (t) => {
+  // Each injection lets the real `symlink()` succeed and then reports a failure.
+  const reports: Array<
+    [string, (where: StorageLayout, state: { failed: boolean }) => CreateStorageOptions]
+  > = [
+    [
+      'the directory revalidation after the call fails',
+      (where, state) => {
+        let created = false
+        return {
+          afterOperation(name, target) {
+            if (name === 'symlink' && target === latestPath(where)) created = true
+          },
+          beforeOperation(name, target) {
+            if (created && !state.failed && name === 'lstat' && target === where.root) {
+              state.failed = true
+              throw eio()
+            }
+          }
+        }
+      }
+    ],
+    [
+      'the storage rejects after it created the link',
+      (where, state) => ({
+        afterOperation(name, target) {
+          if (name === 'symlink' && target === latestPath(where) && !state.failed) {
+            state.failed = true
+            throw eio()
+          }
+        }
+      })
+    ]
+  ]
+  for (const prior of [PRIORS[1], PRIORS[0]]) {
+    for (const [name, inject] of reports) {
+      const label = `${prior.label}, ${name}`
+      const state = { failed: false }
+      const crash: Crash = { count: 0, at: null, dead: false }
+      const { layout, links, before } = await scenarioStore(t, prior, crash, (where) =>
+        inject(where, state)
+      )
+      await t.exception(() => begin(links, prior), { code: ERRORS.LINK_FAILED }, label)
+      t.ok(state.failed, `${label}: the failure was injected after the link was created`)
       t.alike(
         await observe(layout, links),
-        { link: null, record: changes.record ? foreign : intended },
-        `${label}: the record is exactly as found, not the previous one`
+        before,
+        `${label}: the created link is gone and the previous record is back`
       )
-      t.is(
-        await fs.promises.readFile(journalFile(layout), 'utf8'),
-        journal,
-        `${label}: the journal is left exactly as it was`
-      )
+      t.absent(await exists(journalFile(layout)), `${label}: nothing is left blocking the name`)
       t.alike(await fs.promises.readdir(layout.publications), [], label)
+      const next = await begin(links, prior)
+      t.is(next.status, 'LINKED', `${label}: the next request works`)
+      await links.rollbackManual(next.transaction!)
+      t.alike(await observe(layout, links), before, `${label}: and restores as usual`)
+    }
+  }
+
+  // The link exists and removing it fails once: the request's link, its record, and its
+  // journal all stay, so no state is left without recovery data, and the next request finishes.
+  for (const prior of [PRIORS[1], PRIORS[0]]) {
+    const label = `${prior.label}, the created link cannot be removed`
+    let created = false
+    let revalidated = false
+    let removals = 0
+    const crash: Crash = { count: 0, at: null, dead: false }
+    const { layout, links, before } = await scenarioStore(t, prior, crash, (where) => ({
+      afterOperation(name, target) {
+        if (name === 'symlink' && target === latestPath(where)) created = true
+      },
+      beforeOperation(name, target) {
+        if (created && !revalidated && name === 'lstat' && target === where.root) {
+          revalidated = true
+          throw eio()
+        }
+        if (revalidated && name === 'unlink' && target === latestPath(where) && ++removals === 1) {
+          throw eio()
+        }
+      }
+    }))
+    await t.exception(() => begin(links, prior), { code: ERRORS.LINK_FAILED }, label)
+    t.is(removals, 1, `${label}: the removal was attempted and failed`)
+    t.alike(
+      await observe(layout, links),
+      {
+        link: prior.target,
+        record: {
+          version: 2,
+          mode: 'manual',
+          name: 'latest',
+          target: prior.target,
+          transferId: prior.id,
+          targetKind: 'directory'
+        }
+      },
+      `${label}: the link keeps its own record`
+    )
+    t.ok(await exists(journalFile(layout)), `${label}: and its journal`)
+    const next = await begin(links, prior)
+    t.is(next.status, 'LINKED', `${label}: the next request finishes the undo and goes ahead`)
+    await links.rollbackManual(next.transaction!)
+    t.alike(await observe(layout, links), before, `${label}: and restores as usual`)
+    t.absent(await exists(journalFile(layout)), label)
+  }
+})
+
+test('a failed creation never removes, adopts, or erases the record for an entry it did not make', async (t) => {
+  const entryAt = async (file: string) => {
+    const stat = await fs.promises.lstat(file)
+    const text = stat.isSymbolicLink()
+      ? await fs.promises.readlink(file)
+      : await fs.promises.readFile(file, 'utf8')
+    return { dev: stat.dev, ino: stat.ino, text }
+  }
+  const entries: Array<[string, (file: string, prior: Prior) => Promise<void>]> = [
+    ['a file', (file) => fs.promises.writeFile(file, 'operator file')],
+    ['a symlink to the requested target', (file, prior) => fs.promises.symlink(prior.target, file)],
+    ['a symlink to another target', (file) => fs.promises.symlink('0.20.0', file)]
+  ]
+  for (const prior of [PRIORS[1], PRIORS[0]]) {
+    for (const [name, make] of entries) {
+      // `symlink()` finds it there (`EEXIST`): it was never the request's, so it stays exactly as
+      // it is, the record the request wrote is withdrawn, and the request is a plain conflict.
+      {
+        const label = `${prior.label}, ${name} wins the race`
+        const made: { entry: Awaited<ReturnType<typeof entryAt>> | null } = { entry: null }
+        const crash: Crash = { count: 0, at: null, dead: false }
+        const { layout, links, before } = await scenarioStore(t, prior, crash, (where) => ({
+          async beforeOperation(operation, target) {
+            if (operation !== 'symlink' || target !== latestPath(where) || made.entry) return
+            await make(latestPath(where), prior)
+            made.entry = await entryAt(latestPath(where))
+          }
+        }))
+        await t.exception(() => begin(links, prior), { code: ERRORS.LINK_CONFLICT }, label)
+        t.ok(made.entry, `${label}: it was put there`)
+        t.alike(
+          await entryAt(latestPath(layout)),
+          made.entry!,
+          `${label}: it is the same entry, untouched`
+        )
+        t.alike(
+          (await observe(layout, links)).record,
+          before.record,
+          `${label}: the previous record`
+        )
+        t.absent(await exists(journalFile(layout)), `${label}: no journal is left`)
+        t.alike(await fs.promises.readdir(layout.publications), [], label)
+      }
+
+      // The failure is not `EEXIST`, so nothing says the entry is not the request's own and it
+      // is not proven to be: the entry is left alone and the journal and record are kept, so the
+      // name fails closed until it is dealt with. Only a missing entry lets the undo finish.
+      if (name === 'a symlink to the requested target') continue
+      {
+        const label = `${prior.label}, ${name} appears and the call fails otherwise`
+        const made: { entry: Awaited<ReturnType<typeof entryAt>> | null } = { entry: null }
+        const crash: Crash = { count: 0, at: null, dead: false }
+        const { layout, links } = await scenarioStore(t, prior, crash, (where) => ({
+          async beforeOperation(operation, target) {
+            if (operation !== 'symlink' || target !== latestPath(where) || made.entry) return
+            await make(latestPath(where), prior)
+            made.entry = await entryAt(latestPath(where))
+            throw eio()
+          }
+        }))
+        await t.exception(() => begin(links, prior), { code: ERRORS.LINK_FAILED }, label)
+        t.alike(await entryAt(latestPath(layout)), made.entry!, `${label}: the entry is untouched`)
+        t.ok(await exists(journalFile(layout)), `${label}: the journal is kept`)
+        t.is(
+          (await observe(layout, links)).record?.transferId,
+          prior.id,
+          `${label}: and the record`
+        )
+        await t.exception(() => begin(links, prior), { code: ERRORS.LINK_FAILED }, label)
+        t.alike(await entryAt(latestPath(layout)), made.entry!, `${label}: still untouched`)
+        await fs.promises.rm(latestPath(layout))
+        t.is((await begin(links, prior)).status, 'LINKED', `${label}: once it is gone`)
+      }
     }
   }
 })

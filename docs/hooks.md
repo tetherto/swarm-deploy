@@ -296,13 +296,18 @@ a failed refresh never makes admission less protective.
 - **What is restored.** The link and the ownership record, together. A change to
   the record alone, such as a refreshed transfer ID for an unchanged link, is
   restored too. If creating the link itself fails, for example because the
-  filesystem refused once, the record the request replaced is put back (it is
-  never simply deleted), the journal is removed, and the next request for the name
-  works. That only happens while the journal is still the request's own and the
-  record is still the previous one or the one the request wrote; a record that
-  is anything else is left as found. If that cannot be done, the answer is
-  `LINK_FAILED` and the journal stays until a later request for the name finishes
-  the restore or fails closed.
+  filesystem refused once, the failure is not taken to mean that no link was made
+  (it can be reported after the link appeared, such as a failed check of the
+  directory). The same restore then looks at what is there: it removes a link
+  the request made, puts the previous record back (the record is never simply
+  deleted), and removes the journal, and the next request for the name works. It
+  only does so while the journal is still the request's own and the link and the
+  record are still the previous state or the one the request made; anything else
+  is left as found, the answer is `LINK_FAILED`, and the journal and the
+  request's record stay until a later request for the name finishes the restore
+  or fails closed. If instead an entry was already at the name (`EEXIST`), that
+  entry is never removed or adopted, only the record the request wrote is
+  withdrawn, and the request fails with `LINK_CONFLICT`.
 - **Never over a change somebody else made.** The restore only proceeds when the
   link and the record are still the previous state or the one this request
   made (same text and, where the filesystem reports it, the same inode). A

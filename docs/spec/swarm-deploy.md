@@ -720,16 +720,27 @@ is logged by link name and changes neither the answer (`LINKED`, or the hook's
 failure after a restore) nor any state, and the name stays reserved until a later
 successful refresh replaces the snapshot.
 
-When creating the link fails (nothing existed at the name), the request puts back
-the record it replaced, or removes the record when there was none, and removes the
-journal; the name's record is never deleted while a previous record is on file.
-Before it changes the record it re-proves the fence: the journal on disk must
-still be its own, and the record must be the previous one (nothing to do) or the
-one the request wrote. Any other record is somebody else's and is left untouched.
-A restore that itself fails, or is refused for that reason, answers `LINK_FAILED`,
-not `LINK_CONFLICT`, and the
-journal stays until a later request for the name finishes the restore or fails
-closed.
+Creating the link (nothing existed at the name) is exclusive: `symlink` never
+overwrites. When it fails with `EEXIST`, the entry that was there is not the
+request's, so it is never removed or adopted; the request puts back the record it
+replaced, or removes the record when there was none, removes the journal, and
+answers `LINK_CONFLICT`. Before it changes the record it re-proves the fence: the
+journal on disk must still be its own, and the record must be the previous one
+(nothing to do) or the one the request wrote. Any other record is somebody
+else's and is left untouched.
+
+Every other failure of the creation (including one reported after the call, such
+as a failed revalidation of the root directory once the link was made) does not
+say whether the link exists, so none of it is assumed: the record and the journal
+are left as they are and the failure goes to the journal's own restore, which
+classifies what is at the name. A link at the name with the intended text is
+taken to be the request's own (the same assumption crash recovery makes while
+`applied` is unset) and is removed, then the previous record is put back and the
+journal removed. A missing link only needs the record put back. Any other entry
+is not the request's: nothing is changed, the journal and record stay, and the
+name fails closed. A restore that itself fails, or is refused for any of these
+reasons, answers `LINK_FAILED`, not `LINK_CONFLICT`, and the journal stays until a
+later request for the name finishes the restore or fails closed.
 
 Restore is compare-and-restore. The visible link must be the prior link or the
 one the request made (same text, and the same identity when both sides report
