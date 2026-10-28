@@ -10,6 +10,7 @@ import {
   type ArtifactKind,
   type BeforeCommitContext,
   type ClientLinkEvent,
+  type ClientLinkHookFailure,
   type ClientLinkOptions,
   type ClientLinkResult,
   type ClientLinkStatus,
@@ -365,7 +366,31 @@ const reportedLinkResult: ClientLinkResult = {
 }
 const reported: HookResult | undefined = reportedLinkResult.hookResult
 void [defaultLinkOptions, optedIn, declined, plainLinkResult, reported]
-// @ts-expect-error The only link option is hookResult.
+// The failure policy names what happens to the link when afterLink fails; it is independent of
+// the result request, and omitting it means rollback.
+const rollbackOptions: ClientLinkOptions = { hookFailure: 'rollback' }
+const keepOptions: ClientLinkOptions = { hookFailure: 'keep', hookResult: true }
+const policy: ClientLinkHookFailure = 'keep'
+const policyOptions: ClientLinkOptions = { hookFailure: policy }
+const keptLink: Promise<ClientLinkResult> = client.link('release-1.2.3', 'current', keepOptions)
+const restoredEvent: ServerLinkEvent = {
+  fingerprint: '0123456789ab',
+  target: 'release-1.2.3',
+  name: 'current',
+  status: 'failed',
+  reason: 'HOOK_FAILED',
+  rolledBack: true
+}
+const rolledBack: true | undefined = restoredEvent.rolledBack
+void [rollbackOptions, policyOptions, keptLink, rolledBack]
+// @ts-expect-error The failure policy is a closed set.
+const badPolicy: ClientLinkOptions = { hookFailure: 'delete' }
+// @ts-expect-error The failure policy is a word, not a flag.
+const flagPolicy: ClientLinkOptions = { hookFailure: true }
+// @ts-expect-error The server event only ever says a request was restored.
+const notRolledBack: ServerLinkEvent['rolledBack'] = false
+void [badPolicy, flagPolicy, notRolledBack]
+// @ts-expect-error The link options are hookFailure and hookResult only.
 const unknownLinkOption: ClientLinkOptions = { results: true }
 // @ts-expect-error hookResult is a boolean.
 const stringLinkOption: ClientLinkOptions = { hookResult: 'yes' }

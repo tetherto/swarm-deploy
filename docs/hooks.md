@@ -35,8 +35,9 @@ types. A runnable Node-only example is in
   success reply: for an upload, after `afterCommit` succeeded and for each
   automatic link now pointing at the uploaded artifact; for an explicit link
   request, after the request passed every policy check. Its failure fails the
-  upload or link request though the artifact and link are already stored. See
-  [Link publication hooks](#link-publication-hooks).
+  upload or link request though the artifact is already stored; an upload's
+  automatic link stays, while an explicit link request rolls its link back unless
+  it asked to keep it. See [Link publication hooks](#link-publication-hooks).
 - `onFailure(context)`: once per failed connection whose metadata was decoded,
   and once per failed `afterLink`, after the client has been answered.
 
@@ -145,9 +146,12 @@ Failure sequences:
   (`alreadyCommitted: true`) and then `afterLink` with `status: 'UNCHANGED'`.
   A failing `afterLink` on an already-committed retry rejects the offer with
   `HOOK_FAILED` and a later retry repeats it.
-- `afterLink` throws on an explicit link request: the link stays as decided, the
-  client receives a `FAILED` link result with `HOOK_FAILED`, and `onFailure`
-  runs. The same request again returns `UNCHANGED` once the hook succeeds.
+- `afterLink` throws on an explicit link request: by default the previous link
+  and ownership record are restored (a new link is removed) before the client
+  receives a `FAILED` link result with `HOOK_FAILED`, and `onFailure` runs after
+  that. The same request again links afresh (`LINKED`) once the hook succeeds. With
+  `hookFailure: 'keep'` the link stays as decided and the same request again
+  returns `UNCHANGED`. See [Rollback and its limits](#rollback-and-its-limits).
 - A failure after every hook succeeded (for example the terminal reply cannot be
   written) does not call `onFailure`.
 
@@ -220,7 +224,8 @@ seeds, and TAR bytes:
   ahead for the same link, and the deferred retention pass; for a link request,
   the queue ahead and the hook. If the client's wait expires first it reports
   `UPLOAD_IDLE_TIMEOUT` instead of `HOOK_FAILED` and closes the connection. The
-  server still runs its hooks, and the artifact and link stay durable, so a
+  server still runs its hooks and finishes the request (an explicit link is
+  finalized or restored as the hook decides; the artifact stays durable), so a
   retry is safe. Set the client idle timeout above the worst-case total, and
   make publishers fail on their own well before it.
 - **The answer is delivered.** After writing a `HOOK_FAILED` answer the server
@@ -229,34 +234,99 @@ seeds, and TAR bytes:
   `HOOK_FAILED` answer, including `beforeCommit` and `afterCommit`. Other
   failure answers are still followed by an immediate close, as before, so on a
   real network a client may see a reset rather than their stable code.
-- **No rollback.** The link is made durable before the hook runs and a failed
-  hook never undoes it, nor the committed artifact. After `HOOK_FAILED` the
-  link points where the request asked, unless a later request has moved it.
-- **Safe retry.** Repeating the same link request returns `UNCHANGED` and runs
-  the hook again, and repeating the upload takes the already-committed path
-  and runs the hooks again, so a failed publication is retried without
-  changing the link. The first attempt reports `HOOK_FAILED` and the retry
-  reports `UNCHANGED`: the result describes the link.
+- **A failed link request is rolled back by default.** The link is made
+  durable before the hook runs, so the hook sees it. When the hook then fails,
+  returns a result that cannot be sent, or is cut off because the server is
+  closing, the server restores the previous local symlink and its ownership
+  record (or removes a link the request created) before it answers
+  `HOOK_FAILED`. An adopted, unowned symlink comes back with its exact text,
+  whatever it was; the text is only stored and written back, never followed. The
+  request can opt out with `hookFailure: 'keep'` (`--hook-failure keep`), which
+  leaves the new link in place as before. Either way the request waits for the
+  hook and a failure is still `HOOK_FAILED`. See
+  [Rollback and its limits](#rollback-and-its-limits). Automatic links of an
+  upload are not rolled back.
+- **Safe retry.** Repeating the same link request runs the hook again, and
+  repeating the upload takes the already-committed path and runs the hooks
+  again, so a failed publication is retried. After a rolled-back request the
+  retry reports `LINKED`, because the link was restored; after `keep`, or for a
+  request that changed nothing, it reports `UNCHANGED`. The result describes the
+  link, not the publication.
 - **Repeatable.** Every cause above can call the hook more than once for the
   same link and artifact. Write hooks that are idempotent, identify the work by
   `link.name` plus `artifact.transferId` (and `link.target`), and treat the
   context as at-least-once.
-- **No lease across hook code.** Hook code runs after the storage-root lease is
-  released, so a slow or failing hook never blocks commits, retention, other
+- **No lease across hook code.** Hook code runs with no storage-root lease held,
+  so a slow or failing hook never blocks commits, uploads, retention, other
   links, or recovery, and a hook that calls back into the server cannot
-  deadlock on it.
-- **Per-link order.** For one link name, hooks start in the order the durable
-  link decisions were made and never overlap, so within one running server a
-  slow publication of an older decision cannot overtake the publication of a
-  newer one. Hooks for different links run concurrently. An upload takes its
-  place when it reconciles the link, so it holds that place while its
-  `afterCommit` runs. The ordering is in memory: it is not a transaction with
-  your publisher and does not survive a restart, and a hook that never returns
-  delays later hooks for that link (and their clients, until the client's idle
-  timeout) and keeps its own connection open, because there is no hook
-  timeout. A hook must not wait for another link request or upload that
-  involves the same link name on its own server, since that one is queued
-  behind it.
+  deadlock on it. The lease is taken only around the link change itself and
+  around finalizing or restoring it.
+- **Per-link order.** Explicit link requests for one link name run one at a time
+  in arrival order, in both modes, from their decision through their hook to
+  their finalize or restore. A request therefore never decides against another
+  request's unfinished change, and a queued request does not even change the link
+  until the one ahead has finished. Names are compared without regard to case,
+  as one entry on a case-insensitive volume. Requests for different links run
+  concurrently. The automatic links of an upload keep their own in-memory,
+  first-in first-out line: an upload takes its place when it reconciles the link,
+  so it holds that place while its `afterCommit` runs. Neither ordering is a
+  transaction with your publisher, and a hook that never returns delays later
+  requests for that link (and their clients, until the client's idle timeout) and
+  keeps its own connection open, because there is no hook timeout. A hook must
+  not wait for another link request or upload that involves the same link name
+  on its own server, since that one is queued behind it.
+
+### Rollback and its limits
+
+A link request that changes something writes a small durable journal first: the
+previous visible state (no link, or the symlink's exact text) and the previous
+ownership record, beside the ownership records in `.swarm-deploy/links`. It is
+removed once the hook has succeeded (before the answer is written, so a failed
+write never undoes a successful hook) or the change has been restored. A request
+that changes nothing writes no journal and has nothing to restore.
+
+- **What is restored.** The link and the ownership record, together. A change to
+  the record alone, such as a refreshed transfer ID for an unchanged link, is
+  restored too.
+- **Never over a change somebody else made.** The restore only proceeds when the
+  link and the record are still the previous state or the one this request
+  made (same text and, where the filesystem reports it, the same inode). A
+  regular file, another symlink, a replaced link, or an edited or removed record
+  is left exactly as found. The request then fails with `LINK_FAILED` instead
+  of `HOOK_FAILED`, `rolledBack` is not reported, the journal stays, and
+  further requests for that name fail with `LINK_FAILED` until the state is
+  resolved by an operator (remove the journal file only after making the link
+  and record what you want). `onFailure` still runs for the hook's own failure.
+  There is no compare-and-swap rename in the storage adapter, so a writer
+  outside the server that changes the link in the instant between the check and
+  the swap can still be replaced.
+- **Crash and restart.** A journal found at start-up means the outcome of that
+  request is unknown and its client never heard success, so the previous link is
+  restored before retention runs or a client connects. A journal that cannot be
+  restored because the state changed is reported and kept: that name is blocked
+  and the artifacts it names stay pinned, while the rest of the server starts. A
+  corrupt journal stops the server from starting. If the server stops after the
+  hook succeeded but before the journal is removed, the restore undoes a
+  publication your system may have accepted: the client's retry runs the hook
+  again, which is the existing at-least-once contract.
+- **Retention.** While a journal exists, both the attempted and the previous
+  artifact are kept from retention (the attempted one, the previous record's
+  target, and an adopted symlink's text when it exactly names a managed
+  artifact), so the restore never points at a removed artifact.
+- **What is never undone.** The uploaded artifact, and anything the hook did
+  elsewhere, such as a submission it made to an external store. The link is also
+  visible to local consumers for as long as the hook runs, even when it is later
+  restored.
+- **Cannot be restored exactly.** A previous symlink whose text is empty, longer
+  than 4096 bytes, contains NUL, or contains the Unicode replacement character
+  (what decoding invalid UTF-8 leaves behind) is refused with `LINK_CONFLICT`
+  before anything changes. Use `hookFailure: 'keep'` to adopt such a link, since
+  that mode keeps no journal.
+- **Older servers.** The request always carries its policy, so a server older
+  than 0.6.0 rejects it instead of silently keeping a link you expected to be
+  rolled back. Upgrade servers before clients. A 0.6.0 server treats a request
+  without the field, from an older client, as `rollback`, which is a change of
+  default for those clients.
 
 **What it does not guarantee.** The hook runs after the lease is released, so the
 context is the snapshot of one decision, not live state. By the time it runs,
@@ -301,12 +371,14 @@ const hooks: ServerHooks = {
   return type as `HookResult` when branches return different object literals.
 - **A refused result is a failed hook.** When the caller asked, an unusable
   result fails like a throw: the stable `HOOK_FAILED` with its fixed message, the
-  link left in place, and the same safe retry. `onFailure` receives an `Error`
+  link restored (or kept, with `hookFailure: 'keep'`), and the same safe retry.
+  Asking for the result does not change the failure policy, and the policy does
+  not change what is returned. `onFailure` receives an `Error`
   that names the reason and the path inside the result (for example `too large`
   or `unsupported function at $.run`), never a value. The server log carries no
   result data either.
-- **At-least-once.** Every call, including the retry that reports `UNCHANGED`,
-  runs the hook again and returns that run's result, so return the same ID for
+- **At-least-once.** Every call, including a retry that reports `LINKED` after a
+  rollback or `UNCHANGED`, runs the hook again and returns that run's result, so return the same ID for
   the same work, as you would for any idempotent hook.
 - **Who sees it.** The result goes to the authenticated client that asked, so
   return only data that caller may see. Leave out credentials, tokens, and
@@ -333,12 +405,18 @@ rejects the request instead of answering it, so the call fails; it never returns
 without the result. Upgrade servers before clients that ask.
 
 **Observing a failure.** A failed `afterLink` is reported on the server as: a
-`link` event with `status: 'failed'`, `reason: 'HOOK_FAILED'` and `result`
-(`LINKED` or `UNCHANGED`, the durable outcome) for a link request; a `failure`
-event with `HOOK_FAILED`; a `Link hook failed` warning with the link name,
-target, trigger, and status (never callback text); and `onFailure` with
-`phase: 'afterLink'`, the `link`, and the raw exception. Automatic links
-emit no `link` event, so an upload reports through the other three.
+`link` event with `status: 'failed'` and `reason: 'HOOK_FAILED'` for a link
+request, carrying `rolledBack: true` when the previous link and record were
+restored, and otherwise `result` (`LINKED` or `UNCHANGED`, the outcome that
+stayed in place) when `keep` or a request that changed nothing left it; a
+`failure` event with `HOOK_FAILED`; a `Link hook failed` warning with the link
+name, target, trigger, and status (never callback text); and `onFailure` with
+`phase: 'afterLink'`, the `link`, and the raw exception, once the link is restored
+or final and the client has been answered. When a restore cannot be proven or
+fails, the event and the answer are `LINK_FAILED`, `rolledBack` is absent, and a
+`Managed link rollback failed` warning names the link and the error code, never a
+path. Automatic links emit no `link` event, so an upload reports through the
+other three.
 
 A runnable, Node-only example is in
 [`examples/link-publisher`](../examples/link-publisher). It uses

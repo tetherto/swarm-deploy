@@ -117,37 +117,71 @@ test('Client.link settles only after afterLink returns, and a failure reaches th
   held.open()
   t.alike(await pending, { target: 'release-1', name: 'current', status: 'LINKED' })
 
-  mode = 'fail'
-  const failure: unknown = await client.link('release-1', 'second').then(
-    () => null,
-    (error: unknown) => error
-  )
-  t.ok(failure instanceof SwarmDeployError)
-  t.is((failure as SwarmDeployError).code, ERRORS.HOOK_FAILED)
-  t.absent((failure as SwarmDeployError).message.includes('sk-secret'), 'the caller sees no text')
-  t.is(
-    await fs.promises.readlink(path.join(storage, 'second')),
-    'release-1',
-    'the failed publication leaves the link in place'
-  )
+  const fails = (...args: Parameters<Client['link']>): Promise<unknown> =>
+    client.link(...args).then(
+      () => null,
+      (error: unknown) => error
+    )
+  const exists = (name: string): Promise<boolean> =>
+    fs.promises.lstat(path.join(storage, name)).then(
+      () => true,
+      () => false
+    )
 
+  // The default policy rolls a failed link back; the error is the same either way.
+  mode = 'fail'
+  for (const [name, options] of [
+    ['second', undefined],
+    ['fourth', { hookFailure: 'rollback' as const }]
+  ] as const) {
+    const failure = await fails('release-1', name, options)
+    t.ok(failure instanceof SwarmDeployError)
+    t.is((failure as SwarmDeployError).code, ERRORS.HOOK_FAILED, name)
+    t.absent((failure as SwarmDeployError).message.includes('sk-secret'), 'the caller sees no text')
+    t.is(await exists(name), false, `${name}: the failed publication left no link`)
+  }
   mode = 'pass'
   t.alike(await client.link('release-1', 'second'), {
     target: 'release-1',
     name: 'second',
+    status: 'LINKED'
+  })
+
+  // keep is the explicit opt-out: the new link stays, and the retry finds it unchanged.
+  mode = 'fail'
+  const kept = await fails('release-1', 'third', { hookFailure: 'keep' })
+  t.is((kept as SwarmDeployError).code, ERRORS.HOOK_FAILED)
+  t.is(await fs.promises.readlink(path.join(storage, 'third')), 'release-1', 'keep left the link')
+  mode = 'pass'
+  t.alike(await client.link('release-1', 'third', { hookFailure: 'keep' }), {
+    target: 'release-1',
+    name: 'third',
     status: 'UNCHANGED'
   })
   t.alike(
     contexts.map((context) => `${context.link.name}:${context.status}`),
-    ['current:LINKED', 'second:LINKED', 'second:UNCHANGED']
+    [
+      'current:LINKED',
+      'second:LINKED',
+      'fourth:LINKED',
+      'second:LINKED',
+      'third:LINKED',
+      'third:UNCHANGED'
+    ]
   )
   t.alike(events, [
     'current:requested:false',
     'current:LINKED:true',
     'second:requested:false',
     'second:HOOK_FAILED:true',
+    'fourth:requested:false',
+    'fourth:HOOK_FAILED:true',
     'second:requested:false',
-    'second:UNCHANGED:true'
+    'second:LINKED:true',
+    'third:requested:false',
+    'third:HOOK_FAILED:true',
+    'third:requested:false',
+    'third:UNCHANGED:true'
   ])
 })
 
@@ -302,6 +336,68 @@ test('swarm-deploy link --json prints the hook result through a real client and 
   t.ok(missing.stderr.length > 0)
 })
 
+test('swarm-deploy link rolls a failed hook back by default and keeps the link with --hook-failure keep', async (t) => {
+  let fail = true
+  const { server, client, testnet, storage, source } = await setup(t, {
+    symlinks: [{ selector: 'release-1' }],
+    hooks: {
+      afterLink: () => {
+        if (fail) throw new Error('publisher token sk-secret rejected')
+        return { submissionId: 'sub-1' }
+      }
+    }
+  })
+  t.is((await client.upload(await write(source, 'release-1', 'first'))).status, 'COMMITTED')
+  const env = { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') }
+  const run = async (...args: string[]) => {
+    const stdout = output()
+    const stderr = output()
+    const code = await main(
+      ['link', '--server-key', b4a.toString(server.publicKey, 'hex'), ...args],
+      env,
+      {
+        dht: testnet.createNode(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        connectTimeout: 5_000,
+        idleTimeout: 10_000
+      }
+    )
+    return { code, stdout: stdout.text(), stderr: stderr.text() }
+  }
+  const linked = (name: string): Promise<boolean> =>
+    fs.promises.lstat(path.join(storage, name)).then(
+      () => true,
+      () => false
+    )
+
+  for (const args of [[], ['--hook-failure', 'rollback']]) {
+    const failed = await run(...args, 'release-1', 'rolled')
+    t.is(failed.code, 1, args.join(' '))
+    t.is(failed.stdout, '')
+    t.ok(failed.stderr.includes('HOOK_FAILED'))
+    t.absent(failed.stderr.includes('sk-secret'))
+    t.is(await linked('rolled'), false, `${args.join(' ') || 'default'}: no link was left`)
+  }
+  const kept = await run('--hook-failure', 'keep', 'release-1', 'kept')
+  t.is(kept.code, 1)
+  t.is(kept.stdout, '')
+  t.is(await linked('kept'), true, 'keep left the link')
+
+  // The policy and the result request are independent: a success answers the same either way.
+  fail = false
+  for (const policy of ['rollback', 'keep']) {
+    const result = await run('--json', '--hook-failure', policy, 'release-1', `ok-${policy}`)
+    t.is(result.code, 0, policy)
+    t.alike(JSON.parse(result.stdout), {
+      target: 'release-1',
+      name: `ok-${policy}`,
+      status: 'LINKED',
+      hookResult: { submissionId: 'sub-1' }
+    })
+  }
+})
+
 test('Client.upload waits for afterLink on an automatic link and retries a failed one as ALREADY_COMMITTED', async (t) => {
   const held = gate()
   let mode: 'hold' | 'fail' | 'pass' = 'hold'
@@ -415,10 +511,19 @@ test('the link-publisher example publishes each link change through a no-shell p
 
   process.env.SWARM_DEPLOY_PUBLISH_DIR = path.join(published, 'missing')
   await t.exception(client.link('app-1.tar', 'beta'), { code: ERRORS.HOOK_FAILED })
-  t.is(await fs.promises.readlink(path.join(storage, 'beta')), 'app-1.tar')
+  await t.exception(() => fs.promises.lstat(path.join(storage, 'beta')), { code: 'ENOENT' })
   process.env.SWARM_DEPLOY_PUBLISH_DIR = published
-  t.is((await client.link('app-1.tar', 'beta')).status, 'UNCHANGED')
+  t.is((await client.link('app-1.tar', 'beta')).status, 'LINKED', 'the failed link was rolled back')
   t.is((await read('beta')).link, 'beta', 'the retry published the change the failure missed')
+
+  // keep leaves the link and the retry reports it unchanged, as before the default changed.
+  process.env.SWARM_DEPLOY_PUBLISH_DIR = path.join(published, 'missing')
+  const keep = { hookFailure: 'keep' } as const
+  await t.exception(client.link('app-1.tar', 'gamma', keep), { code: ERRORS.HOOK_FAILED })
+  t.is(await fs.promises.readlink(path.join(storage, 'gamma')), 'app-1.tar')
+  process.env.SWARM_DEPLOY_PUBLISH_DIR = published
+  t.is((await client.link('app-1.tar', 'gamma', keep)).status, 'UNCHANGED')
+  t.is((await read('gamma')).link, 'gamma')
 })
 
 test('the link-publisher example rejects at its deadline whatever the publisher does and ends the child', async (t) => {

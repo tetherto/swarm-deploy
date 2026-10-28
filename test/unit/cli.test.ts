@@ -434,6 +434,71 @@ test('CLI --json belongs to link alone and is parsed as a strict flag', async (t
   t.absent(uploadUsage?.includes('--json'))
 })
 
+test('CLI link --hook-failure names the policy, independently of --json, and is strict', async (t) => {
+  const linked = (target: string, name: string): Promise<unknown> =>
+    Promise.resolve({ target, name, status: 'LINKED' as const })
+  const accepted: Array<[string[], unknown[]]> = [
+    [['--hook-failure', 'keep'], [{ hookFailure: 'keep' }]],
+    [['--hook-failure', 'rollback'], [{ hookFailure: 'rollback' }]],
+    [['--json', '--hook-failure', 'keep'], [{ hookFailure: 'keep', hookResult: true }]],
+    [['--hook-failure', 'rollback', '--json'], [{ hookFailure: 'rollback', hookResult: true }]]
+  ]
+  for (const [flags, asked] of accepted) {
+    const result = await runLink([...flags, 'release-1.2.3', 'current'], linked)
+    t.is(result.code, 0, flags.join(' '))
+    t.alike(result.calls, [['release-1.2.3', 'current', ...asked]], flags.join(' '))
+    t.is(result.stderr, '')
+    t.is(
+      result.stdout,
+      flags.includes('--json')
+        ? '{"target":"release-1.2.3","name":"current","status":"LINKED"}\n'
+        : 'current -> release-1.2.3 LINKED\n',
+      'the policy never changes the output'
+    )
+  }
+  // Without the flag the client's own default (rollback) applies and nothing is passed.
+  t.alike((await runLink(['release-1.2.3', 'current'], linked)).calls, [
+    ['release-1.2.3', 'current']
+  ])
+
+  const never = (): Promise<unknown> => Promise.reject(new Error('Link should not be attempted'))
+  for (const args of [
+    ['--hook-failure', 'release-1.2.3', 'current'],
+    ['--hook-failure', 'delete', 'release-1.2.3', 'current'],
+    ['--hook-failure', 'ROLLBACK', 'release-1.2.3', 'current'],
+    ['--hook-failure', '', 'release-1.2.3', 'current'],
+    ['--hook-failure=keep', 'release-1.2.3', 'current'],
+    ['--hook-failure', 'keep', '--hook-failure', 'keep', 'release-1.2.3', 'current'],
+    ['--hook-failure', 'keep', '--hook-failure', 'rollback', 'release-1.2.3', 'current'],
+    ['--hook-failure', 'keep', 'release-1.2.3'],
+    ['--hook-failures', 'keep', 'release-1.2.3', 'current']
+  ]) {
+    const result = await runLink(args, never)
+    t.is(result.code, 2, args.join(' '))
+    t.is(result.stdout, '')
+    t.alike(result.calls, [], 'nothing is requested for a malformed command')
+  }
+
+  const key = b4a.toString(SERVER_KEY, 'hex')
+  const env = { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') }
+  for (const args of [
+    ['upload', '--server-key', key, '--hook-failure', 'keep', 'artifact.txt'],
+    ['server', '--hook-failure', 'keep'],
+    ['reset-storage', '--hook-failure', 'keep', '--storage', '.']
+  ]) {
+    const stderr = output()
+    t.is(await main(args, env, { stderr: stderr.stream }), 2, args[0])
+    t.ok(stderr.text().includes('Unknown option'), `${args[0]} does not accept --hook-failure`)
+  }
+  const linkUsage = USAGE.split('\n').find((line) => line.startsWith('  swarm-deploy link'))
+  t.ok(linkUsage?.includes('[--hook-failure <rollback|keep>]'))
+  t.absent(
+    USAGE.split('\n')
+      .find((line) => line.startsWith('  swarm-deploy upload'))
+      ?.includes('hook-failure')
+  )
+})
+
 test('CLI rejects unsafe link arguments as configuration errors', async (t) => {
   const stderr = output()
   const clientSeed = b4a.toString(CLIENT_SEED, 'hex')

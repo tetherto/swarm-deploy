@@ -159,6 +159,7 @@ swarm-deploy link \
   --seed-file <seed-file> \
   --server-key <64-lower-hex> \
   [--idle-timeout <milliseconds>] \
+  [--hook-failure <rollback|keep>] \
   [--json] \
   <target> <link-name>
 ```
@@ -166,8 +167,8 @@ swarm-deploy link \
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>`, or use
 `SWARM_DEPLOY_CLIENT_SEED`, exactly as for `upload`. `--server-key` pins the
 server identity, and `--idle-timeout` has the same 60-second default and
-inactivity semantics as upload. `--json` takes no value and belongs to `link`
-alone; see [JSON output](#json-output).
+inactivity semantics as upload. `--hook-failure` takes `rollback` (the default)
+or `keep` and `--json` takes no value; both belong to `link` alone.
 
 The command asks the authenticated server to point `<link-name>` at the
 existing managed file or directory `<target>`. The target must match a
@@ -190,12 +191,26 @@ See [Managed symlinks](managed-links.md#selection-and-ownership-rules).
 
 When the server has an `afterLink` hook, success is printed only after the hook
 returns, for as long as `--idle-timeout` allows. If the hook fails, the command
-exits `1` and prints `HOOK_FAILED`; the link itself has already changed, and
-running the same command again is safe and re-runs the hook. A hook slower than
-`--idle-timeout` makes the command fail with a timeout instead, though the
-server still finishes the hook (see
-[Link publication hooks](hooks.md#link-publication-hooks)). The rules behind
-manual links are in [Managed symlinks](managed-links.md).
+exits `1` and prints `HOOK_FAILED`, in both modes, and running the same command
+again is safe and re-runs the hook. A hook slower than `--idle-timeout` makes
+the command fail with a timeout instead, though the server still finishes the
+hook (see [Link publication hooks](hooks.md#link-publication-hooks)). The rules
+behind manual links are in [Managed symlinks](managed-links.md).
+
+### Hook failure policy
+
+By default (`--hook-failure rollback`, or no flag) a failed hook restores the
+previous local link and its ownership record before the command exits, or removes
+a link the command created, so a rerun links afresh and prints `LINKED`. With
+`--hook-failure keep` the new link stays, as in 0.5.x, and a rerun prints
+`UNCHANGED`. Either way the command waits for the hook, exits `1` with
+`HOOK_FAILED`, and nothing the hook did elsewhere is undone. If the restore
+cannot be proven or fails, the command prints `LINK_FAILED` and the server leaves
+what it found; see
+[Rollback and its limits](hooks.md#rollback-and-its-limits). The policy is always
+sent, so a server older than 0.6.0 rejects the command instead of silently
+keeping the link: upgrade servers before clients. `--hook-failure` and `--json`
+are independent.
 
 ### JSON output
 

@@ -543,7 +543,8 @@ test('Client link half-closes one control request and requires an explicit link 
     v: 1,
     kind: 'link',
     target: 'release-1.2.3',
-    name: 'current'
+    name: 'current',
+    hookFailure: 'rollback'
   })
   t.is(successSocket.writes.length, 1)
   await successClient.close()
@@ -613,7 +614,7 @@ test('Client.link asks for the hook result only when told to and returns what th
   })
   t.is(
     b4a.toString(asked.writes[0].subarray(4)),
-    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookResult":true}'
+    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookFailure":"rollback","hookResult":true}'
   )
   t.alike(optedIn.events, [
     { target: 'release-1.2.3', name: 'current', status: 'requested', final: false },
@@ -630,20 +631,44 @@ test('Client.link asks for the hook result only when told to and returns what th
   t.alike(Object.keys(none), ['target', 'name', 'status'])
   await quiet.client.close()
 
-  // Not asking, in any spelling, is the unchanged four-field request and the plain result.
-  for (const options of [undefined, {}, { hookResult: false }, { hookResult: undefined }]) {
+  // Not asking for the result gives the plain result, and the policy is always spelled out:
+  // rollback unless the caller says keep, in every spelling.
+  const request = (policy: string): string =>
+    `{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookFailure":"${policy}"}`
+  const spellings: Array<[Record<string, unknown> | undefined, string]> = [
+    [undefined, 'rollback'],
+    [{}, 'rollback'],
+    [{ hookResult: false }, 'rollback'],
+    [{ hookResult: undefined }, 'rollback'],
+    [{ hookFailure: undefined }, 'rollback'],
+    [{ hookFailure: 'rollback' }, 'rollback'],
+    [{ hookFailure: 'keep' }, 'keep'],
+    [{ hookFailure: 'keep', hookResult: false }, 'keep']
+  ]
+  for (const [options, policy] of spellings) {
     const socket = new FakeSocket(serverKey)
     socket.onEnd = () => socket.feed(linkAnswer({ v: 1, status: 'LINKED' }))
     const plain = linkClient(serverKey, socket)
     const result = await plain.client.link('release-1.2.3', 'current', options)
     t.alike(Object.keys(result), ['target', 'name', 'status'], JSON.stringify(options))
-    t.is(
-      b4a.toString(socket.writes[0].subarray(4)),
-      '{"v":1,"kind":"link","target":"release-1.2.3","name":"current"}',
-      JSON.stringify(options)
-    )
+    t.is(b4a.toString(socket.writes[0].subarray(4)), request(policy), JSON.stringify(options))
     await plain.client.close()
   }
+
+  // The policy and the result request are independent of each other.
+  const both = new FakeSocket(serverKey)
+  both.onEnd = () => both.feed(linkAnswer({ v: 1, status: 'LINKED', hookResult: reported }))
+  const combined = linkClient(serverKey, both)
+  const answer = await combined.client.link('release-1.2.3', 'current', {
+    hookFailure: 'keep',
+    hookResult: true
+  })
+  t.alike(answer.hookResult, reported)
+  t.is(
+    b4a.toString(both.writes[0].subarray(4)),
+    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookFailure":"keep","hookResult":true}'
+  )
+  await combined.client.close()
 })
 
 test('Client.link rejects hook-result data it did not ask for or that is malformed', async (t) => {
@@ -737,10 +762,11 @@ test('Client.link refuses unknown options before connecting', async (t) => {
   await client.close()
 })
 
-test('an opted-in Client.link against a server that predates the option fails instead of returning', async (t) => {
+test('a current Client.link against a server that predates the policy field fails instead of linking', async (t) => {
   const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
-  // A server of the previous release decodes a link request with an exact four-field key set, so
-  // anything else ends the stream without an answer.
+  // A server of the previous release decodes a link request with an exact key set, so any
+  // field it does not know ends the stream without an answer and links nothing.
+  const answered: string[] = []
   const legacyServer = (): FakeSocket => {
     const socket = new FakeSocket(serverKey)
     let request: Record<string, unknown> = {}
@@ -750,6 +776,7 @@ test('an opted-in Client.link against a server that predates the option fails in
     }
     socket.onEnd = () => {
       if (Object.keys(request).sort().join() === 'kind,name,target,v') {
+        answered.push('LINKED')
         socket.feed(linkAnswer({ v: 1, status: 'LINKED' }))
       } else {
         socket.finishInput()
@@ -758,26 +785,27 @@ test('an opted-in Client.link against a server that predates the option fails in
     return socket
   }
 
-  const plainSocket = legacyServer()
-  const plain = linkClient(serverKey, plainSocket)
-  t.alike(await plain.client.link('release-1.2.3', 'current'), {
-    target: 'release-1.2.3',
-    name: 'current',
-    status: 'LINKED'
-  })
-  await plain.client.close()
-
-  const askedSocket = legacyServer()
-  const asked = linkClient(serverKey, askedSocket)
-  await t.exception(asked.client.link('release-1.2.3', 'current', { hookResult: true }), {
-    code: ERRORS.PROTOCOL_INVALID
-  })
-  t.is(
-    (asked.events.at(-1) as { status: string }).status,
-    ERRORS.PROTOCOL_INVALID,
-    'the final event reports the failure, not a link status'
-  )
-  await asked.client.close()
+  // Every spelling sends the policy, so none is silently kept by an older server.
+  for (const options of [
+    undefined,
+    {},
+    { hookFailure: 'rollback' as const },
+    { hookFailure: 'keep' as const },
+    { hookResult: true }
+  ]) {
+    const socket = legacyServer()
+    const { client, events } = linkClient(serverKey, socket)
+    await t.exception(client.link('release-1.2.3', 'current', options), {
+      code: ERRORS.PROTOCOL_INVALID
+    })
+    t.is(
+      (events.at(-1) as { status: string }).status,
+      ERRORS.PROTOCOL_INVALID,
+      `${JSON.stringify(options)}: the final event reports the failure, not a link status`
+    )
+    await client.close()
+  }
+  t.alike(answered, [], 'the older server never accepted a request')
 })
 
 test('Client close aborts pending work promptly and removes direct-wire listeners', async (t) => {
@@ -1993,11 +2021,22 @@ test('Server links an authenticated request target after a clean close', async (
 async function linkAll(
   node: FakeServerNode,
   target: string,
-  name: string
+  name: string,
+  hookFailure?: 'rollback' | 'keep'
 ): Promise<{ socket: FakeSocket; result: { v: number; status: string; code?: string } }> {
   const socket = new FakeSocket(CLIENT_KEY)
   node.accept(socket)
-  socket.feed(encodeControlFrame(encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })))
+  socket.feed(
+    encodeControlFrame(
+      encodeLinkRequestRecord({
+        v: 1,
+        kind: 'link',
+        target,
+        name,
+        ...(hookFailure === undefined ? {} : { hookFailure })
+      })
+    )
+  )
   socket.finishInput()
   await waitFor(() => socket.writes.length === 1)
   return {
@@ -2455,12 +2494,17 @@ test('a link reconciliation failure after a durable commit is retried as already
 
 type LinkFrame = { v: number; status: string; code?: string; hookResult?: unknown }
 
-/** A link request; only `hookResult` set asks for what the server's `afterLink` hook returned. */
+/**
+ * A link request. Only `hookResult` asks for what the server's `afterLink` hook returned, and
+ * `hookFailure` is sent only when given: without it the request has the shape an older client
+ * sends, which the server treats as `rollback`.
+ */
 function linkRequest(
   node: FakeServerNode,
   target: string,
   name: string,
-  hookResult = false
+  hookResult = false,
+  hookFailure?: 'rollback' | 'keep'
 ): FakeSocket {
   const socket = new FakeSocket(CLIENT_KEY)
   node.accept(socket)
@@ -2471,6 +2515,7 @@ function linkRequest(
         kind: 'link',
         target,
         name,
+        ...(hookFailure === undefined ? {} : { hookFailure }),
         ...(hookResult ? { hookResult: true as const } : {})
       })
     )
@@ -2500,16 +2545,6 @@ function deadline<T>(promise: Promise<T>, label: string): Promise<T> {
       timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 5_000)
     })
   ]).finally(() => clearTimeout(timer))
-}
-
-async function waitForLinkTarget(file: string, expected: string): Promise<void> {
-  const started = Date.now()
-  for (;;) {
-    const target = await fs.promises.readlink(file).catch(() => null)
-    if (target === expected) return
-    if (Date.now() - started > 5_000) throw new Error(`Timed out waiting for link to ${expected}`)
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
 }
 
 /** The number of link names that still have a place reserved in their hook line. */
@@ -2626,7 +2661,7 @@ test('a failing afterLink answers HOOK_FAILED without its message, keeps the lin
   const metadata = metadataFromManifest(input.manifest)
   await uploadAll(node, input)
 
-  const socket = linkRequest(node, 'release-1', 'current')
+  const socket = linkRequest(node, 'release-1', 'current', false, 'keep')
   ref.current = socket
   await waitFor(() => failures.length === 1)
 
@@ -2637,7 +2672,7 @@ test('a failing afterLink answers HOOK_FAILED without its message, keeps the lin
   t.is(
     await fs.promises.readlink(path.join(server.storageDir, 'current')),
     'release-1',
-    'a publishing failure does not roll the durable link back'
+    'keep leaves the durable link in place'
   )
 
   const failure = failures[0].context
@@ -2743,40 +2778,67 @@ test('logger details name public-key hashes publicKeyId while events keep finger
   }
 })
 
-test('retrying an unchanged link re-runs afterLink so a failed publication can be retried', async (t) => {
-  const calls: string[] = []
-  let failures = 1
-  const { server, node } = await createServer(t, {
-    symlinks: [{ selector: '/^release-\\d+$/' }],
-    hooks: {
-      afterLink: ({ status, link }) => {
-        calls.push(`${link.name}:${status}`)
-        if (failures-- > 0) throw new Error('publish failed')
+test('a failed afterLink is retried by repeating the request, and the policy decides what the retry sees', async (t) => {
+  // `undefined` is the request an older client sends, which means rollback.
+  const policies: Array<['keep' | 'rollback' | undefined, string[], string[], string[]]> = [
+    [
+      'keep',
+      ['current:LINKED', 'current:UNCHANGED', 'current:UNCHANGED'],
+      ['failed:LINKED:false', 'unchanged:undefined:false', 'unchanged:undefined:false'],
+      ['UNCHANGED', 'UNCHANGED']
+    ],
+    [
+      'rollback',
+      ['current:LINKED', 'current:LINKED', 'current:UNCHANGED'],
+      ['failed:undefined:true', 'linked:undefined:false', 'unchanged:undefined:false'],
+      ['LINKED', 'UNCHANGED']
+    ],
+    [
+      undefined,
+      ['current:LINKED', 'current:LINKED', 'current:UNCHANGED'],
+      ['failed:undefined:true', 'linked:undefined:false', 'unchanged:undefined:false'],
+      ['LINKED', 'UNCHANGED']
+    ]
+  ]
+  for (const [policy, expectedCalls, expectedEvents, retries] of policies) {
+    const label = String(policy)
+    const calls: string[] = []
+    let failures = 1
+    const { server, node } = await createServer(t, {
+      symlinks: [{ selector: '/^release-\\d+$/' }],
+      hooks: {
+        afterLink: ({ status, link }) => {
+          calls.push(`${link.name}:${status}`)
+          if (failures-- > 0) throw new Error('publish failed')
+        }
       }
+    })
+    const events: string[] = []
+    server.on('link', (event) =>
+      events.push(`${event.status}:${event.result}:${event.rolledBack === true}`)
+    )
+    await uploadAll(node, await manifest(t, 'release-1', 'first'))
+
+    const failed = linkRequest(node, 'release-1', 'current', false, policy)
+    await waitFor(() => failed.writes.length === 1)
+    t.alike(linkFrame(failed), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }, label)
+    const link = path.join(server.storageDir, 'current')
+    if (policy === 'keep') t.is(await fs.promises.readlink(link), 'release-1', label)
+    else await t.exception(() => fs.promises.lstat(link), { code: 'ENOENT' }, label)
+
+    for (const expected of retries) {
+      const retry = linkRequest(node, 'release-1', 'current', false, policy)
+      await waitFor(() => retry.writes.length === 1)
+      t.is(linkFrame(retry).status, expected, `${label}: ${expected}`)
     }
-  })
-  const events: string[] = []
-  server.on('link', (event) => events.push(`${event.status}:${event.result}`))
-  await uploadAll(node, await manifest(t, 'release-1', 'first'))
-
-  const failed = linkRequest(node, 'release-1', 'current')
-  await waitFor(() => failed.writes.length === 1)
-  t.alike(linkFrame(failed), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED })
-
-  const retry = linkRequest(node, 'release-1', 'current')
-  await waitFor(() => retry.writes.length === 1)
-  t.alike(linkFrame(retry), { v: 1, status: 'UNCHANGED' })
-  const repeated = linkRequest(node, 'release-1', 'current')
-  await waitFor(() => repeated.writes.length === 1)
-  t.alike(linkFrame(repeated), { v: 1, status: 'UNCHANGED' })
-
-  t.alike(
-    calls,
-    ['current:LINKED', 'current:UNCHANGED', 'current:UNCHANGED'],
-    'every request reaches the hook, so a publisher can be retried without changing the link'
-  )
-  t.alike(events, ['failed:LINKED', 'unchanged:undefined', 'unchanged:undefined'])
-  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
+    t.alike(
+      calls,
+      expectedCalls,
+      `${label}: every request reaches the hook, so a publisher can be retried`
+    )
+    t.alike(events, expectedEvents, label)
+    t.is(await fs.promises.readlink(link), 'release-1', `${label}: the retry leaves the link`)
+  }
 })
 
 test('afterLink never runs for unauthorized, disallowed, missing, or conflicting link requests', async (t) => {
@@ -2995,7 +3057,7 @@ test('an afterLink-only server defers post-commit retention until the hook succe
   t.alike(seen, ['LINKED'], 'the commit itself moved the link, not an earlier retention pass')
 })
 
-test('a pending afterLink holds no storage lease, and one link runs its hooks in decision order', async (t) => {
+test('a pending afterLink holds no storage lease, and requests for one link run one at a time in both modes', async (t) => {
   const held = gate()
   const started: string[] = []
   const { server, node } = await createServer(t, {
@@ -3023,50 +3085,27 @@ test('a pending afterLink holds no storage lease, and one link runs its hooks in
     'a link with another name'
   )
   t.alike(linkFrame(other), { v: 1, status: 'LINKED' })
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r5', 'aa'))), 'an upload carries on')
 
-  const second = linkRequest(node, 'r3', 'current')
-  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r3')
+  // Same name, either policy: the second request does not even decide until the first has
+  // finished, so it can never decide against an unfinished change.
+  const second = linkRequest(node, 'r3', 'current', false, 'keep')
+  const third = linkRequest(node, 'r4', 'current')
   await settled()
-  t.alike(started, ['current->r1', 'other->r2'], 'the repoint is durable but its hook waits')
-  t.is(first.writes.length, 0)
-  t.is(second.writes.length, 0)
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'r1')
+  t.alike(started, ['current->r1', 'other->r2'], 'neither waiting request has run its hook')
+  t.is(first.writes.length + second.writes.length + third.writes.length, 0)
 
   held.open()
-  await waitFor(() => first.writes.length === 1 && second.writes.length === 1)
-  t.alike(started, ['current->r1', 'other->r2', 'current->r3'])
-  t.alike(linkFrame(first), { v: 1, status: 'LINKED' })
-  t.alike(linkFrame(second), { v: 1, status: 'LINKED' })
+  await waitFor(
+    () => first.writes.length === 1 && second.writes.length === 1 && third.writes.length === 1
+  )
+  t.alike(started, ['current->r1', 'other->r2', 'current->r3', 'current->r4'], 'in arrival order')
+  for (const socket of [first, second, third]) {
+    t.alike(linkFrame(socket), { v: 1, status: 'LINKED' })
+  }
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'r4')
   await waitFor(() => reservedHookLines(server) === 0)
-})
-
-test('retention can remove the previous target while its afterLink is still pending', async (t) => {
-  const held = gate()
-  const contexts: AfterLinkContext[] = []
-  const { server, node } = await createServer(t, {
-    maxStorageBytes: 4,
-    symlinks: [{ selector: '/^r\\d$/' }],
-    hooks: {
-      afterLink: async (context) => {
-        contexts.push(context)
-        if (context.link.target === 'r1') await held.wait
-      }
-    }
-  })
-  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r1', 'aa'))))
-  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r2', 'bb'))))
-  const first = linkRequest(node, 'r1', 'current')
-  await waitFor(() => contexts.length === 1)
-  const second = linkRequest(node, 'r2', 'current')
-  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r2')
-
-  t.absent(finalCode(await uploadAll(node, await manifest(t, 'r3', 'cc'))))
-  await t.exception(() => fs.promises.lstat(contexts[0].link.targetPath), { code: 'ENOENT' })
-  t.is(contexts[0].link.target, 'r1', 'the pending hook still describes its own decision')
-
-  held.open()
-  await waitFor(() => first.writes.length === 1 && second.writes.length === 1)
-  t.alike(linkFrame(second), { v: 1, status: 'LINKED' })
-  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'r2')
 })
 
 test('afterLink results reach only a request that asked, and only once the hook has resolved', async (t) => {
@@ -3196,9 +3235,9 @@ test('concurrent requests for one link get their own hook result, in decision or
   const first = linkRequest(node, 'r1', 'current', true)
   await waitFor(() => calls === 1)
   const second = linkRequest(node, 'r2', 'current', true)
-  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r2')
   await settled()
-  t.is(calls, 1, 'the second hook waits for the first to finish')
+  t.is(calls, 1, 'the second request waits for the first to finish')
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'r1')
   t.is(first.writes.length + second.writes.length, 0)
 
   gates[0].open()
@@ -3242,7 +3281,7 @@ class Receipt {
   id = 'receipt'
 }
 
-test('an unusable afterLink result fails an opted-in request as HOOK_FAILED and keeps the link', async (t) => {
+test('an unusable afterLink result fails an opted-in request as HOOK_FAILED and, with keep, keeps the link', async (t) => {
   const secret = 'sk-secret-token'
   const deep = (): Record<string, unknown> => {
     let value: Record<string, unknown> = { token: secret }
@@ -3296,7 +3335,7 @@ test('an unusable afterLink result fails an opted-in request as HOOK_FAILED and 
   for (const [index, [label, build]] of unusable.entries()) {
     next = build
     const name = `link${index}`
-    const socket = linkRequest(node, 'release-1', name, true)
+    const socket = linkRequest(node, 'release-1', name, true, 'keep')
     await waitFor(() => socket.writes.length === 1)
     t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }, label)
     t.is(socket.writes.length, 1, `${label}: one terminal record`)
@@ -3317,13 +3356,13 @@ test('an unusable afterLink result fails an opted-in request as HOOK_FAILED and 
 
   // The link is durable, so a retry reruns the hook and now returns its result.
   next = () => ({ ok: true })
-  const retry = linkRequest(node, 'release-1', 'link0', true)
+  const retry = linkRequest(node, 'release-1', 'link0', true, 'keep')
   await waitFor(() => retry.writes.length === 1)
   t.is(linkText(retry), '{"v":1,"status":"UNCHANGED","hookResult":{"ok":true}}')
 
   // A request that did not ask is unaffected by the same value.
   next = unusable[0][1]
-  const plain = linkRequest(node, 'release-1', 'link0')
+  const plain = linkRequest(node, 'release-1', 'link0', false, 'keep')
   await waitFor(() => plain.writes.length === 1)
   t.is(linkText(plain), '{"v":1,"status":"UNCHANGED"}')
   t.is(failures.length, unusable.length, 'no further failure was reported')
@@ -3348,6 +3387,831 @@ test('a throwing afterLink on an opted-in request is the same sanitized HOOK_FAI
   t.is(failures[0].error, injected, 'onFailure still receives the raw exception')
 })
 
+/** Uploads each name as a 2-byte artifact whose contents are `aa`, each expected to commit. */
+async function uploadEach(t: Assert, node: FakeServerNode, names: string[]): Promise<void> {
+  for (const name of names) {
+    t.absent(finalCode(await uploadAll(node, await manifest(t, name, 'aa'))), name)
+  }
+}
+
+const LINKS_DIRECTORY = path.join('.swarm-deploy', 'links')
+
+/** Every file in the managed-link directory, ownership records and rollback journals alike. */
+async function linkFiles(storageDir: string): Promise<string[]> {
+  return (await fs.promises.readdir(path.join(storageDir, LINKS_DIRECTORY))).sort()
+}
+
+async function journalFiles(storageDir: string): Promise<string[]> {
+  return (await linkFiles(storageDir)).filter((name) => name.endsWith('.rollback.json'))
+}
+
+/** The ownership record file for a link name, parsed, or `null`. */
+async function ownership(
+  storageDir: string,
+  name: string
+): Promise<Record<string, unknown> | null> {
+  const hash = b4a.toString(sodiumSha256(b4a.from(name)), 'hex')
+  try {
+    const text = await fs.promises.readFile(
+      path.join(storageDir, LINKS_DIRECTORY, `${hash}.json`),
+      'utf8'
+    )
+    return JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+/** The text of the symlink at a name, `null` when nothing is there. */
+function visibleLink(storageDir: string, name: string): Promise<string | null> {
+  return fs.promises.readlink(path.join(storageDir, name)).catch(() => null)
+}
+
+test('a failed afterLink restores the previous link and ownership record, or removes a new link', async (t) => {
+  const secret = 'sk-secret-token'
+  const priors: Array<{
+    label: string
+    adopt?: (outside: string) => string
+    /** Link `current` at this artifact through a successful request first. */
+    managed?: string
+    expect: (outside: string) => string | null
+    expectRecord: string | null
+    /** The request: its target. */
+    target: string
+    status: 'LINKED' | 'UNCHANGED'
+  }> = [
+    { label: 'no link', expect: () => null, expectRecord: null, target: 'r2', status: 'LINKED' },
+    {
+      label: 'a managed link to another target',
+      managed: 'r1',
+      expect: () => 'r1',
+      expectRecord: 'r1',
+      target: 'r2',
+      status: 'LINKED'
+    },
+    {
+      label: 'an adopted foreign absolute symlink',
+      adopt: (outside) => outside,
+      expect: (outside) => outside,
+      expectRecord: null,
+      target: 'r2',
+      status: 'LINKED'
+    },
+    {
+      label: 'an adopted dangling symlink',
+      adopt: () => 'no-such-target',
+      expect: () => 'no-such-target',
+      expectRecord: null,
+      target: 'r2',
+      status: 'LINKED'
+    },
+    {
+      label: 'an adopted symlink that already reads as the target',
+      adopt: () => 'r2',
+      expect: () => 'r2',
+      expectRecord: null,
+      target: 'r2',
+      status: 'LINKED'
+    }
+  ]
+  const failures: Array<[string, boolean]> = [
+    ['throws', false],
+    ['returns an unusable result', true]
+  ]
+  for (const prior of priors) {
+    for (const [failure, asksForResult] of failures) {
+      const label = `${prior.label}, hook ${failure}`
+      const storageDir = await createTempDir(t)
+      const outside = await createTempDir(t)
+      if (prior.adopt) {
+        await fs.promises.symlink(prior.adopt(outside), path.join(storageDir, 'current'))
+      }
+      let behave: 'ok' | 'throw' | 'invalid' = 'ok'
+      const hookErrors: HookFailureContext[] = []
+      const logs: Array<Record<string, unknown>> = []
+      const { server, node } = await createServer(t, {
+        storageDir,
+        symlinks: [{ selector: '/^r\\d$/' }],
+        logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+        hooks: {
+          afterLink: () => {
+            if (behave === 'throw') throw new Error(secret)
+            if (behave === 'invalid') return { token: secret, run: () => 1 } as never
+            return { done: true }
+          },
+          onFailure: (context) => void hookErrors.push(context)
+        }
+      })
+      const events: Array<Record<string, unknown>> = []
+      server.on('link', (event) => events.push({ ...event }))
+      await uploadEach(t, node, ['r1', 'r2'])
+      if (prior.managed) {
+        t.alike(
+          (await linkAll(node, prior.managed, 'current')).result,
+          { v: 1, status: 'LINKED' },
+          label
+        )
+        events.length = 0
+      }
+      const record = await ownership(storageDir, 'current')
+
+      behave = asksForResult ? 'invalid' : 'throw'
+      const socket = linkRequest(node, prior.target, 'current', asksForResult)
+      await waitFor(() => hookErrors.length === 1)
+      t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }, label)
+      t.is(socket.writes.length, 1, `${label}: one terminal record`)
+      t.absent(
+        b4a.toString(socket.writes[0]).includes(secret),
+        `${label}: nothing leaks on the wire`
+      )
+      t.is(
+        await visibleLink(storageDir, 'current'),
+        prior.expect(outside),
+        `${label}: link restored`
+      )
+      t.alike(await ownership(storageDir, 'current'), record, `${label}: ownership restored`)
+      t.alike(await journalFiles(storageDir), [], `${label}: no journal`)
+      t.alike(
+        events,
+        [
+          {
+            fingerprint: publicKeyId(CLIENT_KEY),
+            target: prior.target,
+            name: 'current',
+            status: 'failed',
+            reason: ERRORS.HOOK_FAILED,
+            rolledBack: true
+          }
+        ],
+        `${label}: the event says the change was restored and claims no durable result`
+      )
+      t.is(hookErrors[0].phase, 'afterLink', label)
+      t.absent(
+        JSON.stringify(logs).includes(secret) || JSON.stringify(logs).includes(storageDir),
+        `${label}: the log carries neither hook data nor a path`
+      )
+      t.absent(
+        logs.some((entry) => entry.message === 'Managed link rollback failed'),
+        label
+      )
+
+      // The change was undone, so repeating the request makes it again.
+      behave = 'ok'
+      const retry = linkRequest(node, prior.target, 'current')
+      await waitFor(() => retry.writes.length === 1)
+      t.alike(linkFrame(retry), { v: 1, status: 'LINKED' }, `${label}: the retry links again`)
+      t.is(await visibleLink(storageDir, 'current'), prior.target, label)
+      t.alike(await journalFiles(storageDir), [], `${label}: a success leaves no journal`)
+    }
+  }
+})
+
+test('keep leaves the new link and its record after a failed afterLink, and a request with no change has nothing to restore', async (t) => {
+  const storageDir = await createTempDir(t)
+  await fs.promises.symlink('no-such-target', path.join(storageDir, 'adopted'))
+  let fail = true
+  const hookErrors: HookFailureContext[] = []
+  const { server, node } = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^r\\d$/' }],
+    hooks: {
+      afterLink: () => {
+        if (fail) throw new Error('publish failed')
+      },
+      onFailure: (context) => void hookErrors.push(context)
+    }
+  })
+  const events: Array<Record<string, unknown>> = []
+  server.on('link', (event) =>
+    events.push({ status: event.status, result: event.result, rolledBack: event.rolledBack })
+  )
+  await uploadEach(t, node, ['r1', 'r2'])
+
+  for (const name of ['current', 'adopted']) {
+    const socket = linkRequest(node, 'r1', name, false, 'keep')
+    await waitFor(() => socket.writes.length === 1)
+    t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }, name)
+    t.is(await visibleLink(storageDir, name), 'r1', `${name}: keep leaves the new link`)
+    t.is((await ownership(storageDir, name))?.target, 'r1', `${name}: and its ownership record`)
+  }
+  await waitFor(() => hookErrors.length === 2)
+  t.alike(events, [
+    { status: 'failed', result: 'LINKED', rolledBack: undefined },
+    { status: 'failed', result: 'LINKED', rolledBack: undefined }
+  ])
+  t.alike(await journalFiles(storageDir), [], 'keep writes no journal')
+
+  // An exact repeat changes nothing: the hook fails again, there is nothing to restore, and
+  // the event still describes the link as it is.
+  events.length = 0
+  for (const policy of ['rollback', undefined] as const) {
+    const repeat = linkRequest(node, 'r1', 'current', false, policy)
+    await waitFor(() => repeat.writes.length === 1)
+    t.alike(linkFrame(repeat), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }, String(policy))
+    t.is(await visibleLink(storageDir, 'current'), 'r1', `${policy}: the existing link stays`)
+    t.alike(await journalFiles(storageDir), [])
+  }
+  await waitFor(() => hookErrors.length === 4)
+  t.alike(events, [
+    { status: 'failed', result: 'UNCHANGED', rolledBack: undefined },
+    { status: 'failed', result: 'UNCHANGED', rolledBack: undefined }
+  ])
+
+  // A hook that succeeds is final in either mode and leaves no journal.
+  fail = false
+  for (const policy of ['rollback', 'keep'] as const) {
+    const name = `${policy}-ok`
+    const socket = linkRequest(node, 'r2', name, false, policy)
+    await waitFor(() => socket.writes.length === 1)
+    t.alike(linkFrame(socket), { v: 1, status: 'LINKED' }, policy)
+    t.is(await visibleLink(storageDir, name), 'r2', policy)
+    t.alike(await journalFiles(storageDir), [])
+  }
+  await server.close()
+})
+
+test('an automatic link whose hook fails is left alone: only an explicit link request rolls back', async (t) => {
+  const storageDir = await createTempDir(t)
+  let fail = true
+  const { node } = await createServer(t, {
+    storageDir,
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterLink: () => {
+        if (fail) throw new Error('publish failed')
+      }
+    }
+  })
+  const input = await manifest(t, 'release-1', 'first')
+  const failed = await uploadAll(node, input)
+  t.is(finalCode(failed), ERRORS.HOOK_FAILED)
+  t.is(
+    await visibleLink(storageDir, 'latest'),
+    'release-1',
+    'the automatic link is not rolled back'
+  )
+  t.alike(await journalFiles(storageDir), [], 'and nothing is journaled for it')
+  fail = false
+  t.is(statuses(await uploadAll(node, input)).at(-1), 'ALREADY_COMMITTED')
+})
+
+const DYING_OPERATIONS = new Set([
+  'rename',
+  'unlink',
+  'symlink',
+  'write',
+  'truncate',
+  'rm',
+  'rmdir'
+])
+
+/** Storage whose every mutation fails once `die()` is called, as if the process were killed. */
+function dyingStorage(): { storage: ReturnType<typeof createStorage>; die(): void } {
+  let dead = false
+  const storage = createStorage({
+    beforeOperation(name, _target, ...rest) {
+      if (!dead) return
+      if (DYING_OPERATIONS.has(name) || (name === 'open' && rest[0] === 'wx')) {
+        throw new Error('the process is dead')
+      }
+    }
+  })
+  return { storage, die: () => void (dead = true) }
+}
+
+type InterruptedPrior = 'missing' | 'managed' | 'adopted'
+
+/**
+ * Leaves a storage root as a killed server would: three 2-byte artifacts, a link request for
+ * `r2` whose hook never returns, its change and journal on disk, and the old server closed.
+ */
+async function interruptedRequest(
+  t: Assert,
+  prior: InterruptedPrior,
+  storageDir: string
+): Promise<void> {
+  if (prior === 'adopted') {
+    await fs.promises.symlink('no-such-target', path.join(storageDir, 'current'))
+  }
+  const dying = dyingStorage()
+  let hung = false
+  const { server, node } = await createServer(t, {
+    storageDir,
+    storage: dying.storage,
+    symlinks: [{ selector: '/^r\\d$/' }],
+    hooks: {
+      afterLink: ({ link }) => {
+        if (link.target !== 'r2') return
+        hung = true
+        dying.die()
+        return new Promise<void>(() => {})
+      }
+    }
+  })
+  await uploadEach(t, node, ['r1', 'r2', 'r3'])
+  if (prior === 'managed') {
+    t.alike((await linkAll(node, 'r1', 'current')).result, { v: 1, status: 'LINKED' })
+  }
+  const socket = linkRequest(node, 'r2', 'current')
+  await waitFor(() => hung)
+  await deadline(server.close(), 'the old server to close')
+  // A killed process leaves its lock behind; this process is still alive, so drop it by hand.
+  await fs.promises.rm(path.join(storageDir, '.swarm-deploy', 'lock'), {
+    recursive: true,
+    force: true
+  })
+  t.is(socket.destroyed, true)
+  t.is(await visibleLink(storageDir, 'current'), 'r2', `${prior}: the unfinished change is on disk`)
+  t.is((await journalFiles(storageDir)).length, 1, `${prior}: with its journal`)
+}
+
+test('a request that was interrupted is restored at the next start, before retention can run', async (t) => {
+  const priors: Array<[InterruptedPrior, string | null, string | null]> = [
+    ['missing', null, null],
+    ['managed', 'r1', 'r1'],
+    ['adopted', 'no-such-target', null]
+  ]
+  for (const [prior, link, record] of priors) {
+    const storageDir = await createTempDir(t)
+    await interruptedRequest(t, prior, storageDir)
+
+    const logs: Array<Record<string, unknown>> = []
+    const restarted = await createServer(t, {
+      storageDir,
+      maxStorageBytes: 4,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      logger: { warn: (message, details) => void logs.push({ message, ...details }) }
+    })
+    t.is(await visibleLink(storageDir, 'current'), link, `${prior}: the previous link is back`)
+    t.is(((await ownership(storageDir, 'current')) ?? { target: null }).target, record, prior)
+    t.alike(await journalFiles(storageDir), [], `${prior}: the journal is gone`)
+    t.ok(
+      logs.some(
+        (entry) =>
+          entry.message === 'Restored a managed link after an unfinished request' &&
+          entry.name === 'current'
+      ),
+      `${prior}: the restore is logged by link name`
+    )
+    t.absent(JSON.stringify(logs).includes(storageDir), `${prior}: no path in the log`)
+    // Retention ran after recovery: a managed previous target is pinned by its restored
+    // record, while the attempted one is just an old artifact again.
+    const exists = (name: string): Promise<boolean> =>
+      fs.promises.lstat(path.join(storageDir, name)).then(
+        () => true,
+        () => false
+      )
+    t.is(
+      await exists('r1'),
+      prior === 'managed',
+      `${prior}: the previous target survives retention`
+    )
+    // Making room evicts the oldest artifact nothing holds: with a managed previous link that
+    // is `r2` (the unconfirmed target is only an old artifact again), otherwise `r1`.
+    t.is(await exists('r2'), prior !== 'managed', `${prior}: the unconfirmed target is unpinned`)
+    t.is(await exists('r3'), true, prior)
+
+    // The name is usable again, and an exact repeat is now a fresh link.
+    const retry = linkRequest(restarted.node, 'r3', 'current')
+    await waitFor(() => retry.writes.length === 1)
+    t.alike(linkFrame(retry), { v: 1, status: 'LINKED' }, prior)
+  }
+})
+
+test('a journal that cannot be proven at start-up blocks its name, keeps its artifacts, and fails closed', async (t) => {
+  const storageDir = await createTempDir(t)
+  await interruptedRequest(t, 'managed', storageDir)
+  // Somebody replaced the unfinished link while the server was down.
+  await fs.promises.rm(path.join(storageDir, 'current'))
+  await fs.promises.symlink('r3', path.join(storageDir, 'current'))
+
+  const logs: Array<Record<string, unknown>> = []
+  const restarted = await createServer(t, {
+    storageDir,
+    maxStorageBytes: 4,
+    symlinks: [{ selector: '/^r\\d$/' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) }
+  })
+  t.is(await visibleLink(storageDir, 'current'), 'r3', 'their change is left as it is')
+  t.is((await journalFiles(storageDir)).length, 1, 'the journal stays')
+  t.ok(
+    logs.some(
+      (entry) =>
+        entry.message === 'Managed link rollback is blocked by a change made since' &&
+        entry.name === 'current'
+    )
+  )
+  // Both the attempted and the previous artifact stay pinned by the journal through startup
+  // retention, so only the unpinned newest one made room.
+  for (const name of ['r1', 'r2']) {
+    t.ok((await fs.promises.lstat(path.join(storageDir, name))).isFile(), `${name} is pinned`)
+  }
+  await t.exception(() => fs.promises.lstat(path.join(storageDir, 'r3')), { code: 'ENOENT' })
+
+  const blocked = await linkAll(restarted.node, 'r1', 'current')
+  t.alike(
+    blocked.result,
+    { v: 1, status: 'FAILED', code: ERRORS.LINK_FAILED },
+    'the name fails closed'
+  )
+  const other = await linkAll(restarted.node, 'r1', 'elsewhere')
+  t.alike(other.result, { v: 1, status: 'LINKED' }, 'other names carry on')
+  t.is(await visibleLink(storageDir, 'current'), 'r3')
+})
+
+test('a corrupt journal stops the server from starting rather than guessing what to restore', async (t) => {
+  const storageDir = await createTempDir(t)
+  await interruptedRequest(t, 'missing', storageDir)
+  const [journal] = await journalFiles(storageDir)
+  const file = path.join(storageDir, LINKS_DIRECTORY, journal)
+  await fs.promises.writeFile(file, '{"version":1}')
+  const restarted = new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    dht: new FakeServerNode(),
+    symlinks: [{ selector: '/^r\\d$/' }]
+  })
+  t.teardown(() => restarted.close())
+  await t.exception(() => restarted.listen(), { code: ERRORS.LINK_FAILED })
+  t.is(await visibleLink(storageDir, 'current'), 'r2', 'nothing was changed')
+  t.is(
+    await fs.promises.readFile(file, 'utf8'),
+    '{"version":1}',
+    'and the journal is left for the operator'
+  )
+})
+
+test('a restore that fails answers LINK_FAILED, keeps the journal, and is finished by the next request', async (t) => {
+  const storageDir = await createTempDir(t)
+  let failRestore = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (failRestore && name === 'unlink' && target.endsWith(`${path.sep}current`)) {
+        throw new Error(`injected failure for ${target}`)
+      }
+    }
+  })
+  const hookErrors: HookFailureContext[] = []
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    storageDir,
+    storage,
+    symlinks: [{ selector: '/^r\\d$/' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      afterLink: () => {
+        if (failRestore) throw new Error('publish failed')
+      },
+      onFailure: (context) => void hookErrors.push(context)
+    }
+  })
+  const events: Array<Record<string, unknown>> = []
+  server.on('link', (event) =>
+    events.push({
+      status: event.status,
+      reason: event.reason,
+      result: event.result,
+      rolledBack: event.rolledBack
+    })
+  )
+  await uploadEach(t, node, ['r1', 'r2'])
+
+  failRestore = true
+  const socket = linkRequest(node, 'r1', 'current')
+  await waitFor(() => hookErrors.length === 1)
+  t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.LINK_FAILED })
+  t.is(b4a.toString(socket.writes[0]).includes(storageDir), false)
+  t.alike(events, [
+    { status: 'failed', reason: ERRORS.LINK_FAILED, result: undefined, rolledBack: undefined }
+  ])
+  t.is(hookErrors[0].phase, 'afterLink', 'onFailure still reports the hook failure')
+  t.ok(
+    logs.some(
+      (entry) =>
+        entry.message === 'Managed link rollback failed' &&
+        entry.name === 'current' &&
+        entry.reason === ERRORS.LINK_FAILED
+    )
+  )
+  t.absent(JSON.stringify(logs).includes(storageDir), 'the log carries no path')
+  t.is(await visibleLink(storageDir, 'current'), 'r1', 'the change could not be undone')
+  t.is((await journalFiles(storageDir)).length, 1, 'so its journal is kept')
+
+  // Still pinned by the journal, and still unresolved for any request to that name.
+  failRestore = false
+  const next = linkRequest(node, 'r2', 'current')
+  await waitFor(() => next.writes.length === 1)
+  t.alike(
+    linkFrame(next),
+    { v: 1, status: 'LINKED' },
+    'the pending restore is finished, then this request runs'
+  )
+  t.is(await visibleLink(storageDir, 'current'), 'r2')
+  t.alike(await journalFiles(storageDir), [])
+})
+
+test('a change somebody else made during the hook is never overwritten by the restore', async (t) => {
+  const changes: Array<[string, (link: string) => Promise<void>]> = [
+    [
+      'a regular file',
+      async (link) => {
+        await fs.promises.rm(link)
+        await fs.promises.writeFile(link, 'operator file')
+      }
+    ],
+    [
+      'another symlink',
+      async (link) => {
+        await fs.promises.rm(link)
+        await fs.promises.symlink('r2', link)
+      }
+    ],
+    [
+      'a symlink with the same text',
+      async (link) => {
+        await fs.promises.rm(link)
+        await fs.promises.symlink('r1', link)
+      }
+    ]
+  ]
+  for (const [label, change] of changes) {
+    const storageDir = await createTempDir(t)
+    const hookErrors: HookFailureContext[] = []
+    const events: Array<Record<string, unknown>> = []
+    const { server, node } = await createServer(t, {
+      storageDir,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      hooks: {
+        afterLink: async ({ link }) => {
+          await change(link.path)
+          throw new Error('publish failed')
+        },
+        onFailure: (context) => void hookErrors.push(context)
+      }
+    })
+    server.on('link', (event) =>
+      events.push({ status: event.status, reason: event.reason, rolledBack: event.rolledBack })
+    )
+    await uploadEach(t, node, ['r1', 'r2'])
+    const socket = linkRequest(node, 'r1', 'current')
+    await waitFor(() => hookErrors.length === 1)
+    t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.LINK_FAILED }, label)
+    t.alike(
+      events,
+      [{ status: 'failed', reason: ERRORS.LINK_FAILED, rolledBack: undefined }],
+      label
+    )
+    t.is((await journalFiles(storageDir)).length, 1, `${label}: the journal is kept`)
+    const stat = await fs.promises.lstat(path.join(storageDir, 'current'))
+    if (label === 'a regular file') {
+      t.is(
+        await fs.promises.readFile(path.join(storageDir, 'current'), 'utf8'),
+        'operator file',
+        label
+      )
+    } else {
+      t.is(stat.isSymbolicLink(), true, label)
+      t.is(
+        await visibleLink(storageDir, 'current'),
+        label === 'another symlink' ? 'r2' : 'r1',
+        label
+      )
+    }
+    const next = await linkAll(node, 'r2', 'current')
+    t.alike(
+      next.result,
+      { v: 1, status: 'FAILED', code: ERRORS.LINK_FAILED },
+      `${label}: fails closed`
+    )
+  }
+})
+
+test('a closing server restores an aborted request, and a disconnected client does not change the outcome', async (t) => {
+  // Closing mid-hook, with a managed previous link: the previous target comes back.
+  {
+    const storageDir = await createTempDir(t)
+    let started = 0
+    const { server, node } = await createServer(t, {
+      storageDir,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      hooks: {
+        afterLink: ({ link }) => {
+          if (link.target !== 'r2') return
+          started++
+          return new Promise<void>(() => {})
+        }
+      }
+    })
+    await uploadEach(t, node, ['r1', 'r2'])
+    t.alike((await linkAll(node, 'r1', 'current')).result, { v: 1, status: 'LINKED' })
+    const socket = linkRequest(node, 'r2', 'current')
+    await waitFor(() => started === 1)
+    t.is(await visibleLink(storageDir, 'current'), 'r2')
+    await deadline(server.close(), 'the server to close')
+    t.is(socket.destroyed, true)
+    t.is(await visibleLink(storageDir, 'current'), 'r1', 'close restored the previous link')
+    t.is((await ownership(storageDir, 'current'))?.target, 'r1', 'and its ownership record')
+    t.alike(await journalFiles(storageDir), [])
+  }
+
+  // The client drops while the hook runs: the hook's outcome alone decides.
+  for (const outcome of ['fails', 'succeeds'] as const) {
+    const storageDir = await createTempDir(t)
+    const held = gate()
+    const hookErrors: HookFailureContext[] = []
+    const { server, node } = await createServer(t, {
+      storageDir,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      hooks: {
+        afterLink: async ({ link }) => {
+          if (link.target !== 'r2') return
+          await held.wait
+          if (outcome === 'fails') throw new Error('publish failed')
+        },
+        onFailure: (context) => void hookErrors.push(context)
+      }
+    })
+    const events: Array<Record<string, unknown>> = []
+    server.on('link', (event) =>
+      events.push({
+        status: event.status,
+        reason: event.reason,
+        result: event.result,
+        rolledBack: event.rolledBack
+      })
+    )
+    await uploadEach(t, node, ['r1', 'r2'])
+    t.alike((await linkAll(node, 'r1', 'current')).result, { v: 1, status: 'LINKED' })
+    events.length = 0
+    const socket = linkRequest(node, 'r2', 'current')
+    await waitFor(() => reservedHookLines(server) === 1)
+    socket.destroy()
+    held.open()
+    await waitFor(() => events.length === 1)
+    if (outcome === 'fails') {
+      t.is(
+        await visibleLink(storageDir, 'current'),
+        'r1',
+        `${outcome}: restored although nobody is listening`
+      )
+      t.alike(events, [
+        { status: 'failed', reason: ERRORS.HOOK_FAILED, result: undefined, rolledBack: true }
+      ])
+      t.is(hookErrors.length, 1, 'onFailure still ran')
+    } else {
+      t.is(
+        await visibleLink(storageDir, 'current'),
+        'r2',
+        `${outcome}: final although nobody is listening`
+      )
+      t.is(hookErrors.length, 0)
+    }
+    t.alike(await journalFiles(storageDir), [], outcome)
+  }
+
+  // A write that fails after the hook succeeded cannot undo it: the change was already final.
+  {
+    const storageDir = await createTempDir(t)
+    const { server, node } = await createServer(t, {
+      storageDir,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      hooks: { afterLink: () => {} }
+    })
+    const events: Array<Record<string, unknown>> = []
+    server.on('link', (event) =>
+      events.push({ status: event.status, reason: event.reason, rolledBack: event.rolledBack })
+    )
+    t.absent(finalCode(await uploadAll(node, await manifest(t, 'r1', 'aa'))))
+    const socket = new FakeSocket(CLIENT_KEY)
+    socket.onWrite = () => {
+      throw new Error('the connection is gone')
+    }
+    node.accept(socket)
+    socket.feed(
+      encodeControlFrame(
+        encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'r1', name: 'current' })
+      )
+    )
+    socket.finishInput()
+    await waitFor(() => events.length === 1)
+    t.is(await visibleLink(storageDir, 'current'), 'r1', 'the finalized link stays')
+    t.alike(events, [{ status: 'failed', reason: ERRORS.LINK_FAILED, rolledBack: undefined }])
+    t.alike(await journalFiles(storageDir), [])
+  }
+})
+
+test('requests for one link are ordered across modes, and each one decides against what the last left', async (t) => {
+  // The first request links `r1`, the second `r2`. Each row gives the policies, whether each
+  // hook fails, what each client is answered, and the link that must be left at the end.
+  const orders: Array<
+    ['rollback' | 'keep', boolean, 'rollback' | 'keep', boolean, [string, string], string | null]
+  > = [
+    // The first is restored to no link, so the second finds none and links afresh.
+    ['rollback', true, 'keep', false, ['HOOK_FAILED', 'LINKED'], 'r2'],
+    // The first kept `r1`, so the second's restore goes back to it rather than to no link.
+    ['keep', true, 'rollback', true, ['HOOK_FAILED', 'HOOK_FAILED'], 'r1'],
+    ['rollback', false, 'rollback', true, ['LINKED', 'HOOK_FAILED'], 'r1']
+  ]
+  for (const [firstPolicy, firstFails, secondPolicy, secondFails, answers, final] of orders) {
+    const label = `${firstPolicy}(${firstFails ? 'fails' : 'ok'}) then ${secondPolicy}(${secondFails ? 'fails' : 'ok'})`
+    const storageDir = await createTempDir(t)
+    const held = gate()
+    const seen: string[] = []
+    let calls = 0
+    const { node } = await createServer(t, {
+      storageDir,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      hooks: {
+        afterLink: async ({ status, link }) => {
+          const call = calls++
+          seen.push(`${link.target}:${status}`)
+          if (call === 0) await held.wait
+          if (call === 0 ? firstFails : secondFails) throw new Error('publish failed')
+        }
+      }
+    })
+    await uploadEach(t, node, ['r1', 'r2'])
+    const first = linkRequest(node, 'r1', 'current', false, firstPolicy)
+    await waitFor(() => calls === 1)
+    const second = linkRequest(node, 'r2', 'current', false, secondPolicy)
+    await settled()
+    t.is(calls, 1, `${label}: the second request waits for the first to finish`)
+    t.is(await visibleLink(storageDir, 'current'), 'r1', `${label}: and has not changed the link`)
+    held.open()
+    await waitFor(() => first.writes.length === 1 && second.writes.length === 1)
+    const answered = (socket: FakeSocket): string => {
+      const frame = linkFrame(socket)
+      return frame.code ?? frame.status
+    }
+    t.alike([answered(first), answered(second)], answers, `${label}: each is answered for itself`)
+    t.is(await visibleLink(storageDir, 'current'), final, label)
+    t.is((await ownership(storageDir, 'current'))?.target, final, `${label}: and its record`)
+    t.alike(
+      seen,
+      ['r1:LINKED', 'r2:LINKED'],
+      `${label}: each decided against the state the last one left`
+    )
+    t.alike(await journalFiles(storageDir), [], label)
+  }
+})
+
+test('a pending request keeps both its attempted and its previous artifact from retention', async (t) => {
+  const priors: Array<['managed' | 'adopted', 'rollback' | 'keep', boolean]> = [
+    // [previous link, policy, is the previous artifact still there after retention made room?]
+    ['managed', 'rollback', true],
+    ['managed', 'keep', false],
+    ['adopted', 'rollback', true],
+    ['adopted', 'keep', false]
+  ]
+  for (const [prior, policy, previousSurvives] of priors) {
+    const label = `${prior} previous link, ${policy}`
+    const storageDir = await createTempDir(t)
+    if (prior === 'adopted') await fs.promises.symlink('r1', path.join(storageDir, 'current'))
+    const held = gate()
+    let pending = false
+    const { node } = await createServer(t, {
+      storageDir,
+      maxStorageBytes: 6,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      hooks: {
+        afterLink: async ({ link }) => {
+          if (link.target !== 'r2') return
+          pending = true
+          await held.wait
+          if (policy === 'rollback') throw new Error('publish failed')
+        }
+      }
+    })
+    await uploadEach(t, node, ['r1', 'r2', 'r3'])
+    if (prior === 'managed') {
+      t.alike((await linkAll(node, 'r1', 'current')).result, { v: 1, status: 'LINKED' })
+    }
+
+    const socket = linkRequest(node, 'r2', 'current', false, policy)
+    await waitFor(() => pending)
+    // Storage is full: this upload makes retention evict the oldest artifact nothing holds.
+    t.absent(finalCode(await uploadAll(node, await manifest(t, 'r4', 'dd'))), label)
+    const there = (name: string): Promise<boolean> =>
+      fs.promises.lstat(path.join(storageDir, name)).then(
+        () => true,
+        () => false
+      )
+    t.is(await there('r2'), true, `${label}: the attempted artifact stays`)
+    t.is(await there('r1'), previousSurvives, `${label}: the previous artifact`)
+    t.is(await there('r3'), !previousSurvives, `${label}: the other old artifact made room instead`)
+    held.open()
+    await waitFor(() => socket.writes.length === 1)
+    if (policy === 'rollback') {
+      t.is(await visibleLink(storageDir, 'current'), 'r1', `${label}: the restore finds its target`)
+      t.is(await there('r1'), true)
+    }
+  }
+})
+
 test('closing the server aborts a pending afterLink and a queued one and frees the hook line', async (t) => {
   let started = 0
   const { server, node } = await createServer(t, {
@@ -3364,15 +4228,20 @@ test('closing the server aborts a pending afterLink and a queued one and frees t
   const first = linkRequest(node, 'r1', 'current')
   await waitFor(() => started === 1)
   const second = linkRequest(node, 'r2', 'current')
-  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r2')
   await settled()
-  t.is(started, 1, 'the queued hook has not started')
+  t.is(started, 1, 'the queued request has not started')
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'r1')
 
   await deadline(server.close(), 'the server to close')
   t.is(started, 1, 'closing never starts the queued hook')
   t.is(reservedHookLines(server), 0)
   t.is(first.destroyed, true)
   t.is(second.destroyed, true)
+  // The aborted request's link was restored (it did not exist) and the queued one never decided.
+  await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'current')), {
+    code: 'ENOENT'
+  })
+  t.alike(await fs.promises.readdir(path.join(server.storageDir, '.swarm-deploy', 'links')), [])
 })
 
 test('an authenticated link request replaces an unrecorded symlink and survives hook failure, restart, and retention', async (t) => {
@@ -3405,14 +4274,17 @@ test('an authenticated link request replaces an unrecorded symlink and survives 
   await uploadAll(first.node, await manifest(t, '0.20.1', 'aa'))
   await uploadAll(first.node, await manifest(t, '0.20.2', 'bb'))
 
-  t.alike((await linkAll(first.node, '0.20.1', 'latest')).result, {
+  t.alike((await linkAll(first.node, '0.20.1', 'latest', 'keep')).result, {
     v: 1,
     status: 'FAILED',
     code: ERRORS.HOOK_FAILED
   })
-  t.is(await fs.promises.readlink(latest), '0.20.1', 'the replacement is durable')
+  t.is(await fs.promises.readlink(latest), '0.20.1', 'keep leaves the replacement in place')
   failing = false
-  t.alike((await linkAll(first.node, '0.20.1', 'latest')).result, { v: 1, status: 'UNCHANGED' })
+  t.alike((await linkAll(first.node, '0.20.1', 'latest', 'keep')).result, {
+    v: 1,
+    status: 'UNCHANGED'
+  })
   t.alike(calls, ['latest:LINKED', 'latest:UNCHANGED'], 'the retry reruns the hook')
 
   t.alike((await linkAll(first.node, '0.20.1', 'operator')).result, {

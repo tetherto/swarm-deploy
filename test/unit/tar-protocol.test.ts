@@ -421,6 +421,70 @@ test('the hook-result opt-in is a strict capability on the request and optional 
   )
 })
 
+test('the hook failure policy is a strict optional request field, independent of the result opt-in', (t) => {
+  const base = { v: 1, kind: 'link', target: 'release-1.2.3', name: 'current' } as const
+  // Absent is what an older client sends: the same four fields as ever.
+  t.is(
+    b4a.toString(encodeLinkRequestRecord({ ...base })),
+    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current"}'
+  )
+  for (const hookFailure of ['rollback', 'keep'] as const) {
+    const request: LinkRequestRecord = { ...base, hookFailure }
+    const bytes = encodeLinkRequestRecord(request)
+    t.is(
+      b4a.toString(bytes),
+      `{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookFailure":"${hookFailure}"}`
+    )
+    t.alike(decodeLinkRequestRecord(bytes), request)
+    t.alike(decodeFirstControlRecord(bytes), request)
+    t.exception(() => decodeAnyMetadataRecord(bytes), { code: ERRORS.PROTOCOL_INVALID })
+
+    const both: LinkRequestRecord = { ...base, hookFailure, hookResult: true }
+    const bothBytes = encodeLinkRequestRecord(both)
+    t.is(
+      b4a.toString(bothBytes),
+      `{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookFailure":"${hookFailure}","hookResult":true}`
+    )
+    t.alike(decodeLinkRequestRecord(bothBytes), both)
+  }
+
+  // Exactly the two policies, spelled exactly; nothing else stands in for a missing field.
+  for (const hookFailure of [
+    'ROLLBACK',
+    'Keep',
+    '',
+    'none',
+    'delete',
+    true,
+    false,
+    null,
+    1,
+    {},
+    []
+  ]) {
+    const bad = { ...base, hookFailure } as unknown as LinkRequestRecord
+    t.exception(() => encodeLinkRequestRecord(bad), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  for (const body of [
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":"ROLLBACK"}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":null}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookfailure":"keep"}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":"keep","onFailure":"keep"}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":"keep","hookResult":false}'
+  ]) {
+    t.exception(() => decodeLinkRequestRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID })
+    t.exception(() => decodeFirstControlRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  // Answers never carry the policy.
+  for (const status of ['LINKED', 'UNCHANGED']) {
+    t.exception(
+      () =>
+        decodeLinkResultRecord(b4a.from(`{"v":1,"status":"${status}","hookFailure":"rollback"}`)),
+      { code: ERRORS.PROTOCOL_INVALID }
+    )
+  }
+})
+
 test('a link result record refuses malformed or misplaced hook-result data', (t) => {
   const record = (hookResult: string, status = 'LINKED'): Buffer =>
     b4a.from(`{"v":1,"status":"${status}","hookResult":${hookResult}}`)

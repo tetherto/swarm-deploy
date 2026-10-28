@@ -15,6 +15,7 @@ import { Server, type ServerLogger, type ServerOptions } from './server.js'
 import { encodeLinkRequestRecord } from './tar-protocol/controls.js'
 import {
   Client,
+  type ClientLinkHookFailure,
   type ClientLinkResult,
   type ClientOptions,
   type ClientUploadResult
@@ -68,7 +69,7 @@ const USAGE = [
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
   '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module>]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] <file-or-directory>',
-  '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--json] <target> <link-name>',
+  '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--hook-failure <rollback|keep>] [--json] <target> <link-name>',
   '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]]',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
@@ -853,7 +854,14 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
 async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, flagOptions, positionals } = parseOptions(
     args,
-    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout', '--json']),
+    new Set([
+      '--seed-file',
+      '--seed',
+      '--server-key',
+      '--idle-timeout',
+      '--hook-failure',
+      '--json'
+    ]),
     new Set(),
     new Set(['--server-key', '--seed']),
     new Set(['--json']),
@@ -861,6 +869,12 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
     true
   )
   const json = flagOptions['--json'] === true
+  const policy = options['--hook-failure']
+  if (policy !== undefined && policy !== 'rollback' && policy !== 'keep') {
+    throw usageError('Invalid --hook-failure')
+  }
+  const hookFailure: ClientLinkHookFailure | undefined =
+    policy === 'rollback' || policy === 'keep' ? policy : undefined
   const [target, name] = requirePositionals(positionals, 2, 'link requires a target and link name')
   try {
     encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })
@@ -922,9 +936,17 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
   let code = 0
   try {
     try {
-      // Only --json asks the server for the hook's result; the plain call is unchanged.
-      if (json) code = printLinkJson(await client.link(target, name, { hookResult: true }), io)
-      else code = printLinkResult(await client.link(target, name), io)
+      // Only --json asks the server for the hook's result, and only --hook-failure names a
+      // policy; the client sends its own default (rollback), so the plain call is two arguments.
+      const asked = {
+        ...(hookFailure === undefined ? {} : { hookFailure }),
+        ...(json ? { hookResult: true } : {})
+      }
+      const result =
+        Object.keys(asked).length === 0
+          ? await client.link(target, name)
+          : await client.link(target, name, asked)
+      code = json ? printLinkJson(result, io) : printLinkResult(result, io)
     } catch (err) {
       runError = new CliError(linkErrorMessage(err), 1)
     }

@@ -48,15 +48,29 @@ export function isTreeMetadata(value: AnyMetadataRecord): value is TreeMetadataR
   return (value as TreeMetadataRecord).kind === 'directory'
 }
 
+/**
+ * What the server does with a link it just made when `afterLink` fails:
+ * `rollback` restores the previous link and ownership metadata (or removes a
+ * link that did not exist), `keep` leaves the new link in place.
+ */
+export type LinkHookFailurePolicy = 'rollback' | 'keep'
+
 export interface LinkRequestRecord {
   v: typeof CONTROL_VERSION
   kind: 'link'
   target: string
   name: string
   /**
+   * The failure policy. A current client always sends it, so an older strict
+   * server rejects the request instead of silently keeping a link the caller
+   * expects to be rolled back. A request without it, from an older client, is
+   * handled as `rollback`.
+   */
+  hookFailure?: LinkHookFailurePolicy
+  /**
    * Opt-in: asks the server to return what its `afterLink` hook returned. The
-   * field is sent only when `true`, so a default request keeps its exact
-   * four-field shape and an older strict server rejects an opted-in one.
+   * field is sent only when `true`, so an older strict server rejects an
+   * opted-in request.
    */
   hookResult?: true
 }
@@ -267,12 +281,20 @@ const LINK_REQUEST_KEYS = ['v', 'kind', 'target', 'name']
 
 function validateLinkRequest(value: unknown): LinkRequestRecord {
   if (!isRecord(value)) throw invalid('Link request record must be an object')
+  const hasPolicy = Object.prototype.hasOwnProperty.call(value, 'hookFailure')
   const asksForResult = Object.prototype.hasOwnProperty.call(value, 'hookResult')
-  exactKeys(value, asksForResult ? [...LINK_REQUEST_KEYS, 'hookResult'] : LINK_REQUEST_KEYS)
+  exactKeys(value, [
+    ...LINK_REQUEST_KEYS,
+    ...(hasPolicy ? ['hookFailure'] : []),
+    ...(asksForResult ? ['hookResult'] : [])
+  ])
   assertVersion(value.v)
   if (value.kind !== 'link') throw invalid('Invalid control request kind')
   assertName(value.target)
   assertName(value.name)
+  if (hasPolicy && value.hookFailure !== 'rollback' && value.hookFailure !== 'keep') {
+    throw invalid('Invalid hook failure policy')
+  }
   // Only `true` opts in; `false` would be a second spelling of the default.
   if (asksForResult && value.hookResult !== true) throw invalid('Invalid hook result request')
   return value as unknown as LinkRequestRecord

@@ -173,6 +173,7 @@ idempotent.
 
 ```ts
 interface ClientLinkOptions {
+  hookFailure?: 'rollback' | 'keep' // default 'rollback'
   hookResult?: boolean // default false
 }
 
@@ -184,15 +185,29 @@ interface ClientLinkResult {
 }
 ```
 
+`hookFailure` says what the server does with the link it just made when its
+`afterLink` hook fails. The request waits for the hook in both modes, and a failed
+hook is `HOOK_FAILED` in both. `'rollback'` (the default) restores the previous
+local symlink and its ownership record, or removes a link the request created,
+before the error is returned; `'keep'` leaves the new link in place, as 0.5.x did.
+Neither undoes the uploaded artifact or anything the hook did elsewhere, and
+neither affects an upload's automatic links. After a rollback the same request
+links afresh (`LINKED`), after `'keep'` it returns `UNCHANGED`. The policy is
+always sent, so a server older than 0.6.0 rejects the request and the call fails
+rather than keeping a link you expected to be rolled back; upgrade servers
+first. If a restore cannot be proven or fails, the call fails with `LINK_FAILED`
+instead and the server leaves what it found. See
+[Rollback and its limits](hooks.md#rollback-and-its-limits). Unknown options and
+values reject with `PROTOCOL_INVALID` before connecting.
+
 `hookResult: true` asks the server for what its `afterLink` hook returned, a
 plain JSON object (`HookResult`, with `HookResultValue` for its values) the hook
 author chose to report, such as an accepted submission's ID or evidence URL. It
 arrives only after the hook has resolved and is absent when the server has no
 hook or the hook returned nothing. It is data the hook reported, not proof that
 anything was published, and it is never placed in client events or logs. Without
-the option the request and the result are exactly what earlier versions
-exchanged. Unknown options and non-boolean values reject with `PROTOCOL_INVALID`
-before connecting. An opted-in request needs a server of version 0.5.0 or later;
+the option the answer is exactly what earlier versions returned, and it is
+independent of `hookFailure`. An opted-in request needs a server of version 0.5.0 or later;
 an older server rejects it, so the call fails rather than returning without the
 result. A server that sends a result nobody asked for, or a malformed one, fails
 the call with `PROTOCOL_INVALID`. See
@@ -261,8 +276,11 @@ Server events:
 - `link`: one terminal manual-link outcome with `target`, `name`, client
   fingerprint, and status `linked`, `unchanged`, `rejected`, or `failed`.
   Rejected and failed outcomes also include a stable `reason`. A failed
-  `afterLink` hook is `failed` with reason `HOOK_FAILED` and `result`
-  (`LINKED` or `UNCHANGED`), the durable outcome the link had already reached.
+  `afterLink` hook is `failed` with reason `HOOK_FAILED` and either
+  `rolledBack: true` (the previous link and record were restored; there is no
+  `result`) or `result` (`LINKED` or `UNCHANGED`), the outcome that stayed in place
+  after `keep` or a request that changed nothing. A restore that could not be
+  proven or failed is `failed` with `LINK_FAILED` and neither field.
   Automatic links emit no `link` event.
 - `failure`: stable failure code and peer fingerprint.
 - `listening`: local server-key fingerprint.
@@ -362,8 +380,10 @@ try {
 `HOOK_FAILED` is the stable code for a failed `beforeCommit`, `afterCommit`, or
 `afterLink` callback. Its message is fixed and the original exception is
 available only as `cause` and to `onFailure`. For `afterCommit` and
-`afterLink` the artifact (and, for `afterLink`, the link) is already durable
-when the code is reported, so a retry is safe and does not undo it.
+`afterLink` the artifact is already durable when the code is reported, so a retry
+is safe and does not undo it. An upload's automatic link stays too; an explicit
+link request restores its previous link first unless it asked to keep it (see
+[Link results](#link-results)).
 
 Stable codes include authentication and server-key rejection, invalid
 configuration and protocol records, file and staging limits, disk reserve,

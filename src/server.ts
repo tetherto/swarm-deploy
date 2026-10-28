@@ -37,9 +37,13 @@ import type { HookResult } from './hook-result.js'
 import { keyPairFromSeed } from './identity.js'
 import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
-import { LinkStore, type LinkReconcileResult } from './storage/link-store.js'
+import {
+  LinkStore,
+  type LinkReconcileResult,
+  type ManualLinkTransaction
+} from './storage/link-store.js'
 import { acquireStorageLock, assertNoPendingStorageReset, initLayout } from './storage/layout.js'
-import { withRootLease } from './storage/root-coordinator.js'
+import { withNameLease, withRootLease } from './storage/root-coordinator.js'
 import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
 import {
   RetentionManager,
@@ -201,6 +205,12 @@ export interface ServerLinkEvent extends FingerprintEvent {
    * already matched) and only its `afterLink` hook failed.
    */
   result?: 'LINKED' | 'UNCHANGED'
+  /**
+   * Present, and `true`, only on a failed request whose previous link and
+   * ownership record were restored. `result` is then omitted, because the change
+   * it would describe no longer applies.
+   */
+  rolledBack?: true
 }
 export interface ServerEventMap {
   authentication: AuthenticationEvent
@@ -238,6 +248,18 @@ interface PendingLinkHook {
 
 function releaseLinkHooks(pending: readonly PendingLinkHook[]): void {
   for (const item of pending) item.turn.release()
+}
+
+/** What an explicit link request has learned so far; the terminal event and `onFailure` read it. */
+interface LinkRequestState {
+  /** Set once the link decision is made, so a later failure can report what the link did. */
+  durable: HookLinkStatus | null
+  /** The hook that was running. */
+  failed: PendingLinkHook | null
+  /** The hook's own failure, kept even if a failed rollback replaces the error that is returned. */
+  hookError: SwarmDeployError | null
+  /** True only when a failed request's previous link and record were restored. */
+  rolledBack: boolean
 }
 
 function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDeployError {
@@ -591,6 +613,7 @@ export class Server extends EventEmitter {
       if (target) pins.add(target.transferId)
       else pins.add(link.transferId)
     }
+    await this.pinPendingRollbacks(records, pins)
     return { pins, desired, result }
   }
 
@@ -607,7 +630,44 @@ export class Server extends EventEmitter {
       const target = records.find((record) => record.name === ledger.target)
       if (target) pins.add(target.transferId)
     }
+    await this.pinPendingRollbacks(records, pins)
     return pins
+  }
+
+  /**
+   * While a rollback journal exists, a request's outcome is unknown, so both the
+   * attempted and the previous link keep their artifacts: the journal's own
+   * transfer IDs, plus the current artifact whose name equals the attempted
+   * target, the previous record's target, or the previous symlink's text. Only
+   * names are compared; a previous symlink's text is never resolved.
+   */
+  private async pinPendingRollbacks(records: CommitRecord[], pins: Set<string>): Promise<void> {
+    if (!this.links) return
+    for (const pending of await this.links.pendingRollbacks()) {
+      pins.add(pending.transferId)
+      if (pending.priorRecord) pins.add(pending.priorRecord.transferId)
+      for (const name of [pending.target, pending.priorRecord?.target, pending.priorLiteral]) {
+        const record =
+          name === undefined || name === null ? undefined : records.find((r) => r.name === name)
+        if (record) pins.add(record.transferId)
+      }
+    }
+  }
+
+  /** Start-up: restore every link whose request an earlier process never finished. */
+  private async recoverLinkRollbacks(): Promise<void> {
+    if (!this.links) return
+    const recovery = await withRootLease(this.layout!.root, async () => {
+      const result = await this.links!.recoverRollbacks()
+      await this.refreshManagedLinkNames()
+      return result
+    })
+    for (const name of recovery.restored) {
+      this.logger.warn('Restored a managed link after an unfinished request', { name })
+    }
+    for (const name of recovery.blocked) {
+      this.logger.warn('Managed link rollback is blocked by a change made since', { name })
+    }
   }
 
   /**
@@ -720,16 +780,18 @@ export class Server extends EventEmitter {
   ): Promise<void> {
     let emitted = false
     let resultWriteStarted = false
-    // `durable` is set once the link is durable, so a later hook failure can report what the
-    // link did; `failed` is the hook that was running. Held in an object because a closure sets it.
-    const state: { durable: HookLinkStatus | null; failed: PendingLinkHook | null } = {
+    // Held in an object because closures set it.
+    const state: LinkRequestState = {
       durable: null,
-      failed: null
+      failed: null,
+      hookError: null,
+      rolledBack: false
     }
     const emitTerminal = (
       status: ServerLinkEvent['status'],
       reason?: ErrorCode,
-      result?: ServerLinkEvent['result']
+      result?: ServerLinkEvent['result'],
+      rolledBack = false
     ): void => {
       if (emitted) return
       emitted = true
@@ -739,7 +801,8 @@ export class Server extends EventEmitter {
         name: request.name,
         status,
         ...(reason === undefined ? {} : { reason }),
-        ...(result === undefined ? {} : { result })
+        ...(result === undefined ? {} : { result }),
+        ...(rolledBack ? { rolledBack: true } : {})
       })
     }
     try {
@@ -754,68 +817,25 @@ export class Server extends EventEmitter {
       if (this.linkNames.has(request.name)) {
         throw fail(ERRORS.LINK_NOT_ALLOWED, 'Manual link name is reserved by an automatic rule')
       }
-      const decided = await withRootLease(this.layout!.root, async () => {
-        const records = await this.commits!.list()
-        const target = records.find(
-          (record) => record.name === request.target && !isReservedHistoryName(record.name)
-        )
-        if (!target) throw fail(ERRORS.LINK_TARGET_NOT_FOUND, 'Manual link target was not found')
-        const artifacts = new Set(records.map((record) => record.name))
-        if (artifacts.has(request.name)) {
-          throw fail(ERRORS.LINK_CONFLICT, 'Manual link name conflicts with an artifact')
-        }
-        if (!this.links) throw fail(ERRORS.LINK_FAILED, 'Managed link storage is unavailable')
-        const link: DesiredLink = {
-          name: request.name,
-          target: target.name,
-          transferId: target.transferId,
-          targetKind: commitRecordKind(target)
-        }
-        const linked = await this.links.linkManual(link, {
-          managedArtifactNames: artifacts,
-          automaticLinkNames: this.linkNames
-        })
-        await this.refreshManagedLinkNames()
-        // The link is durable here. Its hook runs after this lease is released, so a
-        // slow or failing hook never blocks commits, retention, or other links.
-        const pending: PendingLinkHook | null =
-          this.hooks.afterLink === undefined
-            ? null
-            : {
-                link: this.hookLink(link, 'manual'),
-                artifact: this.recordArtifact(target),
-                status: linked.status,
-                trigger: 'request',
-                turn: this.linkHookTurns.reserve(link.name)
-              }
-        return { status: linked.status, pending }
-      })
-      state.durable = decided.status
-      let hookResult: HookResult | undefined
-      if (decided.pending !== null) {
-        const pending = decided.pending
-        try {
-          ;[hookResult] = await this.runLinkHooks(
-            [pending],
-            owner,
-            (item) => {
-              state.failed = item
-            },
-            request.hookResult === true
-          )
-        } finally {
-          pending.turn.release()
-        }
-      }
+      // Every explicit request for one link runs one at a time, from its decision through its
+      // hook to its commit or rollback, so a request never decides against another's unfinished
+      // change. The key is case-folded because a case-insensitive volume has one entry for both
+      // spellings. It is held without the root lease: commits, retention, uploads, and links
+      // with other names carry on while a hook runs.
+      const published = await withNameLease(
+        this.layout!.root,
+        `link:${request.name.toLowerCase()}`,
+        () => this.publishLink(owner, request, state)
+      )
       resultWriteStarted = true
       await writeLinkResult(
         socket,
-        hookResult === undefined
-          ? { v: 1, status: decided.status }
-          : { v: 1, status: decided.status, hookResult },
+        published.hookResult === undefined
+          ? { v: 1, status: published.status }
+          : { v: 1, status: published.status, hookResult: published.hookResult },
         { signal: this.signal, timeout: this.idleTimeout }
       )
-      emitTerminal(decided.status === 'LINKED' ? 'linked' : 'unchanged')
+      emitTerminal(published.status === 'LINKED' ? 'linked' : 'unchanged')
     } catch (error) {
       let reason =
         error instanceof SwarmDeployError &&
@@ -849,10 +869,14 @@ export class Server extends EventEmitter {
       }
       this.logger.warn('Direct link failed', { publicKeyId: fingerprint(owner), reason })
       this.emitSafe('failure', { fingerprint: fingerprint(owner), reason })
+      // A restored request has no durable outcome to report; `rolledBack` says so instead.
       emitTerminal(
         rejected && reason !== ERRORS.LINK_FAILED ? 'rejected' : 'failed',
         reason,
-        reason === ERRORS.HOOK_FAILED && state.durable !== null ? state.durable : undefined
+        reason === ERRORS.HOOK_FAILED && state.durable !== null && !state.rolledBack
+          ? state.durable
+          : undefined,
+        state.rolledBack
       )
       if (answered && reason === ERRORS.HOOK_FAILED) {
         this.closeAfterAnswer(socket)
@@ -861,8 +885,10 @@ export class Server extends EventEmitter {
           socket.destroy()
         } catch {}
       }
-      // The client has been answered and the link is already durable; onFailure only observes.
-      if (reason === ERRORS.HOOK_FAILED && state.failed !== null) {
+      // The client has been answered and the link is restored or final, with no lease held;
+      // onFailure only observes. It runs for the hook's own failure even when a failed
+      // rollback is what the client was told.
+      if (state.hookError !== null && state.failed !== null) {
         await this.runFailureHook(
           Object.freeze({
             artifact: state.failed.artifact,
@@ -870,7 +896,7 @@ export class Server extends EventEmitter {
             phase: 'afterLink' as const,
             resumed: false,
             alreadyCommitted: true,
-            error: callbackError(error),
+            error: callbackError(state.hookError),
             link: state.failed.link
           }),
           owner,
@@ -878,6 +904,133 @@ export class Server extends EventEmitter {
         )
       }
     }
+  }
+
+  /**
+   * One explicit link request, run under the link's name lease: decide (and, when
+   * a failed hook is to roll back, journal) under the root lease, release it, wait
+   * for the hook, then finalize or restore under the root lease again. A hook
+   * that fails, returns an unusable result, or is aborted by a closing server
+   * restores the previous link and ownership record before the error is
+   * returned; a restore that cannot be proven or fails turns the answer into
+   * `LINK_FAILED` and leaves the journal for the next request or start-up. A hook
+   * that succeeded is final before the answer is written, so a failed write
+   * never undoes it.
+   */
+  private async publishLink(
+    owner: Uint8Array,
+    request: LinkRequestRecord,
+    state: LinkRequestState
+  ): Promise<{ status: HookLinkStatus; hookResult: HookResult | undefined }> {
+    // A request that waited for the lease may find the server closing; it changes nothing then.
+    throwIfAborted(this.signal)
+    const open: { transaction: ManualLinkTransaction | null } = { transaction: null }
+    try {
+      const decided = await withRootLease(this.layout!.root, async () => {
+        const records = await this.commits!.list()
+        const target = records.find(
+          (record) => record.name === request.target && !isReservedHistoryName(record.name)
+        )
+        if (!target) throw fail(ERRORS.LINK_TARGET_NOT_FOUND, 'Manual link target was not found')
+        const artifacts = new Set(records.map((record) => record.name))
+        if (artifacts.has(request.name)) {
+          throw fail(ERRORS.LINK_CONFLICT, 'Manual link name conflicts with an artifact')
+        }
+        if (!this.links) throw fail(ERRORS.LINK_FAILED, 'Managed link storage is unavailable')
+        const link: DesiredLink = {
+          name: request.name,
+          target: target.name,
+          transferId: target.transferId,
+          targetKind: commitRecordKind(target)
+        }
+        const options = { managedArtifactNames: artifacts, automaticLinkNames: this.linkNames }
+        let status: HookLinkStatus
+        if (request.hookFailure !== 'keep' && this.hooks.afterLink !== undefined) {
+          // A request with no hook has nothing to fail, so only a hooked request is journaled.
+          const begun = await this.links.beginManual(link, options)
+          open.transaction = begun.transaction
+          status = begun.status
+        } else {
+          status = (await this.links.linkManual(link, options)).status
+        }
+        await this.refreshManagedLinkNames()
+        // The link is durable here. Its hook runs after this lease is released, so a
+        // slow or failing hook never blocks commits, retention, or other links.
+        const pending: PendingLinkHook | null =
+          this.hooks.afterLink === undefined
+            ? null
+            : {
+                link: this.hookLink(link, 'manual'),
+                artifact: this.recordArtifact(target),
+                status,
+                trigger: 'request',
+                turn: this.linkHookTurns.reserve(link.name)
+              }
+        return { status, pending }
+      })
+      state.durable = decided.status
+      let hookResult: HookResult | undefined
+      if (decided.pending !== null) {
+        const pending = decided.pending
+        try {
+          ;[hookResult] = await this.runLinkHooks(
+            [pending],
+            owner,
+            (item) => {
+              state.failed = item
+            },
+            request.hookResult === true
+          )
+        } finally {
+          pending.turn.release()
+        }
+      }
+      if (open.transaction !== null) {
+        await this.settleLink(
+          (links, transaction) => links.commitManual(transaction),
+          open.transaction
+        )
+        open.transaction = null
+      }
+      return { status: decided.status, hookResult }
+    } catch (error) {
+      if (
+        error instanceof SwarmDeployError &&
+        error.code === ERRORS.HOOK_FAILED &&
+        state.failed !== null
+      ) {
+        state.hookError = error
+      }
+      if (open.transaction !== null) {
+        try {
+          await this.settleLink(
+            (links, transaction) => links.rollbackManual(transaction),
+            open.transaction
+          )
+        } catch (rollbackError) {
+          this.logger.warn('Managed link rollback failed', {
+            publicKeyId: fingerprint(owner),
+            name: request.name,
+            reason: codeOf(rollbackError)
+          })
+          throw fail(ERRORS.LINK_FAILED, 'Unable to restore the previous managed link', error)
+        }
+        state.rolledBack = true
+      }
+      throw error
+    }
+  }
+
+  /** Finalizes or restores a journaled link under the root lease and refreshes the name snapshot. */
+  private settleLink(
+    operation: (links: LinkStore, transaction: ManualLinkTransaction) => Promise<void>,
+    transaction: ManualLinkTransaction
+  ): Promise<void> {
+    return withRootLease(this.layout!.root, async () => {
+      if (!this.links) throw fail(ERRORS.LINK_FAILED, 'Managed link storage is unavailable')
+      await operation(this.links, transaction)
+      await this.refreshManagedLinkNames()
+    })
   }
 
   /**
@@ -1499,6 +1652,9 @@ export class Server extends EventEmitter {
         journals: recovered.length,
         purgedSessions: this.sessions.purgedSessions
       })
+      // A link request that never finished is undone before retention can run or any
+      // client connects: its outcome is unknown, and the caller never heard success.
+      await this.recoverLinkRollbacks()
       this.retention = new RetentionManager({
         layout: this.layout,
         sessionStore: this.sessions,

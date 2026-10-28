@@ -89,13 +89,25 @@ export interface UploadResult {
 }
 export type ClientUploadResult = UploadResult
 export type ClientLinkStatus = 'LINKED' | 'UNCHANGED'
+/** What the server does with the link it just made when `afterLink` fails. */
+export type ClientLinkHookFailure = 'rollback' | 'keep'
 export interface ClientLinkOptions {
   /**
+   * What happens to the link when the server's `afterLink` hook fails. The
+   * request waits for the hook either way, and a failed hook is still a
+   * `HOOK_FAILED` error. `'rollback'` (the default) restores the previous local
+   * link and its ownership record, or removes a link the request created, before
+   * the error is returned; `'keep'` leaves the new link in place. Neither undoes
+   * the uploaded artifact or anything the hook did elsewhere. The policy is
+   * always sent, so a server older than 0.6.0 rejects the request and the call
+   * fails instead of keeping a link you expected to be rolled back.
+   */
+  hookFailure?: ClientLinkHookFailure
+  /**
    * Ask the server to return what its `afterLink` hook returned, as
-   * `ClientLinkResult.hookResult`. Off by default, and then the request and
-   * its answer are exactly what earlier versions exchange. A server older than
-   * 0.5.0 rejects the opted-in request, so the call fails instead of returning
-   * without the result.
+   * `ClientLinkResult.hookResult`. Off by default. It is independent of
+   * `hookFailure`. A server older than 0.5.0 rejects the opted-in request, so
+   * the call fails instead of returning without the result.
    */
   hookResult?: boolean
 }
@@ -167,20 +179,27 @@ function duration(value: unknown, label: string, fallback: number): number {
   }
   return actual as number
 }
-/** Whether the options ask for the hook's result; anything unexpected is refused. */
-function linkOptions(options: unknown): boolean {
-  if (options === undefined) return false
+/** The failure policy and result request the options ask for; anything unexpected is refused. */
+function linkOptions(options: unknown): {
+  hookFailure: ClientLinkHookFailure
+  hookResult: boolean
+} {
+  const asked = { hookFailure: 'rollback' as ClientLinkHookFailure, hookResult: false }
+  if (options === undefined) return asked
   if (typeof options !== 'object' || options === null || Array.isArray(options)) {
     throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
   }
-  if (Object.keys(options).some((name) => name !== 'hookResult')) {
+  if (Object.keys(options).some((name) => name !== 'hookResult' && name !== 'hookFailure')) {
     throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
   }
-  const wanted = (options as { hookResult?: unknown }).hookResult
-  if (wanted !== undefined && typeof wanted !== 'boolean') {
+  const { hookFailure, hookResult } = options as { hookFailure?: unknown; hookResult?: unknown }
+  if (hookResult !== undefined && typeof hookResult !== 'boolean') {
     throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
   }
-  return wanted === true
+  if (hookFailure !== undefined && hookFailure !== 'rollback' && hookFailure !== 'keep') {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
+  }
+  return { hookFailure: hookFailure ?? asked.hookFailure, hookResult: hookResult === true }
 }
 function codeOf(error: unknown): ErrorCode {
   return error instanceof SwarmDeployError &&
@@ -413,13 +432,15 @@ export class Client extends EventEmitter {
     name: string,
     options?: ClientLinkOptions
   ): Promise<ClientLinkResult> {
-    const wantsResult = linkOptions(options)
-    // Only an opted-in request carries the field, so the default stays the four-field record.
+    const { hookFailure, hookResult: wantsResult } = linkOptions(options)
+    // The policy is always explicit, so a server that predates it rejects the request
+    // rather than keeping a link the caller expects to be rolled back.
     const request: LinkRequestRecord = {
       v: 1 as const,
       kind: 'link' as const,
       target,
       name,
+      hookFailure,
       ...(wantsResult ? { hookResult: true as const } : {})
     }
     // Validate before opening a connection so malformed names never leave the client.

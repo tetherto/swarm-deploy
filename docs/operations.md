@@ -356,6 +356,43 @@ including every older client and CLI, see the unchanged request and answer
 whatever the hook returns, so no client needs to change. Nothing is stored and no
 dependency is added.
 
+### Link hook failure policy
+
+**Behavior change (0.6.0).** When an explicit link request's `afterLink` hook
+fails, the server now restores the previous local symlink and its ownership
+record (or removes a link the request created) before answering `HOOK_FAILED`;
+until 0.5.x the new link stayed. A request opts out with `hookFailure: 'keep'`
+(`swarm-deploy link --hook-failure keep`). The hook is still awaited in both
+modes, a failure is still `HOOK_FAILED`, the uploaded artifact and anything the
+hook did elsewhere are never undone, and an upload's automatic links are
+unchanged.
+
+- **Upgrade servers first.** Current clients and the CLI always send the policy,
+  which a server older than 0.6.0 rejects, so a new client against an old server
+  fails instead of keeping a link it expected to be rolled back. Older clients
+  against a 0.6.0 server send no policy and are handled as `rollback`: for them
+  the default changed, and the retry after a failed hook now reports `LINKED`
+  rather than `UNCHANGED`. Automation that relied on the link surviving a failed
+  hook should pass `keep`.
+- **Persisted state.** A request that changes a link writes a journal,
+  `.swarm-deploy/links/<sha256(link-name)>.rollback.json` (at most 32 KiB), before
+  it changes anything, and removes it when the request is finalized or restored.
+  An idle, normally stopped server has none. After a crash the next start restores
+  the previous link and record before retention runs or any client connects, and
+  logs `Restored a managed link after an unfinished request` with the link name.
+  If the link or record was changed from outside in the meantime, that name is
+  left alone and blocked (`Managed link rollback is blocked by a change made
+since`), its artifacts stay pinned, and the rest of the server starts; see
+  [Removing a managed link](managed-links.md#removing-a-managed-link) for how to
+  clear it. A corrupt journal stops the server from starting.
+- **Rolling back the server** to a version before 0.6.0 is safe once no journal
+  remains (stop the server normally and check `.swarm-deploy/links`): an older
+  server ignores the file and cannot restore a link whose request was interrupted.
+- **Time.** Requests for one link name now queue from decision through hook to
+  finalize or restore, so a slow hook delays later requests for the same name
+  (they still wait at most the client's idle timeout) while other links, uploads,
+  and retention are unaffected.
+
 ### Overlapping retries now get `FILE_BUSY`
 
 **Behavior change.** A transfer ID may have only one in-flight commit

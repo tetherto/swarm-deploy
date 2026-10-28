@@ -61,6 +61,7 @@ export {
   type ClientEventMap,
   type ClientEventName,
   type ClientLinkEvent,
+  type ClientLinkHookFailure,
   type ClientLinkOptions,
   type ClientLinkResult,
   type ClientLinkStatus,
