@@ -357,6 +357,18 @@ artifact transfer ID. No success is sent before it returns, and a failure is
 for a rejected or unauthorized link, for a manual link whose target is replaced,
 or for reconciliation done by startup or retention.
 
+`afterLink` may return a plain JSON object. The server reads that value only for
+an explicit link request that asked for it (see the manual link control
+protocol); an upload's automatic links and a request that did not ask ignore it
+without inspecting it. A checked copy is sent in the `LINKED` or `UNCHANGED`
+answer after the hook has resolved. An unusable value (not a plain object, or
+containing `undefined`, a function, a symbol, a BigInt, a non-finite number, a
+class instance, an accessor, a symbol key, a cycle, more than 8 levels, or more
+than 3072 bytes) fails the request like a throw: `HOOK_FAILED` with the fixed
+message, the link kept, and `onFailure` receiving an error that names the reason
+and path but no value. The result is whatever the hook chose to report, such as
+an external submission ID, and is not proof of publication.
+
 The hook runs after the storage-root lease is released, so it never blocks other
 work and cannot deadlock on it; consequently its context is a snapshot of one
 decision and the link or target may already have changed. For one link name the
@@ -528,9 +540,12 @@ An authenticated client sends one strict bounded first control record:
 
 ```ts
 { v: 1, kind: 'link', target: string, name: string }
+{ v: 1, kind: 'link', target: string, name: string, hookResult: true } // opt-in
 ```
 
-The record has exactly those fields. It is a control RPC separate from upload
+The record has exactly the first four fields, plus `hookResult` only when the
+client asks for the hook result (see below); `hookResult` can only be `true`, so
+the default request is byte-for-byte the four-field record. It is a control RPC separate from upload
 offers and TAR bytes. The client half-closes after the request; the server
 requires EOF immediately, so trailing control records or payload bytes fail the
 request. The response is exactly one strict record:
@@ -539,7 +554,22 @@ request. The response is exactly one strict record:
 { v: 1, status: 'LINKED' }
 { v: 1, status: 'UNCHANGED' }
 { v: 1, status: 'FAILED', code: ErrorCode }
+{ v: 1, status: 'LINKED' | 'UNCHANGED', hookResult: HookResult } // opt-in only
 ```
+
+`hookResult` appears only in the answer to a request that carried
+`hookResult: true`, only on `LINKED` or `UNCHANGED`, and only when the server's
+`afterLink` hook returned an object. A `FAILED` record never carries it, and a
+client that did not ask treats one as `PROTOCOL_INVALID`. The decoder accepts
+exactly one extra key and validates its value as a plain JSON object: strings,
+finite numbers, booleans, `null`, arrays, and plain objects, at most 8 levels
+deep, at most 3072 UTF-8 bytes of compact JSON (so the record stays inside the
+4 KiB control record limit, which is unchanged), with no `__proto__` key. The
+server builds the value from what the hook returned, as a copy, and fails the
+request with `HOOK_FAILED` (the durable link kept, no result sent) when the hook
+returns anything else; a hook that returns nothing sends no field. A result is
+what the hook chose to report, not proof of publication, and it is never put in
+events or logs. `CONTROL_VERSION` stays `1`.
 
 HyperDHT Noise identity, pinned server identity, the server firewall, and the
 immutable client allowlist authenticate a link caller exactly as for upload.
@@ -682,7 +712,12 @@ symlink policy needs an adapter without `symlink` and `readlink`.
 
 Old upload clients remain compatible because link is a separate first-control
 variant. A client that sends a link request to an older strict server is not
-compatible: `swarm-deploy link` requires an upgraded server. This version reads
+compatible: `swarm-deploy link` requires an upgraded server. The hook-result
+opt-in follows the same rule: a server older than 0.5.0 decodes link requests
+with an exact four-field key set and rejects `hookResult`, so an opted-in client
+fails instead of returning without the result, while a client that does not ask
+sends and receives exactly the records above and needs no change. Upgrade
+servers before clients that ask. This version reads
 v1 automatic ledgers and writes v2 mode-aware ledgers. After an upgraded server
 creates, repairs, or repoints any managed link, v0.2.0 cannot read its v2
 record. Rollback then requires restoring the complete pre-upgrade storage
@@ -703,7 +738,9 @@ The CLI keeps role-specific seed generation and server/upload commands and adds
 `link`. Server startup prints the server public key and then `ready`. Upload and
 link require `--server-key <64-lower-hex>` plus client seed configuration and
 accept the same idle timeout. `swarm-deploy link <target> <link-name>` prints
-exactly `<link-name> -> <target> <LINKED|UNCHANGED>` on success. Topic commands
+exactly `<link-name> -> <target> <LINKED|UNCHANGED>` on success;
+`swarm-deploy link --json <target> <link-name>` asks for the hook result and
+prints one JSON object `{ target, name, status, hookResult? }` instead. Topic commands
 and `--topic` are removed.
 
 Events and logs expose lifecycle milestones for direct connection, offer,
@@ -712,8 +749,10 @@ retention, and failure. They use short SHA-256 fingerprints and never expose
 seeds, secret keys, full public keys, TAR contents, or session material.
 Listener and logger failures cannot affect protocol correctness.
 
-`Client.link(target, name)` returns
-`ClientLinkResult { target, name, status: 'LINKED' | 'UNCHANGED' }`.
+`Client.link(target, name, options?)` returns
+`ClientLinkResult { target, name, status: 'LINKED' | 'UNCHANGED', hookResult? }`;
+`options` is `{ hookResult?: boolean }`, and `hookResult` is present only when
+requested and returned by the hook.
 After the request write succeeds, the client `link` event reports `requested`
 with `final: false`, followed by exactly one success status or stable error code
 with `final: true`. A request-write failure after connection can emit only the

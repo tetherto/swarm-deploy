@@ -347,6 +347,15 @@ pass the same way `afterCommit` does (see
 needs rolling back: removing the hook returns the server to the previous
 behavior.
 
+Returning data from `afterLink` is a separate, opt-in addition (0.5.0): a
+client asks for it with `Client.link(..., { hookResult: true })` or
+`swarm-deploy link --json`, and only then does the link request and answer carry
+one extra field. Servers must be upgraded before clients that ask, because a
+server older than 0.5.0 rejects the opted-in request. Clients that do not ask,
+including every older client and CLI, see the unchanged request and answer
+whatever the hook returns, so no client needs to change. Nothing is stored and no
+dependency is added.
+
 ### Overlapping retries now get `FILE_BUSY`
 
 **Behavior change.** A transfer ID may have only one in-flight commit

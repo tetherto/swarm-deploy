@@ -10,6 +10,7 @@ import {
   type ArtifactKind,
   type BeforeCommitContext,
   type ClientLinkEvent,
+  type ClientLinkOptions,
   type ClientLinkResult,
   type ClientLinkStatus,
   type ClientEventMap,
@@ -21,6 +22,8 @@ import {
   type HookLinkMode,
   type HookLinkStatus,
   type HookLinkTrigger,
+  type HookResult,
+  type HookResultValue,
   type RetentionEvent,
   type ReleaseCoordinates,
   type ServerHooks,
@@ -345,6 +348,74 @@ void artifactPath
 // @ts-expect-error The failure context error is unknown, not an Error.
 const failureMessage: string = ({} as HookFailureContext).error.message
 void failureMessage
+
+// Opting in to the hook's result, and what a hook may return for it.
+const linkOptions: ClientLinkOptions = { hookResult: true }
+const defaultLinkOptions: ClientLinkOptions = {}
+const optedIn: Promise<ClientLinkResult> = client.link('release-1.2.3', 'current', linkOptions)
+const declined: Promise<ClientLinkResult> = client.link('release-1.2.3', 'current', {
+  hookResult: false
+})
+const plainLinkResult: ClientLinkResult = { target: 'a', name: 'b', status: 'LINKED' }
+const reportedLinkResult: ClientLinkResult = {
+  target: 'a',
+  name: 'b',
+  status: 'UNCHANGED',
+  hookResult: { submissionId: 'sub-1', evidence: ['u1'], detail: { queued: true, note: null } }
+}
+const reported: HookResult | undefined = reportedLinkResult.hookResult
+void [defaultLinkOptions, optedIn, declined, plainLinkResult, reported]
+// @ts-expect-error The only link option is hookResult.
+const unknownLinkOption: ClientLinkOptions = { results: true }
+// @ts-expect-error hookResult is a boolean.
+const stringLinkOption: ClientLinkOptions = { hookResult: 'yes' }
+void [unknownLinkOption, stringLinkOption]
+// @ts-expect-error The options are an object, not a bare flag.
+void client.link('release-1.2.3', 'current', true)
+
+const resultValue: HookResultValue = ['x', 1, true, null, { nested: [{ deep: 'y' }] }]
+const plainResult: HookResult = { id: 'sub-1', attempts: 2, ratio: 0.5, accepted: true, note: null }
+const nestedResult: HookResult = { evidence: [{ url: 'u1' }, ['u2']], detail: { queue: [] } }
+void [resultValue, plainResult, nestedResult]
+const resultHooks = {
+  async afterLink(context: AfterLinkContext) {
+    return {
+      submissionId: context.link.name,
+      accepted: context.status === 'LINKED',
+      evidence: [context.artifact.sha256],
+      detail: { transferId: context.artifact.transferId, release: null }
+    }
+  }
+} satisfies ServerHooks
+const syncResultHook: ServerHooks = { afterLink: () => ({ submitted: true }) }
+// The result is optional, so a hook that returns nothing, as every earlier hook did, still fits.
+const voidHook: ServerHooks = { afterLink: () => {} }
+const asyncVoidHook: ServerHooks = { afterLink: async () => {} }
+const maybeResultHook: ServerHooks = {
+  afterLink: async (context): Promise<HookResult | undefined> =>
+    context.status === 'LINKED' ? { linked: true } : undefined
+}
+void [resultHooks, syncResultHook, voidHook, asyncVoidHook, maybeResultHook]
+// @ts-expect-error A hook result is a JSON object, not a primitive.
+const primitiveResultHook: ServerHooks = { afterLink: () => 'ok' }
+// @ts-expect-error A hook result is an object, not an array.
+const arrayResultHook: ServerHooks = { afterLink: () => ['ok'] }
+// @ts-expect-error Only afterLink may return data.
+const commitResultHook: ServerHooks = { afterCommit: () => ({ id: 1 }) }
+void [primitiveResultHook, arrayResultHook, commitResultHook]
+// @ts-expect-error A Date is not a JSON value.
+const dateResult: HookResult = { when: new Date() }
+// @ts-expect-error A function is not a JSON value.
+const functionResult: HookResult = { run: () => 1 }
+// @ts-expect-error undefined is not a JSON value.
+const undefinedResult: HookResult = { missing: undefined }
+// @ts-expect-error A BigInt is not a JSON value.
+const bigintResult: HookResult = { count: 1n }
+// @ts-expect-error A result is an object, not an array.
+const arrayResult: HookResult = ['x']
+void [dateResult, functionResult, undefinedResult, bigintResult, arrayResult]
+// @ts-expect-error A returned result is read-only data.
+plainResult.id = 'changed'
 
 declare const symlinkStorage: SymlinkCapableStorage
 const storageAdapter: StorageAdapter = symlinkStorage

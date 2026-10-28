@@ -1,5 +1,6 @@
 import { onAbort, type AbortSignalLike } from './abort.js'
 import { ERRORS, SwarmDeployError } from './errors.js'
+import { copyHookResult, type HookResult } from './hook-result.js'
 import type { ReleaseCoordinates } from './release.js'
 import type { ArtifactKind } from './types.js'
 
@@ -98,7 +99,14 @@ export interface HookFailureContext {
 export interface ServerHooks {
   beforeCommit?(context: BeforeCommitContext): void | Promise<void>
   afterCommit?(context: AfterCommitContext): void | Promise<void>
-  afterLink?(context: AfterLinkContext): void | Promise<void>
+  /**
+   * May return a plain JSON object (see `HookResult`) that you choose to hand
+   * back to an explicit `Client.link` caller that asked for it. Nothing is
+   * derived from the context, the error, or the environment. The value is read
+   * only for such a request: an upload's automatic links and a request that did
+   * not opt in ignore it, even when it is not valid.
+   */
+  afterLink?(context: AfterLinkContext): void | HookResult | Promise<void | HookResult>
   onFailure?(context: HookFailureContext): void | Promise<void>
 }
 
@@ -153,6 +161,21 @@ export function hookError(phase: HookFailurePhase, cause: unknown): SwarmDeployE
 }
 
 /**
+ * The checked copy of what an `afterLink` hook returned, or `undefined` for a
+ * hook that returned nothing. Any other value that is not a valid result fails
+ * like a throw: `HOOK_FAILED` with a fixed message, and the reason (never the
+ * value) on `cause` for `onFailure`.
+ */
+export function hookResultOf(returned: unknown): HookResult | undefined {
+  if (returned === undefined) return undefined
+  try {
+    return copyHookResult(returned)
+  } catch (cause) {
+    throw hookError('afterLink', cause)
+  }
+}
+
+/**
  * The error an `onFailure` hook should see: the raw exception for failures this
  * module wrapped, otherwise the error unchanged. Only identity-tracked wrappers
  * unwrap, so a forged `HOOK_FAILED` error cannot masquerade as one.
@@ -164,16 +187,22 @@ export function callbackError(error: unknown): unknown {
 }
 
 /**
+ * How a hook call ended. `value` is whatever the callback returned or resolved
+ * to; the caller decides whether to read it.
+ */
+export type HookOutcome = { status: 'completed'; value: unknown } | { status: 'aborted' }
+
+/**
  * Calls a callback with no receiver and settles when it does or when the
  * server aborts, whichever is first. A callback that outlives an abort keeps
  * running detached; its later rejection is swallowed.
  */
 export async function invokeHook<Context>(
-  callback: (context: Context) => void | Promise<void>,
+  callback: (context: Context) => unknown,
   context: Context,
   signal: AbortSignalLike
-): Promise<'completed' | 'aborted'> {
-  let pending: Promise<void>
+): Promise<HookOutcome> {
+  let pending: Promise<unknown>
   try {
     pending = Promise.resolve(callback(context))
   } catch (cause) {
@@ -181,11 +210,14 @@ export async function invokeHook<Context>(
   }
   pending.catch(() => {})
   let release = (): void => {}
-  const aborted = new Promise<'aborted'>((resolve) => {
-    release = onAbort(signal, () => resolve('aborted'))
+  const aborted = new Promise<HookOutcome>((resolve) => {
+    release = onAbort(signal, () => resolve({ status: 'aborted' }))
   })
   try {
-    return await Promise.race([pending.then(() => 'completed' as const), aborted])
+    return await Promise.race([
+      pending.then((value): HookOutcome => ({ status: 'completed', value })),
+      aborted
+    ])
   } finally {
     release()
   }

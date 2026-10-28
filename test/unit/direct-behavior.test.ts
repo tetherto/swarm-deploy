@@ -16,9 +16,11 @@ import {
   type AfterLinkContext,
   type BeforeCommitContext,
   type HookFailureContext,
+  type HookResult,
   type ServerHooks,
   type ServerScheduler
 } from '../../dist/index.js'
+import { MAX_HOOK_RESULT_BYTES } from '../../dist/hook-result.js'
 import { fixedSeriesKey } from '../../dist/release.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import type {
@@ -572,6 +574,210 @@ test('Client link half-closes one control request and requires an explicit link 
   await t.exception(eofClient.link('release-1.2.3', 'current'), { code: ERRORS.PROTOCOL_INVALID })
   await eofClient.close()
   t.is(eofSocket.destroyed, true)
+})
+
+/** A link answer built by hand, so it can carry fields the encoder would refuse. */
+function linkAnswer(body: string | Record<string, unknown>): Buffer {
+  return encodeControlFrame(b4a.from(typeof body === 'string' ? body : JSON.stringify(body)))
+}
+
+function linkClient(
+  serverKey: Buffer,
+  socket: FakeSocket
+): { client: Client; events: unknown[]; logs: Array<Record<string, unknown>> } {
+  const events: unknown[] = []
+  const logs: Array<Record<string, unknown>> = []
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(socket),
+    logger: { info: (message, details) => void logs.push({ message, ...details }) }
+  })
+  client.on('link', (event) => events.push(event))
+  return { client, events, logs }
+}
+
+test('Client.link asks for the hook result only when told to and returns what the server sent', async (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const reported = { submissionId: 'sub-42', state: 'accepted', evidence: ['evidence-marker'] }
+
+  const asked = new FakeSocket(serverKey)
+  asked.onEnd = () => asked.feed(linkAnswer({ v: 1, status: 'UNCHANGED', hookResult: reported }))
+  const optedIn = linkClient(serverKey, asked)
+  t.alike(await optedIn.client.link('release-1.2.3', 'current', { hookResult: true }), {
+    target: 'release-1.2.3',
+    name: 'current',
+    status: 'UNCHANGED',
+    hookResult: reported
+  })
+  t.is(
+    b4a.toString(asked.writes[0].subarray(4)),
+    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookResult":true}'
+  )
+  t.alike(optedIn.events, [
+    { target: 'release-1.2.3', name: 'current', status: 'requested', final: false },
+    { target: 'release-1.2.3', name: 'current', status: 'UNCHANGED', final: true }
+  ])
+  t.absent(JSON.stringify(optedIn.logs).includes('evidence-marker'), 'the log carries no data')
+  await optedIn.client.close()
+
+  // A hook that returned nothing leaves no field, whatever the request asked.
+  const silent = new FakeSocket(serverKey)
+  silent.onEnd = () => silent.feed(linkAnswer({ v: 1, status: 'LINKED' }))
+  const quiet = linkClient(serverKey, silent)
+  const none = await quiet.client.link('release-1.2.3', 'current', { hookResult: true })
+  t.alike(Object.keys(none), ['target', 'name', 'status'])
+  await quiet.client.close()
+
+  // Not asking, in any spelling, is the unchanged four-field request and the plain result.
+  for (const options of [undefined, {}, { hookResult: false }, { hookResult: undefined }]) {
+    const socket = new FakeSocket(serverKey)
+    socket.onEnd = () => socket.feed(linkAnswer({ v: 1, status: 'LINKED' }))
+    const plain = linkClient(serverKey, socket)
+    const result = await plain.client.link('release-1.2.3', 'current', options)
+    t.alike(Object.keys(result), ['target', 'name', 'status'], JSON.stringify(options))
+    t.is(
+      b4a.toString(socket.writes[0].subarray(4)),
+      '{"v":1,"kind":"link","target":"release-1.2.3","name":"current"}',
+      JSON.stringify(options)
+    )
+    await plain.client.close()
+  }
+})
+
+test('Client.link rejects hook-result data it did not ask for or that is malformed', async (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const answered = async (
+    answer: Buffer,
+    options?: { hookResult: boolean }
+  ): Promise<{ failure: unknown; events: unknown[] }> => {
+    const socket = new FakeSocket(serverKey)
+    socket.onEnd = () => socket.feed(answer)
+    const { client, events } = linkClient(serverKey, socket)
+    const failure: unknown = await client.link('release-1.2.3', 'current', options).then(
+      (result) => result,
+      (error: unknown) => error
+    )
+    await client.close()
+    return { failure, events }
+  }
+
+  const unrequested = await answered(
+    linkAnswer({ v: 1, status: 'LINKED', hookResult: { id: 'sub-1' } })
+  )
+  t.is(code(unrequested.failure), ERRORS.PROTOCOL_INVALID, 'a default request gets no data')
+  t.alike(unrequested.events[1], {
+    target: 'release-1.2.3',
+    name: 'current',
+    status: ERRORS.PROTOCOL_INVALID,
+    final: true
+  })
+
+  const deep = '{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":{}}}}}}}}}'
+  for (const body of [
+    '{"v":1,"status":"LINKED","hookResult":null}',
+    '{"v":1,"status":"LINKED","hookResult":[]}',
+    '{"v":1,"status":"LINKED","hookResult":"sk-secret"}',
+    '{"v":1,"status":"LINKED","hookResult":7}',
+    `{"v":1,"status":"LINKED","hookResult":${deep}}`,
+    `{"v":1,"status":"LINKED","hookResult":{"k":"${'x'.repeat(MAX_HOOK_RESULT_BYTES)}"}}`,
+    '{"v":1,"status":"LINKED","hookResult":{"__proto__":{"admin":true}}}',
+    '{"v":1,"status":"LINKED","hookResult":{},"extra":1}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{}}',
+    '{"v":1,"status":"LINKED","results":{"id":"sub-1"}}'
+  ]) {
+    const { failure } = await answered(linkAnswer(body), { hookResult: true })
+    t.is(code(failure), ERRORS.PROTOCOL_INVALID, body.slice(0, 60))
+    t.absent(failure instanceof Error && failure.message.includes('sk-secret'))
+  }
+
+  // A hook failure stays the stable code on an opted-in request too.
+  const failed = await answered(linkAnswer({ v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }), {
+    hookResult: true
+  })
+  t.is(code(failed.failure), ERRORS.HOOK_FAILED)
+})
+
+test('Client.link refuses unknown options before connecting', async (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const socket = new FakeSocket(serverKey)
+  let connects = 0
+  const node: DirectDhtNode = {
+    ...fakeClientNode(socket),
+    connect() {
+      connects++
+      return socket as unknown as DirectDhtSocket
+    }
+  }
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: node
+  })
+  for (const options of [
+    { results: true },
+    { hookResult: 'yes' },
+    { hookResult: 1 },
+    { hookResult: null },
+    { hookResult: true, extra: 1 },
+    null,
+    [],
+    [true],
+    'hookResult',
+    5
+  ]) {
+    await t.exception(client.link('release-1.2.3', 'current', options as never), {
+      code: ERRORS.PROTOCOL_INVALID
+    })
+  }
+  t.is(connects, 0)
+  t.is(socket.writes.length, 0)
+  await client.close()
+})
+
+test('an opted-in Client.link against a server that predates the option fails instead of returning', async (t) => {
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  // A server of the previous release decodes a link request with an exact four-field key set, so
+  // anything else ends the stream without an answer.
+  const legacyServer = (): FakeSocket => {
+    const socket = new FakeSocket(serverKey)
+    let request: Record<string, unknown> = {}
+    socket.onWrite = (bytes) => {
+      request = JSON.parse(b4a.toString(bytes.subarray(4)))
+      return true
+    }
+    socket.onEnd = () => {
+      if (Object.keys(request).sort().join() === 'kind,name,target,v') {
+        socket.feed(linkAnswer({ v: 1, status: 'LINKED' }))
+      } else {
+        socket.finishInput()
+      }
+    }
+    return socket
+  }
+
+  const plainSocket = legacyServer()
+  const plain = linkClient(serverKey, plainSocket)
+  t.alike(await plain.client.link('release-1.2.3', 'current'), {
+    target: 'release-1.2.3',
+    name: 'current',
+    status: 'LINKED'
+  })
+  await plain.client.close()
+
+  const askedSocket = legacyServer()
+  const asked = linkClient(serverKey, askedSocket)
+  await t.exception(asked.client.link('release-1.2.3', 'current', { hookResult: true }), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.is(
+    (asked.events.at(-1) as { status: string }).status,
+    ERRORS.PROTOCOL_INVALID,
+    'the final event reports the failure, not a link status'
+  )
+  await asked.client.close()
 })
 
 test('Client close aborts pending work promptly and removes direct-wire listeners', async (t) => {
@@ -2247,18 +2453,39 @@ test('a link reconciliation failure after a durable commit is retried as already
   t.is(await fs.promises.readlink(path.join(server.storageDir, 'latest')), '0.18.1')
 })
 
-type LinkFrame = { v: number; status: string; code?: string }
+type LinkFrame = { v: number; status: string; code?: string; hookResult?: unknown }
 
-function linkRequest(node: FakeServerNode, target: string, name: string): FakeSocket {
+/** A link request; only `hookResult` set asks for what the server's `afterLink` hook returned. */
+function linkRequest(
+  node: FakeServerNode,
+  target: string,
+  name: string,
+  hookResult = false
+): FakeSocket {
   const socket = new FakeSocket(CLIENT_KEY)
   node.accept(socket)
-  socket.feed(encodeControlFrame(encodeLinkRequestRecord({ v: 1, kind: 'link', target, name })))
+  socket.feed(
+    encodeControlFrame(
+      encodeLinkRequestRecord({
+        v: 1,
+        kind: 'link',
+        target,
+        name,
+        ...(hookResult ? { hookResult: true as const } : {})
+      })
+    )
+  )
   socket.finishInput()
   return socket
 }
 
 function linkFrame(socket: FakeSocket): LinkFrame {
   return decodeLinkResultRecord(socket.writes[0].subarray(4)) as LinkFrame
+}
+
+/** The exact link result record a socket was sent. */
+function linkText(socket: FakeSocket): string {
+  return b4a.toString(socket.writes[0].subarray(4))
 }
 
 function settled(): Promise<void> {
@@ -2840,6 +3067,285 @@ test('retention can remove the previous target while its afterLink is still pend
   await waitFor(() => first.writes.length === 1 && second.writes.length === 1)
   t.alike(linkFrame(second), { v: 1, status: 'LINKED' })
   t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'r2')
+})
+
+test('afterLink results reach only a request that asked, and only once the hook has resolved', async (t) => {
+  const held = gate()
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    logger: {
+      info: (message, details) => void logs.push({ message, ...details }),
+      warn: (message, details) => void logs.push({ message, ...details })
+    },
+    hooks: {
+      afterLink: async ({ link, artifact }) => {
+        await held.wait
+        return {
+          submissionId: `sub-${link.name}`,
+          transferId: artifact.transferId,
+          evidence: ['https://example.test/review/evidence-marker'],
+          state: 'accepted'
+        }
+      }
+    }
+  })
+  const events: Array<Record<string, unknown>> = []
+  server.on('link', (event) => events.push({ ...event }))
+  const input = await manifest(t, 'release-1', 'first')
+  await uploadAll(node, input)
+  const { transferId } = metadataFromManifest(input.manifest)
+
+  const asked = linkRequest(node, 'release-1', 'current', true)
+  await settled()
+  t.is(asked.writes.length, 0, 'nothing, not even LINKED, is sent while the hook is pending')
+  t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
+  held.open()
+  await waitFor(() => asked.writes.length === 1)
+  t.is(
+    linkText(asked),
+    JSON.stringify({
+      v: 1,
+      status: 'LINKED',
+      hookResult: {
+        submissionId: 'sub-current',
+        transferId,
+        evidence: ['https://example.test/review/evidence-marker'],
+        state: 'accepted'
+      }
+    })
+  )
+
+  const plain = linkRequest(node, 'release-1', 'current')
+  await waitFor(() => plain.writes.length === 1)
+  t.is(linkText(plain), '{"v":1,"status":"UNCHANGED"}', 'a default request gets the old record')
+
+  t.alike(
+    events.map((event) => event.status),
+    ['linked', 'unchanged']
+  )
+  const observed = JSON.stringify({ events, logs })
+  t.absent(observed.includes('evidence-marker'), 'neither events nor logs carry the data')
+  t.absent(observed.includes('sub-current'))
+})
+
+test('a retried link reruns afterLink and returns its result, and void or no hook omits the field', async (t) => {
+  let attempt = 0
+  let mode: 'count' | 'void' | 'empty' = 'count'
+  const { node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    hooks: {
+      // Branches returning different object literals need the declared type to stay assignable.
+      afterLink: async (): Promise<HookResult | undefined> => {
+        if (mode === 'void') return undefined
+        if (mode === 'empty') return {}
+        return { attempt: ++attempt }
+      }
+    }
+  })
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+
+  const first = linkRequest(node, 'release-1', 'current', true)
+  await waitFor(() => first.writes.length === 1)
+  t.is(linkText(first), '{"v":1,"status":"LINKED","hookResult":{"attempt":1}}')
+  const retry = linkRequest(node, 'release-1', 'current', true)
+  await waitFor(() => retry.writes.length === 1)
+  t.is(linkText(retry), '{"v":1,"status":"UNCHANGED","hookResult":{"attempt":2}}')
+
+  mode = 'void'
+  const omitted = linkRequest(node, 'release-1', 'current', true)
+  await waitFor(() => omitted.writes.length === 1)
+  t.is(
+    linkText(omitted),
+    '{"v":1,"status":"UNCHANGED"}',
+    'a hook that returns nothing sends nothing'
+  )
+  mode = 'empty'
+  const empty = linkRequest(node, 'release-1', 'current', true)
+  await waitFor(() => empty.writes.length === 1)
+  t.is(linkText(empty), '{"v":1,"status":"UNCHANGED","hookResult":{}}')
+
+  const bare = await createServer(t, { symlinks: [{ selector: '/^release-\\d+$/' }] })
+  await uploadAll(bare.node, await manifest(t, 'release-1', 'first'))
+  const without = linkRequest(bare.node, 'release-1', 'current', true)
+  await waitFor(() => without.writes.length === 1)
+  t.is(
+    linkText(without),
+    '{"v":1,"status":"LINKED"}',
+    'a server with no hook has nothing to return'
+  )
+})
+
+test('concurrent requests for one link get their own hook result, in decision order', async (t) => {
+  const gates = [gate(), gate()]
+  let calls = 0
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^r\\d$/' }],
+    hooks: {
+      afterLink: async () => {
+        const call = calls++
+        await gates[call].wait
+        return { call: call + 1 }
+      }
+    }
+  })
+  for (const name of ['r1', 'r2']) {
+    t.absent(finalCode(await uploadAll(node, await manifest(t, name))))
+  }
+
+  const first = linkRequest(node, 'r1', 'current', true)
+  await waitFor(() => calls === 1)
+  const second = linkRequest(node, 'r2', 'current', true)
+  await waitForLinkTarget(path.join(server.storageDir, 'current'), 'r2')
+  await settled()
+  t.is(calls, 1, 'the second hook waits for the first to finish')
+  t.is(first.writes.length + second.writes.length, 0)
+
+  gates[0].open()
+  await waitFor(() => first.writes.length === 1 && calls === 2)
+  t.is(linkText(first), '{"v":1,"status":"LINKED","hookResult":{"call":1}}')
+  t.is(second.writes.length, 0)
+  gates[1].open()
+  await waitFor(() => second.writes.length === 1)
+  t.is(linkText(second), '{"v":1,"status":"LINKED","hookResult":{"call":2}}')
+  await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('a request that did not ask never reads, validates, or fails on what afterLink returned', async (t) => {
+  let reads = 0
+  const returned = (): unknown => ({
+    run: () => 1,
+    cycle: undefined,
+    get leaked() {
+      reads++
+      return 'sk-secret-token'
+    }
+  })
+  const { node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }, { selector: '/^app-\\d+$/' }],
+    hooks: { afterLink: returned as never }
+  })
+
+  // An upload's automatic link is not a request, so its hook result is never read.
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'release-1', 'first'))))
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'app-1', 'app'))))
+  const plain = linkRequest(node, 'app-1', 'stable')
+  await waitFor(() => plain.writes.length === 1)
+  t.is(linkText(plain), '{"v":1,"status":"LINKED"}')
+  const again = linkRequest(node, 'app-1', 'stable')
+  await waitFor(() => again.writes.length === 1)
+  t.is(linkText(again), '{"v":1,"status":"UNCHANGED"}')
+  t.is(reads, 0, 'the returned value was never touched')
+})
+
+class Receipt {
+  id = 'receipt'
+}
+
+test('an unusable afterLink result fails an opted-in request as HOOK_FAILED and keeps the link', async (t) => {
+  const secret = 'sk-secret-token'
+  const deep = (): Record<string, unknown> => {
+    let value: Record<string, unknown> = { token: secret }
+    for (let level = 1; level < 9; level++) value = { child: value }
+    return value
+  }
+  const cycle = (): unknown => {
+    const value: Record<string, unknown> = { token: secret }
+    value.self = value
+    return value
+  }
+  const unusable: Array<[string, () => unknown]> = [
+    ['a nested function', () => ({ token: secret, run: () => 1 })],
+    ['a BigInt', () => ({ token: secret, id: 1n })],
+    ['a cycle', cycle],
+    ['too deep', deep],
+    ['too large', () => ({ token: secret, blob: 'x'.repeat(4_000) })],
+    ['a string', () => secret],
+    ['a number', () => 42],
+    ['an array', () => [secret]],
+    ['null', () => null],
+    ['a Date', () => new Date(0)],
+    ['a class instance', () => new Receipt()],
+    [
+      'a getter',
+      () => ({
+        get token() {
+          return secret
+        }
+      })
+    ],
+    ['a toJSON method', () => ({ toJSON: () => ({ token: secret }) })]
+  ]
+  let next: () => unknown = () => ({ ok: true })
+  const failures: HookFailureContext[] = []
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      afterLink: () => next() as never,
+      onFailure: (context) => void failures.push(context)
+    }
+  })
+  const events: Array<{ status: string; reason?: string; result?: string }> = []
+  server.on('link', (event) =>
+    events.push({ status: event.status, reason: event.reason, result: event.result })
+  )
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+
+  for (const [index, [label, build]] of unusable.entries()) {
+    next = build
+    const name = `link${index}`
+    const socket = linkRequest(node, 'release-1', name, true)
+    await waitFor(() => socket.writes.length === 1)
+    t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }, label)
+    t.is(socket.writes.length, 1, `${label}: one terminal record`)
+    t.absent(b4a.toString(socket.writes[0]).includes(secret), `${label}: nothing leaks on the wire`)
+    t.is(await fs.promises.readlink(path.join(server.storageDir, name)), 'release-1', label)
+    await waitFor(() => failures.length === index + 1)
+    const failure = failures[index]
+    t.is(failure.phase, 'afterLink', label)
+    t.is(failure.link?.name, name, label)
+    t.ok(failure.error instanceof Error, `${label}: onFailure sees why`)
+    t.absent(String((failure.error as Error).message).includes(secret), `${label}: not the value`)
+  }
+  t.alike(
+    events,
+    unusable.map(() => ({ status: 'failed', reason: ERRORS.HOOK_FAILED, result: 'LINKED' }))
+  )
+  t.absent(JSON.stringify(logs).includes(secret), 'the log carries no result data')
+
+  // The link is durable, so a retry reruns the hook and now returns its result.
+  next = () => ({ ok: true })
+  const retry = linkRequest(node, 'release-1', 'link0', true)
+  await waitFor(() => retry.writes.length === 1)
+  t.is(linkText(retry), '{"v":1,"status":"UNCHANGED","hookResult":{"ok":true}}')
+
+  // A request that did not ask is unaffected by the same value.
+  next = unusable[0][1]
+  const plain = linkRequest(node, 'release-1', 'link0')
+  await waitFor(() => plain.writes.length === 1)
+  t.is(linkText(plain), '{"v":1,"status":"UNCHANGED"}')
+  t.is(failures.length, unusable.length, 'no further failure was reported')
+})
+
+test('a throwing afterLink on an opted-in request is the same sanitized HOOK_FAILED as before', async (t) => {
+  const injected = new Error('publisher token sk-secret rejected')
+  const failures: HookFailureContext[] = []
+  const { node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    hooks: {
+      afterLink: () => {
+        throw injected
+      },
+      onFailure: (context) => void failures.push(context)
+    }
+  })
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  const socket = linkRequest(node, 'release-1', 'current', true)
+  await waitFor(() => failures.length === 1)
+  t.is(linkText(socket), '{"v":1,"status":"FAILED","code":"HOOK_FAILED"}')
+  t.is(failures[0].error, injected, 'onFailure still receives the raw exception')
 })
 
 test('closing the server aborts a pending afterLink and a queued one and frees the hook line', async (t) => {

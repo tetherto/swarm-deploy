@@ -12,9 +12,11 @@ import {
   SwarmDeployError,
   keyPairFromSeed,
   type AfterLinkContext,
+  type HookResult,
   type ServerHooks,
   type ServerOptions
 } from '../../dist/index.js'
+import { main } from '../../dist/cli.js'
 import { loadHooksModule } from '../../dist/hooks-module.js'
 import { createTempDir } from '../helpers/files.js'
 import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
@@ -147,6 +149,157 @@ test('Client.link settles only after afterLink returns, and a failure reaches th
     'second:requested:false',
     'second:UNCHANGED:true'
   ])
+})
+
+test('Client.link returns the hook result only after the hook resolves, and only to a caller that asked', async (t) => {
+  const held = gate()
+  const contexts: AfterLinkContext[] = []
+  let mode: 'valid' | 'invalid' = 'valid'
+  const { client, storage, source } = await setup(t, {
+    symlinks: [{ selector: 'release-1' }],
+    hooks: {
+      afterLink: async (context): Promise<HookResult> => {
+        contexts.push(context)
+        if (contexts.length === 1) await held.wait
+        if (mode === 'invalid') return { submissionId: 'sk-secret', send: () => 1 } as never
+        return {
+          submissionId: `sub-${contexts.length}`,
+          link: context.link.name,
+          observed: context.status,
+          evidence: ['https://example.test/review/evidence-marker']
+        }
+      }
+    }
+  })
+  const events: unknown[] = []
+  client.on('link', (event) => events.push(event))
+  t.is((await client.upload(await write(source, 'release-1', 'first'))).status, 'COMMITTED')
+
+  let resolved = false
+  const pending = client.link('release-1', 'current', { hookResult: true }).then((result) => {
+    resolved = true
+    return result
+  })
+  await waitFor(() => contexts.length === 1)
+  await settled()
+  t.is(resolved, false, 'neither the status nor the data arrives while the hook runs')
+  held.open()
+  const first = await pending
+  t.alike(first, {
+    target: 'release-1',
+    name: 'current',
+    status: 'LINKED',
+    hookResult: {
+      submissionId: 'sub-1',
+      link: 'current',
+      observed: 'LINKED',
+      evidence: ['https://example.test/review/evidence-marker']
+    }
+  })
+
+  // The retry reruns the hook and returns what it returns this time.
+  const retry = await client.link('release-1', 'current', { hookResult: true })
+  t.is(retry.status, 'UNCHANGED')
+  t.is((retry.hookResult as { submissionId: string }).submissionId, 'sub-2')
+  t.is((retry.hookResult as { observed: string }).observed, 'UNCHANGED')
+
+  // A caller that does not ask gets the plain result although the hook still ran and returned data.
+  const plain = await client.link('release-1', 'current')
+  t.alike(plain, { target: 'release-1', name: 'current', status: 'UNCHANGED' })
+  t.alike(Object.keys(plain), ['target', 'name', 'status'])
+  t.is(contexts.length, 3)
+  t.absent(JSON.stringify(events).includes('evidence-marker'), 'link events never carry the data')
+
+  // An unusable result is a sanitized HOOK_FAILED; the durable link and the retry are untouched.
+  mode = 'invalid'
+  const failure: unknown = await client.link('release-1', 'current', { hookResult: true }).then(
+    () => null,
+    (error: unknown) => error
+  )
+  t.ok(failure instanceof SwarmDeployError)
+  t.is((failure as SwarmDeployError).code, ERRORS.HOOK_FAILED)
+  t.absent((failure as SwarmDeployError).message.includes('sk-secret'))
+  t.is(await fs.promises.readlink(path.join(storage, 'current')), 'release-1')
+  t.is((await client.link('release-1', 'current')).status, 'UNCHANGED', 'a plain request is fine')
+  mode = 'valid'
+  const recovered = await client.link('release-1', 'current', { hookResult: true })
+  t.is(recovered.status, 'UNCHANGED')
+  t.is((recovered.hookResult as { link: string }).link, 'current')
+})
+
+function output(): { stream: { write(value: string): void }; text(): string } {
+  let text = ''
+  return {
+    stream: {
+      write(value: string) {
+        text += value
+      }
+    },
+    text: () => text
+  }
+}
+
+test('swarm-deploy link --json prints the hook result through a real client and plain output is unchanged', async (t) => {
+  let calls = 0
+  const { server, client, testnet, source } = await setup(t, {
+    symlinks: [{ selector: 'release-1' }],
+    hooks: {
+      afterLink: (context): HookResult | undefined => {
+        calls++
+        if (context.link.name === 'quiet') return undefined
+        return { submissionId: `sub-${calls}`, state: 'accepted', details: { queued: true } }
+      }
+    }
+  })
+  t.is((await client.upload(await write(source, 'release-1', 'first'))).status, 'COMMITTED')
+  const env = { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') }
+  const run = async (...args: string[]) => {
+    const stdout = output()
+    const stderr = output()
+    const code = await main(
+      ['link', '--server-key', b4a.toString(server.publicKey, 'hex'), ...args],
+      env,
+      {
+        dht: testnet.createNode(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        connectTimeout: 5_000,
+        idleTimeout: 10_000
+      }
+    )
+    return { code, stdout: stdout.text(), stderr: stderr.text() }
+  }
+
+  const linked = await run('--json', 'release-1', 'current')
+  t.is(linked.code, 0)
+  t.is(linked.stdout.endsWith('\n'), true)
+  t.alike(JSON.parse(linked.stdout), {
+    target: 'release-1',
+    name: 'current',
+    status: 'LINKED',
+    hookResult: { submissionId: 'sub-1', state: 'accepted', details: { queued: true } }
+  })
+  t.is(linked.stdout.trimEnd().includes('\n'), false, 'one object on one line')
+  t.absent(linked.stderr.includes('sub-1'), 'diagnostics never carry the data')
+
+  const again = await run('release-1', '--json', 'current')
+  t.is(again.code, 0)
+  t.is(JSON.parse(again.stdout).status, 'UNCHANGED')
+  t.is(JSON.parse(again.stdout).hookResult.submissionId, 'sub-2', 'a retry reruns the hook')
+
+  const quiet = await run('--json', 'release-1', 'quiet')
+  t.alike(JSON.parse(quiet.stdout), { target: 'release-1', name: 'quiet', status: 'LINKED' })
+
+  const plain = await run('release-1', 'current')
+  t.is(plain.code, 0)
+  t.is(plain.stdout, 'current -> release-1 UNCHANGED\n')
+  t.absent(plain.stdout.includes('sub-'))
+  t.is(calls, 4, 'the hook runs for every request')
+
+  const missing = await run('--json', 'release-9', 'current')
+  t.is(missing.code, 1)
+  t.is(missing.stdout, '', 'a failure prints no JSON')
+  t.ok(missing.stderr.length > 0)
 })
 
 test('Client.upload waits for afterLink on an automatic link and retries a failed one as ALREADY_COMMITTED', async (t) => {
