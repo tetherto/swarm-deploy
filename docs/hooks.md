@@ -285,9 +285,24 @@ removed once the hook has succeeded (before the answer is written, so a failed
 write never undoes a successful hook) or the change has been restored. A request
 that changes nothing writes no journal and has nothing to restore.
 
+Removing the journal after a successful hook is the point of no return. As soon
+as it succeeds the request is finished: the server refreshes its list of managed
+names only afterwards, and if that refresh fails it is logged and nothing else
+changes (the answer stays a success, and the link is never restored). The same
+holds after a restore: a failed refresh is never reported as a failed restore.
+Until the next successful refresh replaces the list, the name stays reserved, so
+a failed refresh never makes admission less protective.
+
 - **What is restored.** The link and the ownership record, together. A change to
   the record alone, such as a refreshed transfer ID for an unchanged link, is
-  restored too.
+  restored too. If creating the link itself fails, for example because the
+  filesystem refused once, the record the request replaced is put back (it is
+  never simply deleted), the journal is removed, and the next request for the name
+  works. That only happens while the journal is still the request's own and the
+  record is still the previous one or the one the request wrote; a record that
+  is anything else is left as found. If that cannot be done, the answer is
+  `LINK_FAILED` and the journal stays until a later request for the name finishes
+  the restore or fails closed.
 - **Never over a change somebody else made.** The restore only proceeds when the
   link and the record are still the previous state or the one this request
   made (same text and, where the filesystem reports it, the same inode). A
@@ -300,6 +315,11 @@ that changes nothing writes no journal and has nothing to restore.
   There is no compare-and-swap rename in the storage adapter, so a writer
   outside the server that changes the link in the instant between the check and
   the swap can still be replaced.
+- **Only its own journal.** A request changes, restores, or removes nothing
+  unless the journal on disk is still the one it wrote (same token and the same
+  recorded states). If that file was removed, replaced by another request's, or
+  edited, the request fails with `LINK_FAILED` and leaves the link, the record,
+  and the file as found: it never erases a journal that is not its own.
 - **Crash and restart.** A journal found at start-up means the outcome of that
   request is unknown and its client never heard success, so the previous link is
   restored before retention runs or a client connects. A journal that cannot be
@@ -311,8 +331,12 @@ that changes nothing writes no journal and has nothing to restore.
   again, which is the existing at-least-once contract.
 - **Retention.** While a journal exists, both the attempted and the previous
   artifact are kept from retention (the attempted one, the previous record's
-  target, and an adopted symlink's text when it exactly names a managed
-  artifact), so the restore never points at a removed artifact.
+  target, and the artifact an adopted symlink names), so the restore never
+  points at a removed artifact. That symlink's text is only compared, never
+  resolved: it names an artifact when it is exactly its name, `./name`, or
+  `<this server's storage root>/name`, each optionally followed by one `/`. Any
+  other spelling, including a path to the same file through a different route,
+  pins nothing. The text itself is still restored exactly, whatever it says.
 - **What is never undone.** The uploaded artifact, and anything the hook did
   elsewhere, such as a submission it made to an external store. The link is also
   visible to local consumers for as long as the hook runs, even when it is later

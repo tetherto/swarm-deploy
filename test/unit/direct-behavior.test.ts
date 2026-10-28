@@ -4212,6 +4212,247 @@ test('a pending request keeps both its attempted and its previous artifact from 
   }
 })
 
+test('a journal replaced during the hook is never erased or acted on by the request that opened it', async (t) => {
+  for (const outcome of ['succeeds', 'fails'] as const) {
+    const storageDir = await createTempDir(t)
+    const hookErrors: HookFailureContext[] = []
+    const logs: Array<Record<string, unknown>> = []
+    let replacement = ''
+    const { server, node } = await createServer(t, {
+      storageDir,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+      hooks: {
+        afterLink: async ({ link }) => {
+          if (link.target !== 'r2') return
+          // Another request's journal (or an operator's edit) takes its place on disk.
+          const file = path.join(storageDir, LINKS_DIRECTORY, (await journalFiles(storageDir))[0])
+          const journal = JSON.parse(await fs.promises.readFile(file, 'utf8')) as object
+          replacement = JSON.stringify({
+            ...journal,
+            token: 'f'.repeat(32),
+            prior: { link: { state: 'SYMLINK', literal: 'r0', identity: null }, record: null }
+          })
+          await fs.promises.writeFile(file, replacement)
+          if (outcome === 'fails') throw new Error('publish failed')
+        },
+        onFailure: (context) => void hookErrors.push(context)
+      }
+    })
+    const events: Array<Record<string, unknown>> = []
+    server.on('link', (event) =>
+      events.push({ status: event.status, reason: event.reason, rolledBack: event.rolledBack })
+    )
+    await uploadEach(t, node, ['r1', 'r2'])
+    t.alike((await linkAll(node, 'r1', 'current')).result, { v: 1, status: 'LINKED' })
+    events.length = 0
+
+    const socket = linkRequest(node, 'r2', 'current')
+    await waitFor(() => socket.writes.length === 1)
+    t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.LINK_FAILED }, outcome)
+    t.is(await visibleLink(storageDir, 'current'), 'r2', `${outcome}: the link was left as it was`)
+    t.is((await ownership(storageDir, 'current'))?.target, 'r2', `${outcome}: and its record`)
+    const [journal] = await journalFiles(storageDir)
+    t.is(
+      await fs.promises.readFile(path.join(storageDir, LINKS_DIRECTORY, journal), 'utf8'),
+      replacement,
+      `${outcome}: the other journal is exactly as it was`
+    )
+    t.alike(
+      events,
+      [{ status: 'failed', reason: ERRORS.LINK_FAILED, rolledBack: undefined }],
+      outcome
+    )
+    t.is(hookErrors.length, outcome === 'fails' ? 1 : 0, `${outcome}: onFailure`)
+    t.ok(
+      logs.some((entry) => entry.message === 'Managed link rollback failed'),
+      outcome
+    )
+  }
+})
+
+test('a name-snapshot refresh that fails after the outcome is final changes neither answer nor state', async (t) => {
+  for (const outcome of ['commit', 'restore'] as const) {
+    const storageDir = await createTempDir(t)
+    let armed = false
+    let injected = 0
+    const storage = createStorage({
+      beforeOperation(name, target) {
+        if (armed && name === 'readdir' && target.endsWith(LINKS_DIRECTORY)) {
+          armed = false
+          injected++
+          throw new Error('injected refresh failure')
+        }
+      }
+    })
+    const logs: Array<Record<string, unknown>> = []
+    const { server, node } = await createServer(t, {
+      storageDir,
+      storage,
+      symlinks: [{ selector: '/^r\\d$/' }],
+      logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+      hooks: {
+        afterLink: () => {
+          // The next read of the managed-link directory, which is the refresh, fails once.
+          armed = true
+          if (outcome === 'restore') throw new Error('publish failed')
+        }
+      }
+    })
+    const events: Array<Record<string, unknown>> = []
+    server.on('link', (event) =>
+      events.push({ status: event.status, reason: event.reason, rolledBack: event.rolledBack })
+    )
+    await uploadEach(t, node, ['r1'])
+
+    const socket = linkRequest(node, 'r1', 'current')
+    await waitFor(() => socket.writes.length === 1)
+    t.is(injected, 1, `${outcome}: the refresh failure was injected`)
+    if (outcome === 'commit') {
+      t.alike(linkFrame(socket), { v: 1, status: 'LINKED' }, 'a finalized link is still a success')
+      t.is(await visibleLink(storageDir, 'current'), 'r1', 'and stays')
+      t.is((await ownership(storageDir, 'current'))?.target, 'r1')
+      t.alike(events, [{ status: 'linked', reason: undefined, rolledBack: undefined }])
+    } else {
+      t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED })
+      t.is(await visibleLink(storageDir, 'current'), null, 'the link was removed')
+      t.is(await ownership(storageDir, 'current'), null)
+      t.alike(events, [{ status: 'failed', reason: ERRORS.HOOK_FAILED, rolledBack: true }])
+    }
+    t.alike(await journalFiles(storageDir), [], `${outcome}: no journal remains`)
+    t.absent(
+      logs.some((entry) => entry.message === 'Managed link rollback failed'),
+      `${outcome}: nothing was misreported as a failed restore`
+    )
+    t.ok(
+      logs.some(
+        (entry) =>
+          entry.message === 'Managed link names could not be refreshed' && entry.name === 'current'
+      ),
+      `${outcome}: the failed refresh is logged by link name`
+    )
+
+    // The name stays reserved even where the restore removed its record, until a later
+    // reconcile replaces the snapshot: admission is never weaker than it was.
+    const offer = async (): Promise<string | undefined> => {
+      const probe = new FakeSocket(CLIENT_KEY)
+      node.accept(probe)
+      probe.feed(metadataFrame((await manifest(t, 'current', 'payload')).manifest))
+      await waitFor(() => probe.writes.length > 0)
+      const first = JSON.parse(b4a.toString(probe.writes[0].subarray(4))) as { code?: string }
+      probe.destroy()
+      return first.code
+    }
+    t.is(await offer(), ERRORS.INVALID_FILENAME, `${outcome}: the name is still reserved`)
+    if (outcome === 'restore') {
+      const { retention } = server as unknown as {
+        retention: { run(options: { trigger: 'manual' }): Promise<unknown> }
+      }
+      await retention.run({ trigger: 'manual' })
+      t.is(await offer(), undefined, 'a later successful reconcile frees it')
+    }
+  }
+})
+
+/** `[what the adopted symlink says, built from the test directories, policy, survives]` */
+type AdoptedRow = [
+  string,
+  (storageDir: string, outside: string) => string,
+  'rollback' | 'keep',
+  boolean
+]
+
+const absoluteRoot = (dir: string): string => path.resolve(dir)
+
+/**
+ * For each row: an unowned `current` symlink with that text, a pending request for
+ * `app-2.0.0.bin` that will fail, and a third release that makes `maxCount: 2` rotation want
+ * `app-1.0.0.bin`. `survives` says whether the journal's pins keep it, and the symlink's exact
+ * text must come back either way.
+ */
+async function adoptedLinkRetention(t: Assert, rows: AdoptedRow[]): Promise<void> {
+  for (const [label, spell, policy, survives] of rows) {
+    const storageDir = await createTempDir(t)
+    const outside = await createTempDir(t)
+    const literal = spell(storageDir, outside)
+    await fs.promises.symlink(literal, path.join(storageDir, 'current'))
+    const held = gate()
+    let pending = false
+    const { node } = await createServer(t, {
+      storageDir,
+      artifactPatterns: ['{series}-{version}.bin'],
+      maxCount: 2,
+      symlinks: [{ selector: '/^app-\\d+\\.\\d+\\.\\d+\\.bin$/' }],
+      hooks: {
+        afterLink: async () => {
+          pending = true
+          await held.wait
+          throw new Error('publish failed')
+        }
+      }
+    })
+    for (const version of ['1.0.0', '2.0.0']) {
+      t.absent(finalCode(await uploadAll(node, await manifest(t, `app-${version}.bin`, 'aa'))))
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    const socket = linkRequest(node, 'app-2.0.0.bin', 'current', false, policy)
+    await waitFor(() => pending)
+    // The third release makes retention keep the newest two, so `app-1.0.0.bin` goes unless held.
+    t.absent(finalCode(await uploadAll(node, await manifest(t, 'app-3.0.0.bin', 'aa'))), label)
+    const there = (name: string): Promise<boolean> =>
+      fs.promises.lstat(path.join(storageDir, name)).then(
+        () => true,
+        () => false
+      )
+    t.is(await there('app-1.0.0.bin'), survives, `${label}: the previous artifact`)
+    t.is(await there('app-2.0.0.bin'), true, `${label}: the attempted artifact`)
+
+    held.open()
+    await waitFor(() => socket.writes.length === 1)
+    t.alike(linkFrame(socket), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED }, label)
+    if (policy === 'rollback') {
+      t.is(await visibleLink(storageDir, 'current'), literal, `${label}: the exact text is back`)
+    }
+  }
+}
+
+test('the previous artifact of an adopted link is pinned by its exact name, ./name, or absolute path', async (t) => {
+  await adoptedLinkRetention(t, [
+    ['its name', () => 'app-1.0.0.bin', 'rollback', true],
+    ['./name', () => './app-1.0.0.bin', 'rollback', true],
+    ['./name/', () => './app-1.0.0.bin/', 'rollback', true],
+    [
+      'the absolute path in this root',
+      (dir) => `${absoluteRoot(dir)}/app-1.0.0.bin`,
+      'rollback',
+      true
+    ],
+    [
+      'the absolute path and a slash',
+      (dir) => `${absoluteRoot(dir)}/app-1.0.0.bin/`,
+      'rollback',
+      true
+    ]
+  ])
+})
+
+test('no other spelling of an adopted link pins anything, is resolved, or loses its text', async (t) => {
+  await adoptedLinkRetention(t, [
+    ['the name in another directory', (_dir, out) => `${out}/app-1.0.0.bin`, 'rollback', false],
+    ['a detour back to the name', () => './sub/../app-1.0.0.bin', 'rollback', false],
+    ['an absolute detour', (dir) => `${absoluteRoot(dir)}/sub/../app-1.0.0.bin`, 'rollback', false],
+    [
+      'a path through the parent',
+      (dir) => `../${path.basename(dir)}/app-1.0.0.bin`,
+      'rollback',
+      false
+    ],
+    ['a dangling literal', () => 'no-such-target', 'rollback', false],
+    // Without a journal nothing holds the previous artifact back, however it is spelled.
+    ['the absolute path, with keep', (dir) => `${absoluteRoot(dir)}/app-1.0.0.bin`, 'keep', false]
+  ])
+})
+
 test('closing the server aborts a pending afterLink and a queued one and frees the hook line', async (t) => {
   let started = 0
   const { server, node } = await createServer(t, {

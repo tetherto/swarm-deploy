@@ -704,6 +704,33 @@ after a restore. It is validated strictly when read: any other key, version,
 unsafe name, foreign filename hash, malformed text, oversize file, or non-regular
 file fails closed with `LINK_FAILED`, and nothing in it is used as a path.
 
+A request holds a snapshot of its journal and acts on the file only while the file
+is still that journal: before it removes the file (commit or restore), restores
+the link or record, or cleans up after a failed change, it re-reads the file and
+requires the same `token` and the same `name`, `intended`, and `prior`; `applied`
+may be unset on one side only (the write that sets it can fail, and a recovered
+journal has no in-memory copy), and two different values are an edit. A missing,
+replaced, or edited journal fails closed with `LINK_FAILED`, leaves the link,
+record, and file as found, and is never erased by the request that lost it.
+
+The commit point is final. Once the removal succeeded the request is finished and
+no unjournaled rollback is attempted; refreshing the server's managed-name
+snapshot comes after it and can only add the name to the snapshot. A failure there
+is logged by link name and changes neither the answer (`LINKED`, or the hook's
+failure after a restore) nor any state, and the name stays reserved until a later
+successful refresh replaces the snapshot.
+
+When creating the link fails (nothing existed at the name), the request puts back
+the record it replaced, or removes the record when there was none, and removes the
+journal; the name's record is never deleted while a previous record is on file.
+Before it changes the record it re-proves the fence: the journal on disk must
+still be its own, and the record must be the previous one (nothing to do) or the
+one the request wrote. Any other record is somebody else's and is left untouched.
+A restore that itself fails, or is refused for that reason, answers `LINK_FAILED`,
+not `LINK_CONFLICT`, and the
+journal stays until a later request for the name finishes the restore or fails
+closed.
+
 Restore is compare-and-restore. The visible link must be the prior link or the
 one the request made (same text, and the same identity when both sides report
 one), and the record must be the prior record or the one the request wrote; every
@@ -721,9 +748,14 @@ journal that fails validation stops the start. Any later request for a name with
 journal first resolves it or fails closed.
 
 While a journal exists it holds back, from retention, the attempted target, the
-previous record's target, and any current artifact whose name exactly equals the
-previous symlink's text (compared as a name; the text is never resolved), in
-addition to the ordinary pins. Only the root lease is held while a journal is
+previous record's target, and any current artifact that the previous symlink's
+text names, in addition to the ordinary pins. The text is untrusted and is only
+compared as a string, never resolved or used as a path: for each current artifact
+`n`, the candidates are `n`, `./n`, and `<root>/n`, where `<root>` is the layout
+root of this server, each optionally followed by one `/`, and the text pins the
+artifact only if it is exactly one of them. Any other spelling, including a path
+that reaches the same file by a different route, pins nothing; the text is still
+restored exactly. Only the root lease is held while a journal is
 written, restored, or removed; a hook never runs under it.
 
 Automatic reconciliation ignores manual records and therefore never repoints

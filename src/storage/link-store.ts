@@ -97,6 +97,19 @@ interface RollbackJournal {
   applied: { identity: LinkIdentity } | null
 }
 
+/**
+ * What `convergeManual` needs from a request that journals its change. `begin` is
+ * awaited with the state the request found, right before its first change, and is
+ * never called for a request that changes nothing. `withdraw` is called when
+ * creating the link failed before any link existed; it puts the previous record
+ * back only while the journal and the record are still this request's own, and
+ * throws `LINK_FAILED`, changing nothing, otherwise.
+ */
+interface Journaling {
+  begin(prior: { record: ManagedSymlinkRecord | null; destination: Destination }): Promise<void>
+  withdraw(): Promise<void>
+}
+
 /** An open rollback-able change: finalize it with `commitManual` or undo it with `rollbackManual`. */
 export interface ManualLinkTransaction {
   readonly name: string
@@ -244,6 +257,39 @@ function sameRecord(
 /** The ownership record a rollback-able request writes for its intended link. */
 function intendedRecord(journal: RollbackJournal): ManagedSymlinkRecord {
   return { version: 2, mode: 'manual', name: journal.name, ...journal.intended }
+}
+
+function sameIdentity(left: LinkIdentity, right: LinkIdentity): boolean {
+  if (left === null || right === null) return left === right
+  return identitiesEqual(left, right)
+}
+
+function samePriorLink(left: PriorLink, right: PriorLink): boolean {
+  if (left.state === 'MISSING' || right.state === 'MISSING') return left.state === right.state
+  return left.literal === right.literal && sameIdentity(left.identity, right.identity)
+}
+
+/**
+ * Whether the journal on disk is still the one an open request holds: the same
+ * token and every field that is fixed when the journal is created (name, intended
+ * link, previous link and record). Only `applied` may differ, and only by being
+ * unset on one side: it is written after the change, so the disk copy of a request
+ * whose last write failed, or the in-memory copy of a journal recovered from disk,
+ * can lag behind. Two different identities are an edit.
+ */
+function sameJournal(persisted: RollbackJournal, open: RollbackJournal): boolean {
+  return (
+    persisted.token === open.token &&
+    persisted.name === open.name &&
+    persisted.intended.target === open.intended.target &&
+    persisted.intended.transferId === open.intended.transferId &&
+    persisted.intended.targetKind === open.intended.targetKind &&
+    samePriorLink(persisted.prior.link, open.prior.link) &&
+    sameRecord(persisted.prior.record, open.prior.record) &&
+    (persisted.applied === null ||
+      open.applied === null ||
+      sameIdentity(persisted.applied.identity, open.applied.identity))
+  )
 }
 
 /**
@@ -513,15 +559,26 @@ export class LinkStore {
    * so a crash after the link appears never leaves an unrecorded link; the
    * link itself is created without overwriting, so a path that appeared since
    * classification is never replaced and its record is withdrawn.
+   *
+   * A request that journals its change passes `withdraw`, which puts back the
+   * record it replaced instead of deleting the name's record: with a previous
+   * record on file, deleting it would leave a state the journal rightly refuses
+   * to restore. It proves the journal and the record are still its own first.
    */
-  private async createLink(link: DesiredLink, mode: LinkOwnershipMode): Promise<void> {
+  private async createLink(
+    link: DesiredLink,
+    mode: LinkOwnershipMode,
+    withdraw?: () => Promise<void>
+  ): Promise<void> {
     await this.writeRecord(link, mode)
     try {
       await withSafeDirectoryIdentity(this.layout.root, this.storage, () =>
         this.storage.symlink(link.target, this.finalPath(link.name))
       )
     } catch (error: unknown) {
-      await this.removeRecord(link.name).catch(() => {})
+      // A failed restore is not the conflict that caused it: it surfaces as itself.
+      if (withdraw) await withdraw()
+      else await this.removeRecord(link.name).catch(() => {})
       if (errorCode(error) === 'EEXIST') {
         throw conflict('Unmanaged path at a configured managed link name')
       }
@@ -619,10 +676,41 @@ export class LinkStore {
     await writeAtomic(this.journalPath(journal.name), bytes, this.storage)
   }
 
-  private async removeJournal(name: string): Promise<void> {
+  /**
+   * Fails closed unless the journal on disk is still the one `journal` was made
+   * from. A request's snapshot is only a claim on its own journal: if that file
+   * was removed, replaced by another request's, or edited, it describes somebody
+   * else's state now, and nothing is changed or erased on its behalf.
+   */
+  private async assertOwned(journal: RollbackJournal): Promise<void> {
+    const persisted = await this.readJournal(journal.name)
+    if (persisted === null) throw failure('Rollback journal is missing')
+    if (!sameJournal(persisted, journal)) throw failure('Rollback journal was replaced')
+  }
+
+  /**
+   * Puts back the ownership record a creation that failed had replaced. Nothing is
+   * written unless the journal on disk is still this request's own and the record
+   * is still the previous one (then there is nothing to do) or the one this request
+   * wrote: a record that is anything else is somebody else's and is left as found.
+   */
+  private async putBackRecord(journal: RollbackJournal): Promise<void> {
+    await this.assertOwned(journal)
+    const record = await this.readRecord(journal.name)
+    if (sameRecord(record, journal.prior.record)) return
+    if (!sameRecord(record, intendedRecord(journal))) {
+      throw failure('Managed link changed since the pending request')
+    }
+    if (journal.prior.record === null) await this.removeRecord(journal.name)
+    else await this.writeRecord(journal.prior.record, 'manual')
+  }
+
+  /** Removes a journal only after proving the file on disk is still this one. */
+  private async removeOwnedJournal(journal: RollbackJournal): Promise<void> {
+    await this.assertOwned(journal)
     await withSafeDirectoryIdentity(this.layout.links, this.storage, async () => {
       try {
-        await this.storage.unlink(this.journalPath(name))
+        await this.storage.unlink(this.journalPath(journal.name))
       } catch (error: unknown) {
         if (!isMissing(error)) throw error
       }
@@ -689,41 +777,94 @@ export class LinkStore {
    * every other mutation, runs under the root lease.
    */
   async beginManual(link: DesiredLink, options: ManualLinkOptions): Promise<ManualLinkBegin> {
-    const held: { journal: RollbackJournal | null } = { journal: null }
+    const held: {
+      journal: RollbackJournal | null
+      /** The first write of the journal returned, so it is on disk. */
+      durable: boolean
+      /** Creating the link failed and the previous record is back: nothing of ours remains. */
+      undone: boolean
+    } = { journal: null, durable: false, undone: false }
     try {
-      const result = await this.convergeManual(link, options, async ({ record, destination }) => {
-        held.journal = {
-          version: 1,
-          name: link.name,
-          token: randomSuffix(),
-          intended: {
-            target: link.target,
-            transferId: link.transferId,
-            targetKind: link.targetKind
-          },
-          prior: { link: this.priorLink(destination), record },
-          applied: null
+      const journaling: Journaling = {
+        begin: async ({ record, destination }) => {
+          held.journal = {
+            version: 1,
+            name: link.name,
+            token: randomSuffix(),
+            intended: {
+              target: link.target,
+              transferId: link.transferId,
+              targetKind: link.targetKind
+            },
+            prior: { link: this.priorLink(destination), record },
+            applied: null
+          }
+          await this.writeJournal(held.journal)
+          held.durable = true
+        },
+        withdraw: async () => {
+          if (held.journal === null) throw failure('Rollback journal is missing')
+          await this.putBackRecord(held.journal)
+          held.undone = true
         }
-        await this.writeJournal(held.journal)
-      })
+      }
+      const result = await this.convergeManual(link, options, journaling)
       const journal = held.journal
       if (journal === null) return { ...result, transaction: null }
       const now = await this.classify(link.name)
       journal.applied = { identity: now.state === 'SYMLINK' ? now.identity : null }
+      // This write replaces the file, so it must still be ours to replace.
+      await this.assertOwned(journal)
       await this.writeJournal(journal)
       return { ...result, transaction: { name: link.name, journal } }
     } catch (error: unknown) {
       // The change began and did not finish: put back what was there. If that
-      // cannot be proven the journal stays, and the name fails closed until resolved.
-      if (held.journal !== null) await this.settle(held.journal).catch(() => {})
+      // cannot be proven the journal stays, the name fails closed until resolved,
+      // and the answer is `LINK_FAILED`, not the error that interrupted the change.
+      try {
+        await this.undoBegin(held)
+      } catch (undoError: unknown) {
+        throw failure('The interrupted link change could not be undone', undoError)
+      }
       throw asLinkError(error)
     }
   }
 
-  /** The request's hook succeeded: the change is final and the journal is removed. */
+  /**
+   * Settles the journal of a `beginManual` that threw. Nothing is touched unless
+   * the journal on disk is this request's own: one that was never written needs
+   * nothing, and a missing or replaced one is somebody else's to resolve.
+   */
+  private async undoBegin(held: {
+    journal: RollbackJournal | null
+    durable: boolean
+    undone: boolean
+  }): Promise<void> {
+    const journal = held.journal
+    if (journal === null) return
+    if (!held.durable) {
+      // The first write did not return, and the change always follows it, so nothing has
+      // changed. The file may still have landed (a failure after the rename); clean up only
+      // that, and only if it is ours.
+      const persisted = await this.readJournal(journal.name)
+      if (persisted === null) return
+      if (persisted.token !== journal.token) throw failure('Rollback journal was replaced')
+    }
+    // `undone`: the link was never created and the previous record is back, so the
+    // journal has nothing left to restore, whatever now sits at the link name.
+    if (held.undone) await this.removeOwnedJournal(journal)
+    else await this.settle(journal)
+  }
+
+  /**
+   * The request's hook succeeded: the change is final and the journal is removed.
+   * Removing it is the commit point, so it must still be this request's own
+   * journal; a missing, replaced, or edited one fails closed with `LINK_FAILED`
+   * and is left alone.
+   */
   async commitManual(transaction: ManualLinkTransaction): Promise<void> {
     try {
-      await this.removeJournal(transaction.name)
+      await this.removeOwnedJournal(transaction.journal)
     } catch (error: unknown) {
       throw asLinkError(error)
     }
@@ -820,10 +961,15 @@ export class LinkStore {
     }
   }
 
-  /** Restores a journal's previous state if it is provably ours to restore, then removes it. */
+  /**
+   * Restores a journal's previous state if it is provably ours to restore, then
+   * removes it. The journal on disk must still be this one before anything is
+   * restored and again before it is removed.
+   */
   private async settle(journal: RollbackJournal): Promise<void> {
+    await this.assertOwned(journal)
     await this.restore(journal)
-    await this.removeJournal(journal.name)
+    await this.removeOwnedJournal(journal)
   }
 
   /**
@@ -1051,10 +1197,7 @@ export class LinkStore {
   private async convergeManual(
     link: DesiredLink,
     { managedArtifactNames, automaticLinkNames }: ManualLinkOptions,
-    begin?: (prior: {
-      record: ManagedSymlinkRecord | null
-      destination: Destination
-    }) => Promise<void>
+    journaling?: Journaling
   ): Promise<ManualLinkResult> {
     if (
       !managedArtifactNames ||
@@ -1097,8 +1240,8 @@ export class LinkStore {
     }
     const prior = { record, destination }
     if (destination.state === 'MISSING') {
-      await begin?.(prior)
-      await this.createLink(link, 'manual')
+      await journaling?.begin(prior)
+      await this.createLink(link, 'manual', journaling?.withdraw)
       return { status: 'LINKED' }
     }
     if (record === null) {
@@ -1111,7 +1254,7 @@ export class LinkStore {
       // first and the record second: a crash between them leaves a symlink at the
       // requested target that this same request takes over again on retry.
       const reserved = [...automaticLinkNames, ...managedArtifactNames]
-      await begin?.(prior)
+      await journaling?.begin(prior)
       await this.replaceLink(link, 'manual', () =>
         this.assertTakeoverStillSafe(link.name, destination, reserved)
       )
@@ -1126,15 +1269,15 @@ export class LinkStore {
           return { status: 'UNCHANGED' }
         }
         // Only the record changes, but it is still a change a failed hook undoes.
-        await begin?.(prior)
+        await journaling?.begin(prior)
         await this.writeRecord(link, 'manual')
         return { status: 'UNCHANGED' }
       }
-      await begin?.(prior)
+      await journaling?.begin(prior)
       await this.writeRecord(link, 'manual')
       return { status: 'LINKED' }
     }
-    await begin?.(prior)
+    await journaling?.begin(prior)
     await this.replaceLink(link, 'manual')
     return { status: 'LINKED' }
   }

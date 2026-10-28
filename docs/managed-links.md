@@ -143,7 +143,7 @@ A link request that is waiting for its hook, or whose restore could not be
 finished, also has a rollback journal, `.swarm-deploy/links/<sha256(link-name)>.rollback.json`.
 It is removed by the server when the request is finalized or restored, and a
 server stopped normally leaves none. If one remains because the link or record was
-changed from outside, requests for that name fail with `LINK_FAILED` and the
+changed from outside, or the journal itself was edited, requests for that name fail with `LINK_FAILED` and the
 journal keeps the artifacts it names from retention. After making the symlink and
 its ownership record what you want, stop the server and remove that one journal
 file; do not edit it.

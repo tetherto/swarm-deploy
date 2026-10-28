@@ -638,17 +638,36 @@ export class Server extends EventEmitter {
    * While a rollback journal exists, a request's outcome is unknown, so both the
    * attempted and the previous link keep their artifacts: the journal's own
    * transfer IDs, plus the current artifact whose name equals the attempted
-   * target, the previous record's target, or the previous symlink's text. Only
-   * names are compared; a previous symlink's text is never resolved.
+   * target or the previous record's target, and the one an adopted previous
+   * symlink names. That symlink's text is untrusted and is only ever compared as
+   * a string, never resolved or used to build a path: it counts as naming an
+   * artifact when it is exactly that artifact's name, `./name`, or the absolute
+   * `<storage root>/name` (the root being this server's own), each optionally
+   * followed by one `/`. Any other spelling, including a path to the same file
+   * through a different route, is not recognized and pins nothing.
    */
   private async pinPendingRollbacks(records: CommitRecord[], pins: Set<string>): Promise<void> {
     if (!this.links) return
-    for (const pending of await this.links.pendingRollbacks()) {
-      pins.add(pending.transferId)
-      if (pending.priorRecord) pins.add(pending.priorRecord.transferId)
-      for (const name of [pending.target, pending.priorRecord?.target, pending.priorLiteral]) {
-        const record =
-          name === undefined || name === null ? undefined : records.find((r) => r.name === name)
+    const pending = await this.links.pendingRollbacks()
+    if (pending.length === 0) return
+    // Every spelling is built from this server's own root and a stored record name, so
+    // an untrusted symlink text can only be equal to one of them, never produce one.
+    const root = this.layout!.root
+    const base = root.endsWith(path.sep) ? root : `${root}${path.sep}`
+    const byName = new Map(records.map((record) => [record.name, record]))
+    const spelled = new Map<string, CommitRecord>()
+    for (const record of records) {
+      for (const spelling of [record.name, `./${record.name}`, `${base}${record.name}`]) {
+        spelled.set(spelling, record)
+        spelled.set(`${spelling}/`, record)
+      }
+    }
+    for (const entry of pending) {
+      pins.add(entry.transferId)
+      if (entry.priorRecord) pins.add(entry.priorRecord.transferId)
+      const named = [byName.get(entry.target), byName.get(entry.priorRecord?.target ?? '')]
+      if (entry.priorLiteral !== null) named.push(spelled.get(entry.priorLiteral))
+      for (const record of named) {
         if (record) pins.add(record.transferId)
       }
     }
@@ -986,11 +1005,11 @@ export class Server extends EventEmitter {
         }
       }
       if (open.transaction !== null) {
-        await this.settleLink(
-          (links, transaction) => links.commitManual(transaction),
-          open.transaction
-        )
+        const transaction = open.transaction
+        await this.settleLink((links) => links.commitManual(transaction))
+        // Final: the journal is gone, so no later failure may try to undo the link.
         open.transaction = null
+        await this.refreshAfterSettle(request.name)
       }
       return { status: decided.status, hookResult }
     } catch (error) {
@@ -1002,11 +1021,9 @@ export class Server extends EventEmitter {
         state.hookError = error
       }
       if (open.transaction !== null) {
+        const transaction = open.transaction
         try {
-          await this.settleLink(
-            (links, transaction) => links.rollbackManual(transaction),
-            open.transaction
-          )
+          await this.settleLink((links) => links.rollbackManual(transaction))
         } catch (rollbackError) {
           this.logger.warn('Managed link rollback failed', {
             publicKeyId: fingerprint(owner),
@@ -1015,22 +1032,39 @@ export class Server extends EventEmitter {
           })
           throw fail(ERRORS.LINK_FAILED, 'Unable to restore the previous managed link', error)
         }
+        // Restored and journal removed: from here the request is a clean failure.
+        open.transaction = null
         state.rolledBack = true
+        await this.refreshAfterSettle(request.name)
       }
       throw error
     }
   }
 
-  /** Finalizes or restores a journaled link under the root lease and refreshes the name snapshot. */
-  private settleLink(
-    operation: (links: LinkStore, transaction: ManualLinkTransaction) => Promise<void>,
-    transaction: ManualLinkTransaction
-  ): Promise<void> {
+  /** Finalizes or restores a journaled link under the root lease. */
+  private settleLink(operation: (links: LinkStore) => Promise<void>): Promise<void> {
     return withRootLease(this.layout!.root, async () => {
       if (!this.links) throw fail(ERRORS.LINK_FAILED, 'Managed link storage is unavailable')
-      await operation(this.links, transaction)
-      await this.refreshManagedLinkNames()
+      await operation(this.links)
     })
+  }
+
+  /**
+   * Refreshes the managed-name snapshot once a link was finalized or restored. The
+   * outcome is already durable, so a failure here is only logged and never changes
+   * it. The snapshot then keeps what it had and adds this name, so admission stays at
+   * least as protective as before until the next reconcile replaces it.
+   */
+  private async refreshAfterSettle(name: string): Promise<void> {
+    try {
+      await withRootLease(this.layout!.root, () => this.refreshManagedLinkNames())
+    } catch (error: unknown) {
+      this.managedLinkNamesSnapshot = new Set([...this.managedLinkNamesSnapshot, name])
+      this.logger.warn('Managed link names could not be refreshed', {
+        name,
+        reason: codeOf(error)
+      })
+    }
   }
 
   /**

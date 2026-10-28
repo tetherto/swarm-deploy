@@ -384,7 +384,12 @@ unchanged.
   left alone and blocked (`Managed link rollback is blocked by a change made
 since`), its artifacts stay pinned, and the rest of the server starts; see
   [Removing a managed link](managed-links.md#removing-a-managed-link) for how to
-  clear it. A corrupt journal stops the server from starting.
+  clear it. A corrupt journal stops the server from starting. A request whose own
+  journal was removed, replaced, or edited while it ran fails with `LINK_FAILED`
+  and leaves the link, record, and file as found. After a request is finished, a
+  failure to refresh the server's managed-name list is logged as `Managed link
+names could not be refreshed` with the link name; it does not change the answer
+  or the link.
 - **Rolling back the server** to a version before 0.6.0 is safe once no journal
   remains (stop the server normally and check `.swarm-deploy/links`): an older
   server ignores the file and cannot restore a link whose request was interrupted.
