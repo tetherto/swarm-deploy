@@ -4705,7 +4705,8 @@ test('post-operation hooks are detached by default: unsettled ones delay no answ
   const logs: Array<Record<string, unknown>> = []
   const { server, node } = await createServer(t, {
     maxActiveUploads: 1,
-    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    // The automatic rule moves `latest`; the one-argument rule authorizes explicit requests.
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }, { selector: '/^release-\\d+$/' }],
     logger: { warn: (message, details) => void logs.push({ message, ...details }) },
     hooks: {
       afterCommit: hang('afterCommit'),
@@ -4753,7 +4754,9 @@ test('post-operation hooks are detached by default: unsettled ones delay no answ
 test('a response hook is awaited even when it finishes with nothing, whatever the request asked for', async (t) => {
   let held = gate()
   const { node } = await createServer(t, {
-    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    // The automatic rule gives uploads a link hook; the one-argument rule authorizes the
+    // explicit requests below.
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }, { selector: '/^release-\\d+$/' }],
     hooks: {
       afterCommit: async () => {
         await held.wait
@@ -5306,4 +5309,316 @@ test('an upload offer asks for hook data with exactly true, and the records carr
     { code: ERRORS.PROTOCOL_INVALID },
     'each part fits, the whole does not'
   )
+})
+
+test('upload data on the wire is checked against its side, and an empty receipt is never accepted', async (t) => {
+  const link = '{"name":"a","target":"b","result":{}}'
+
+  // Success carries only what the awaited afterCommit and afterLink hooks returned, and a
+  // failed answer only what onFailure returned; an empty receipt, or an empty list of
+  // calls, is never sent.
+  for (const body of [
+    '{"v":1,"status":"COMMITTED","hookResult":{"onFailure":{}}}',
+    '{"v":1,"status":"COMMITTED","hookResult":{"afterCommit":{},"onFailure":{}}}',
+    '{"v":1,"status":"COMMITTED","hookResult":{"afterLink":[],"onFailure":{}}}',
+    '{"v":1,"status":"COMMITTED","hookResult":{}}',
+    '{"v":1,"status":"COMMITTED","hookResult":{"afterLink":[]}}',
+    '{"v":1,"status":"COMMITTED","hookResult":{"afterCommit":{},"afterLink":[]}}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"afterCommit":{}}}',
+    `{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"afterLink":[${link}]}}`,
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"onFailure":{},"afterCommit":{}}}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{}}'
+  ]) {
+    t.exception(() => decodeFinalRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID }, body)
+  }
+  for (const body of [
+    '{"v":1,"status":"ALREADY_COMMITTED","hookResult":{"onFailure":{}}}',
+    '{"v":1,"status":"ALREADY_COMMITTED","hookResult":{"afterCommit":{},"onFailure":{}}}',
+    '{"v":1,"status":"ALREADY_COMMITTED","hookResult":{}}',
+    '{"v":1,"status":"ALREADY_COMMITTED","hookResult":{"afterLink":[]}}',
+    '{"v":1,"status":"REJECTED","code":"FILE_EXISTS","hookResult":{"afterCommit":{}}}',
+    `{"v":1,"status":"REJECTED","code":"FILE_EXISTS","hookResult":{"afterLink":[${link}]}}`,
+    '{"v":1,"status":"REJECTED","code":"FILE_EXISTS","hookResult":{"onFailure":{},"afterLink":[]}}',
+    '{"v":1,"status":"REJECTED","code":"FILE_EXISTS","hookResult":{}}'
+  ]) {
+    t.exception(
+      () => decodeAdmissionRecord(b4a.from(body)),
+      { code: ERRORS.PROTOCOL_INVALID },
+      body
+    )
+  }
+
+  // A hook that returned an empty object is data, so a receipt that carries it is allowed.
+  t.alike(
+    decodeFinalRecord(b4a.from('{"v":1,"status":"COMMITTED","hookResult":{"afterCommit":{}}}')),
+    {
+      v: 1,
+      status: 'COMMITTED',
+      hookResult: { afterCommit: {} }
+    }
+  )
+  t.alike(
+    decodeFinalRecord(
+      b4a.from('{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"onFailure":{}}}')
+    ),
+    { v: 1, status: 'FAILED', code: 'HOOK_FAILED', hookResult: { onFailure: {} } }
+  )
+  t.alike(
+    decodeAdmissionRecord(
+      b4a.from('{"v":1,"status":"REJECTED","code":"FILE_EXISTS","hookResult":{"onFailure":{}}}')
+    ),
+    { v: 1, status: 'REJECTED', code: 'FILE_EXISTS', hookResult: { onFailure: {} } }
+  )
+  t.alike(
+    decodeAdmissionRecord(
+      b4a.from(`{"v":1,"status":"ALREADY_COMMITTED","hookResult":{"afterLink":[${link}]}}`)
+    ),
+    {
+      v: 1,
+      status: 'ALREADY_COMMITTED',
+      hookResult: { afterLink: [{ name: 'a', target: 'b', result: {} }] }
+    }
+  )
+
+  // The encoder refuses the same, so a server cannot write what a client would reject.
+  for (const record of [
+    { v: 1, status: 'COMMITTED', hookResult: { onFailure: {} } },
+    { v: 1, status: 'COMMITTED', hookResult: {} },
+    { v: 1, status: 'COMMITTED', hookResult: { afterLink: [] } },
+    { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED, hookResult: { afterCommit: {} } },
+    { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED, hookResult: {} }
+  ]) {
+    t.exception(() => encodeFinalRecord(record as never), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  for (const record of [
+    { v: 1, status: 'ALREADY_COMMITTED', hookResult: { onFailure: {} } },
+    { v: 1, status: 'ALREADY_COMMITTED', hookResult: {} },
+    { v: 1, status: 'REJECTED', code: ERRORS.FILE_EXISTS, hookResult: { afterCommit: {} } },
+    { v: 1, status: 'REJECTED', code: ERRORS.FILE_EXISTS, hookResult: {} }
+  ]) {
+    t.exception(() => encodeAdmissionRecord(record as never), { code: ERRORS.PROTOCOL_INVALID })
+  }
+})
+
+test('failure data is bounded together with its wrapper before anything is written, and the primary code is always sent', async (t) => {
+  // `{"k":""}` is 8 bytes, so this is a result whose compact JSON is exactly `bytes` long.
+  const padded = (bytes: number): HookResult => ({ k: 'x'.repeat(bytes - 8) })
+  const jsonBytes = (value: unknown): number => b4a.from(JSON.stringify(value)).byteLength
+  let data: HookResult = padded(3_058)
+  let failCommit = false
+  const calls: HookFailureContext[] = []
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      afterCommit: () => {
+        if (failCommit) throw new Error('afterCommit sk-secret')
+      },
+      onFailure: (context): HookResult => {
+        calls.push(context)
+        return data
+      }
+    },
+    hookModes: { afterCommit: 'response', onFailure: 'response' }
+  })
+  await fs.promises.writeFile(path.join(server.storageDir, 'taken.txt'), 'something else')
+  const dropped = (): number =>
+    logs.filter((entry) => entry.message === 'Failure hook failed').length
+  const rejected = async (asking: boolean): Promise<FakeSocket> => {
+    const input = await manifest(t, 'taken.txt', 'mine')
+    return asking ? uploadAsking(node, input) : uploadAll(node, input)
+  }
+  const plain = '{"v":1,"status":"REJECTED","code":"FILE_EXISTS"}'
+
+  // The widest data that still fits next to the `{ onFailure }` wrapper rides on the answer.
+  const fitting = await rejected(true)
+  t.alike(lastRecord(fitting), {
+    v: 1,
+    status: 'REJECTED',
+    code: ERRORS.FILE_EXISTS,
+    hookResult: { onFailure: data }
+  })
+  t.is(jsonBytes(lastRecord(fitting).hookResult), 3_072, 'exactly at the bound')
+  t.ok(fitting.writes.at(-1)!.byteLength <= 4 + 4_096, 'inside one control record')
+  t.is(dropped(), 0)
+
+  // 3,070 bytes fit alone but not wrapped, and one byte past the wrapped bound is the same:
+  // the data is dropped and logged, the primary code is sent, and onFailure is not called again.
+  for (const size of [3_070, 3_059]) {
+    data = padded(size)
+    const before = calls.length
+    const failed = await rejected(true)
+    t.is(lastText(failed), plain, `${size} bytes: the original rejection is what is sent`)
+    t.is(calls.length, before + 1, `${size} bytes: called once, never recursively`)
+  }
+  t.is(dropped(), 2)
+  // The same data for an offer that did not ask is dropped quietly too, and changes nothing.
+  const before = calls.length
+  t.is(lastText(await rejected(false)), plain)
+  t.is(calls.length, before + 1)
+  t.is(dropped(), 3)
+
+  // After a durable step the failed answer is the upload's own `FAILED`, with the same rules.
+  failCommit = true
+  data = padded(3_070)
+  const late = await uploadAsking(node, await manifest(t, 'release-1', 'first'))
+  t.is(lastText(late), '{"v":1,"status":"FAILED","code":"HOOK_FAILED"}')
+  data = padded(3_058)
+  const lateFitting = await uploadAsking(node, await manifest(t, 'release-2', 'second'))
+  t.alike(lastRecord(lateFitting), {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.HOOK_FAILED,
+    hookResult: { onFailure: data }
+  })
+  t.is(dropped(), 4)
+  failCommit = false
+
+  // A link answer carries the data alone, so the bound is the data's own: 3,072 bytes fit and
+  // one more is dropped with the primary code still sent.
+  data = padded(3_072)
+  const fullLink = linkRequest(node, 'release-9', 'current', true)
+  await waitFor(() => fullLink.writes.length === 1)
+  t.alike(linkFrame(fullLink), {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.LINK_TARGET_NOT_FOUND,
+    hookResult: data
+  })
+  t.ok(fullLink.writes[0].byteLength <= 4 + 4_096)
+  data = padded(3_073)
+  const oversized = linkRequest(node, 'release-9', 'current', true)
+  await waitFor(() => oversized.writes.length === 1)
+  t.is(linkText(oversized), '{"v":1,"status":"FAILED","code":"LINK_TARGET_NOT_FOUND"}')
+  t.is(dropped(), 5)
+  t.absent(JSON.stringify(logs).includes('sk-secret'), 'nothing of the data or errors is logged')
+})
+
+test('a decoded early rejection whose answer cannot be written still reaches onFailure exactly once, holding nothing', async (t) => {
+  for (const mode of ['detached', 'response'] as const) {
+    const seen: HookFailureContext[] = []
+    const { server, node } = await createServer(t, {
+      hooks: { onFailure: (context) => void seen.push(context) },
+      hookModes: { onFailure: mode }
+    })
+    await fs.promises.writeFile(path.join(server.storageDir, 'taken.txt'), 'something else')
+    const input = await manifest(t, 'taken.txt', 'mine')
+    const socket = new FakeSocket(CLIENT_KEY)
+    socket.onWrite = () => {
+      throw new Error('socket write failed')
+    }
+    node.accept(socket)
+    socket.feed(metadataFrame(input.manifest))
+    await waitFor(() => seen.length === 1)
+    await settled()
+
+    t.is(seen.length, 1, `${mode}: once, although the rejection could not be written`)
+    t.is(seen[0].phase, 'offer', mode)
+    t.is(seen[0].path, null, mode)
+    t.alike(
+      seen[0].outcome,
+      { status: 'failed', code: ERRORS.FILE_EXISTS, phase: 'offer' },
+      `${mode}: it keeps the primary failure's context, not the write error`
+    )
+    const held = server as unknown as {
+      activeTransfers: Set<string>
+      activeUploads: Set<unknown>
+    }
+    t.is(held.activeTransfers.size, 0, `${mode}: the transfer guard was handed back`)
+    t.is(held.activeUploads.size, 0, `${mode}: and no upload slot is held`)
+
+    // The server carries on: the next rejection is answered and reported as usual.
+    const next = await uploadAll(node, await manifest(t, 'taken.txt', 'again'))
+    t.is(finalCode(next), ERRORS.FILE_EXISTS, mode)
+    await waitFor(() => seen.length === 2)
+    await settled()
+    t.is(seen.length, 2, mode)
+  }
+})
+
+test('a detached onFailure pins the durable artifact it concerns, from its commit record, and nothing for an early failure', async (t) => {
+  let held = gate()
+  let failCommit = false
+  const seen: HookFailureContext[] = []
+  const { server, node } = await createServer(t, {
+    replaceNames: ['app.bin'],
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    hooks: {
+      afterCommit: () => {
+        if (failCommit) throw new Error('afterCommit failed')
+      },
+      // Detached, as it is by default: it runs after the answer and holds the pin until it ends.
+      onFailure: async (context) => {
+        seen.push(context)
+        await held.wait
+      }
+    }
+  })
+  const pins = (): string[] =>
+    [...(server as unknown as { detached: { pins(): Iterable<string> } }).detached.pins()].sort()
+  const idOf = (input: { manifest: TarManifest }): string =>
+    metadataFromManifest(input.manifest).transferId
+  const release = async (): Promise<void> => {
+    held.open()
+    await waitFor(() => pins().length === 0)
+  }
+
+  // An upload that failed after its commit pins the artifact it committed.
+  const second = await manifest(t, 'release-2', 'second')
+  t.absent(finalCode(await uploadAll(node, second)))
+  failCommit = true
+  held = gate()
+  const first = await manifest(t, 'release-1', 'first')
+  t.is(lastText(await uploadAll(node, first)), '{"v":1,"status":"FAILED","code":"HOOK_FAILED"}')
+  await waitFor(() => seen.length === 1)
+  t.alike(pins(), [idOf(first)], 'the committed artifact stays pinned while the hook runs')
+  await release()
+
+  // An explicit link whose target was resolved pins that target's commit record.
+  failCommit = false
+  held = gate()
+  const conflict = linkRequest(node, 'release-1', 'release-2')
+  await waitFor(() => conflict.writes.length === 1)
+  t.is(linkFrame(conflict).code, ERRORS.LINK_CONFLICT)
+  await waitFor(() => seen.length === 2)
+  t.alike(pins(), [idOf(first)])
+  await release()
+
+  // Failures before anything durable exists pin nothing: not an unverified offer, not a
+  // staging path, not a target that was never resolved.
+  held = gate()
+  await fs.promises.writeFile(path.join(server.storageDir, 'taken.txt'), 'something else')
+  t.is(finalCode(await uploadAll(node, await manifest(t, 'taken.txt', 'mine'))), ERRORS.FILE_EXISTS)
+  const missing = linkRequest(node, 'release-9', 'current')
+  await waitFor(() => missing.writes.length === 1 && seen.length === 4)
+  t.alike(pins(), [], 'an early failure pins nothing')
+  held.open()
+
+  // An already-committed mutable name can hold another upload's record: the record decides.
+  held = gate()
+  const original = await manifest(t, 'app.bin', 'same')
+  t.is(lastText(await uploadAll(node, original)), '{"v":1,"status":"COMMITTED"}')
+  const duplicate = await manifest(t, 'app.bin', 'same')
+  t.not(idOf(duplicate), idOf(original), 'the same bytes offered again have their own transfer ID')
+  failCommit = true
+  const offered = new FakeSocket(CLIENT_KEY)
+  node.accept(offered)
+  offered.feed(metadataFrame(duplicate.manifest))
+  await waitFor(() => isTerminal(offered))
+  t.is(finalCode(offered), ERRORS.HOOK_FAILED)
+  await waitFor(() => seen.length === 5)
+  t.alike(pins(), [idOf(original)], 'the durable record is pinned, not the offer')
+  t.is(seen[4].alreadyCommitted, true)
+  await release()
+
+  // Closing the server ends the pin without waiting for the callback.
+  failCommit = false
+  held = gate()
+  const again = linkRequest(node, 'release-1', 'release-2')
+  await waitFor(() => again.writes.length === 1 && seen.length === 6)
+  t.alike(pins(), [idOf(first)])
+  await promptly(server.close(), 'a close with a pending failure hook')
+  t.alike(pins(), [], 'the pin is gone once the server closed')
+  held.open()
 })

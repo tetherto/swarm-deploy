@@ -93,6 +93,15 @@ on success, or `{ onFailure: HookResult }` on a failure whose primary `code` is
 unchanged; the offer must have asked, the decoder validates the shape and each
 component as a `HookResult`, and the whole value is held to the same 3072 bytes of
 compact JSON so the record stays inside the unchanged 4 KiB control record limit.
+The keys are tied to the side: a successful record (`COMMITTED`,
+`ALREADY_COMMITTED`) carries only `afterCommit` and `afterLink`, a failed one
+(`FAILED`, `REJECTED`) only `onFailure`; the other side's keys are refused. A
+receipt names at least one hook and an `afterLink` list at least one call, so an
+empty receipt or list is refused, while a hook's own empty object
+(`{ afterCommit: {} }`) is legitimate data. The encoder refuses the same. A server
+bounds the `{ onFailure }` value, wrapper included, before it builds the answer
+(`onFailure` data of at most 3058 bytes), and drops data that does not fit with a
+logged `Failure hook failed`, so the primary code is always what is sent.
 Combined data that would exceed it fails the upload with `HOOK_FAILED` like an
 unusable value. A client that did not ask treats the key as `PROTOCOL_INVALID`.
 

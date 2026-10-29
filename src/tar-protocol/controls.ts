@@ -212,13 +212,32 @@ function assertReceiptRequest(value: Record<string, unknown>): void {
   }
 }
 
-/** Checks the upload data an answer carries, when it carries any. */
-function assertUploadReceipt(value: Record<string, unknown>): void {
+/**
+ * Checks the upload data an answer carries, when it carries any. A successful answer
+ * carries only what the awaited `afterCommit` and `afterLink` hooks returned, and a
+ * failed one only what `onFailure` returned, so the keys of the other side are
+ * refused. A receipt names at least one hook and an `afterLink` list at least one
+ * call: a hook that returned an empty object is real data (`{ afterCommit: {} }`),
+ * but a receipt with nothing in it is never sent.
+ */
+function assertUploadReceipt(value: Record<string, unknown>, side: 'success' | 'failure'): void {
   if (!hasKey(value, 'hookResult')) return
+  let receipt: UploadHookResult
   try {
-    copyUploadHookResult(value.hookResult)
+    receipt = copyUploadHookResult(value.hookResult)
   } catch (error) {
     throw invalid('Invalid hook result', error)
+  }
+  const misplaced =
+    side === 'success'
+      ? receipt.onFailure !== undefined
+      : receipt.afterCommit !== undefined || receipt.afterLink !== undefined
+  if (
+    Object.keys(receipt).length === 0 ||
+    misplaced ||
+    (receipt.afterLink !== undefined && receipt.afterLink.length === 0)
+  ) {
+    throw invalid('Invalid hook result')
   }
 }
 
@@ -376,14 +395,14 @@ function validateAdmission(value: unknown): AdmissionRecord {
     exactKeys(value, ['v', 'status'])
   } else if (value.status === 'ALREADY_COMMITTED') {
     exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
-    assertUploadReceipt(value)
+    assertUploadReceipt(value, 'success')
   } else if (value.status === 'REJECTED') {
     exactKeys(
       value,
       hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
     )
     assertStableCode(value.code)
-    assertUploadReceipt(value)
+    assertUploadReceipt(value, 'failure')
   } else {
     throw invalid('Invalid admission status')
   }
@@ -395,14 +414,14 @@ function validateFinal(value: unknown): FinalRecord {
   assertVersion(value.v)
   if (value.status === 'COMMITTED') {
     exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
-    assertUploadReceipt(value)
+    assertUploadReceipt(value, 'success')
   } else if (value.status === 'FAILED') {
     exactKeys(
       value,
       hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
     )
     assertStableCode(value.code)
-    assertUploadReceipt(value)
+    assertUploadReceipt(value, 'failure')
   } else {
     throw invalid('Invalid final status')
   }

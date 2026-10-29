@@ -513,8 +513,13 @@ test('CLI upload --json asks for the hooks data and prints one JSON object', asy
 })
 
 test('CLI --json prints the server onFailure data of a failed request next to the primary code', async (t) => {
+  // What the client really throws for a failed answer: a fixed message, with anything raw (here
+  // a secret) only on `cause`, which no command prints.
   const failure = (code: string, hookResult?: unknown): SwarmDeployError =>
-    Object.assign(new SwarmDeployError(code, 'raw server message sk-secret'), { hookResult })
+    Object.assign(
+      new SwarmDeployError(code, 'Server failed request', new Error('raw server text sk-secret')),
+      { hookResult }
+    )
 
   const link = await runLink(['--json', 'release-1.2.3', 'current'], () =>
     Promise.reject(failure(ERRORS.LINK_CONFLICT, { ticket: 'T-1' }))
@@ -531,7 +536,8 @@ test('CLI --json prints the server onFailure data of a failed request next to th
   )
   t.is(upload.code, 1)
   t.is(upload.stdout, '{"code":"HOOK_FAILED","hookResult":{"onFailure":{"ticket":"T-2"}}}\n')
-  t.absent((upload.stdout + upload.stderr + link.stdout).includes('sk-secret'))
+  t.ok(upload.stderr.includes('Server failed request'), 'upload keeps printing the error message')
+  t.absent((upload.stdout + upload.stderr + link.stdout).includes('sk-secret'), 'nothing raw leaks')
 
   // Nothing is printed without data, and nothing without --json.
   const bare = await runUpload(['--json', 'artifact.txt'], () =>

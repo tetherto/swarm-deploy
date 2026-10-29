@@ -894,11 +894,16 @@ export class Server extends EventEmitter {
     })
   }
 
-  /** The same for the detached `afterCommit` hook, ordered per artifact name. */
+  /**
+   * The same for the detached `afterCommit` hook, ordered per artifact name. `pin`
+   * is the durable commit record's transfer ID, which for an already-committed
+   * mutable name can belong to another upload than the one that offered it.
+   */
   private detachCommit(
     context: Omit<AfterCommitContext, 'outcome'>,
     scope: OperationScope,
-    owner: Uint8Array | null
+    owner: Uint8Array | null,
+    pin: string
   ): void {
     const hook = this.hooks.afterCommit
     if (hook === undefined) return
@@ -908,7 +913,7 @@ export class Server extends EventEmitter {
       context,
       outcome: scope,
       turn: this.commitHookTurns.reserve(context.artifact.name),
-      pin: context.artifact.transferId,
+      pin,
       fields: {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
         name: context.artifact.name,
@@ -923,18 +928,27 @@ export class Server extends EventEmitter {
    * returns the checked data it finished with, or `undefined`: it never throws,
    * and a throw, an unusable value, or a closing server leaves the failure being
    * reported exactly as it was. It is never called for its own failure.
+   *
+   * What comes back is already known to fit the answer it will ride on. An upload
+   * wraps it as `{ onFailure }`, which is a few bytes larger than the data alone, so
+   * the data is bounded together with that wrapper here, before any record is built:
+   * data that fits alone but not wrapped is dropped (and logged) like any other
+   * unusable value, and the answer that is written still carries the original code.
    */
   private async awaitFailureHook(
     context: HookFailureContext,
     owner: Uint8Array | null,
-    transfer: string
+    transfer: string,
+    wrappedForUpload = false
   ): Promise<HookResult | undefined> {
     const hook = this.hooks.onFailure
     if (hook === undefined || !this.responds('onFailure')) return undefined
     try {
       const outcome = await invokeHook(hook, context, this.signal)
       if (outcome.status === 'aborted' || outcome.value === undefined) return undefined
-      return copyHookResult(outcome.value)
+      const data = copyHookResult(outcome.value)
+      if (wrappedForUpload) copyUploadHookResult({ onFailure: data })
+      return data
     } catch {
       this.logger.warn('Failure hook failed', {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
@@ -946,11 +960,18 @@ export class Server extends EventEmitter {
     }
   }
 
-  /** A `detached` `onFailure` hook: registered once the failed answer was attempted, never awaited. */
+  /**
+   * A `detached` `onFailure` hook: registered once the failed answer was attempted,
+   * never awaited. `pin` is the transfer ID of the durable artifact the failure
+   * concerns, taken from the durable commit record where there is one, or `null`
+   * when nothing durable exists (an early failure): nothing is pinned for an
+   * unverified offer or a staging path.
+   */
   private detachFailureHook(
     context: HookFailureContext,
     owner: Uint8Array | null,
-    transfer: string
+    transfer: string,
+    pin: string | null
   ): void {
     const hook = this.hooks.onFailure
     if (hook === undefined || this.responds('onFailure')) return
@@ -960,7 +981,7 @@ export class Server extends EventEmitter {
       context,
       outcome: context.outcome,
       turn: null,
-      pin: null,
+      pin,
       fields: {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
         transfer,
@@ -1150,7 +1171,16 @@ export class Server extends EventEmitter {
       // The client has been answered and the link is restored or final, with no lease held. A
       // detached onFailure starts now and nothing waits for it; it runs for the hook's own
       // failure even when a failed rollback is what the client was told.
-      if (failure !== null) this.detachFailureHook(failure, owner, transfer)
+      // The target's commit record is the durable artifact it concerns, so that is what stays
+      // pinned until the call ends; a request that never resolved a target pins nothing.
+      if (failure !== null) {
+        this.detachFailureHook(
+          failure,
+          owner,
+          transfer,
+          state.artifact === null ? null : state.artifact.transferId
+        )
+      }
       // A detached `afterLink` registered after the link was decided still stands: it learns
       // the request ended in failure only when a later awaited step failed it, and a failed
       // answer write after a final link is delivery, not outcome.
@@ -1415,6 +1445,10 @@ export class Server extends EventEmitter {
     let receiptRequested = false
     // The code the upload failed with, for detached hooks that outlive its awaited steps.
     let failedWith: ErrorCode = ERRORS.PROTOCOL_INVALID
+    // The transfer ID of the durable commit record this connection concerns, once there is
+    // one: what a detached call pins. It comes from the record, not from the offer, because an
+    // already-committed mutable name can be another upload's. `null` before anything is durable.
+    let durableId: string | null = null
     let guardedTransfer: string | null = null
     // Settled once, after the answer was attempted; detached hooks of this operation wait for it.
     const scope = new OperationScope()
@@ -1459,18 +1493,27 @@ export class Server extends EventEmitter {
     }
     const rejectEarly = async (reason: ErrorCode, message: string): Promise<void> => {
       const failed = failureContext(fail(reason, message), reason)
-      // A `response` onFailure is awaited before the rejection and may add data to it.
+      // A `response` onFailure is awaited before the rejection and may add data to it, already
+      // bounded together with the `{ onFailure }` wrapper it will be sent in.
       const receipt =
-        failed === null ? undefined : await this.awaitFailureHook(failed, owner, event!.transfer)
-      await this.rejectOffer(
-        socket,
-        event!,
-        owner,
-        reason,
-        receiptRequested && receipt !== undefined ? { onFailure: receipt } : undefined
-      )
-      sentAdmission = true
-      if (failed !== null) this.detachFailureHook(failed, owner, event!.transfer)
+        failed === null
+          ? undefined
+          : await this.awaitFailureHook(failed, owner, event!.transfer, true)
+      try {
+        await this.rejectOffer(
+          socket,
+          event!,
+          owner,
+          reason,
+          receiptRequested && receipt !== undefined ? { onFailure: receipt } : undefined
+        )
+        sentAdmission = true
+      } finally {
+        // Scheduled exactly once, when the answer was attempted, whether or not it could be
+        // written: the context is already taken, so the connection's own failure path will not
+        // schedule it again. A detached call holds no slot, guard, or lease.
+        if (failed !== null) this.detachFailureHook(failed, owner, event!.transfer, durableId)
+      }
     }
     try {
       const first = await reader.control(decodeFirstControlRecord, this.signal, this.idleTimeout)
@@ -1531,7 +1574,14 @@ export class Server extends EventEmitter {
           resumed: alreadyDurable ? false : resumed,
           alreadyCommitted: alreadyDurable
         })
-        if (this.detaches('afterCommit')) this.detachCommit(commitContext, scope, owner)
+        if (this.detaches('afterCommit')) {
+          this.detachCommit(
+            commitContext,
+            scope,
+            owner,
+            durableId ?? commitContext.artifact.transferId
+          )
+        }
         const linkHooks = await this.reconcileAfterCommit(hookArtifact)
         // The places in the link hook lines this call still owns: all of them for a response
         // hook, none once each has been handed to its detached job.
@@ -1609,6 +1659,8 @@ export class Server extends EventEmitter {
           status: 'succeeded'
         })
         commitSucceeded = true
+        // The record this commit just wrote carries the authenticated transfer ID.
+        durableId = metadata.transferId
         hookPath = path.join(this.layout!.root, metadata.name)
         await this.retireQuietly(verified.transferId, owner)
         const receipt = await runPostCommit(false)
@@ -1649,6 +1701,9 @@ export class Server extends EventEmitter {
       )
       if (inspected.status === 'ALREADY_COMMITTED') {
         alreadyCommitted = true
+        // The durable record decides, not the offer: for a mutable name that already holds
+        // identical content it can be another upload's record, with another transfer ID.
+        durableId = inspected.record.transferId
         hookPath = path.join(this.layout!.root, metadata.name)
         const receipt = await runPostCommit(true)
         hooksFinished = true
@@ -1812,7 +1867,9 @@ export class Server extends EventEmitter {
       // nor whether the operation failed, and it is never called for its own failure.
       const failed = failureContext(callbackError(error), reason)
       const receipt =
-        failed === null ? undefined : await this.awaitFailureHook(failed, owner, event!.transfer)
+        failed === null
+          ? undefined
+          : await this.awaitFailureHook(failed, owner, event!.transfer, true)
       const failureReceipt: UploadHookResult | undefined =
         receiptRequested && receipt !== undefined ? { onFailure: receipt } : undefined
       let answered = false
@@ -1845,8 +1902,9 @@ export class Server extends EventEmitter {
         } catch {}
       }
       this.activeUploads.delete(socket)
-      // A detached onFailure starts now, after the answer, and nothing waits for it.
-      if (failed !== null) this.detachFailureHook(failed, owner, event!.transfer)
+      // A detached onFailure starts now, after the answer, and nothing waits for it. It pins
+      // the durable artifact the failure concerns, if the upload got that far.
+      if (failed !== null) this.detachFailureHook(failed, owner, event!.transfer, durableId)
     } finally {
       this.activeUploads.delete(socket)
       releaseTransfer()

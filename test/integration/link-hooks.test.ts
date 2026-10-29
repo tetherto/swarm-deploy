@@ -260,7 +260,16 @@ test('Client.link returns the hook result only after the hook resolves, and only
   t.is((failure as SwarmDeployError).code, ERRORS.HOOK_FAILED)
   t.absent((failure as SwarmDeployError).message.includes('sk-secret'))
   t.is(await fs.promises.readlink(path.join(storage, 'current')), 'release-1')
-  t.is((await client.link('release-1', 'current')).status, 'UNCHANGED', 'a plain request is fine')
+  // The declaration, not the request, makes the hook part of the answer, so a request that did
+  // not ask for the data fails on the same unusable value; the durable link is still untouched.
+  const plainFailure: unknown = await client.link('release-1', 'current').then(
+    () => null,
+    (error: unknown) => error
+  )
+  t.ok(plainFailure instanceof SwarmDeployError, 'a plain request fails as well')
+  t.is((plainFailure as SwarmDeployError).code, ERRORS.HOOK_FAILED)
+  t.absent((plainFailure as SwarmDeployError).message.includes('sk-secret'))
+  t.is(await fs.promises.readlink(path.join(storage, 'current')), 'release-1')
   mode = 'valid'
   const recovered = await client.link('release-1', 'current', { hookResult: true })
   t.is(recovered.status, 'UNCHANGED')

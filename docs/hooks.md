@@ -96,7 +96,13 @@ the `artifact` when there is one, and the `request` of a link request). A
 `response` `onFailure` is awaited before the failed answer and may add data to it;
 if it throws, returns an unusable value, or the server is closing, the answer
 carries the primary failure's own code exactly as it would have, the failure is
-logged, and `onFailure` is not called again for it.
+logged, and `onFailure` is not called again for it. An upload's failed answer wraps
+the data as `{ onFailure }`, so the data is bounded together with that wrapper
+(3,058 bytes of compact JSON at most) before anything is written; data that fits
+alone but not wrapped is dropped like any other unusable value, never allowed to
+turn the answer into a different error. A link request's failed answer carries the
+data alone (3,072 bytes at most). A detached `onFailure` is scheduled once the
+failed answer was attempted, even when writing it failed.
 
 **Detached execution is best effort and process-local.**
 
@@ -113,9 +119,14 @@ logged, and `onFailure` is not called again for it.
 - At most 1024 detached calls may be queued or running at once; a call beyond that
   is dropped and logged (`Detached hook dropped`, reason `capacity`).
 - While a detached call is queued or running, its artifact is pinned against
-  retention, from registration until it ends. A call can still see a snapshot: a
-  replacement can change what is at the path, so open or copy what you need
-  promptly.
+  retention, from registration until it ends. The pinned ID is the durable commit
+  record's, which for an already-committed mutable name can be another upload's
+  than the one that offered it. A detached `onFailure` pins the durable artifact
+  its failure concerns (an upload that failed after its commit, or a link request
+  whose target was resolved); a failure before anything durable exists pins
+  nothing, since an unverified offer or a staging path is not protected. A call
+  can still see a snapshot: a replacement can change what is at the path, so open
+  or copy what you need promptly.
 - Closing the server aborts the waits: queued calls are dropped (logged as
   `Detached hook skipped`), a running callback is abandoned and keeps running on its
   own, and closing never waits for hook code. A detached hook's failure or
