@@ -16,6 +16,7 @@ import {
   type AfterLinkContext,
   type BeforeCommitContext,
   type HookFailureContext,
+  type HookModes,
   type HookResult,
   type ServerHooks,
   type ServerScheduler
@@ -225,6 +226,18 @@ function metadataFrame(value: TarManifest, reset = false): Buffer {
   return encodeControlFrame(encodeMetadataRecord(metadataFromManifest(value, reset)))
 }
 
+/**
+ * Post-operation hooks are detached by default. Most tests here assert what happens while a
+ * hook is awaited (it gates the answer, it can fail the operation), so their `afterCommit` and
+ * `afterLink` hooks are declared `response` unless a test names its own `hookModes`.
+ */
+function awaitedHooks(hooks: ServerHooks | null | undefined): HookModes {
+  const modes: HookModes = {}
+  if (hooks?.afterCommit !== undefined) modes.afterCommit = 'response'
+  if (hooks?.afterLink !== undefined) modes.afterLink = 'response'
+  return modes
+}
+
 async function createServer(
   t: Assert,
   options: Partial<ConstructorParameters<typeof Server>[0]> = {}
@@ -238,7 +251,8 @@ async function createServer(
     maxStagingBytes: 64 * 1024,
     minFreeBytes: 0,
     dht: node,
-    ...options
+    ...options,
+    hookModes: options.hookModes ?? awaitedHooks(options.hooks)
   })
   t.teardown(() => server.close())
   await server.listen()
@@ -709,7 +723,9 @@ test('Client.link rejects hook-result data it did not ask for or that is malform
     `{"v":1,"status":"LINKED","hookResult":{"k":"${'x'.repeat(MAX_HOOK_RESULT_BYTES)}"}}`,
     '{"v":1,"status":"LINKED","hookResult":{"__proto__":{"admin":true}}}',
     '{"v":1,"status":"LINKED","hookResult":{},"extra":1}',
-    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{}}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":null}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":"sk-secret"}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{},"extra":1}',
     '{"v":1,"status":"LINKED","results":{"id":"sub-1"}}'
   ]) {
     const { failure } = await answered(linkAnswer(body), { hookResult: true })
@@ -722,6 +738,30 @@ test('Client.link rejects hook-result data it did not ask for or that is malform
     hookResult: true
   })
   t.is(code(failed.failure), ERRORS.HOOK_FAILED)
+  t.is((failed.failure as { hookResult?: unknown }).hookResult, undefined)
+
+  // The data of a response-declared onFailure rides on a failed answer, which keeps its own
+  // code; it is exposed on the error only to a request that asked, and refused otherwise.
+  const withData = await answered(
+    linkAnswer({
+      v: 1,
+      status: 'FAILED',
+      code: ERRORS.LINK_CONFLICT,
+      hookResult: { ticket: 'T-1' }
+    }),
+    { hookResult: true }
+  )
+  t.is(code(withData.failure), ERRORS.LINK_CONFLICT, 'the primary code is never replaced')
+  t.alike((withData.failure as { hookResult?: unknown }).hookResult, { ticket: 'T-1' })
+  const unasked = await answered(
+    linkAnswer({
+      v: 1,
+      status: 'FAILED',
+      code: ERRORS.LINK_CONFLICT,
+      hookResult: { ticket: 'T-1' }
+    })
+  )
+  t.is(code(unasked.failure), ERRORS.PROTOCOL_INVALID, 'a default request gets no data')
 })
 
 test('Client.link refuses unknown options before connecting', async (t) => {
@@ -1507,7 +1547,9 @@ test('Server reports onFailure once with phase, path and the original error for 
   t.is(context.phase, 'offer')
   t.is(context.path, null)
   t.is((context.error as SwarmDeployError).code, ERRORS.FILE_EXISTS)
-  t.is(context.artifact.name, 'offer-fail.txt')
+  t.is(context.artifact!.name, 'offer-fail.txt')
+  t.is(context.operation, 'upload')
+  t.alike(context.outcome, { status: 'failed', code: ERRORS.FILE_EXISTS, phase: 'offer' })
 
   calls.length = 0
   const transferInput = await manifest(t, 'transfer-fail.txt', 'x'.repeat(2000))
@@ -1615,7 +1657,7 @@ test('Server rejects a concurrent duplicate transfer with FILE_BUSY instead of r
   t.is(context.phase, 'offer')
   t.is(context.path, null)
   t.is((context.error as SwarmDeployError).code, ERRORS.FILE_BUSY)
-  t.is(context.artifact.transferId, metadata.transferId)
+  t.is(context.artifact!.transferId, metadata.transferId)
 
   held.open()
   await waitFor(() => isTerminal(first))
@@ -1697,10 +1739,10 @@ test('Server reports every early offer rejection to onFailure exactly once after
     t.is(context.resumed, false, entry.name)
     t.is(context.alreadyCommitted, false, entry.name)
     t.is((context.error as SwarmDeployError).code, entry.reason, entry.name)
-    t.is(context.artifact.name, entry.name, entry.name)
-    t.is(context.artifact.size, metadata.fileSize, entry.name)
-    t.is(context.artifact.transferId, metadata.transferId, entry.name)
-    t.is(context.artifact.release !== undefined, entry.release, entry.name)
+    t.is(context.artifact!.name, entry.name, entry.name)
+    t.is(context.artifact!.size, metadata.fileSize, entry.name)
+    t.is(context.artifact!.transferId, metadata.transferId, entry.name)
+    t.is(context.artifact!.release !== undefined, entry.release, entry.name)
     t.ok(Object.isFrozen(context) && Object.isFrozen(context.artifact), entry.name)
     await server.close()
   }
@@ -2177,7 +2219,10 @@ test('Server maps manual link outcomes, excludes hooks, and reserves durable nam
     status: 'FAILED',
     code: ERRORS.LINK_CONFLICT
   })
-  t.alike(hooks, [], 'link requests never run artifact hooks')
+  // A refused request never runs an artifact hook; onFailure alone reports each refusal.
+  await waitFor(() => hooks.length === 5)
+  t.alike(hooks, ['failure', 'failure', 'failure', 'failure', 'failure'])
+  hooks.length = 0
   const rejectedUpload = await uploadAll(node, await manifest(t, 'current', 'reserved'))
   t.is(finalCode(rejectedUpload), ERRORS.INVALID_FILENAME)
   t.alike(
@@ -2681,7 +2726,10 @@ test('a failing afterLink answers HOOK_FAILED without its message, keeps the lin
   t.is(failure.path, path.join(path.resolve(server.storageDir), 'current'))
   t.is(failure.resumed, false)
   t.is(failure.alreadyCommitted, true)
-  t.is(failure.artifact.transferId, metadata.transferId)
+  t.is(failure.artifact!.transferId, metadata.transferId)
+  t.is(failure.operation, 'link')
+  t.alike(failure.request, { name: 'current', target: 'release-1' })
+  t.alike(failure.outcome, { status: 'failed', code: ERRORS.HOOK_FAILED, phase: 'afterLink' })
   t.alike(failure.link, {
     name: 'current',
     target: 'release-1',
@@ -2732,7 +2780,11 @@ test('logger details name public-key hashes publicKeyId while events keep finger
       onFailure: () => {
         throw new Error('observer failed')
       }
-    }
+    },
+    // `Failure hook failed` is what a `response` onFailure that throws logs; a detached one is
+    // covered by the next test. Declaring any mode replaces the helper's default, so the
+    // afterLink gate is named too.
+    hookModes: { afterLink: 'response', onFailure: 'response' }
   })
   const failures: Array<Record<string, unknown>> = []
   server.on('failure', (event) => failures.push({ ...event }))
@@ -2776,6 +2828,47 @@ test('logger details name public-key hashes publicKeyId while events keep finger
     const text = typeof secret === 'string' ? secret : b4a.toString(secret, 'hex')
     t.absent(serialized.includes(text), 'no raw key, seed, or storage path in the log details')
   }
+})
+
+test('a detached hook that fails is logged with publicKeyId, its hook name, and no callback text', async (t) => {
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      beforeCommit: () => {
+        throw new Error('deploy gate said no sk-secret')
+      },
+      // Detached by default: it runs after the answer, and its failure is only logged.
+      onFailure: () => {
+        throw new Error('observer failed sk-secret')
+      }
+    }
+  })
+  const failures: Array<Record<string, unknown>> = []
+  server.on('failure', (event) => failures.push({ ...event }))
+  const messages = (message: string): Array<Record<string, unknown>> =>
+    logs.filter((entry) => entry.message === message)
+
+  const refused = await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  t.is(finalCode(refused), ERRORS.HOOK_FAILED, 'the answer is the primary failure')
+  await waitFor(() => messages('Detached hook failed').length === 1)
+
+  const clientId = publicKeyId(CLIENT_KEY)
+  const [entry] = messages('Detached hook failed')
+  t.is(entry.hook, 'onFailure')
+  t.is(entry.publicKeyId, clientId, 'the peer is named publicKeyId')
+  t.ok(/^[0-9a-f]{12}$/.test(String(entry.transfer)), 'a transfer hash stays transfer')
+  t.is(entry.phase, 'beforeCommit')
+  t.is(entry.reason, ERRORS.HOOK_FAILED)
+  t.absent('fingerprint' in entry, 'no logger detail is named fingerprint')
+  t.is(messages('Failure hook failed').length, 0, 'the response-mode message is not used')
+  t.ok(
+    failures.length >= 1 && failures.every((event) => event.fingerprint === clientId),
+    'events keep their fingerprint field with the same ID'
+  )
+  const serialized = JSON.stringify(logs)
+  t.absent(serialized.includes('sk-secret'), 'no callback text in the log')
+  t.absent(serialized.includes(server.storageDir), 'and no storage path')
 })
 
 test('a failed afterLink is retried by repeating the request, and the policy decides what the retry sees', async (t) => {
@@ -2885,7 +2978,14 @@ test('afterLink never runs for unauthorized, disallowed, missing, or conflicting
   t.is(unlisted.destroyed, true, 'the server itself rejects an unlisted key')
   t.is(unlisted.writes.length, 0)
   t.is(stranger.writes.length, 0)
-  t.alike(calls, [], 'no hook, including onFailure, runs for a request that never changed a link')
+  // afterLink never runs for a request that changed no link. onFailure alone reports each
+  // refused request that reached the server, once, and nothing for a key it did not accept.
+  await waitFor(() => calls.length === cases.length)
+  await settled()
+  t.alike(
+    calls,
+    cases.map(() => 'onFailure')
+  )
   await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'current')), {
     code: 'ENOENT'
   })
@@ -2990,7 +3090,7 @@ test('a failing automatic-link hook keeps the artifact and link, and a retry rer
   t.is(failure.path, path.join(path.resolve(server.storageDir), 'latest'))
   t.is(failure.link?.name, 'latest')
   t.is(failure.link?.target, 'release-1')
-  t.is(failure.artifact.transferId, metadata.transferId)
+  t.is(failure.artifact!.transferId, metadata.transferId)
   t.is(failure.alreadyCommitted, false)
 
   failing = false
@@ -3250,7 +3350,7 @@ test('concurrent requests for one link get their own hook result, in decision or
   await waitFor(() => reservedHookLines(server) === 0)
 })
 
-test('a request that did not ask never reads, validates, or fails on what afterLink returned', async (t) => {
+test('a detached afterLink never has its return value read, validated, or able to fail anything', async (t) => {
   let reads = 0
   const returned = (): unknown => ({
     run: () => 1,
@@ -3262,10 +3362,12 @@ test('a request that did not ask never reads, validates, or fails on what afterL
   })
   const { node } = await createServer(t, {
     symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }, { selector: '/^app-\\d+$/' }],
-    hooks: { afterLink: returned as never }
+    hooks: { afterLink: returned as never },
+    hookModes: { afterLink: 'detached' }
   })
 
-  // An upload's automatic link is not a request, so its hook result is never read.
+  // Neither an upload's automatic link nor a request asking for the data gets any: the hook is
+  // detached, so it contributes nothing and its value is never touched.
   t.absent(finalCode(await uploadAll(node, await manifest(t, 'release-1', 'first'))))
   t.absent(finalCode(await uploadAll(node, await manifest(t, 'app-1', 'app'))))
   const plain = linkRequest(node, 'app-1', 'stable')
@@ -3360,12 +3462,14 @@ test('an unusable afterLink result fails an opted-in request as HOOK_FAILED and,
   await waitFor(() => retry.writes.length === 1)
   t.is(linkText(retry), '{"v":1,"status":"UNCHANGED","hookResult":{"ok":true}}')
 
-  // A request that did not ask is unaffected by the same value.
+  // A response hook's value is checked whatever the request asked: one that did not ask for
+  // the data fails on the same unusable value, because the declaration, not the request, is
+  // what makes the hook's answer part of the operation.
   next = unusable[0][1]
   const plain = linkRequest(node, 'release-1', 'link0', false, 'keep')
   await waitFor(() => plain.writes.length === 1)
-  t.is(linkText(plain), '{"v":1,"status":"UNCHANGED"}')
-  t.is(failures.length, unusable.length, 'no further failure was reported')
+  t.alike(linkFrame(plain), { v: 1, status: 'FAILED', code: ERRORS.HOOK_FAILED })
+  await waitFor(() => failures.length === unusable.length + 1)
 })
 
 test('a throwing afterLink on an opted-in request is the same sanitized HOOK_FAILED as before', async (t) => {
@@ -4263,7 +4367,11 @@ test('a journal replaced during the hook is never erased or acted on by the requ
       [{ status: 'failed', reason: ERRORS.LINK_FAILED, rolledBack: undefined }],
       outcome
     )
-    t.is(hookErrors.length, outcome === 'fails' ? 1 : 0, `${outcome}: onFailure`)
+    // The request failed either way, so onFailure reports it once: as the hook's own failure
+    // when the hook failed, and as a failure of the request itself when the hook had succeeded.
+    await waitFor(() => hookErrors.length === 1)
+    t.is(hookErrors[0].phase, outcome === 'fails' ? 'afterLink' : 'link', `${outcome}: onFailure`)
+    t.is(hookErrors[0].outcome.code, ERRORS.LINK_FAILED, `${outcome}: the code the answer carries`)
     t.ok(
       logs.some((entry) => entry.message === 'Managed link rollback failed'),
       outcome
@@ -4553,4 +4661,649 @@ test('an authenticated link request replaces an unrecorded symlink and survives 
   for (const name of ['0.19.0', '0.20.0']) {
     t.is(await fs.promises.readFile(path.join(storageDir, name, 'legacy.bin'), 'utf8'), name)
   }
+})
+
+/** An offer that asks for the hooks' data. The opt-in is not part of the transfer identity. */
+function askingFrame(value: TarManifest): Buffer {
+  return encodeControlFrame(
+    encodeMetadataRecord({ ...metadataFromManifest(value), hookResult: true })
+  )
+}
+
+/** Uploads like `uploadAll`, with an offer that asks for the hooks' data. */
+async function uploadAsking(
+  node: FakeServerNode,
+  input: { manifest: TarManifest; tar: Buffer }
+): Promise<FakeSocket> {
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(askingFrame(input.manifest))
+  await waitFor(() => statuses(socket).includes('ACCEPT') || isTerminal(socket))
+  if (!isTerminal(socket)) {
+    socket.feed(input.tar)
+    socket.finishInput()
+  }
+  await waitFor(() => isTerminal(socket))
+  return socket
+}
+
+/** The exact last record a socket was sent. */
+function lastText(socket: FakeSocket): string {
+  return b4a.toString(socket.writes.at(-1)!.subarray(4))
+}
+
+function lastRecord(socket: FakeSocket): Record<string, unknown> {
+  return JSON.parse(lastText(socket)) as Record<string, unknown>
+}
+
+test('post-operation hooks are detached by default: unsettled ones delay no answer and hold no slot or lease', async (t) => {
+  const calls: string[] = []
+  const hang = (name: string) => (): Promise<void> => {
+    calls.push(name)
+    return new Promise<void>(() => {})
+  }
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    maxActiveUploads: 1,
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      afterCommit: hang('afterCommit'),
+      afterLink: hang('afterLink'),
+      onFailure: hang('onFailure')
+    },
+    // No declaration at all: every post-operation hook is detached.
+    hookModes: {}
+  })
+  const events: string[] = []
+  server.on('link', (event) => events.push(event.status))
+
+  const first = await uploadAll(node, await manifest(t, 'release-1', 'first'))
+  t.is(lastText(first), '{"v":1,"status":"COMMITTED"}', 'an unsettled hook is not waited for')
+  await waitFor(() => calls.includes('afterCommit') && calls.includes('afterLink'))
+  t.is(await visibleLink(server.storageDir, 'latest'), 'release-1')
+
+  // The hooks are still unsettled, yet the one upload slot and the link are free: the next
+  // upload is admitted and moves the link, and explicit requests are answered at once.
+  const second = await uploadAll(node, await manifest(t, 'release-2', 'second'))
+  t.is(lastText(second), '{"v":1,"status":"COMMITTED"}')
+  t.is(await visibleLink(server.storageDir, 'latest'), 'release-2')
+  const linked = linkRequest(node, 'release-1', 'stable')
+  await waitFor(() => linked.writes.length === 1)
+  t.alike(linkFrame(linked), { v: 1, status: 'LINKED' })
+  const again = linkRequest(node, 'release-1', 'stable')
+  await waitFor(() => again.writes.length === 1)
+  t.alike(linkFrame(again), { v: 1, status: 'UNCHANGED' })
+  t.alike(events, ['linked', 'unchanged'])
+
+  // A failed answer is just as prompt, and its onFailure is detached as well.
+  await fs.promises.writeFile(path.join(server.storageDir, 'taken.txt'), 'something else')
+  const refused = await uploadAll(node, await manifest(t, 'taken.txt', 'mine'))
+  t.is(finalCode(refused), ERRORS.FILE_EXISTS)
+  await waitFor(() => calls.includes('onFailure'))
+
+  // Closing waits for none of it, and drops what was still queued behind a running call.
+  await promptly(server.close(), 'a close with unsettled detached hooks')
+  t.ok(
+    logs.some((entry) => entry.message === 'Detached hook skipped' && entry.hook === 'afterLink'),
+    'a queued call is dropped and logged by hook name'
+  )
+})
+
+test('a response hook is awaited even when it finishes with nothing, whatever the request asked for', async (t) => {
+  let held = gate()
+  const { node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterCommit: async () => {
+        await held.wait
+      },
+      afterLink: async () => {
+        await held.wait
+      }
+    },
+    hookModes: { afterCommit: 'response', afterLink: 'response' }
+  })
+
+  for (const asking of [false, true]) {
+    held = gate()
+    const input = await manifest(t, asking ? 'release-2' : 'release-1', 'payload')
+    const socket = new FakeSocket(CLIENT_KEY)
+    node.accept(socket)
+    socket.feed(asking ? askingFrame(input.manifest) : metadataFrame(input.manifest))
+    await waitFor(() => statuses(socket).includes('ACCEPT'))
+    socket.feed(input.tar)
+    socket.finishInput()
+    await settled()
+    t.absent(isTerminal(socket), `an upload that ${asking ? 'asked' : 'did not ask'} waits`)
+    held.open()
+    await waitFor(() => isTerminal(socket))
+    t.is(lastText(socket), '{"v":1,"status":"COMMITTED"}', 'void adds no data, asked or not')
+  }
+
+  for (const asking of [false, true]) {
+    held = gate()
+    const socket = linkRequest(node, 'release-1', asking ? 'asked' : 'plain', asking)
+    await settled()
+    t.is(socket.writes.length, 0, `a link request that ${asking ? 'asked' : 'did not ask'} waits`)
+    held.open()
+    await waitFor(() => socket.writes.length === 1)
+    t.is(linkText(socket), '{"v":1,"status":"LINKED"}')
+  }
+})
+
+test('upload data from response hooks is combined, sent only to an offer that asked, and bounded as a whole', async (t) => {
+  let commitData: HookResult | undefined = { deploy: 'd1' }
+  let padding = 0
+  const { server, node } = await createServer(t, {
+    symlinks: [
+      { selector: '/^app-\\d+$/', name: 'latest' },
+      { selector: '/^app-\\d+$/', name: 'stable' }
+    ],
+    hooks: {
+      afterCommit: ({ artifact }): HookResult | undefined =>
+        commitData === undefined ? undefined : { ...commitData, artifact: artifact.name },
+      afterLink: ({ link }): HookResult => ({ published: link.name, pad: 'x'.repeat(padding) })
+    },
+    hookModes: { afterCommit: 'response', afterLink: 'response' }
+  })
+  const links = (name: string): unknown[] =>
+    ['latest', 'stable'].map((link) => ({
+      name: link,
+      target: name,
+      result: { published: link, pad: '' }
+    }))
+  const sorted = (record: Record<string, unknown>): Record<string, unknown> => {
+    const data = record.hookResult as { afterLink?: Array<{ name: string }> }
+    data.afterLink?.sort((left, right) => left.name.localeCompare(right.name))
+    return record
+  }
+
+  // An offer that did not ask gets the record it always got.
+  const app1 = await manifest(t, 'app-1', 'one')
+  const plain = await uploadAll(node, app1)
+  t.is(lastText(plain), '{"v":1,"status":"COMMITTED"}')
+
+  // An already-committed retry that asks carries the combined data: afterCommit's object, and
+  // one entry per automatic link whose response hook returned one.
+  const retry = new FakeSocket(CLIENT_KEY)
+  node.accept(retry)
+  retry.feed(askingFrame(app1.manifest))
+  await waitFor(() => isTerminal(retry))
+  t.alike(sorted(lastRecord(retry)), {
+    v: 1,
+    status: 'ALREADY_COMMITTED',
+    hookResult: { afterCommit: { deploy: 'd1', artifact: 'app-1' }, afterLink: links('app-1') }
+  })
+
+  const fresh = await uploadAsking(node, await manifest(t, 'app-2', 'two'))
+  t.alike(sorted(lastRecord(fresh)), {
+    v: 1,
+    status: 'COMMITTED',
+    hookResult: { afterCommit: { deploy: 'd1', artifact: 'app-2' }, afterLink: links('app-2') }
+  })
+
+  // A response hook that finishes with nothing adds no key for itself.
+  commitData = undefined
+  const quiet = await uploadAsking(node, await manifest(t, 'app-3', 'three'))
+  t.alike(Object.keys(lastRecord(quiet).hookResult as object), ['afterLink'])
+
+  // Each part is valid and the whole is not: the answer must fit one control record, so the
+  // response hooks' combined data fails the upload like a throw, asked for or not. The
+  // artifact stays committed, and nothing of the data is sent.
+  commitData = { big: 'x'.repeat(1_500) }
+  padding = 1_500
+  for (const [asked, name] of [
+    [true, 'app-4'],
+    [false, 'app-5']
+  ] as const) {
+    const input = await manifest(t, name, name)
+    const failed = asked ? await uploadAsking(node, input) : await uploadAll(node, input)
+    t.is(lastText(failed), '{"v":1,"status":"FAILED","code":"HOOK_FAILED"}', name)
+    t.ok((await fs.promises.lstat(path.join(server.storageDir, name))).isFile(), `${name} stays`)
+  }
+})
+
+test('a response onFailure is awaited before a failed answer, adds data only when asked, and never replaces the primary failure', async (t) => {
+  const seen: HookFailureContext[] = []
+  let behavior: 'data' | 'throw' | 'junk' = 'data'
+  let failCommit = false
+  let held = gate()
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      afterCommit: () => {
+        if (failCommit) throw new Error('afterCommit sk-secret')
+      },
+      onFailure: async (context): Promise<HookResult | undefined> => {
+        seen.push(context)
+        await held.wait
+        if (behavior === 'throw') throw new Error('onFailure sk-secret')
+        if (behavior === 'junk') return new Date(0) as never
+        return { ticket: 'T-1' }
+      }
+    },
+    hookModes: { afterCommit: 'response', onFailure: 'response' }
+  })
+  await fs.promises.writeFile(path.join(server.storageDir, 'taken.txt'), 'something else')
+  const offer = async (asking: boolean): Promise<FakeSocket> => {
+    held = gate()
+    const input = await manifest(t, 'taken.txt', 'mine')
+    const socket = new FakeSocket(CLIENT_KEY)
+    node.accept(socket)
+    socket.feed(asking ? askingFrame(input.manifest) : metadataFrame(input.manifest))
+    await settled()
+    t.absent(isTerminal(socket), 'the failed answer waits for a response onFailure')
+    held.open()
+    await waitFor(() => isTerminal(socket))
+    return socket
+  }
+
+  const asked = await offer(true)
+  t.is(
+    lastText(asked),
+    '{"v":1,"status":"REJECTED","code":"FILE_EXISTS","hookResult":{"onFailure":{"ticket":"T-1"}}}'
+  )
+  t.is(seen.length, 1)
+  t.is(seen[0].operation, 'upload')
+  t.is(seen[0].path, null, 'nothing durable exists, so no path is made up')
+  t.alike(seen[0].outcome, { status: 'failed', code: ERRORS.FILE_EXISTS, phase: 'offer' })
+  t.is(lastText(await offer(false)), '{"v":1,"status":"REJECTED","code":"FILE_EXISTS"}')
+  t.is(seen.length, 2, 'it ran for the offer that did not ask, too')
+
+  // Its own failure, or an unusable value, leaves the primary failure exactly as it was, is
+  // logged without its text, and does not call onFailure again.
+  for (const next of ['throw', 'junk'] as const) {
+    behavior = next
+    const before = seen.length
+    const failed = await offer(true)
+    t.is(lastText(failed), '{"v":1,"status":"REJECTED","code":"FILE_EXISTS"}', next)
+    t.is(seen.length, before + 1, `${next}: called once, never recursively`)
+  }
+  t.is(logs.filter((entry) => entry.message === 'Failure hook failed').length, 2)
+  t.absent(JSON.stringify(logs).includes('sk-secret'))
+  behavior = 'data'
+
+  // A failure of a link request before any link exists reaches it too, with no artifact made up.
+  held = gate()
+  held.open()
+  const missing = linkRequest(node, 'release-9', 'current', true)
+  await waitFor(() => missing.writes.length === 1)
+  t.is(
+    linkText(missing),
+    '{"v":1,"status":"FAILED","code":"LINK_TARGET_NOT_FOUND","hookResult":{"ticket":"T-1"}}'
+  )
+  const refused = seen.at(-1)!
+  t.is(refused.operation, 'link')
+  t.is(refused.artifact, null)
+  t.is(refused.path, null)
+  t.is(refused.phase, 'link')
+  t.alike(refused.request, { name: 'current', target: 'release-9' })
+  t.alike(refused.outcome, { status: 'failed', code: ERRORS.LINK_TARGET_NOT_FOUND, phase: 'link' })
+  const quiet = linkRequest(node, 'release-9', 'current')
+  await waitFor(() => quiet.writes.length === 1)
+  t.is(linkText(quiet), '{"v":1,"status":"FAILED","code":"LINK_TARGET_NOT_FOUND"}')
+
+  // After a durable step a response hook that fails fails the upload, and onFailure sees the
+  // raw error, the committed path, and the same code the answer reports.
+  failCommit = true
+  const input = await manifest(t, 'release-1', 'first')
+  const socket = await uploadAsking(node, input)
+  t.is(
+    lastText(socket),
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"onFailure":{"ticket":"T-1"}}}',
+    'the primary code is still HOOK_FAILED'
+  )
+  const late = seen.at(-1)!
+  t.is(late.phase, 'afterCommit')
+  t.is(late.path, path.join(path.resolve(server.storageDir), 'release-1'))
+  t.alike(late.outcome, { status: 'failed', code: ERRORS.HOOK_FAILED, phase: 'afterCommit' })
+  t.is((late.error as Error).message, 'afterCommit sk-secret', 'onFailure still sees the raw error')
+  t.ok((await fs.promises.lstat(path.join(server.storageDir, 'release-1'))).isFile())
+})
+
+test('a detached hook starts after the answer and is told how the operation ended', async (t) => {
+  const calls: Array<{
+    alreadyCommitted: boolean
+    seen: string[]
+    outcome: unknown
+    path: string
+  }> = []
+  let current: FakeSocket | null = null
+  let failLink = true
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^app-\\d+$/', name: 'latest' }],
+    hooks: {
+      afterCommit: (context) => {
+        calls.push({
+          alreadyCommitted: context.alreadyCommitted,
+          seen: current ? statuses(current) : [],
+          outcome: context.outcome,
+          path: context.path
+        })
+      },
+      afterLink: () => {
+        if (failLink) throw new Error('publisher rejected')
+      }
+    },
+    hookModes: { afterCommit: 'detached', afterLink: 'response' }
+  })
+  const run = async (input: { manifest: TarManifest; tar: Buffer }): Promise<FakeSocket> => {
+    const socket = new FakeSocket(CLIENT_KEY)
+    current = socket
+    node.accept(socket)
+    socket.feed(metadataFrame(input.manifest))
+    await waitFor(() => statuses(socket).includes('ACCEPT') || isTerminal(socket))
+    if (!isTerminal(socket)) {
+      socket.feed(input.tar)
+      socket.finishInput()
+    }
+    await waitFor(() => isTerminal(socket))
+    return socket
+  }
+  const input = await manifest(t, 'app-1', 'one')
+  const root = path.resolve(server.storageDir)
+
+  // A later awaited step (the response afterLink) fails the upload after the artifact was
+  // committed: the detached afterCommit runs after that answer and is told it failed.
+  const failed = await run(input)
+  t.is(lastText(failed), '{"v":1,"status":"FAILED","code":"HOOK_FAILED"}')
+  await waitFor(() => calls.length === 1)
+  t.alike(calls[0].seen, ['ACCEPT', 'FAILED'], 'it started only once the answer was written')
+  t.alike(calls[0].outcome, { status: 'failed', code: ERRORS.HOOK_FAILED, phase: 'afterLink' })
+  t.is(calls[0].path, path.join(root, 'app-1'), 'a durable artifact exists, so its path is real')
+  t.is(calls[0].alreadyCommitted, false)
+
+  // The retry is final: the same hook now learns it succeeded.
+  failLink = false
+  const retry = await run(input)
+  t.is(lastText(retry), '{"v":1,"status":"ALREADY_COMMITTED"}')
+  await waitFor(() => calls.length === 2)
+  t.alike(calls[1].seen, ['ALREADY_COMMITTED'])
+  t.alike(calls[1].outcome, { status: 'succeeded' })
+  t.is(calls[1].alreadyCommitted, true)
+
+  // A failure before anything is durable never reaches it: that is onFailure's.
+  await fs.promises.writeFile(path.join(server.storageDir, 'taken.txt'), 'something else')
+  t.is(finalCode(await uploadAll(node, await manifest(t, 'taken.txt', 'mine'))), ERRORS.FILE_EXISTS)
+  await settled()
+  t.is(calls.length, 2)
+})
+
+test('a detached afterLink never journals, rolls back, or fails a link, and its failure is only logged by hook name', async (t) => {
+  const logs: Array<Record<string, unknown>> = []
+  const failures: HookFailureContext[] = []
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }, { selector: '/^app-\\d+$/', name: 'latest' }],
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      afterLink: () => {
+        throw new Error('publisher token sk-secret rejected')
+      },
+      onFailure: (context) => void failures.push(context)
+    },
+    hookModes: { afterLink: 'detached' }
+  })
+  const linkEvents: Array<{ status: string; reason?: string }> = []
+  const failureEvents: string[] = []
+  server.on('link', (event) => linkEvents.push({ status: event.status, reason: event.reason }))
+  server.on('failure', (event) => failureEvents.push(event.reason))
+  await uploadAll(node, await manifest(t, 'release-1', 'first'))
+
+  // The request carries the default rollback policy, which only a response hook can use.
+  const socket = linkRequest(node, 'release-1', 'current', false, 'rollback')
+  await waitFor(() => socket.writes.length === 1)
+  t.is(linkText(socket), '{"v":1,"status":"LINKED"}')
+  t.alike(await journalFiles(server.storageDir), [], 'no rollback journal was ever written')
+  await waitFor(() => logs.some((entry) => entry.message === 'Detached hook failed'))
+  const failed = logs.find((entry) => entry.message === 'Detached hook failed')
+  t.is(failed?.hook, 'afterLink')
+  t.is(failed?.name, 'current')
+  t.is(failed?.trigger, 'request')
+  t.is(failed?.reason, ERRORS.HOOK_FAILED)
+  t.is(await visibleLink(server.storageDir, 'current'), 'release-1', 'the failure reverts nothing')
+  t.is((await ownership(server.storageDir, 'current'))?.target, 'release-1')
+  t.alike(await journalFiles(server.storageDir), [])
+  t.alike(linkEvents, [{ status: 'linked', reason: undefined }])
+  t.alike(failureEvents, [], 'it is not a failure of the request')
+
+  // An automatic link's hook cannot fail its upload either.
+  const upload = await uploadAll(node, await manifest(t, 'app-1', 'app'))
+  t.is(lastText(upload), '{"v":1,"status":"COMMITTED"}')
+  await waitFor(() => logs.some((entry) => entry.trigger === 'upload'))
+  t.is(await visibleLink(server.storageDir, 'latest'), 'app-1')
+
+  await settled()
+  t.alike(failures, [], 'onFailure is not called for a detached hook failing')
+  t.absent(JSON.stringify(logs).includes('sk-secret'), 'callback text stays out of the log')
+})
+
+test('detached afterLink calls for one link run one at a time in decision order and pin their artifacts until they end', async (t) => {
+  const gates = [gate(), gate(), gate()]
+  const order: string[] = []
+  let calls = 0
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^r\\d$/' }],
+    hooks: {
+      afterLink: async ({ link }) => {
+        const index = calls++
+        order.push(`${link.target}:start`)
+        await gates[index].wait
+        order.push(`${link.target}:end`)
+      }
+    },
+    hookModes: { afterLink: 'detached' }
+  })
+  const ids: string[] = []
+  for (const name of ['r1', 'r2', 'r3']) {
+    const input = await manifest(t, name)
+    ids.push(metadataFromManifest(input.manifest).transferId)
+    t.absent(finalCode(await uploadAll(node, input)))
+  }
+  const pins = (): string[] =>
+    [...(server as unknown as { detached: { pins(): Iterable<string> } }).detached.pins()].sort()
+
+  const requests = ['r1', 'r2', 'r3'].map((target) => linkRequest(node, target, 'current'))
+  await waitFor(() => requests.every((socket) => socket.writes.length === 1))
+  t.alike(
+    requests.map((socket) => linkFrame(socket).status),
+    ['LINKED', 'LINKED', 'LINKED'],
+    'every request is answered without waiting for a hook'
+  )
+  await waitFor(() => order.length === 1)
+  await settled()
+  t.alike(order, ['r1:start'], 'the next call waits for the one ahead')
+  t.alike(
+    pins(),
+    [...ids].sort(),
+    'every queued or running call pins its artifact from registration'
+  )
+
+  gates[0].open()
+  await waitFor(() => order.length === 3)
+  t.alike(order, ['r1:start', 'r1:end', 'r2:start'], 'in decision order, one at a time')
+  gates[1].open()
+  gates[2].open()
+  await waitFor(() => order.length === 6)
+  t.alike(order.slice(3), ['r2:end', 'r3:start', 'r3:end'])
+  await waitFor(() => pins().length === 0)
+  await waitFor(() => reservedHookLines(server) === 0)
+})
+
+test('Client.upload asks for hook data only when told to and returns what the server sent', async (t) => {
+  const root = await createTempDir(t)
+  const file = path.join(root, 'artifact.txt')
+  await fs.promises.writeFile(file, 'artifact payload')
+  const serverKey = keyPairFromSeed(SERVER_SEED).publicKey
+  const data = {
+    afterCommit: { deploy: 'd1' },
+    afterLink: [{ name: 'latest', target: 'artifact.txt', result: { id: 1 } }]
+  }
+  const answering = (answer: Record<string, unknown>): FakeSocket => {
+    const socket = new FakeSocket(serverKey)
+    socket.onWrite = (_bytes, index) => {
+      if (index === 0) {
+        queueMicrotask(() => socket.feed(encodeControlFrame(b4a.from(JSON.stringify(answer)))))
+      }
+      return true
+    }
+    return socket
+  }
+  const attempt = async (
+    answer: Record<string, unknown>,
+    options?: { hookResult?: unknown }
+  ): Promise<{ outcome: unknown; offer: Record<string, unknown> }> => {
+    const socket = answering(answer)
+    const client = new Client({
+      seed: CLIENT_SEED,
+      serverPublicKey: serverKey,
+      idleTimeout: 1_000,
+      dht: fakeClientNode(socket)
+    })
+    const outcome: unknown = await client.upload(file, options as never).then(
+      (result) => result,
+      (error: unknown) => error
+    )
+    await client.close()
+    const offer = JSON.parse(b4a.toString(socket.writes[0].subarray(4))) as Record<string, unknown>
+    return { outcome, offer }
+  }
+  const committed = { v: 1, status: 'ALREADY_COMMITTED' }
+
+  const plain = await attempt(committed)
+  t.absent('hookResult' in plain.offer, 'nothing is sent unless asked')
+  t.absent('hookResult' in (plain.outcome as object))
+
+  const asked = await attempt({ ...committed, hookResult: data }, { hookResult: true })
+  t.is(asked.offer.hookResult, true)
+  t.alike((asked.outcome as { hookResult: unknown }).hookResult, data)
+  t.is(
+    asked.offer.transferId,
+    plain.offer.transferId,
+    'the opt-in is not part of the transfer identity'
+  )
+  const askedNothing = await attempt(committed, { hookResult: true })
+  t.is(askedNothing.offer.hookResult, true)
+  t.absent('hookResult' in (askedNothing.outcome as object), 'asked, but no hook returned data')
+  const declined = await attempt(committed, { hookResult: false })
+  t.absent('hookResult' in declined.offer, 'false is the default, not a second spelling')
+
+  const unrequested = await attempt({ ...committed, hookResult: data })
+  t.is(code(unrequested.outcome), ERRORS.PROTOCOL_INVALID, 'data nobody asked for is refused')
+  const malformed = await attempt(
+    { ...committed, hookResult: { beforeCommit: { id: 1 } } },
+    { hookResult: true }
+  )
+  t.is(code(malformed.outcome), ERRORS.PROTOCOL_INVALID)
+
+  // A rejection keeps its own code; a response-declared onFailure's data rides on the error.
+  const rejection = { v: 1, status: 'REJECTED', code: ERRORS.FILE_EXISTS }
+  const withData = await attempt(
+    { ...rejection, hookResult: { onFailure: { ticket: 'T-1' } } },
+    { hookResult: true }
+  )
+  t.is(code(withData.outcome), ERRORS.FILE_EXISTS)
+  t.alike((withData.outcome as { hookResult: unknown }).hookResult, {
+    onFailure: { ticket: 'T-1' }
+  })
+  const bare = await attempt(rejection, { hookResult: true })
+  t.is(code(bare.outcome), ERRORS.FILE_EXISTS)
+  t.is((bare.outcome as { hookResult?: unknown }).hookResult, undefined)
+  t.is(
+    code((await attempt({ ...rejection, hookResult: { onFailure: {} } })).outcome),
+    ERRORS.PROTOCOL_INVALID
+  )
+
+  // The options are checked before anything is sent.
+  const socket = answering(committed)
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: serverKey,
+    idleTimeout: 1_000,
+    dht: fakeClientNode(socket)
+  })
+  for (const options of [{ hookResult: 'yes' }, { hookResult: 1 }, { results: true }, null, []]) {
+    await t.exception(client.upload(file, options as never), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  t.is(socket.writes.length, 0)
+  await client.close()
+})
+
+test('an upload offer asks for hook data with exactly true, and the records carry bounded data', async (t) => {
+  const { node } = await createServer(t)
+  const input = await manifest(t, 'artifact.txt', 'artifact payload')
+  const raw = (extra: Record<string, unknown>): Buffer =>
+    encodeControlFrame(
+      b4a.from(JSON.stringify({ ...metadataFromManifest(input.manifest), ...extra }))
+    )
+  for (const extra of [
+    { hookResult: false },
+    { hookResult: 1 },
+    { hookResult: 'true' },
+    { results: true }
+  ]) {
+    const socket = new FakeSocket(CLIENT_KEY)
+    node.accept(socket)
+    socket.feed(raw(extra))
+    await waitFor(() => isTerminal(socket))
+    t.is(finalCode(socket), ERRORS.PROTOCOL_INVALID, JSON.stringify(extra))
+  }
+
+  // The records are strict: data only where it belongs, in the combined shape, within the limit.
+  const data = {
+    afterCommit: { id: 1 },
+    afterLink: [{ name: 'a', target: 'b', result: { id: 2 } }]
+  }
+  t.alike(decodeFinalRecord(encodeFinalRecord({ v: 1, status: 'COMMITTED', hookResult: data })), {
+    v: 1,
+    status: 'COMMITTED',
+    hookResult: data
+  })
+  t.alike(
+    decodeAdmissionRecord(
+      encodeAdmissionRecord({
+        v: 1,
+        status: 'REJECTED',
+        code: ERRORS.FILE_EXISTS,
+        hookResult: { onFailure: { ticket: 'T' } }
+      })
+    ),
+    { v: 1, status: 'REJECTED', code: 'FILE_EXISTS', hookResult: { onFailure: { ticket: 'T' } } }
+  )
+  for (const body of [
+    '{"v":1,"status":"COMMITTED","hookResult":{"beforeCommit":{}}}',
+    '{"v":1,"status":"COMMITTED","hookResult":[]}',
+    '{"v":1,"status":"COMMITTED","hookResult":{"afterLink":[{"name":"a"}]}}',
+    '{"v":1,"status":"COMMITTED","hookResult":{},"extra":1}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":null}'
+  ]) {
+    t.exception(() => decodeFinalRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID }, body)
+  }
+  for (const body of [
+    '{"v":1,"status":"VERIFIED","hookResult":{}}',
+    '{"v":1,"status":"ACCEPT","offset":0,"hookResult":{}}',
+    '{"v":1,"status":"ALREADY_COMMITTED","hookResult":{"afterCommit":7}}'
+  ]) {
+    t.exception(
+      () => decodeAdmissionRecord(b4a.from(body)),
+      { code: ERRORS.PROTOCOL_INVALID },
+      body
+    )
+  }
+  const big = (): HookResult => ({ k: 'x'.repeat(1_700) })
+  t.exception(
+    () =>
+      encodeFinalRecord({
+        v: 1,
+        status: 'COMMITTED',
+        hookResult: {
+          afterCommit: big(),
+          afterLink: [{ name: 'a', target: 'b', result: big() }]
+        }
+      }),
+    { code: ERRORS.PROTOCOL_INVALID },
+    'each part fits, the whole does not'
+  )
 })

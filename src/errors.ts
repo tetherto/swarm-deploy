@@ -1,3 +1,5 @@
+import type { HookResult, UploadHookResult } from './hook-result.js'
+
 export const ERRORS = {
   AUTH_REJECTED: 'AUTH_REJECTED',
   SERVER_KEY_MISMATCH: 'SERVER_KEY_MISMATCH',
@@ -33,6 +35,12 @@ export class SwarmDeployError extends Error {
   declare code: ErrorCode | string
   declare cause: unknown | null
   declare transport?: boolean
+  /**
+   * Set on a client error only when the request asked for hook data and the
+   * server's response-declared `onFailure` hook returned some with the failed
+   * answer. The code above is always the primary failure's.
+   */
+  declare hookResult?: HookResult | UploadHookResult
 
   constructor(code: ErrorCode | string, message: string, cause: unknown | null = null) {
     super(message)

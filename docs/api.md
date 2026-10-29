@@ -107,28 +107,41 @@ Optional operational limits and policies:
   `{ selector, name }` and manual-authorization `{ selector }` entries; see
   [Managed symlinks](managed-links.md).
 - `hooks?: ServerHooks | null`; see [Deployment hooks](hooks.md).
+- `hookModes?: HookModes | null`: which post-operation hooks (`afterCommit`,
+  `afterLink`, `onFailure`) are `'response'`, awaited before the answer. Every
+  other post-operation hook is `'detached'`: it runs after the answer, and nothing
+  waits for it. See
+  [Response and detached hooks](hooks.md#response-and-detached-hooks).
 
-The root package exports the `ServerHooks`, `BeforeCommitContext`,
+The root package exports the `ServerHooks`, `HookModes`, `HookResponse`,
+`OperationOutcome`, `FailedOutcome`, `BeforeCommitContext`,
 `AfterCommitContext`, `AfterLinkContext`, `HookFailureContext`,
 `HookFailurePhase`, `HookArtifact`, `HookLink`, `HookLinkMode`, `HookLinkStatus`,
-`HookLinkTrigger`, `HookResult`, `HookResultValue`, `ReleaseCoordinates`, and
+`HookLinkTrigger`, `HookResult`, `HookResultValue`, `UploadHookResult`,
+`UploadLinkResult`, `ClientUploadOptions`, `ReleaseCoordinates`, and
 `VersionGranularity` types:
 
 ```ts
-import type { ServerHooks } from 'swarm-deploy'
+import { Server, type HookModes, type ServerHooks } from 'swarm-deploy'
 
 const hooks: ServerHooks = {
   async afterCommit({ artifact, path, alreadyCommitted }) {
     // Idempotent: skip work already recorded for artifact.transferId.
+    const deployment = await deploy(artifact.transferId, path)
+    return { deploymentId: deployment.id } // data for a client that asks
   },
-  async afterLink({ link, artifact, status, trigger }) {
-    // Repeatable: skip when link.name already publishes artifact.transferId.
-    // May return a JSON object for a caller that asked; see below.
+  async afterLink({ link, artifact, status, trigger, outcome }) {
+    // Detached: runs after the answer; `outcome` says how the operation ended.
+    if (outcome.status === 'succeeded') await publish(link.name, artifact.transferId)
   },
-  onFailure({ phase, path, error }) {
-    console.error(phase, path, error)
+  onFailure({ phase, path, error, outcome }) {
+    // Every failed operation, including ones before anything durable exists.
+    console.error(phase, path, outcome.code, error)
   }
 }
+// afterCommit gates the upload, so it is a response hook; the others stay detached.
+const hookModes: HookModes = { afterCommit: 'response' }
+const server = new Server({ /* ... */ hooks, hookModes })
 ```
 
 Advanced integration and test seams:
@@ -186,8 +199,9 @@ interface ClientLinkResult {
 ```
 
 `hookFailure` says what the server does with the link it just made when its
-`afterLink` hook fails. The request waits for the hook in both modes, and a failed
-hook is `HOOK_FAILED` in both. `'rollback'` (the default) restores the previous
+`response` `afterLink` hook fails (it has no effect on a `detached` one, which cannot
+fail the request and leaves nothing to restore). The request waits for the hook in
+both modes, and a failed hook is `HOOK_FAILED` in both. `'rollback'` (the default) restores the previous
 local symlink and its ownership record, or removes a link the request created,
 before the error is returned; `'keep'` leaves the new link in place, as 0.5.x did.
 Neither undoes the uploaded artifact or anything the hook did elsewhere, and
@@ -200,14 +214,20 @@ instead and the server leaves what it found. See
 [Rollback and its limits](hooks.md#rollback-and-its-limits). Unknown options and
 values reject with `PROTOCOL_INVALID` before connecting.
 
-`hookResult: true` asks the server for what its `afterLink` hook returned, a
+`hookResult: true` asks the server to send back what its `response` `afterLink`
+hook returned, a
 plain JSON object (`HookResult`, with `HookResultValue` for its values) the hook
 author chose to report, such as an accepted submission's ID or evidence URL. It
 arrives only after the hook has resolved and is absent when the server has no
-hook or the hook returned nothing. It is data the hook reported, not proof that
+hook, the hook is `detached`, or the hook returned nothing. It is data the hook
+reported, not proof that
 anything was published, and it is never placed in client events or logs. Without
 the option the answer is exactly what earlier versions returned, and it is
-independent of `hookFailure`. An opted-in request needs a server of version 0.5.0 or later;
+independent of `hookFailure`. The option only asks for data to be sent: whether
+the server waits for the hook is its own declaration and never depends on it. When
+a failed request's answer carries data from the server's `response` `onFailure`, it is
+`error.hookResult` on the thrown `SwarmDeployError`, next to the unchanged primary
+`error.code`. An opted-in request needs a server of version 0.5.0 or later;
 an older server rejects it, so the call fails rather than returning without the
 result. A server that sends a result nobody asked for, or a malformed one, fails
 the call with `PROTOCOL_INVALID`. See
@@ -239,12 +259,35 @@ interface UploadResult {
   digest: Buffer
   transferId: Buffer
   entryCount?: number
+  hookResult?: UploadHookResult // only when requested and a response hook returned data
+}
+
+interface ClientUploadOptions {
+  hookResult?: boolean // default false
+}
+
+interface UploadHookResult {
+  afterCommit?: HookResult
+  afterLink?: Array<{ name: string; target: string; result: HookResult }>
+  onFailure?: HookResult // only on the error of a failed upload
 }
 ```
 
 Files and directories share the same result shape. For a directory, `size` is
 aggregate payload bytes and `entryCount` counts stored entries (files and
 directories).
+
+`Client.upload(path, { hookResult: true })` asks the server to send back the data
+its `response`-declared hooks returned: `afterCommit`'s object and one `afterLink`
+entry per automatic link whose `response` `afterLink` returned an object. The
+combined JSON is bounded to 3 KiB, and a failed upload's error carries
+`error.hookResult.onFailure` when the server's `response` `onFailure` returned
+data. The option only asks for the data to be sent; it never decides whether the
+server waits for a hook. The opt-in is sent only when asked for and is not part of
+the transfer identity, so a request that does not ask is unchanged; a server older
+than 0.6.0 rejects an opted-in offer, so the call fails rather than returning
+without the data. Unknown options reject with `PROTOCOL_INVALID` before
+connecting. See [Returning data in the answer](hooks.md#link-publication-hooks).
 
 ## Events
 
@@ -276,7 +319,7 @@ Server events:
 - `link`: one terminal manual-link outcome with `target`, `name`, client
   fingerprint, and status `linked`, `unchanged`, `rejected`, or `failed`.
   Rejected and failed outcomes also include a stable `reason`. A failed
-  `afterLink` hook is `failed` with reason `HOOK_FAILED` and either
+  `response` `afterLink` hook is `failed` with reason `HOOK_FAILED` and either
   `rolledBack: true` (the previous link and record were restored; there is no
   `result`) or `result` (`LINKED` or `UNCHANGED`), the outcome that stayed in place
   after `keep` or a request that changed nothing. A restore that could not be

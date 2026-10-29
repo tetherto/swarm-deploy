@@ -33,7 +33,7 @@ import {
   treeMetadataFromManifest,
   type TreeManifest
 } from './tar-protocol/tree-manifest.js'
-import type { HookResult } from './hook-result.js'
+import type { HookResult, UploadHookResult } from './hook-result.js'
 import {
   encodeLinkRequestRecord,
   type AnyMetadataRecord,
@@ -86,8 +86,26 @@ export interface UploadResult {
   transferId: TransferId
   /** Present only for a directory artifact. */
   entryCount?: number
+  /**
+   * Present only when `ClientUploadOptions.hookResult` was set and a
+   * response-declared hook returned data: `afterCommit`'s object, and one entry
+   * per response-declared automatic `afterLink` call that returned one. Data the
+   * hook author chose to report; it is not proof that anything was published.
+   */
+  hookResult?: UploadHookResult
 }
 export type ClientUploadResult = UploadResult
+export interface ClientUploadOptions {
+  /**
+   * Ask the server to return the data its response-declared hooks returned, as
+   * `UploadResult.hookResult` (or, on a failed upload, `error.hookResult` from a
+   * response-declared `onFailure`). Off by default. This only asks for the data
+   * to be sent back: whether the server waits for a hook is its own declaration
+   * and never depends on this. A server older than 0.6.0 rejects the opted-in
+   * offer, so the call fails instead of returning without the data.
+   */
+  hookResult?: boolean
+}
 export type ClientLinkStatus = 'LINKED' | 'UNCHANGED'
 /** What the server does with the link it just made when `afterLink` fails. */
 export type ClientLinkHookFailure = 'rollback' | 'keep'
@@ -104,10 +122,13 @@ export interface ClientLinkOptions {
    */
   hookFailure?: ClientLinkHookFailure
   /**
-   * Ask the server to return what its `afterLink` hook returned, as
-   * `ClientLinkResult.hookResult`. Off by default. It is independent of
-   * `hookFailure`. A server older than 0.5.0 rejects the opted-in request, so
-   * the call fails instead of returning without the result.
+   * Ask the server to return what its response-declared `afterLink` hook
+   * returned, as `ClientLinkResult.hookResult` (or, on a failed request,
+   * `error.hookResult` from a response-declared `onFailure`). Off by default. It
+   * is independent of `hookFailure` and only asks for the data to be sent back:
+   * whether the server waits for a hook is its own declaration and never depends
+   * on this. A server older than 0.5.0 rejects the opted-in request, so the call
+   * fails instead of returning without the result.
    */
   hookResult?: boolean
 }
@@ -200,6 +221,40 @@ function linkOptions(options: unknown): {
     throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid link options')
   }
   return { hookFailure: hookFailure ?? asked.hookFailure, hookResult: hookResult === true }
+}
+/** The upload options the caller asked for; anything unexpected is refused. */
+function uploadOptions(options: unknown): { hookResult: boolean } {
+  if (options === undefined) return { hookResult: false }
+  if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid upload options')
+  }
+  if (Object.keys(options).some((name) => name !== 'hookResult')) {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid upload options')
+  }
+  const { hookResult } = options as { hookResult?: unknown }
+  if (hookResult !== undefined && typeof hookResult !== 'boolean') {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid upload options')
+  }
+  return { hookResult: hookResult === true }
+}
+/** The data an answer carries, which the request must have asked for. */
+function receiptOf<T>(received: T | undefined, asked: boolean): T | undefined {
+  if (received !== undefined && !asked) {
+    throw fail(ERRORS.PROTOCOL_INVALID, 'Server sent an unrequested hook result')
+  }
+  return received
+}
+/** A failed answer as an error: always the primary code, with the hook's data when asked for. */
+function refused(
+  code: ErrorCode,
+  message: string,
+  received: HookResult | UploadHookResult | undefined,
+  asked: boolean
+): SwarmDeployError {
+  const receipt = receiptOf(received, asked)
+  const error = fail(code, message)
+  if (receipt !== undefined) error.hookResult = receipt
+  return error
 }
 function codeOf(error: unknown): ErrorCode {
   return error instanceof SwarmDeployError &&
@@ -311,7 +366,11 @@ export class Client extends EventEmitter {
     } catch {}
   }
 
-  private async uploadManifest(manifest: AnyManifest, reset = false): Promise<UploadResult> {
+  private async uploadManifest(
+    manifest: AnyManifest,
+    reset = false,
+    wantsResult = false
+  ): Promise<UploadResult> {
     throwIfAborted(this.signal)
     const socket = await this.direct.connect(this.serverPublicKey, {
       signal: this.signal,
@@ -328,23 +387,34 @@ export class Client extends EventEmitter {
     const reader = new DirectWireReader(socket)
     let verificationStarted = false
     try {
-      const metadata = manifestMetadata(manifest, reset)
+      // The opt-in is sent only when asked for, so an older strict server rejects it.
+      // It is not part of the transfer identity: the manifest and its ID are unchanged.
+      const metadata: AnyMetadataRecord = {
+        ...manifestMetadata(manifest, reset),
+        ...(wantsResult ? { hookResult: true as const } : {})
+      }
       await writeMetadata(socket, metadata, { signal: this.signal, timeout: this.idleTimeout })
       this.emitSafe('offer', { name: manifest.name, status: 'offered' })
       const admission = await reader.control(decodeDirectAdmission, this.signal, this.idleTimeout)
       if (admission.status === 'ALREADY_COMMITTED') {
+        const hookResult = receiptOf(admission.hookResult, wantsResult)
         this.emitSafe('offer', { name: manifest.name, status: 'already-committed' })
-        return this.result(manifest, 'ALREADY_COMMITTED')
+        return this.result(manifest, 'ALREADY_COMMITTED', hookResult)
       }
-      if (admission.status === 'REJECTED') throw fail(admission.code, 'Server rejected upload')
+      if (admission.status === 'REJECTED') {
+        throw refused(admission.code, 'Server rejected upload', admission.hookResult, wantsResult)
+      }
       if (admission.status === 'VERIFIED') {
         this.emitSafe('verification', { name: manifest.name, status: 'started' })
         verificationStarted = true
         const final = await reader.control(decodeDirectFinal, this.signal, this.idleTimeout)
-        if (final.status !== 'COMMITTED') throw fail(final.code, 'Server failed verified upload')
+        if (final.status !== 'COMMITTED') {
+          throw refused(final.code, 'Server failed verified upload', final.hookResult, wantsResult)
+        }
+        const hookResult = receiptOf(final.hookResult, wantsResult)
         this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
         this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
-        return this.result(manifest, 'COMMITTED')
+        return this.result(manifest, 'COMMITTED', hookResult)
       }
       const offset = admission.offset
       const expected =
@@ -374,7 +444,7 @@ export class Client extends EventEmitter {
         this.emitSafe('offer', { name: manifest.name, status: 'reset', offset: 0 })
         reader.closeReader()
         socket.destroy()
-        return this.uploadManifest(manifest, true)
+        return this.uploadManifest(manifest, true, wantsResult)
       }
       if (regenerated.bytesSent !== manifest.tarSize - offset) {
         throw fail(ERRORS.PROTOCOL_INVALID, 'Incomplete deterministic TAR transfer')
@@ -392,11 +462,12 @@ export class Client extends EventEmitter {
       endWrite(socket)
       const final = await reader.control(decodeDirectFinal, this.signal, this.idleTimeout)
       if (final.status !== 'COMMITTED') {
-        throw fail(final.code, 'Server failed upload')
+        throw refused(final.code, 'Server failed upload', final.hookResult, wantsResult)
       }
+      const hookResult = receiptOf(final.hookResult, wantsResult)
       this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
       this.emitSafe('commit', { name: manifest.name, status: 'succeeded' })
-      return this.result(manifest, 'COMMITTED')
+      return this.result(manifest, 'COMMITTED', hookResult)
     } catch (error) {
       const reason = codeOf(error)
       if (verificationStarted) {
@@ -412,7 +483,11 @@ export class Client extends EventEmitter {
     }
   }
 
-  private result(manifest: AnyManifest, status: UploadStatus): UploadResult {
+  private result(
+    manifest: AnyManifest,
+    status: UploadStatus,
+    hookResult?: UploadHookResult
+  ): UploadResult {
     const kind: ArtifactKind = isTreeManifest(manifest) ? 'directory' : 'file'
     const result: UploadResult = {
       status,
@@ -421,7 +496,8 @@ export class Client extends EventEmitter {
       size: manifestPayloadBytes(manifest),
       digest: b4a.from(manifestDigest(manifest)),
       transferId: b4a.from(manifest.transferId),
-      ...(isTreeManifest(manifest) ? { entryCount: manifest.entryCount } : {})
+      ...(isTreeManifest(manifest) ? { entryCount: manifest.entryCount } : {}),
+      ...(hookResult === undefined ? {} : { hookResult })
     }
     this.logger.info('Direct upload completed', { name: result.name, status: result.status })
     this.emitSafe('result', { name: result.name, kind, status, final: true })
@@ -464,10 +540,10 @@ export class Client extends EventEmitter {
       this.emitSafe('link', { target, name, status: 'requested', final: false })
       endWrite(socket)
       const response = await reader.control(decodeDirectLinkResult, this.signal, this.idleTimeout)
-      if (response.status === 'FAILED') throw fail(response.code, 'Server failed link request')
-      if (!wantsResult && response.hookResult !== undefined) {
-        throw fail(ERRORS.PROTOCOL_INVALID, 'Server sent an unrequested hook result')
+      if (response.status === 'FAILED') {
+        throw refused(response.code, 'Server failed link request', response.hookResult, wantsResult)
       }
+      receiptOf(response.hookResult, wantsResult)
       const status = response.status
       // Neither the log nor the event carries the hook's data.
       this.logger.info('Direct link completed', { target, name, status })
@@ -488,22 +564,28 @@ export class Client extends EventEmitter {
       } catch {}
     }
   }
-  private async perform(inputPath: string): Promise<UploadResult> {
+  private async perform(
+    inputPath: string,
+    uploadOpts?: ClientUploadOptions
+  ): Promise<UploadResult> {
     if (typeof inputPath !== 'string' || !inputPath) {
       throw fail(ERRORS.INVALID_FILENAME, 'Invalid upload path')
     }
+    const { hookResult } = uploadOptions(uploadOpts)
     const target = await selectUploadTarget(inputPath, { signal: this.signal })
     const options = { signal: this.signal, includeSourceParent: this.includeSourceParent }
     return this.uploadManifest(
       target.kind === 'directory'
         ? await buildTreeManifest(target.path, this.publicKey, options)
-        : await buildTarManifest(target.path, this.publicKey, options)
+        : await buildTarManifest(target.path, this.publicKey, options),
+      false,
+      hookResult
     )
   }
-  upload(inputPath: string): Promise<UploadResult> {
+  upload(inputPath: string, options?: ClientUploadOptions): Promise<UploadResult> {
     if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Client is closed'))
     const operation = this.queue
-      .then(() => this.perform(inputPath))
+      .then(() => this.perform(inputPath, options))
       .catch((error: unknown) => {
         const reason = codeOf(error)
         this.emitSafe('failure', { fingerprint: fingerprint(this.serverPublicKey), reason })

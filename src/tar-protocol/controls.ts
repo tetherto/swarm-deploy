@@ -1,6 +1,11 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError, type ErrorCode } from '../errors.js'
-import { copyHookResult, type HookResult } from '../hook-result.js'
+import {
+  copyHookResult,
+  copyUploadHookResult,
+  type HookResult,
+  type UploadHookResult
+} from '../hook-result.js'
 import { MAX_TREE_ENTRIES } from './tree-path.js'
 import { deterministicTarSize, MAX_USTAR_FILE_BYTES, TAR_BLOCK_BYTES } from './ustar.js'
 
@@ -22,6 +27,12 @@ export interface MetadataRecord {
   tarSha256: string
   transferId: string
   reset: boolean
+  /**
+   * Opt-in: asks for the data the server's response-declared hooks return. Sent
+   * only when `true`, so an older strict server rejects an opted-in offer. It is
+   * not part of the transfer identity or the session.
+   */
+  hookResult?: true
 }
 
 /**
@@ -40,6 +51,8 @@ export interface TreeMetadataRecord {
   tarSha256: string
   transferId: string
   reset: boolean
+  /** As for `MetadataRecord.hookResult`. */
+  hookResult?: true
 }
 
 export type AnyMetadataRecord = MetadataRecord | TreeMetadataRecord
@@ -77,12 +90,13 @@ export interface LinkRequestRecord {
 
 /**
  * `hookResult` appears only on an answer to a request that asked for it, and
- * only when the hook returned an object.
+ * only when a response-declared hook returned an object: `afterLink`'s on
+ * success, `onFailure`'s on a failure, whose `code` is always the primary one.
  */
 export type LinkResultRecord =
   | { v: typeof CONTROL_VERSION; status: 'LINKED'; hookResult?: HookResult }
   | { v: typeof CONTROL_VERSION; status: 'UNCHANGED'; hookResult?: HookResult }
-  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode }
+  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode; hookResult?: HookResult }
 
 /**
  * The first direct control frame may be an upload offer or a link request.
@@ -99,12 +113,18 @@ export type AdmissionRecord =
       prefixSha256: string
     }
   | { v: typeof CONTROL_VERSION; status: 'VERIFIED' }
-  | { v: typeof CONTROL_VERSION; status: 'ALREADY_COMMITTED' }
-  | { v: typeof CONTROL_VERSION; status: 'REJECTED'; code: ErrorCode }
+  | { v: typeof CONTROL_VERSION; status: 'ALREADY_COMMITTED'; hookResult?: UploadHookResult }
+  | {
+      v: typeof CONTROL_VERSION
+      status: 'REJECTED'
+      code: ErrorCode
+      hookResult?: UploadHookResult
+    }
 
+/** `hookResult` as for `LinkResultRecord`, in the upload's combined shape. */
 export type FinalRecord =
-  | { v: typeof CONTROL_VERSION; status: 'COMMITTED' }
-  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode }
+  | { v: typeof CONTROL_VERSION; status: 'COMMITTED'; hookResult?: UploadHookResult }
+  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode; hookResult?: UploadHookResult }
 
 function invalid(message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
@@ -181,6 +201,38 @@ function encodeRecord<T>(value: T, validate: (value: unknown) => T): Buffer {
   return encoded
 }
 
+function hasKey(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+/** An offer's receipt request: absent, or exactly `true` (`false` would be a second spelling of absent). */
+function assertReceiptRequest(value: Record<string, unknown>): void {
+  if (hasKey(value, 'hookResult') && value.hookResult !== true) {
+    throw invalid('Invalid hook result request')
+  }
+}
+
+/** Checks the upload data an answer carries, when it carries any. */
+function assertUploadReceipt(value: Record<string, unknown>): void {
+  if (!hasKey(value, 'hookResult')) return
+  try {
+    copyUploadHookResult(value.hookResult)
+  } catch (error) {
+    throw invalid('Invalid hook result', error)
+  }
+}
+
+/** Checks the link data an answer carries, when it carries any. */
+function assertLinkReceipt(value: Record<string, unknown>): void {
+  if (!hasKey(value, 'hookResult')) return
+  try {
+    // Decoded input is a fresh parse, so the checked original is what is returned.
+    copyHookResult(value.hookResult)
+  } catch (error) {
+    throw invalid('Invalid hook result', error)
+  }
+}
+
 function validateMetadata(value: unknown): MetadataRecord {
   if (!isRecord(value)) throw invalid('Metadata record must be an object')
   const expected = [
@@ -196,7 +248,9 @@ function validateMetadata(value: unknown): MetadataRecord {
   if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
     expected.push('sourceParent')
   }
+  if (hasKey(value, 'hookResult')) expected.push('hookResult')
   exactKeys(value, expected)
+  assertReceiptRequest(value)
   assertVersion(value.v)
   assertName(value.name)
   if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
@@ -251,7 +305,9 @@ function validateTreeMetadata(value: unknown): TreeMetadataRecord {
     'reset'
   ]
   if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) expected.push('sourceParent')
+  if (hasKey(value, 'hookResult')) expected.push('hookResult')
   exactKeys(value, expected)
+  assertReceiptRequest(value)
   assertVersion(value.v)
   if (value.kind !== 'directory') throw invalid('Invalid artifact kind')
   assertName(value.name)
@@ -316,11 +372,18 @@ function validateAdmission(value: unknown): AdmissionRecord {
     assertSafeUint(value.offset, 'resume offset')
     if (value.offset === 0) throw invalid('Invalid resume offset')
     assertHex32(value.prefixSha256, 'prefix digest')
-  } else if (value.status === 'VERIFIED' || value.status === 'ALREADY_COMMITTED') {
+  } else if (value.status === 'VERIFIED') {
     exactKeys(value, ['v', 'status'])
+  } else if (value.status === 'ALREADY_COMMITTED') {
+    exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
+    assertUploadReceipt(value)
   } else if (value.status === 'REJECTED') {
-    exactKeys(value, ['v', 'status', 'code'])
+    exactKeys(
+      value,
+      hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
+    )
     assertStableCode(value.code)
+    assertUploadReceipt(value)
   } else {
     throw invalid('Invalid admission status')
   }
@@ -331,10 +394,15 @@ function validateFinal(value: unknown): FinalRecord {
   if (!isRecord(value)) throw invalid('Final record must be an object')
   assertVersion(value.v)
   if (value.status === 'COMMITTED') {
-    exactKeys(value, ['v', 'status'])
+    exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
+    assertUploadReceipt(value)
   } else if (value.status === 'FAILED') {
-    exactKeys(value, ['v', 'status', 'code'])
+    exactKeys(
+      value,
+      hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
+    )
     assertStableCode(value.code)
+    assertUploadReceipt(value)
   } else {
     throw invalid('Invalid final status')
   }
@@ -345,19 +413,15 @@ function validateLinkResult(value: unknown): LinkResultRecord {
   if (!isRecord(value)) throw invalid('Link result record must be an object')
   assertVersion(value.v)
   if (value.status === 'LINKED' || value.status === 'UNCHANGED') {
-    const hasResult = Object.prototype.hasOwnProperty.call(value, 'hookResult')
-    exactKeys(value, hasResult ? ['v', 'status', 'hookResult'] : ['v', 'status'])
-    if (hasResult) {
-      try {
-        // Decoded input is a fresh parse, so the checked original is what is returned.
-        copyHookResult(value.hookResult)
-      } catch (error) {
-        throw invalid('Invalid hook result', error)
-      }
-    }
+    exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
+    assertLinkReceipt(value)
   } else if (value.status === 'FAILED') {
-    exactKeys(value, ['v', 'status', 'code'])
+    exactKeys(
+      value,
+      hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
+    )
     assertStableCode(value.code)
+    assertLinkReceipt(value)
   } else {
     throw invalid('Invalid link result status')
   }

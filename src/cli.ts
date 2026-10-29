@@ -10,7 +10,13 @@ import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './id
 import { validateReplaceNames } from './files.js'
 import { compileSymlinkRules } from './symlinks.js'
 import { loadHooksModule } from './hooks-module.js'
-import type { ServerHooks } from './hooks.js'
+import {
+  HOOK_MODE_NAMES,
+  snapshotHookModes,
+  type HookModes,
+  type HookResponse,
+  type ServerHooks
+} from './hooks.js'
 import { Server, type ServerLogger, type ServerOptions } from './server.js'
 import { encodeLinkRequestRecord } from './tar-protocol/controls.js'
 import {
@@ -67,8 +73,8 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module>]',
-  '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] <file-or-directory>',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...]',
+  '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] [--json] <file-or-directory>',
   '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--hook-failure <rollback|keep>] [--json] <target> <link-name>',
   '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]]',
   '',
@@ -583,6 +589,28 @@ async function runPublicKey(args: string[]): Promise<string> {
   return b4a.toString(publicKeyFromSeed(seed), 'hex')
 }
 
+/**
+ * Parses repeated `--hook-mode <hook>=<mode>` values. Each names one post-operation
+ * hook once and a mode that is exactly `response` or `detached`.
+ */
+function parseHookModes(values: readonly string[]): HookModes {
+  const modes: Record<string, HookResponse> = Object.create(null) as Record<string, HookResponse>
+  for (const value of values) {
+    const at = value.indexOf('=')
+    const name = at < 0 ? '' : value.slice(0, at)
+    const mode = at < 0 ? '' : value.slice(at + 1)
+    if (
+      !(HOOK_MODE_NAMES as readonly string[]).includes(name) ||
+      (mode !== 'response' && mode !== 'detached') ||
+      Object.prototype.hasOwnProperty.call(modes, name)
+    ) {
+      throw usageError('Invalid --hook-mode')
+    }
+    modes[name] = mode
+  }
+  return { ...modes } as HookModes
+}
+
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, repeatedOptions, pairOptions, positionals } = parseOptions(
     args,
@@ -601,9 +629,10 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--max-versions',
       '--version-granularity',
       '--symlink',
-      '--hooks'
+      '--hooks',
+      '--hook-mode'
     ]),
-    new Set(['--replace-name', '--allow-key', '--artifact-pattern', '--symlink']),
+    new Set(['--replace-name', '--allow-key', '--artifact-pattern', '--symlink', '--hook-mode']),
     new Set(['--allow-key', '--seed']),
     new Set(),
     new Set(['--symlink'])
@@ -666,13 +695,21 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     throw usageError('Invalid --allow-key')
   }
 
+  const cliHookModes = parseHookModes(repeatedOptions['--hook-mode'] || [])
   let hooks: ServerHooks | undefined
+  let hookModes: HookModes | undefined
   if (options['--hooks'] !== undefined) {
     try {
-      hooks = await loadHooksModule(options['--hooks'], io.cwd ?? process.cwd())
+      const loaded = await loadHooksModule(options['--hooks'], io.cwd ?? process.cwd())
+      hooks = loaded.hooks
+      // The command line overrides the module's own declaration for each hook it names.
+      hookModes = { ...loaded.modes, ...cliHookModes }
+      snapshotHookModes(hookModes, hooks)
     } catch (err) {
       throw configError(errorMessage(err))
     }
+  } else if (Object.keys(cliHookModes).length > 0) {
+    throw usageError('--hook-mode requires --hooks')
   }
 
   const symlinkPairs = pairOptions['--symlink'] || []
@@ -703,6 +740,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       versionGranularity: granularity,
       ...(symlinks.length > 0 ? { symlinks } : {}),
       hooks,
+      ...(hookModes === undefined ? {} : { hookModes }),
       dht: io.dht,
       logger: createLogger(io)
     })
@@ -750,6 +788,26 @@ function printUploadResult(result: ClientUploadResult, io: CliIo): number {
   return result.status === 'COMMITTED' || result.status === 'ALREADY_COMMITTED' ? 0 : 1
 }
 
+/** One JSON object on stdout: the upload outcome plus the hooks' own data, when any returned some. */
+function printUploadJson(result: ClientUploadResult, io: CliIo): number {
+  const { name, kind, status, hookResult } = result
+  writeLine(
+    io.stdout,
+    JSON.stringify({ name, kind, status, ...(hookResult === undefined ? {} : { hookResult }) })
+  )
+  return status === 'COMMITTED' || status === 'ALREADY_COMMITTED' ? 0 : 1
+}
+
+/**
+ * With `--json`, a failed request whose answer carried the server's `onFailure` data prints one
+ * JSON object with the primary error code and that data; the exit status and the error message
+ * are the same as without it. Nothing is printed when the server returned none.
+ */
+function printFailureJson(fields: Record<string, string>, err: unknown, io: CliIo): void {
+  if (!(err instanceof SwarmDeployError) || err.hookResult === undefined) return
+  writeLine(io.stdout, JSON.stringify({ ...fields, code: err.code, hookResult: err.hookResult }))
+}
+
 function printLinkResult(result: ClientLinkResult, io: CliIo): number {
   writeLine(io.stdout, `${result.name} -> ${result.target} ${result.status}`)
   return result.status === 'LINKED' || result.status === 'UNCHANGED' ? 0 : 1
@@ -782,11 +840,19 @@ function linkErrorMessage(err: unknown): string {
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   const { options, flagOptions, positionals } = parseOptions(
     args,
-    new Set(['--seed-file', '--seed', '--server-key', '--idle-timeout', '--no-source-parent']),
+    new Set([
+      '--seed-file',
+      '--seed',
+      '--server-key',
+      '--idle-timeout',
+      '--no-source-parent',
+      '--json'
+    ]),
     new Set(),
     new Set(['--server-key', '--seed']),
-    new Set(['--no-source-parent'])
+    new Set(['--no-source-parent', '--json'])
   )
+  const json = flagOptions['--json'] === true
   const [inputPath] = requirePositionals(positionals, 1, 'upload requires a file or directory')
   const seed = await resolveSeed({
     seedFile: options['--seed-file'],
@@ -834,9 +900,14 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   let code = 0
   try {
     try {
-      const result = await client.upload(inputPath)
-      code = printUploadResult(result, io)
+      // Only --json asks the server for the hooks' data. It never changes whether the server
+      // waits for a hook: that is the server's own declaration.
+      const result = json
+        ? await client.upload(inputPath, { hookResult: true })
+        : await client.upload(inputPath)
+      code = json ? printUploadJson(result, io) : printUploadResult(result, io)
     } catch (err) {
+      if (json) printFailureJson({}, err, io)
       runError = new CliError(errorMessage(err), 1)
     }
   } finally {
@@ -948,6 +1019,7 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
           : await client.link(target, name, asked)
       code = json ? printLinkJson(result, io) : printLinkResult(result, io)
     } catch (err) {
+      if (json) printFailureJson({ target, name }, err, io)
       runError = new CliError(linkErrorMessage(err), 1)
     }
   } finally {

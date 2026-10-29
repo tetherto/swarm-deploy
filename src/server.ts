@@ -18,10 +18,12 @@ import {
   hookResultOf,
   HookTurns,
   invokeHook,
+  snapshotHookModes,
   snapshotHooks,
   type AfterCommitContext,
   type AfterLinkContext,
   type BeforeCommitContext,
+  type FailedOutcome,
   type HookArtifact,
   type HookFailureContext,
   type HookFailurePhase,
@@ -29,11 +31,26 @@ import {
   type HookLinkMode,
   type HookLinkStatus,
   type HookLinkTrigger,
+  type HookModes,
   type HookOutcome,
   type HookTurn,
+  type OperationOutcome,
   type ServerHooks
 } from './hooks.js'
-import type { HookResult } from './hook-result.js'
+import {
+  copyHookResult,
+  copyUploadHookResult,
+  type HookResult,
+  type UploadHookResult,
+  type UploadLinkResult
+} from './hook-result.js'
+import {
+  DetachedHooks,
+  MAX_DETACHED_HOOKS,
+  OperationScope,
+  type DetachedInfo,
+  type DetachedProblem
+} from './post-hooks.js'
 import { keyPairFromSeed } from './identity.js'
 import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 import { CommitStore } from './storage/commit-store.js'
@@ -113,6 +130,8 @@ const ANSWER_CLOSE_GRACE = 5_000
  */
 export const MAX_OWED_POST_COMMIT_RETENTION = MAX_CONNECTIONS
 
+export { MAX_DETACHED_HOOKS }
+
 export type ServerLogger = Logger
 export type AllowlistKey = PublicKeyInput | string
 
@@ -143,6 +162,13 @@ export interface ServerOptions {
   replaceNames?: Iterable<string>
   /** Optional deployment lifecycle callbacks; snapshotted at construction. */
   hooks?: ServerHooks | null
+  /**
+   * Which post-operation hooks (`afterCommit`, `afterLink`, `onFailure`) are
+   * `response` hooks, awaited before the answer. Every other post-operation hook,
+   * and every hook not named here, is `detached`: it runs after the answer, and
+   * nothing waits for it. Validated and frozen at construction.
+   */
+  hookModes?: HookModes | null
   /** Repeatable managed-symlink rules; snapshotted and validated at construction. */
   symlinks?: Iterable<SymlinkRule>
 }
@@ -252,6 +278,8 @@ function releaseLinkHooks(pending: readonly PendingLinkHook[]): void {
 
 /** What an explicit link request has learned so far; the terminal event and `onFailure` read it. */
 interface LinkRequestState {
+  /** The target's commit record, once it was resolved. */
+  artifact: HookArtifact | null
   /** Set once the link decision is made, so a later failure can report what the link did. */
   durable: HookLinkStatus | null
   /** The hook that was running. */
@@ -271,6 +299,13 @@ function codeOf(error: unknown): ErrorCode {
     Object.values(ERRORS).includes(error.code as ErrorCode)
     ? (error.code as ErrorCode)
     : ERRORS.PROTOCOL_INVALID
+}
+
+/** What a `response` hook is told: it runs while the operation is still succeeding. */
+const SUCCEEDED: OperationOutcome = Object.freeze({ status: 'succeeded' as const })
+
+function failedOutcome(code: ErrorCode, phase: HookFailurePhase): FailedOutcome {
+  return Object.freeze({ status: 'failed' as const, code, phase })
 }
 function frozenRelease(release: ReleaseCoordinates): ReleaseCoordinates {
   return Object.freeze({
@@ -344,6 +379,7 @@ export class Server extends EventEmitter {
   readonly scheduler: ServerScheduler
   readonly replaceNames: ReadonlySet<string>
   readonly hooks: Readonly<ServerHooks>
+  readonly hookModes: Readonly<HookModes>
   readonly symlinks: readonly CompiledSymlinkRule[]
   readonly linkNames: ReadonlySet<string>
   private managedLinkNamesSnapshot: ReadonlySet<string>
@@ -380,6 +416,10 @@ export class Server extends EventEmitter {
    * and never overlap, while hook code never runs under the lease.
    */
   private readonly linkHookTurns = new HookTurns()
+  /** The same for detached `afterCommit` calls, one line per artifact name. */
+  private readonly commitHookTurns = new HookTurns()
+  /** Detached post-operation callbacks: bounded, best effort, process-local. */
+  private readonly detached: DetachedHooks
   private readonly receives = new Set<Promise<void>>()
   private layout: StorageLayout | null = null
   private sessions: SessionStore | null = null
@@ -488,12 +528,36 @@ export class Server extends EventEmitter {
     this.scheduler = options.scheduler || { setTimeout, clearTimeout, setInterval, clearInterval }
     this.replaceNames = validateReplaceNames(options.replaceNames)
     this.hooks = snapshotHooks(options.hooks)
+    this.hookModes = snapshotHookModes(options.hookModes, this.hooks)
     this.symlinks = compileSymlinkRules(options.symlinks)
     this.linkNames = symlinkRuleNames(this.symlinks)
     this.managedLinkNamesSnapshot = new Set(this.linkNames)
     if (this.symlinks.length > 0) assertSymlinkCapable(this.storage)
     this.logger = safeLogger(options.logger)
     this.signal = this.abort.signal
+    this.detached = new DetachedHooks(this.signal, (problem, info) =>
+      this.reportDetached(problem, info)
+    )
+  }
+
+  /** Whether a post-operation hook is configured and declared `response`, so the answer waits for it. */
+  private responds(name: 'afterCommit' | 'afterLink' | 'onFailure'): boolean {
+    return this.hooks[name] !== undefined && this.hookModes[name] === 'response'
+  }
+
+  /** Whether a post-operation hook is configured and left (or declared) `detached`. */
+  private detaches(name: 'afterCommit' | 'afterLink' | 'onFailure'): boolean {
+    return this.hooks[name] !== undefined && this.hookModes[name] !== 'response'
+  }
+
+  /** A detached run that did not complete: logged with fixed text and the job's own non-secret fields. */
+  private reportDetached(problem: DetachedProblem, info: DetachedInfo): void {
+    this.logger.warn(`Detached hook ${problem}`, {
+      hook: info.hook,
+      ...info.fields,
+      reason:
+        problem === 'failed' ? ERRORS.HOOK_FAILED : problem === 'dropped' ? 'capacity' : 'shutdown'
+    })
   }
 
   private artifactKind(metadata: AnyMetadataRecord): ArtifactKind {
@@ -534,11 +598,14 @@ export class Server extends EventEmitter {
     socket: DirectDhtSocket,
     event: ReturnType<Server['transfer']>,
     owner: Uint8Array,
-    reason: ErrorCode
+    reason: ErrorCode,
+    hookResult?: UploadHookResult
   ): Promise<void> {
     await writeAdmission(
       socket,
-      { v: 1, status: 'REJECTED', code: reason },
+      hookResult === undefined
+        ? { v: 1, status: 'REJECTED', code: reason }
+        : { v: 1, status: 'REJECTED', code: reason, hookResult },
       { signal: this.signal, timeout: this.idleTimeout }
     )
     this.emitSafe('offer', {
@@ -599,7 +666,9 @@ export class Server extends EventEmitter {
   }> {
     const desired = selectDesiredLinks(this.symlinks, records)
     if (!this.links) {
-      return { pins: new Set(desired.map((link) => link.transferId)), desired, result: null }
+      const pins = new Set(desired.map((link) => link.transferId))
+      this.pinDetachedHooks(pins)
+      return { pins, desired, result: null }
     }
     const result = await this.links.reconcile(desired, this.linkNames, {
       managedArtifactNames: new Set(records.map((record) => record.name))
@@ -614,7 +683,17 @@ export class Server extends EventEmitter {
       else pins.add(link.transferId)
     }
     await this.pinPendingRollbacks(records, pins)
+    this.pinDetachedHooks(pins)
     return { pins, desired, result }
+  }
+
+  /**
+   * Pins the artifact of every queued or running detached call, from the moment
+   * it was registered until it finishes, so retention cannot remove what the
+   * callback is about to read. The set lives in memory only.
+   */
+  private pinDetachedHooks(pins: Set<string>): void {
+    for (const transferId of this.detached.pins()) pins.add(transferId)
   }
 
   private async reconcileLinksUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
@@ -624,13 +703,17 @@ export class Server extends EventEmitter {
   /** Pins link targets when reconciliation fails but retention must continue. */
   private async linkPinsFallbackUnlocked(records: CommitRecord[]): Promise<ReadonlySet<string>> {
     const pins = new Set(selectDesiredLinks(this.symlinks, records).map((link) => link.transferId))
-    if (!this.links) return pins
+    if (!this.links) {
+      this.pinDetachedHooks(pins)
+      return pins
+    }
     for (const ledger of await this.links.list()) {
       pins.add(ledger.transferId)
       const target = records.find((record) => record.name === ledger.target)
       if (target) pins.add(target.transferId)
     }
     await this.pinPendingRollbacks(records, pins)
+    this.pinDetachedHooks(pins)
     return pins
   }
 
@@ -725,22 +808,21 @@ export class Server extends EventEmitter {
   }
 
   /**
-   * Runs pending `afterLink` calls one after another, each once every earlier
-   * hook for its link has finished. No storage lease is held while hook code
-   * runs. `begin` is told which call is starting so a caller can attribute a
+   * Runs pending `response` `afterLink` calls one after another, each once every
+   * earlier hook for its link has finished. No storage lease is held while hook
+   * code runs. `begin` is told which call is starting so a caller can attribute a
    * failure. The first failure stops the rest; the caller releases the places.
    *
-   * What a hook returns is read only when `collectResults` is set, which the
-   * explicit link request does when the client asked for it. It then comes back
-   * as a checked copy per call (`undefined` for a hook that returned nothing),
-   * and a value that is not a valid result fails that call like a throw. Without
-   * it the value is never touched, so no caller can be failed by it.
+   * What a response hook returns is always read and checked, whether or not the
+   * client asked for the data: it comes back as a checked copy per call
+   * (`undefined` for a hook that finished with nothing), and a value that is not a
+   * valid result fails that call like a throw. Whether the data is sent is a
+   * separate decision of the caller.
    */
   private async runLinkHooks(
     pending: readonly PendingLinkHook[],
     owner: Uint8Array | null,
-    begin: (item: PendingLinkHook) => void,
-    collectResults = false
+    begin: (item: PendingLinkHook) => void
   ): Promise<Array<HookResult | undefined>> {
     const results: Array<HookResult | undefined> = []
     for (const item of pending) {
@@ -754,10 +836,11 @@ export class Server extends EventEmitter {
             link: item.link,
             artifact: item.artifact,
             status: item.status,
-            trigger: item.trigger
+            trigger: item.trigger,
+            outcome: SUCCEEDED
           })
         )
-        results.push(collectResults ? hookResultOf(returned) : undefined)
+        results.push(hookResultOf(returned, 'afterLink'))
       } catch (error) {
         if (error instanceof SwarmDeployError && error.code === ERRORS.HOOK_FAILED) {
           this.logger.warn('Link hook failed', {
@@ -776,6 +859,116 @@ export class Server extends EventEmitter {
     return results
   }
 
+  /**
+   * Hands one durable link decision to the detached `afterLink` hook. The place in
+   * the link's hook line was reserved, in decision order, by the caller and is now
+   * the job's. The call starts only once `scope` has settled, which is after the
+   * answer was attempted, and it is told how the operation ended.
+   */
+  private detachLink(item: PendingLinkHook, scope: OperationScope, owner: Uint8Array | null): void {
+    const hook = this.hooks.afterLink
+    if (hook === undefined) {
+      item.turn.release()
+      return
+    }
+    const context: Omit<AfterLinkContext, 'outcome'> = Object.freeze({
+      link: item.link,
+      artifact: item.artifact,
+      status: item.status,
+      trigger: item.trigger
+    })
+    this.detached.start<Omit<AfterLinkContext, 'outcome'>>({
+      hook: 'afterLink',
+      callback: hook,
+      context,
+      outcome: scope,
+      turn: item.turn,
+      pin: item.artifact.transferId,
+      fields: {
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
+        name: item.link.name,
+        target: item.link.target,
+        trigger: item.trigger,
+        status: item.status
+      }
+    })
+  }
+
+  /** The same for the detached `afterCommit` hook, ordered per artifact name. */
+  private detachCommit(
+    context: Omit<AfterCommitContext, 'outcome'>,
+    scope: OperationScope,
+    owner: Uint8Array | null
+  ): void {
+    const hook = this.hooks.afterCommit
+    if (hook === undefined) return
+    this.detached.start<Omit<AfterCommitContext, 'outcome'>>({
+      hook: 'afterCommit',
+      callback: hook,
+      context,
+      outcome: scope,
+      turn: this.commitHookTurns.reserve(context.artifact.name),
+      pin: context.artifact.transferId,
+      fields: {
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
+        name: context.artifact.name,
+        transfer: fingerprint(b4a.from(context.artifact.transferId, 'hex')),
+        alreadyCommitted: context.alreadyCommitted
+      }
+    })
+  }
+
+  /**
+   * A `response` `onFailure` hook, awaited before the failed answer is written. It
+   * returns the checked data it finished with, or `undefined`: it never throws,
+   * and a throw, an unusable value, or a closing server leaves the failure being
+   * reported exactly as it was. It is never called for its own failure.
+   */
+  private async awaitFailureHook(
+    context: HookFailureContext,
+    owner: Uint8Array | null,
+    transfer: string
+  ): Promise<HookResult | undefined> {
+    const hook = this.hooks.onFailure
+    if (hook === undefined || !this.responds('onFailure')) return undefined
+    try {
+      const outcome = await invokeHook(hook, context, this.signal)
+      if (outcome.status === 'aborted' || outcome.value === undefined) return undefined
+      return copyHookResult(outcome.value)
+    } catch {
+      this.logger.warn('Failure hook failed', {
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
+        transfer,
+        phase: context.phase,
+        reason: ERRORS.HOOK_FAILED
+      })
+      return undefined
+    }
+  }
+
+  /** A `detached` `onFailure` hook: registered once the failed answer was attempted, never awaited. */
+  private detachFailureHook(
+    context: HookFailureContext,
+    owner: Uint8Array | null,
+    transfer: string
+  ): void {
+    const hook = this.hooks.onFailure
+    if (hook === undefined || this.responds('onFailure')) return
+    this.detached.start<HookFailureContext>({
+      hook: 'onFailure',
+      callback: hook,
+      context,
+      outcome: context.outcome,
+      turn: null,
+      pin: null,
+      fields: {
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
+        transfer,
+        phase: context.phase
+      }
+    })
+  }
+
   private setManagedLinkNames(records: readonly { name: string }[]): void {
     this.managedLinkNamesSnapshot = new Set([
       ...this.linkNames,
@@ -791,16 +984,47 @@ export class Server extends EventEmitter {
     this.setManagedLinkNames(await this.links.list())
   }
 
+  /**
+   * What `onFailure` is told about a failed link request: the target when it was
+   * resolved (never made up when it was not), a path only for a failed `afterLink`
+   * hook, and the primary failure's code and phase.
+   */
+  private linkFailureContext(
+    request: LinkRequestRecord,
+    state: LinkRequestState,
+    error: unknown,
+    code: ErrorCode
+  ): HookFailureContext {
+    const hookFailed = state.hookError !== null && state.failed !== null ? state.failed : null
+    const phase: HookFailurePhase = hookFailed === null ? 'link' : 'afterLink'
+    return Object.freeze({
+      operation: 'link' as const,
+      artifact: state.artifact,
+      path: hookFailed === null ? null : hookFailed.link.path,
+      phase,
+      resumed: false,
+      alreadyCommitted: state.artifact !== null,
+      error: callbackError(
+        state.hookError !== null && hookFailed !== null ? state.hookError : error
+      ),
+      request: Object.freeze({ name: request.name, target: request.target }),
+      ...(hookFailed === null ? {} : { link: hookFailed.link }),
+      outcome: failedOutcome(code, phase)
+    })
+  }
+
   private async receiveLink(
     socket: DirectDhtSocket,
     reader: DirectWireReader,
     owner: Uint8Array,
-    request: LinkRequestRecord
+    request: LinkRequestRecord,
+    scope: OperationScope
   ): Promise<void> {
     let emitted = false
     let resultWriteStarted = false
     // Held in an object because closures set it.
     const state: LinkRequestState = {
+      artifact: null,
       durable: null,
       failed: null,
       hookError: null,
@@ -844,17 +1068,22 @@ export class Server extends EventEmitter {
       const published = await withNameLease(
         this.layout!.root,
         `link:${request.name.toLowerCase()}`,
-        () => this.publishLink(owner, request, state)
+        () => this.publishLink(owner, request, state, scope)
       )
       resultWriteStarted = true
+      // A response hook's data was read and checked above whatever the client asked; the
+      // request decides only whether it is sent back.
+      const hookResult = request.hookResult === true ? published.hookResult : undefined
       await writeLinkResult(
         socket,
-        published.hookResult === undefined
+        hookResult === undefined
           ? { v: 1, status: published.status }
-          : { v: 1, status: published.status, hookResult: published.hookResult },
+          : { v: 1, status: published.status, hookResult },
         { signal: this.signal, timeout: this.idleTimeout }
       )
       emitTerminal(published.status === 'LINKED' ? 'linked' : 'unchanged')
+      // The answer was attempted and the link is final: a detached `afterLink` may start.
+      scope.settle(SUCCEEDED)
     } catch (error) {
       let reason =
         error instanceof SwarmDeployError &&
@@ -869,13 +1098,27 @@ export class Server extends EventEmitter {
         reason === ERRORS.LINK_NOT_ALLOWED ||
         reason === ERRORS.LINK_TARGET_NOT_FOUND ||
         reason === ERRORS.LINK_CONFLICT
+      // The failed-operation hook sees every failure of the request itself, including ones
+      // before any link exists. A failure after the answer began is delivery, not the
+      // operation's failure, so it has no hook call.
+      const failure = resultWriteStarted
+        ? null
+        : this.linkFailureContext(request, state, error, reason)
+      const transfer =
+        state.artifact === null ? 'none' : fingerprint(b4a.from(state.artifact.transferId, 'hex'))
+      // Declared `response`, the hook is awaited before the answer and may add data to it. It
+      // can neither replace the code being reported nor fail the request a second time.
+      const receipt =
+        failure === null ? undefined : await this.awaitFailureHook(failure, owner, transfer)
       let answered = false
       if (!resultWriteStarted) {
         resultWriteStarted = true
         try {
           await writeLinkResult(
             socket,
-            { v: 1, status: 'FAILED', code: reason },
+            receipt !== undefined && request.hookResult === true
+              ? { v: 1, status: 'FAILED', code: reason, hookResult: receipt }
+              : { v: 1, status: 'FAILED', code: reason },
             { timeout: this.idleTimeout }
           )
           answered = true
@@ -904,24 +1147,18 @@ export class Server extends EventEmitter {
           socket.destroy()
         } catch {}
       }
-      // The client has been answered and the link is restored or final, with no lease held;
-      // onFailure only observes. It runs for the hook's own failure even when a failed
-      // rollback is what the client was told.
-      if (state.hookError !== null && state.failed !== null) {
-        await this.runFailureHook(
-          Object.freeze({
-            artifact: state.failed.artifact,
-            path: state.failed.link.path,
-            phase: 'afterLink' as const,
-            resumed: false,
-            alreadyCommitted: true,
-            error: callbackError(state.hookError),
-            link: state.failed.link
-          }),
-          owner,
-          fingerprint(b4a.from(state.failed.artifact.transferId, 'hex'))
-        )
-      }
+      // The client has been answered and the link is restored or final, with no lease held. A
+      // detached onFailure starts now and nothing waits for it; it runs for the hook's own
+      // failure even when a failed rollback is what the client was told.
+      if (failure !== null) this.detachFailureHook(failure, owner, transfer)
+      // A detached `afterLink` registered after the link was decided still stands: it learns
+      // the request ended in failure only when a later awaited step failed it, and a failed
+      // answer write after a final link is delivery, not outcome.
+      scope.settle(
+        state.durable !== null && failure === null
+          ? SUCCEEDED
+          : failedOutcome(reason, state.failed !== null ? 'afterLink' : 'link')
+      )
     }
   }
 
@@ -935,15 +1172,23 @@ export class Server extends EventEmitter {
    * `LINK_FAILED` and leaves the journal for the next request or start-up. A hook
    * that succeeded is final before the answer is written, so a failed write
    * never undoes it.
+   *
+   * That is the `response` hook. A `detached` `afterLink` hook (the default) is
+   * not awaited and cannot fail the request, so nothing is journaled and there is
+   * nothing to restore: the decision is final and the hook is handed to the
+   * detached queue, where it starts after the answer was attempted. The
+   * request's `hookFailure` policy has no effect without a response hook.
    */
   private async publishLink(
     owner: Uint8Array,
     request: LinkRequestRecord,
-    state: LinkRequestState
+    state: LinkRequestState,
+    scope: OperationScope
   ): Promise<{ status: HookLinkStatus; hookResult: HookResult | undefined }> {
     // A request that waited for the lease may find the server closing; it changes nothing then.
     throwIfAborted(this.signal)
     const open: { transaction: ManualLinkTransaction | null } = { transaction: null }
+    const respond = this.responds('afterLink')
     try {
       const decided = await withRootLease(this.layout!.root, async () => {
         const records = await this.commits!.list()
@@ -951,6 +1196,7 @@ export class Server extends EventEmitter {
           (record) => record.name === request.target && !isReservedHistoryName(record.name)
         )
         if (!target) throw fail(ERRORS.LINK_TARGET_NOT_FOUND, 'Manual link target was not found')
+        state.artifact = this.recordArtifact(target)
         const artifacts = new Set(records.map((record) => record.name))
         if (artifacts.has(request.name)) {
           throw fail(ERRORS.LINK_CONFLICT, 'Manual link name conflicts with an artifact')
@@ -964,8 +1210,8 @@ export class Server extends EventEmitter {
         }
         const options = { managedArtifactNames: artifacts, automaticLinkNames: this.linkNames }
         let status: HookLinkStatus
-        if (request.hookFailure !== 'keep' && this.hooks.afterLink !== undefined) {
-          // A request with no hook has nothing to fail, so only a hooked request is journaled.
+        if (request.hookFailure !== 'keep' && respond) {
+          // Only a request whose hook is awaited can fail on it, so only that is journaled.
           const begun = await this.links.beginManual(link, options)
           open.transaction = begun.transaction
           status = begun.status
@@ -991,17 +1237,18 @@ export class Server extends EventEmitter {
       let hookResult: HookResult | undefined
       if (decided.pending !== null) {
         const pending = decided.pending
-        try {
-          ;[hookResult] = await this.runLinkHooks(
-            [pending],
-            owner,
-            (item) => {
+        if (respond) {
+          try {
+            ;[hookResult] = await this.runLinkHooks([pending], owner, (item) => {
               state.failed = item
-            },
-            request.hookResult === true
-          )
-        } finally {
-          pending.turn.release()
+            })
+          } finally {
+            pending.turn.release()
+          }
+        } else {
+          // Registered here, in decision order and before the answer, but it starts only once
+          // the answer was attempted. It cannot undo the decision.
+          this.detachLink(pending, scope, owner)
         }
       }
       if (open.transaction !== null) {
@@ -1118,26 +1365,6 @@ export class Server extends EventEmitter {
     return outcome.value
   }
 
-  /** Runs onFailure once; its own failure is logged and never replaces the original. */
-  private async runFailureHook(
-    context: HookFailureContext,
-    owner: Uint8Array | null,
-    transfer: string
-  ): Promise<void> {
-    const hook = this.hooks.onFailure
-    if (hook === undefined) return
-    try {
-      await invokeHook(hook, context, this.signal)
-    } catch {
-      this.logger.warn('Failure hook failed', {
-        publicKeyId: owner ? fingerprint(owner) : 'invalid',
-        transfer,
-        phase: context.phase,
-        reason: ERRORS.HOOK_FAILED
-      })
-    }
-  }
-
   private async receive(socket: DirectDhtSocket): Promise<void> {
     const owner = socket.remotePublicKey
     if (this.closed || !this.allowed(owner) || !this.sessions || !this.commits) {
@@ -1184,7 +1411,13 @@ export class Server extends EventEmitter {
     let hooksFinished = false
     let finalStarted = false
     let failureReported = false
+    // Whether the offer asked for hook data. It decides only what the answer carries.
+    let receiptRequested = false
+    // The code the upload failed with, for detached hooks that outlive its awaited steps.
+    let failedWith: ErrorCode = ERRORS.PROTOCOL_INVALID
     let guardedTransfer: string | null = null
+    // Settled once, after the answer was attempted; detached hooks of this operation wait for it.
+    const scope = new OperationScope()
     /**
      * Hands the transfer back before this connection's last await. Clearing
      * `guardedTransfer` makes the `finally` a no-op, so a late release can
@@ -1195,27 +1428,28 @@ export class Server extends EventEmitter {
       this.activeTransfers.delete(guardedTransfer)
       guardedTransfer = null
     }
-    // Runs onFailure at most once per connection, after the client was answered.
-    const reportFailure = async (error: unknown): Promise<void> => {
-      if (failureReported || !event || !artifact) return
+    // What the failed-operation hook is told, at most once per connection: only when the offer
+    // was decoded (so there is an artifact to describe) and no awaited step has finished the
+    // operation. The path is whatever exists at this phase and is never made up, so it is
+    // `null` for every failure before a staging or committed path exists.
+    const failureContext = (error: unknown, code: ErrorCode): HookFailureContext | null => {
+      if (failureReported || hooksFinished || !event || !artifact) return null
       failureReported = true
-      // The guard serializes the commit lifecycle, and this connection has
-      // finished its own. `onFailure` only observes, so holding the transfer
-      // across a slow callback would reject the client's legitimate retry.
+      // The guard serializes the commit lifecycle, and this connection has finished its
+      // own. `onFailure` only observes (or answers), so holding the transfer across a slow
+      // callback would reject the client's legitimate retry.
       releaseTransfer()
-      await this.runFailureHook(
-        Object.freeze({
-          artifact,
-          path: hookPath,
-          phase,
-          resumed,
-          alreadyCommitted,
-          error,
-          ...(phase === 'afterLink' && failedLink !== null ? { link: failedLink } : {})
-        }),
-        owner,
-        event.transfer
-      )
+      return Object.freeze({
+        operation: 'upload' as const,
+        artifact,
+        path: hookPath,
+        phase,
+        resumed,
+        alreadyCommitted,
+        error,
+        ...(phase === 'afterLink' && failedLink !== null ? { link: failedLink } : {}),
+        outcome: failedOutcome(code, phase)
+      })
     }
     // Attributes an `afterLink` failure to the link whose hook was starting.
     const beginLinkHook = (item: PendingLinkHook): void => {
@@ -1224,17 +1458,28 @@ export class Server extends EventEmitter {
       hookPath = item.link.path
     }
     const rejectEarly = async (reason: ErrorCode, message: string): Promise<void> => {
-      await this.rejectOffer(socket, event!, owner, reason)
+      const failed = failureContext(fail(reason, message), reason)
+      // A `response` onFailure is awaited before the rejection and may add data to it.
+      const receipt =
+        failed === null ? undefined : await this.awaitFailureHook(failed, owner, event!.transfer)
+      await this.rejectOffer(
+        socket,
+        event!,
+        owner,
+        reason,
+        receiptRequested && receipt !== undefined ? { onFailure: receipt } : undefined
+      )
       sentAdmission = true
-      await reportFailure(fail(reason, message))
+      if (failed !== null) this.detachFailureHook(failed, owner, event!.transfer)
     }
     try {
       const first = await reader.control(decodeFirstControlRecord, this.signal, this.idleTimeout)
       if ('kind' in first && first.kind === 'link') {
-        await this.receiveLink(socket, reader, owner, first)
+        await this.receiveLink(socket, reader, owner, first, scope)
         return
       }
       const metadata = first as AnyMetadataRecord
+      receiptRequested = metadata.hookResult === true
       // The decoded record is shape-validated but not yet authenticated; the
       // artifact context carries only its non-secret descriptive fields.
       event = this.transfer(metadata)
@@ -1269,6 +1514,73 @@ export class Server extends EventEmitter {
       const stagingHookPath = isTreeMetadata(metadata)
         ? path.join(this.layout!.staging, `${metadata.transferId}.tree`)
         : path.join(this.layout!.staging, `${metadata.transferId}.part`)
+      /**
+       * The hooks that follow a durable artifact, shared by a fresh commit and an
+       * already-committed retry. Detached hooks are registered first, as soon as there is
+       * something durable, so a later awaited failure still reaches them (with a failed
+       * outcome); they do not start until the answer was attempted. `response` hooks are
+       * awaited in order, `afterCommit` then each automatic link's `afterLink`, and their
+       * data is read, checked and bounded as one receipt whatever the offer asked for.
+       */
+      const runPostCommit = async (
+        alreadyDurable: boolean
+      ): Promise<UploadHookResult | undefined> => {
+        const commitContext = Object.freeze({
+          artifact: hookArtifact,
+          path: path.join(this.layout!.root, metadata.name),
+          resumed: alreadyDurable ? false : resumed,
+          alreadyCommitted: alreadyDurable
+        })
+        if (this.detaches('afterCommit')) this.detachCommit(commitContext, scope, owner)
+        const linkHooks = await this.reconcileAfterCommit(hookArtifact)
+        // The places in the link hook lines this call still owns: all of them for a response
+        // hook, none once each has been handed to its detached job.
+        let owned = linkHooks
+        if (this.detaches('afterLink')) {
+          owned = []
+          for (const item of linkHooks) this.detachLink(item, scope, owner)
+        }
+        let commitResult: HookResult | undefined
+        let linkResults: Array<HookResult | undefined> = []
+        try {
+          phase = 'afterCommit'
+          if (!alreadyDurable && this.defersPostCommitRetention()) {
+            this.owePostCommitRetention(metadata.transferId)
+          }
+          if (this.responds('afterCommit')) {
+            commitResult = hookResultOf(
+              await this.runHook<AfterCommitContext>(
+                'afterCommit',
+                this.hooks.afterCommit,
+                Object.freeze({ ...commitContext, outcome: SUCCEEDED })
+              ),
+              'afterCommit'
+            )
+          }
+          if (this.responds('afterLink')) {
+            linkResults = await this.runLinkHooks(owned, owner, beginLinkHook)
+          }
+          const links: UploadLinkResult[] = []
+          owned.forEach((item, index) => {
+            const result = linkResults[index]
+            if (result !== undefined) {
+              links.push({ name: item.link.name, target: item.link.target, result })
+            }
+          })
+          if (commitResult === undefined && links.length === 0) return undefined
+          try {
+            return copyUploadHookResult({
+              ...(commitResult === undefined ? {} : { afterCommit: commitResult }),
+              ...(links.length === 0 ? {} : { afterLink: links })
+            })
+          } catch (cause) {
+            // Too large together, though each part was fine: the response hooks' answer is unusable.
+            throw hookError(links.length === 0 ? 'afterCommit' : 'afterLink', cause)
+          }
+        } finally {
+          releaseLinkHooks(owned)
+        }
+      }
       const finish = async (verified: TarSession): Promise<void> => {
         phase = 'beforeCommit'
         hookPath = stagingHookPath
@@ -1299,32 +1611,17 @@ export class Server extends EventEmitter {
         commitSucceeded = true
         hookPath = path.join(this.layout!.root, metadata.name)
         await this.retireQuietly(verified.transferId, owner)
-        const linkHooks = await this.reconcileAfterCommit(hookArtifact)
-        try {
-          phase = 'afterCommit'
-          if (this.defersPostCommitRetention()) {
-            this.owePostCommitRetention(metadata.transferId)
-          }
-          await this.runHook<AfterCommitContext>(
-            'afterCommit',
-            this.hooks.afterCommit,
-            Object.freeze({
-              artifact: hookArtifact,
-              path: hookPath,
-              resumed,
-              alreadyCommitted: false
-            })
-          )
-          await this.runLinkHooks(linkHooks, owner, beginLinkHook)
-        } finally {
-          releaseLinkHooks(linkHooks)
-        }
+        const receipt = await runPostCommit(false)
         hooksFinished = true
         await this.settleDeferredRetention(metadata.transferId, owner)
         finalStarted = true
+        // The data goes out only when the offer asked for it. Awaiting a response hook never
+        // depended on that.
         await writeFinal(
           socket,
-          { v: 1, status: 'COMMITTED' },
+          receiptRequested && receipt !== undefined
+            ? { v: 1, status: 'COMMITTED', hookResult: receipt }
+            : { v: 1, status: 'COMMITTED' },
           { signal: this.signal, timeout: this.idleTimeout }
         )
       }
@@ -1353,23 +1650,7 @@ export class Server extends EventEmitter {
       if (inspected.status === 'ALREADY_COMMITTED') {
         alreadyCommitted = true
         hookPath = path.join(this.layout!.root, metadata.name)
-        const linkHooks = await this.reconcileAfterCommit(hookArtifact)
-        try {
-          phase = 'afterCommit'
-          await this.runHook<AfterCommitContext>(
-            'afterCommit',
-            this.hooks.afterCommit,
-            Object.freeze({
-              artifact: hookArtifact,
-              path: hookPath,
-              resumed: false,
-              alreadyCommitted: true
-            })
-          )
-          await this.runLinkHooks(linkHooks, owner, beginLinkHook)
-        } finally {
-          releaseLinkHooks(linkHooks)
-        }
+        const receipt = await runPostCommit(true)
         hooksFinished = true
         // Only a transfer this process committed can still owe a deferred
         // pass; an ordinary duplicate offer never starts one.
@@ -1378,7 +1659,9 @@ export class Server extends EventEmitter {
         }
         await writeAdmission(
           socket,
-          { v: 1, status: 'ALREADY_COMMITTED' },
+          receiptRequested && receipt !== undefined
+            ? { v: 1, status: 'ALREADY_COMMITTED', hookResult: receipt }
+            : { v: 1, status: 'ALREADY_COMMITTED' },
           { signal: this.signal, timeout: this.idleTimeout }
         )
         sentAdmission = true
@@ -1523,19 +1806,32 @@ export class Server extends EventEmitter {
           reason
         })
       }
+      failedWith = reason
+      // The failed-operation hook sees the primary failure. Declared `response`, it is awaited
+      // before the answer and may add data to it; it can change neither the code reported
+      // nor whether the operation failed, and it is never called for its own failure.
+      const failed = failureContext(callbackError(error), reason)
+      const receipt =
+        failed === null ? undefined : await this.awaitFailureHook(failed, owner, event!.transfer)
+      const failureReceipt: UploadHookResult | undefined =
+        receiptRequested && receipt !== undefined ? { onFailure: receipt } : undefined
       let answered = false
       try {
         if (!sentAdmission) {
           await writeAdmission(
             socket,
-            { v: 1, status: 'REJECTED', code: reason },
+            failureReceipt === undefined
+              ? { v: 1, status: 'REJECTED', code: reason }
+              : { v: 1, status: 'REJECTED', code: reason, hookResult: failureReceipt },
             { timeout: this.idleTimeout }
           )
           answered = true
         } else if (!finalStarted) {
           await writeFinal(
             socket,
-            { v: 1, status: 'FAILED', code: reason },
+            failureReceipt === undefined
+              ? { v: 1, status: 'FAILED', code: reason }
+              : { v: 1, status: 'FAILED', code: reason, hookResult: failureReceipt },
             { timeout: this.idleTimeout }
           )
           answered = true
@@ -1549,11 +1845,16 @@ export class Server extends EventEmitter {
         } catch {}
       }
       this.activeUploads.delete(socket)
-      if (!hooksFinished) await reportFailure(callbackError(error))
+      // A detached onFailure starts now, after the answer, and nothing waits for it.
+      if (failed !== null) this.detachFailureHook(failed, owner, event!.transfer)
     } finally {
       this.activeUploads.delete(socket)
       releaseTransfer()
       reader.closeReader()
+      // The answer was attempted. Detached `afterCommit` and `afterLink` calls of this upload
+      // start now and are told how it ended: a failure of a later awaited step is `failed`,
+      // while a failed answer write after every awaited step finished is delivery, not outcome.
+      scope.settle(hooksFinished ? SUCCEEDED : failedOutcome(failedWith, phase))
     }
   }
 
@@ -1754,6 +2055,10 @@ export class Server extends EventEmitter {
     await this.transport?.close().catch(() => {})
     this.transport = null
     await Promise.allSettled([...this.receives])
+    // The signal is already aborted, so queued detached calls are dropped and a running one
+    // is abandoned (its callback keeps running detached); this waits for neither hook code
+    // nor anything that could hang.
+    await this.detached.drain()
     this.active.clear()
     this.activeTransfers.clear()
     this.pendingAfterCommit.clear()

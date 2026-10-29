@@ -12,8 +12,12 @@
 //     --hooks examples/link-publisher/hooks.mjs
 //
 // `afterLink` runs once the link is durable: after an upload moved an automatic link
-// (`latest` above), or after an explicit `swarm-deploy link app-1.2.3.tar.gz stable`. The
-// client is told nothing until it returns, and a rejection reaches the client as HOOK_FAILED.
+// (`latest` above), or after an explicit `swarm-deploy link app-1.2.3.tar.gz stable`. This
+// publishing step is a gate, so it is declared `response` below: the client is told nothing
+// until it returns, and a rejection reaches the client as HOOK_FAILED (an explicit link is
+// then rolled back unless the request asked to keep it). Without that declaration the hook
+// would be `detached`: the client would be answered first and a failure here would only be
+// logged, so it could never fail the request.
 //
 // Time budget. The server has no hook deadline, and a client waits for its answer for at
 // most its idle timeout: 60 s by default, 5 minutes at most (`--idle-timeout <ms>` on
@@ -43,6 +47,10 @@ const PUBLISHER =
 const PUBLISH_TIMEOUT = 20_000
 // How long after SIGTERM a publisher may keep running before it is sent SIGKILL.
 const KILL_GRACE = 5_000
+
+// Read as data when the module loads, never guessed from the callback. `--hook-mode
+// afterLink=detached` on the command line overrides it.
+export const hookModes = { afterLink: 'response' }
 
 // May run more than once for the same link and artifact (a retry after HOOK_FAILED, or a
 // repeated link request), so the publisher must be idempotent on `artifact.transferId`.

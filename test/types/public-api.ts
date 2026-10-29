@@ -16,6 +16,9 @@ import {
   type ClientLinkStatus,
   type ClientEventMap,
   type ClientOptions,
+  type ClientUploadOptions,
+  type ErrorCode,
+  type FailedOutcome,
   type HookArtifact,
   type HookFailureContext,
   type HookFailurePhase,
@@ -23,8 +26,11 @@ import {
   type HookLinkMode,
   type HookLinkStatus,
   type HookLinkTrigger,
+  type HookModes,
+  type HookResponse,
   type HookResult,
   type HookResultValue,
+  type OperationOutcome,
   type RetentionEvent,
   type ReleaseCoordinates,
   type ServerHooks,
@@ -34,6 +40,8 @@ import {
   type StorageAdapter,
   type SymlinkCapableStorage,
   type SymlinkRule,
+  type UploadHookResult,
+  type UploadLinkResult,
   type UploadResult,
   type UploadTarget,
   type VersionGranularity
@@ -181,25 +189,33 @@ const hooks = {
     const path: string = context.path
     const resumed: boolean = context.resumed
     const already: boolean = context.alreadyCommitted
-    void [path, resumed, already]
+    const outcome: OperationOutcome = context.outcome
+    void [path, resumed, already, outcome]
   },
   afterLink(context: AfterLinkContext) {
     readArtifact(context.artifact)
     readLink(context.link)
     const status: HookLinkStatus = context.status
     const trigger: HookLinkTrigger = context.trigger
-    void [status, trigger]
+    const outcome: OperationOutcome = context.outcome
+    void [status, trigger, outcome]
     return Promise.resolve()
   },
   onFailure(context: HookFailureContext) {
-    readArtifact(context.artifact)
+    // Null only for a link request that failed before its target was resolved.
+    if (context.artifact !== null) readArtifact(context.artifact)
+    const operation: 'upload' | 'link' = context.operation
     const phase: HookFailurePhase = context.phase
     const path: string | null = context.path
     const resumed: boolean = context.resumed
     const already: boolean = context.alreadyCommitted
     const error: unknown = context.error
     const link: HookLink | undefined = context.link
-    void [phase, path, resumed, already, error, link]
+    const request: { readonly name: string; readonly target: string } | undefined = context.request
+    const outcome: FailedOutcome = context.outcome
+    const failed: 'failed' = context.outcome.status
+    const code: ErrorCode = context.outcome.code
+    void [operation, phase, path, resumed, already, error, link, request, outcome, failed, code]
     return Promise.resolve()
   }
 } satisfies ServerHooks
@@ -238,7 +254,8 @@ const phases: HookFailurePhase[] = [
   'beforeCommit',
   'commit',
   'afterCommit',
-  'afterLink'
+  'afterLink',
+  'link'
 ]
 
 void client
@@ -324,7 +341,7 @@ const badHookSignatures = {
   afterLink(context: HookFailureContext) {
     void context
   },
-  // @ts-expect-error onFailure must return void or a promise of void.
+  // @ts-expect-error onFailure may return only void or a plain JSON object, not a string.
   onFailure(context: HookFailureContext) {
     return context.phase
   }
@@ -425,9 +442,89 @@ void [resultHooks, syncResultHook, voidHook, asyncVoidHook, maybeResultHook]
 const primitiveResultHook: ServerHooks = { afterLink: () => 'ok' }
 // @ts-expect-error A hook result is an object, not an array.
 const arrayResultHook: ServerHooks = { afterLink: () => ['ok'] }
-// @ts-expect-error Only afterLink may return data.
+// The post-operation hooks may all return data; whether it is read depends on their declaration.
 const commitResultHook: ServerHooks = { afterCommit: () => ({ id: 1 }) }
-void [primitiveResultHook, arrayResultHook, commitResultHook]
+const failureResultHook: ServerHooks = { onFailure: async () => ({ ticket: 'T-1' }) }
+// @ts-expect-error beforeCommit is a gate and returns nothing.
+const gateResultHook: ServerHooks = { beforeCommit: () => ({ id: 1 }) }
+// @ts-expect-error A hook result is an object, not a primitive.
+const commitPrimitiveHook: ServerHooks = { afterCommit: () => 'ok' }
+void [
+  primitiveResultHook,
+  arrayResultHook,
+  commitResultHook,
+  failureResultHook,
+  gateResultHook,
+  commitPrimitiveHook
+]
+
+// Which post-operation hooks are awaited is a declaration, never inferred from the callback.
+const responseMode: HookResponse = 'response'
+const detachedMode: HookResponse = 'detached'
+const declared: HookModes = {
+  afterCommit: 'response',
+  afterLink: 'detached',
+  onFailure: responseMode
+}
+const emptyDeclaration: HookModes = {}
+const declaredServerOptions = {
+  seed: serverSeed,
+  storageDir: '/srv/swarm-deploy',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096,
+  hooks,
+  hookModes: declared
+} satisfies ServerOptions
+const noDeclarationOptions = {
+  seed: serverSeed,
+  storageDir: '/srv/swarm-deploy',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096,
+  hookModes: null
+} satisfies ServerOptions
+void [detachedMode, emptyDeclaration, declaredServerOptions, noDeclarationOptions]
+// @ts-expect-error A declaration is response or detached.
+const badMode: HookResponse = 'await'
+// @ts-expect-error beforeCommit is a gate and takes no declaration.
+const gateDeclaration: HookModes = { beforeCommit: 'response' }
+// @ts-expect-error The declaration is a word, not a flag.
+const flagDeclaration: HookModes = { afterLink: true }
+void [badMode, gateDeclaration, flagDeclaration]
+
+// What a hook is told about how the operation ended.
+const succeeded: OperationOutcome = { status: 'succeeded' }
+const failedOutcome: OperationOutcome = {
+  status: 'failed',
+  code: 'HOOK_FAILED',
+  phase: 'afterLink'
+}
+const narrowed: ErrorCode | null = failedOutcome.status === 'failed' ? failedOutcome.code : null
+void [succeeded, narrowed]
+// @ts-expect-error A succeeded outcome carries no failure code.
+const succeededWithCode: OperationOutcome = { status: 'succeeded', code: 'HOOK_FAILED' }
+// @ts-expect-error A failed outcome names its code and phase.
+const incompleteFailure: OperationOutcome = { status: 'failed' }
+void [succeededWithCode, incompleteFailure]
+
+// Asking an upload for its hooks' data, and what comes back.
+const uploadOptions: ClientUploadOptions = { hookResult: true }
+const askedUpload: Promise<UploadResult> = client.upload('./app.tar.gz', uploadOptions)
+const plainUpload: Promise<UploadResult> = client.upload('./app.tar.gz')
+const linkEntry: UploadLinkResult = { name: 'latest', target: 'app-1.tar.gz', result: { id: 1 } }
+const uploadData: UploadHookResult = { afterCommit: { id: 'dep-1' }, afterLink: [linkEntry] }
+const failedUploadData: UploadHookResult = { onFailure: { ticket: 'T-1' } }
+const reportedUpload: UploadResult = { ...directoryResult, hookResult: uploadData }
+const afterCommitData: HookResult | undefined = reportedUpload.hookResult?.afterCommit
+void [askedUpload, plainUpload, failedUploadData, afterCommitData]
+// @ts-expect-error The upload options are hookResult only.
+const unknownUploadOption: ClientUploadOptions = { hookFailure: 'keep' }
+// @ts-expect-error hookResult is a boolean.
+const stringUploadOption: ClientUploadOptions = { hookResult: 'yes' }
+// @ts-expect-error The upload data has only the three known hooks.
+const unknownUploadKey: UploadHookResult = { beforeCommit: {} }
+void [unknownUploadOption, stringUploadOption, unknownUploadKey]
 // @ts-expect-error A Date is not a JSON value.
 const dateResult: HookResult = { when: new Date() }
 // @ts-expect-error A function is not a JSON value.

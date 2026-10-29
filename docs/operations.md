@@ -332,10 +332,39 @@ complete pre-upgrade storage backup (including visible links and
 `swarm-deploy link` requires an upgraded server; v0.2.0 does not recognize
 link control requests.
 
+### Detached post-operation hooks (0.6.0)
+
+**Behavior change.** `afterCommit`, `afterLink` and `onFailure` are now `detached`
+unless declared `response` (`ServerOptions.hookModes`, a `hookModes` module
+export, or `swarm-deploy server --hooks <module> --hook-mode <hook>=response`).
+Until 0.5.x every one of them was awaited and a failure failed the upload or the
+link request. A detached hook runs after the answer and nothing waits for it, so
+**a deployment or publishing step that must succeed has to be declared
+`response`** or its failures stop failing uploads and link requests; the same
+holds for a hook module you do not control. The migration steps are in
+[Migrating to 0.6.0](hooks.md#migrating-to-060).
+
+- **What the server keeps.** Detached calls live in the server process only: at
+  most 1024 are queued or running, one at a time per link name and per artifact
+  name, in order. There is no queue on disk, no retry and no exactly-once promise.
+  Closing the server drops the queued ones and abandons a running one, so work
+  that must not be lost is a `response` hook. Failures are logged as
+  `Detached hook failed`, `Detached hook skipped` (server closing) and
+  `Detached hook dropped` (over the bound), each with the hook name and, for a
+  link or artifact, its name, and never callback text.
+- **Retention.** While a detached call is queued or running its artifact is pinned
+  against every retention pass; the pin is in memory and is gone after a restart.
+- **Wire and clients.** Uploads and link requests that do not ask for hook data
+  are byte for byte what they were, so no client needs to change. An upload that
+  asks (`Client.upload(path, { hookResult: true })`, `swarm-deploy upload --json`)
+  carries one new optional field in its offer, which a server older than 0.6.0
+  rejects: upgrade servers before clients that ask. The field is not part of the
+  transfer identity.
+
 ### Link hooks and compatibility
 
 `afterLink` is optional and adds no wire format, persisted state, or dependency.
-A failed hook reaches every client as the existing stable `HOOK_FAILED` code in
+A failed `response` hook reaches every client as the existing stable `HOOK_FAILED` code in
 the ordinary `FAILED` link result (or upload final or admission record), which
 older clients already decode, so clients need no upgrade. Only the CLI
 differs: `swarm-deploy link` prints `HOOK_FAILED` from this version on, and an
@@ -358,8 +387,8 @@ dependency is added.
 
 ### Link hook failure policy
 
-**Behavior change (0.6.0).** When an explicit link request's `afterLink` hook
-fails, the server now restores the previous local symlink and its ownership
+**Behavior change (0.6.0).** When an explicit link request's `response`
+`afterLink` hook fails, the server now restores the previous local symlink and its ownership
 record (or removes a link the request created) before answering `HOOK_FAILED`;
 until 0.5.x the new link stayed. A request opts out with `hookFailure: 'keep'`
 (`swarm-deploy link --hook-failure keep`). The hook is still awaited in both

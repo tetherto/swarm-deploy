@@ -12,6 +12,7 @@ import {
   SwarmDeployError,
   keyPairFromSeed,
   type AfterLinkContext,
+  type HookModes,
   type HookResult,
   type ServerHooks,
   type ServerOptions
@@ -43,9 +44,13 @@ function settled(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 300))
 }
 
+/**
+ * Post-operation hooks are detached by default. These tests are about an awaited `afterLink`
+ * (it gates the answer, it can fail the request), so it is declared `response` here.
+ */
 async function setup(
   t: Assert,
-  options: Pick<ServerOptions, 'symlinks'> & { hooks: ServerHooks }
+  options: Pick<ServerOptions, 'symlinks'> & { hooks: ServerHooks; hookModes?: HookModes }
 ): Promise<{
   server: Server
   client: Client
@@ -64,7 +69,8 @@ async function setup(
     maxStagingBytes: 4096,
     minFreeBytes: 0,
     dht: testnet.createNode(),
-    ...options
+    ...options,
+    hookModes: options.hookModes ?? { afterLink: 'response' }
   })
   const client = new Client({
     seed: CLIENT_SEED,
@@ -471,11 +477,12 @@ test('the link-publisher example publishes each link change through a no-shell p
     return
   }
   const published = await createTempDir(t)
-  const hooks = await loadHooksModule(
+  const { hooks, modes } = await loadHooksModule(
     path.resolve(__dirname, '../../examples/link-publisher/hooks.mjs'),
     process.cwd()
   )
   t.alike(Object.keys(hooks), ['afterLink'])
+  t.alike(modes, { afterLink: 'response' }, 'the example declares its publishing step a gate')
   const previous = process.env.SWARM_DEPLOY_PUBLISH_DIR
   process.env.SWARM_DEPLOY_PUBLISH_DIR = published
   t.teardown(() => {
@@ -487,7 +494,8 @@ test('the link-publisher example publishes each link change through a no-shell p
       { selector: '/^app-\\d+\\.tar$/', name: 'latest' },
       { selector: '/^app-\\d+\\.tar$/' }
     ],
-    hooks
+    hooks,
+    hookModes: modes
   })
   const read = async (name: string): Promise<Record<string, unknown>> =>
     JSON.parse(await fs.promises.readFile(path.join(published, `${name}.json`), 'utf8'))

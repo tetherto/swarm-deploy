@@ -396,7 +396,7 @@ test('CLI link --json keeps failures as stderr diagnostics with no JSON on stdou
   t.ok(rejected.stderr.length > 0, 'an older server that cannot answer the opt-in is an error')
 })
 
-test('CLI --json belongs to link alone and is parsed as a strict flag', async (t) => {
+test('CLI --json belongs to link and upload alone and is parsed as a strict flag', async (t) => {
   const never = (): Promise<unknown> => Promise.reject(new Error('Link should not be attempted'))
   for (const args of [
     ['--json', '--json', 'release-1.2.3', 'current'],
@@ -415,7 +415,6 @@ test('CLI --json belongs to link alone and is parsed as a strict flag', async (t
   const key = b4a.toString(SERVER_KEY, 'hex')
   const env = { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') }
   for (const args of [
-    ['upload', '--server-key', key, '--json', 'artifact.txt'],
     ['server', '--json'],
     ['keygen', '--json', '--out', 'seed'],
     ['public-key', '--json'],
@@ -425,13 +424,124 @@ test('CLI --json belongs to link alone and is parsed as a strict flag', async (t
     t.is(await main(args, env, { stderr: stderr.stream }), 2, args[0])
     t.ok(stderr.text().includes('Unknown option'), `${args[0]} does not accept --json`)
   }
+  for (const args of [
+    ['upload', '--server-key', key, '--json', '--json', 'artifact.txt'],
+    ['upload', '--server-key', key, '--json=true', 'artifact.txt'],
+    ['upload', '--server-key', key, '--json', 'true', 'extra.txt', 'artifact.txt']
+  ]) {
+    const stderr = output()
+    t.is(await main(args, env, { stderr: stderr.stream }), 2, args.join(' '))
+  }
 
   const [linkUsage, uploadUsage] = [
     USAGE.split('\n').find((line) => line.startsWith('  swarm-deploy link')),
     USAGE.split('\n').find((line) => line.startsWith('  swarm-deploy upload'))
   ]
   t.ok(linkUsage?.includes('[--json]'))
-  t.absent(uploadUsage?.includes('--json'))
+  t.ok(uploadUsage?.includes('[--json]'))
+})
+
+/** Runs `upload` with a fake client that records how it was called and answers as told. */
+async function runUpload(
+  args: string[],
+  answer: () => Promise<unknown>
+): Promise<{ code: number; stdout: string; stderr: string; calls: unknown[][] }> {
+  const calls: unknown[][] = []
+  class Client {
+    constructor(_options: ClientOptions) {}
+    upload(...received: unknown[]) {
+      calls.push(received)
+      return answer()
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const stdout = output()
+  const stderr = output()
+  const code = await main(
+    ['upload', '--server-key', b4a.toString(SERVER_KEY, 'hex'), ...args],
+    { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(CLIENT_SEED, 'hex') },
+    {
+      Client: Client as unknown as new (
+        options: ClientOptions
+      ) => import('../../dist/client.js').Client,
+      stdout: stdout.stream,
+      stderr: stderr.stream
+    }
+  )
+  return { code, stdout: stdout.text(), stderr: stderr.text(), calls }
+}
+
+test('CLI upload --json asks for the hooks data and prints one JSON object', async (t) => {
+  const data = {
+    afterCommit: { deploy: 'd1' },
+    afterLink: [{ name: 'latest', target: 'a', result: { id: 1 } }]
+  }
+  const withData = await runUpload(['--json', 'artifact.txt'], () =>
+    Promise.resolve({ status: 'COMMITTED', kind: 'file', name: 'artifact.txt', hookResult: data })
+  )
+  t.is(withData.code, 0)
+  t.alike(withData.calls, [['artifact.txt', { hookResult: true }]])
+  t.is(
+    withData.stdout,
+    '{"name":"artifact.txt","kind":"file","status":"COMMITTED","hookResult":{"afterCommit":{"deploy":"d1"},"afterLink":[{"name":"latest","target":"a","result":{"id":1}}]}}\n'
+  )
+  t.is(withData.stderr, '')
+
+  const without = await runUpload(['artifact.txt', '--json'], () =>
+    Promise.resolve({ status: 'ALREADY_COMMITTED', kind: 'directory', name: '0.18.1' })
+  )
+  t.is(without.code, 0)
+  t.is(
+    without.stdout,
+    '{"name":"0.18.1","kind":"directory","status":"ALREADY_COMMITTED"}\n',
+    'no field when no response hook returned data'
+  )
+
+  // Without --json the call and the output are exactly what they were.
+  const plain = await runUpload(['artifact.txt'], () =>
+    Promise.resolve({
+      status: 'COMMITTED',
+      kind: 'file',
+      name: 'artifact.txt',
+      hookResult: { ignored: 'without the flag' }
+    })
+  )
+  t.alike(plain.calls, [['artifact.txt']], 'a one-argument call: nothing is requested')
+  t.is(plain.stdout, 'artifact.txt file COMMITTED\n')
+})
+
+test('CLI --json prints the server onFailure data of a failed request next to the primary code', async (t) => {
+  const failure = (code: string, hookResult?: unknown): SwarmDeployError =>
+    Object.assign(new SwarmDeployError(code, 'raw server message sk-secret'), { hookResult })
+
+  const link = await runLink(['--json', 'release-1.2.3', 'current'], () =>
+    Promise.reject(failure(ERRORS.LINK_CONFLICT, { ticket: 'T-1' }))
+  )
+  t.is(link.code, 1)
+  t.is(
+    link.stdout,
+    '{"target":"release-1.2.3","name":"current","code":"LINK_CONFLICT","hookResult":{"ticket":"T-1"}}\n'
+  )
+  t.is(link.stderr, `${ERRORS.LINK_CONFLICT}\n`, 'the diagnostic and exit code are unchanged')
+
+  const upload = await runUpload(['--json', 'artifact.txt'], () =>
+    Promise.reject(failure(ERRORS.HOOK_FAILED, { onFailure: { ticket: 'T-2' } }))
+  )
+  t.is(upload.code, 1)
+  t.is(upload.stdout, '{"code":"HOOK_FAILED","hookResult":{"onFailure":{"ticket":"T-2"}}}\n')
+  t.absent((upload.stdout + upload.stderr + link.stdout).includes('sk-secret'))
+
+  // Nothing is printed without data, and nothing without --json.
+  const bare = await runUpload(['--json', 'artifact.txt'], () =>
+    Promise.reject(failure(ERRORS.HOOK_FAILED))
+  )
+  t.is(bare.stdout, '')
+  const quiet = await runLink(['release-1.2.3', 'current'], () =>
+    Promise.reject(failure(ERRORS.LINK_CONFLICT, { ticket: 'T-1' }))
+  )
+  t.is(quiet.stdout, '')
 })
 
 test('CLI link --hook-failure names the policy, independently of --json, and is strict', async (t) => {
@@ -1352,6 +1462,134 @@ test('CLI rejects a hooks module whose extension is not .js, .mjs, or .cjs', asy
   const esm = await runServerCli(root, ['--hooks', 'ok.mjs'], { cwd: root })
   t.is(esm.code, 0)
   t.alike(Object.keys(esm.options?.hooks || {}), ['onFailure'])
+})
+
+test('CLI reads a module hookModes declaration and --hook-mode overrides it per hook', async (t) => {
+  const root = await createTempDir(t)
+  const write = (name: string, source: string): Promise<void> =>
+    fs.promises.writeFile(path.join(root, name), source)
+  await write('plain.cjs', 'module.exports = { afterLink () {} }\n')
+  await write(
+    'declared.cjs',
+    `module.exports = {
+  afterCommit () {}, afterLink () {}, onFailure () {},
+  hookModes: { afterLink: 'response', onFailure: 'detached' }
+}\n`
+  )
+  await write(
+    'declared.mjs',
+    `export function afterLink () {}
+export const hookModes = { afterLink: 'response' }
+export default { onFailure () {}, hookModes: { afterLink: 'detached', onFailure: 'response' } }\n`
+  )
+  await write(
+    'compiled.cjs',
+    `Object.defineProperty(exports, '__esModule', { value: true })
+exports.default = { afterCommit () {}, hookModes: { afterCommit: 'response' } }\n`
+  )
+
+  const cases: Array<[string, string[], Record<string, string>]> = [
+    ['plain.cjs', [], {}],
+    ['plain.cjs', ['--hook-mode', 'afterLink=response'], { afterLink: 'response' }],
+    ['declared.cjs', [], { afterLink: 'response', onFailure: 'detached' }],
+    [
+      'declared.cjs',
+      ['--hook-mode', 'afterLink=detached', '--hook-mode', 'afterCommit=response'],
+      { afterCommit: 'response', afterLink: 'detached', onFailure: 'detached' }
+    ],
+    ['declared.mjs', [], { afterLink: 'response', onFailure: 'response' }],
+    ['compiled.cjs', [], { afterCommit: 'response' }]
+  ]
+  for (const [file, flags, expected] of cases) {
+    const result = await runServerCli(root, ['--hooks', file, ...flags], { cwd: root })
+    t.is(result.code, 0, `${file} ${flags.join(' ')}`)
+    t.is(result.stderr, '')
+    t.alike({ ...result.options?.hookModes }, expected, `${file} ${flags.join(' ')}`)
+    t.ok(Object.isFrozen(result.options?.hooks), 'the callbacks are unchanged by declarations')
+    t.absent('hookModes' in (result.options?.hooks ?? {}), 'a declaration is not a callback')
+  }
+
+  // No --hooks module means nothing to declare, and no option is passed at all.
+  const none = await runServerCli(root, [])
+  t.is(none.code, 0)
+  t.absent('hookModes' in (none.options as ServerOptions))
+})
+
+test('CLI rejects a malformed, repeated, or unmatched --hook-mode and a bad module declaration', async (t) => {
+  const root = await createTempDir(t)
+  const write = (name: string, source: string): Promise<void> =>
+    fs.promises.writeFile(path.join(root, name), source)
+  await write('plain.cjs', 'module.exports = { afterLink () {} }\n')
+  const secret = 'hook-mode-secret-text'
+  const bad: Record<string, string> = {
+    'flag-true.cjs': `module.exports = { afterLink () {}, hookModes: { afterLink: true } }\n`,
+    'unknown-key.cjs': `module.exports = { afterLink () {}, hookModes: { afterLinks: 'response' } }\n`,
+    'gate.cjs': `module.exports = { beforeCommit () {}, hookModes: { beforeCommit: 'response' } }\n`,
+    'word.cjs': `module.exports = { afterLink () {}, hookModes: '${secret}' }\n`,
+    'array.cjs': `module.exports = { afterLink () {}, hookModes: ['response'] }\n`,
+    'unconfigured.cjs': `module.exports = { afterCommit () {}, hookModes: { afterLink: 'response' } }\n`,
+    'bad-value.cjs': `module.exports = { afterLink () {}, hookModes: { afterLink: '${secret}' } }\n`
+  }
+  for (const [name, source] of Object.entries(bad)) await write(name, source)
+
+  for (const name of Object.keys(bad)) {
+    const result = await runServerCli(root, ['--hooks', name], { cwd: root })
+    t.is(result.code, 2, name)
+    t.is(result.constructed, 0, `${name} never constructs the server`)
+    t.ok(result.stderr.includes(name), `${name} is named in the error`)
+    t.absent(result.stderr.includes(secret), `${name} does not leak module content`)
+    t.absent(result.stderr.includes(root), `${name} does not leak the module directory`)
+  }
+
+  const cases: string[][] = [
+    ['--hook-mode', 'afterLink=response'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'afterLink'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'afterLink='],
+    ['--hooks', 'plain.cjs', '--hook-mode', '=response'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'afterLink=await'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'afterLink=Response'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'afterLink=response=x'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'afterlink=response'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'beforeCommit=response'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'toString=response'],
+    ['--hooks', 'plain.cjs', '--hook-mode'],
+    ['--hooks', 'plain.cjs', '--hook-mode', ''],
+    [
+      '--hooks',
+      'plain.cjs',
+      '--hook-mode',
+      'afterLink=response',
+      '--hook-mode',
+      'afterLink=detached'
+    ],
+    [
+      '--hooks',
+      'plain.cjs',
+      '--hook-mode',
+      'afterLink=response',
+      '--hook-mode',
+      'afterLink=response'
+    ],
+    // Valid on its own, but there is no such hook to declare.
+    ['--hooks', 'plain.cjs', '--hook-mode', 'onFailure=response'],
+    ['--hooks', 'plain.cjs', '--hook-mode', 'afterCommit=detached']
+  ]
+  for (const args of cases) {
+    const result = await runServerCli(root, args, { cwd: root })
+    t.is(result.code, 2, args.join(' '))
+    t.is(result.constructed, 0, `${args.join(' ')} never constructs`)
+    t.ok(result.stderr.length > 0, args.join(' '))
+    t.absent(result.stderr.includes(root), `${args.join(' ')} does not leak the directory`)
+  }
+})
+
+test('the server usage documents --hook-mode and the upload usage documents --json', (t) => {
+  const server = USAGE.split('\n').find((line) => line.startsWith('  swarm-deploy server'))
+  t.ok(server?.includes('[--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...'))
+  t.ok(
+    server !== undefined && server.indexOf('--hook-mode') > server.indexOf('--hooks <module>'),
+    'the declaration belongs to a hooks module'
+  )
 })
 
 test('CLI rejects a missing, empty, or repeated --hooks option before construction', async (t) => {

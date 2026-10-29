@@ -80,6 +80,22 @@ One connection carries exactly one file and follows this sequence:
 7. The server sends one explicit terminal result (`COMMITTED`,
    `ALREADY_COMMITTED`, or a stable error) before either peer closes.
 
+The offer may carry one more optional key, `hookResult: true`, to ask for the data
+the server's `response`-declared hooks returned (see "Hooks"). It is sent only when
+asked for and can only be `true`, so an older strict server rejects the offer
+instead of ignoring it, and a request that does not ask is byte for byte what it
+was. It is not one of the fields that derive the transfer ID and is not stored in
+the session, so it changes neither the identity, a resume, nor what is already
+committed. The terminal `COMMITTED` and `ALREADY_COMMITTED` records, and a failed
+`FAILED` or `REJECTED` record, then carry at most one more key,
+`hookResult: { afterCommit?: HookResult, afterLink?: [{ name, target, result }] }`
+on success, or `{ onFailure: HookResult }` on a failure whose primary `code` is
+unchanged; the offer must have asked, the decoder validates the shape and each
+component as a `HookResult`, and the whole value is held to the same 3072 bytes of
+compact JSON so the record stays inside the unchanged 4 KiB control record limit.
+Combined data that would exceed it fails the upload with `HOOK_FAILED` like an
+unusable value. A client that did not ask treats the key as `PROTOCOL_INVALID`.
+
 Control records are length-bounded and cannot be interleaved with TAR bytes.
 EOF, socket close, or an implicit acknowledgment is never upload success.
 Connection setup, metadata, transfer inactivity, result drain, and shutdown
@@ -290,7 +306,59 @@ selecting only those names (named exports win over a default object; one
 `__esModule` interop level is unwrapped; other exports are ignored) and failing
 with exit code 2 on any load or shape error. The path's extension must be
 exactly `.js`, `.mjs`, or `.cjs`; any other extension is rejected before the
-load is attempted. Hooks are
+load is attempted.
+
+`beforeCommit` is a validation gate and is always awaited. `afterCommit`,
+`afterLink` and `onFailure` are post-operation hooks, each `detached` (the
+default) or `response`. The declaration is `ServerOptions.hookModes`
+(`{ afterCommit?, afterLink?, onFailure? }`, each `'response'` or `'detached'`),
+which accepts only those keys and values, only for hooks that are configured, and
+is frozen at construction with each property read once. A module may export
+`hookModes` as data (named exports win over the default object per hook), and the
+repeatable `--hook-mode <hook>=<mode>` overrides it per hook (a malformed,
+repeated, or unmatched flag, or a flag without `--hooks`, is a startup error with
+exit code 2). Nothing is inferred from a callback: no `async` or return-value
+introspection.
+
+A `response` hook is awaited before the answer. Its value is read and checked on
+every call (`undefined`, or a plain JSON object as below), whatever the client
+asked; an unusable value or a throw fails the operation with `HOOK_FAILED`. A
+`detached` hook is registered when the durable work it observes exists and starts
+after the answer was attempted, outside every lease, the upload slot and the
+transfer guard; its return value is never read, a throw or rejection is caught and
+logged (`Detached hook failed`, with the hook, the artifact or link name and
+`HOOK_FAILED`, no callback text), and it never changes an answer already sent or
+calls `onFailure`. At most 1024 detached calls are queued or running; a call
+beyond that is dropped (`Detached hook dropped`, reason `capacity`). Detached
+`afterLink` calls run one at a time per link name, in the order the link decisions
+were made (the place in the line is reserved under the lease), and detached
+`afterCommit` calls one at a time per artifact name in commit order. While a
+detached call is queued or running its artifact's transfer ID is in the retention
+pin set (in memory only). The server's close aborts the waits: queued calls are
+dropped (`Detached hook skipped`), a running callback is abandoned and continues on
+its own, and the close does not wait for hook code. Delivery is best effort and
+process-local: no persistent queue, no retry, no exactly-once guarantee.
+
+Every post-operation context carries `outcome`. A `response` `afterCommit` or
+`afterLink` is called while the operation is still succeeding, so it sees
+`{ status: 'succeeded' }` and is never called for a failed operation. A `detached`
+one starts after the answer and sees the final outcome: `succeeded`, or
+`{ status: 'failed', code, phase }` when a later awaited step failed an upload whose
+artifact was already committed (a failed answer write after every awaited step
+finished is delivery, not outcome). `onFailure` is the failed-operation hook: it
+always sees `{ status: 'failed', code, phase }` with the stable code the answer
+reports, and runs for every failed upload connection whose offer was decoded and
+every failed link request, including failures before any durable artifact or link
+exists, which never call `afterCommit` or `afterLink`. Its context adds
+`operation` (`upload` or `link`) and, for a link request, `request`; `artifact` is
+`null` for a link request that failed before its target was resolved, and `path`
+is `null` unless a staging, committed or link path exists. Declared `response`, it
+is awaited before the failed answer and may return a plain JSON object (carried as
+below); if it throws, returns an unusable value, or the server is closing, the
+answer is exactly what it would have been, the failure is logged
+(`Failure hook failed`), and `onFailure` is not called again. Detached, it starts
+after the answer. No response hook's data can turn a failed operation into a
+success. Hooks are
 trusted code; contexts are frozen and exclude seeds, keys, TAR data, and session
 material. Callbacks are invoked without a receiver. There is no hook timeout;
 only server shutdown abandons a pending callback, which then continues detached.
@@ -361,11 +429,13 @@ request asked for `keep`. It does not run for a rejected or unauthorized link,
 for a manual link whose target is replaced, or for reconciliation done by startup
 or retention.
 
-`afterLink` may return a plain JSON object. The server reads that value only for
-an explicit link request that asked for it (see the manual link control
-protocol); an upload's automatic links and a request that did not ask ignore it
-without inspecting it. A checked copy is sent in the `LINKED` or `UNCHANGED`
-answer after the hook has resolved. An unusable value (not a plain object, or
+A `response` hook may return a plain JSON object. The server always reads and
+checks it (the request's `hookResult` decides only whether it is sent: see the
+control protocols); a detached hook's value is never read. For an explicit link
+request a checked copy of `afterLink`'s object is sent in the `LINKED` or
+`UNCHANGED` answer after the hook has resolved; an upload's answer carries the
+combined `{ afterCommit?, afterLink?: [{ name, target, result }] }` (below). An
+unusable value (not a plain object, or
 containing `undefined`, a function, a symbol, a BigInt, a non-finite number, a
 class instance, an accessor, a symbol key, a cycle, more than 8 levels, or more
 than 3072 bytes) fails the request like a throw: `HOOK_FAILED` with the fixed
@@ -396,13 +466,16 @@ destroys the connection when the peer closes it or after a 5-second grace
 period, so the peer reads the stable code rather than a stream reset. Other
 failure answers are followed by an immediate destroy.
 
-`onFailure` runs at most once per connection after metadata was decoded and the
-failure was sent, unless every gating hook already succeeded; it also runs once
-for a failed `afterLink` on a link request, after the link was restored or final
-and the client was answered, with no lease held. Its
+`onFailure` runs at most once per failed operation after the offer or request was
+decoded, unless every awaited hook already succeeded; for a failed `afterLink` on a
+link request it runs after the link was restored or final, with no lease held, and
+a link request that was refused or failed outside its hook runs it with phase
+`link`. A `detached` one starts after the failed answer was attempted, a
+`response` one is awaited before it. Its
 context phase is `offer`, `transfer`, `verification`, `beforeCommit`, `commit`,
-`afterCommit`, or `afterLink`; its `error` is the raw callback exception for hook
-failures and the original error otherwise. Its path is `null` for `offer`; the
+`afterCommit`, `afterLink`, or `link`; its `error` is the raw callback exception for hook
+failures and the original error otherwise. Its path is `null` for `offer` and for
+`link` without a failed hook; the
 `.tar.part` staging file during transfer and for fresh-upload verification; the
 extracted `.part` staging file for `beforeCommit`, `commit`, and
 verified-reconnect verification; the final path for `afterCommit`; and the link
@@ -556,7 +629,9 @@ An authenticated client sends one strict bounded first control record:
 
 The record has exactly the first four fields, plus `hookFailure` when the client
 states its failure policy and `hookResult` only when it asks for the hook result
-(see below); `hookResult` can only be `true`. A current client always sends
+(see below); `hookResult` can only be `true`. The failure policy applies only to a
+`response` `afterLink`; a `detached` one cannot fail the request, so nothing is
+journaled or restored. A current client always sends
 `hookFailure` (`rollback` unless the caller chose `keep`), so a server that
 predates it rejects the unknown key and the request fails closed instead of
 keeping a link the caller expects to be rolled back; a request without it, which
@@ -575,12 +650,16 @@ request. The response is exactly one strict record:
 { v: 1, status: 'UNCHANGED' }
 { v: 1, status: 'FAILED', code: ErrorCode }
 { v: 1, status: 'LINKED' | 'UNCHANGED', hookResult: HookResult } // opt-in only
+{ v: 1, status: 'FAILED', code: ErrorCode, hookResult: HookResult } // opt-in only
 ```
 
 `hookResult` appears only in the answer to a request that carried
-`hookResult: true`, only on `LINKED` or `UNCHANGED`, and only when the server's
-`afterLink` hook returned an object. A `FAILED` record never carries it, and a
-client that did not ask treats one as `PROTOCOL_INVALID`. The decoder accepts
+`hookResult: true`: on `LINKED` or `UNCHANGED` when the server's `response`
+`afterLink` hook returned an object, and on `FAILED` when its `response`
+`onFailure` hook returned one, in which case `code` is still the primary failure's.
+A client that did not ask treats one as `PROTOCOL_INVALID`. Whether the server
+awaits a hook never depends on this field: the request only asks for the checked
+data to be sent. The decoder accepts
 exactly one extra key and validates its value as a plain JSON object: strings,
 finite numbers, booleans, `null`, arrays, and plain objects, at most 8 levels
 deep, at most 3072 UTF-8 bytes of compact JSON (so the record stays inside the
@@ -802,9 +881,11 @@ the fallback pin set includes recorded transfer IDs and any matching current
 target records, preferring retention to unsafe deletion. Repointing a manual
 link moves the durable pin to its newly selected target.
 
-Link control requests do not upload or commit an artifact and invoke none of
-`beforeCommit`, `afterCommit`, or `onFailure`. They emit link and failure
-events, not upload offer, transfer, verification, commit, or hook events.
+Link control requests do not upload or commit an artifact and invoke neither
+`beforeCommit` nor `afterCommit`; `afterLink` runs for a request that changed or
+confirmed a link, and `onFailure` for one that failed (phase `link` or
+`afterLink`). They emit link and failure events, not upload offer, transfer,
+verification, commit, or hook events.
 
 Stable manual-link failures are:
 
@@ -859,7 +940,14 @@ accept the same idle timeout. `swarm-deploy link <target> <link-name>` prints
 exactly `<link-name> -> <target> <LINKED|UNCHANGED>` on success;
 `swarm-deploy link --json <target> <link-name>` asks for the hook result and
 prints one JSON object `{ target, name, status, hookResult? }` instead, and
-`--hook-failure <rollback|keep>` names the failure policy. Topic commands
+`--hook-failure <rollback|keep>` names the failure policy.
+`swarm-deploy upload --json <path>` asks for the response hooks' data and prints
+`{ name, kind, status, hookResult? }`; with `--json`, a failed request whose answer
+carried `onFailure` data also prints `{ target?, name?, code, hookResult }` before
+the unchanged stderr diagnostic and exit status. `swarm-deploy server --hooks
+<module> --hook-mode <hook>=<response|detached>` (repeatable) declares a
+post-operation hook and overrides the module's own `hookModes`. Neither flag
+changes whether the server awaits a hook beyond that declaration. Topic commands
 and `--topic` are removed.
 
 Events and logs expose lifecycle milestones for direct connection, offer,

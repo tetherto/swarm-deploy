@@ -102,8 +102,8 @@ compare-and-swap, which the storage adapter does not offer: a process that edits
 the storage root while the server runs can still have its change replaced in
 that window, so do not edit a running server's storage root. If the server stops
 after the swap and before the record is written, repeat the same request: it
-takes the link over again and returns `LINKED`. A failing `afterLink` hook
-leaves the taken-over link in place only when the request asked to `keep` it, and
+takes the link over again and returns `LINKED`. A failing `response` `afterLink`
+hook leaves the taken-over link in place only when the request asked to `keep` it, and
 the retry then returns `UNCHANGED`. By default the old symlink comes back with its
 exact text and the retry returns `LINKED` (see
 [Rollback and its limits](hooks.md#rollback-and-its-limits)).
@@ -160,13 +160,17 @@ file; do not edit it.
 The explicit link operation is a control request, not an upload. It supports
 files and directories and is idempotent. It runs none of the upload hooks
 (`beforeCommit`, `afterCommit`), but a server with an `afterLink` hook runs it
-after the link is durable and before the result is returned; see
-[Link publication hooks](hooks.md#link-publication-hooks). If that hook fails, the
+after the link is durable; see
+[Link publication hooks](hooks.md#link-publication-hooks). A `response` hook
+(declared with `hookModes` or `--hook-mode afterLink=response`) is awaited before
+the result is returned, and if it fails the
 previous link and ownership record are restored by default, or kept with
-`swarm-deploy link --hook-failure keep` (`hookFailure: 'keep'`). Requests for one
-link name run one at a time, from decision through hook to finalize or restore,
-while other links, uploads, and retention carry on. A request can also ask for the
-JSON object the hook returned (`swarm-deploy link --json`, or
+`swarm-deploy link --hook-failure keep` (`hookFailure: 'keep'`). A `detached` hook,
+the default, runs after the result was sent, so nothing is journaled and a failure
+can neither change the result nor restore the link. Requests for one
+link name run one at a time, from decision through a response hook to finalize or
+restore, while other links, uploads, and retention carry on. A request can also ask
+for the JSON object a response hook returned (`swarm-deploy link --json`, or
 `Client.link(target, name, { hookResult: true })`); that needs a server of
 version 0.5.0 or later, and the failure policy needs 0.6.0 or later.
 
