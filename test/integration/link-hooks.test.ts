@@ -12,6 +12,7 @@ import {
   SwarmDeployError,
   keyPairFromSeed,
   type AfterLinkContext,
+  type HookFailureContext,
   type HookModes,
   type HookResult,
   type ServerHooks,
@@ -454,13 +455,17 @@ test('Client.upload waits for afterLink on an automatic link and retries a faile
   )
 })
 
-test('an unauthorized client can neither link nor reach afterLink', async (t) => {
+test('an unauthorized client reaches no hook, and an authorized refused link reaches only onFailure', async (t) => {
   const calls: string[] = []
-  const { client, testnet, source } = await setup(t, {
+  const failures: HookFailureContext[] = []
+  const { client, storage, testnet, source } = await setup(t, {
     symlinks: [{ selector: '/^release-\\d$/' }],
     hooks: {
       afterLink: () => void calls.push('afterLink'),
-      onFailure: () => void calls.push('onFailure')
+      onFailure: (context) => {
+        calls.push('onFailure')
+        failures.push(context)
+      }
     }
   })
   t.is((await client.upload(await write(source, 'release-1', 'first'))).status, 'COMMITTED')
@@ -474,10 +479,30 @@ test('an unauthorized client can neither link nor reach afterLink', async (t) =>
   })
   t.teardown(() => stranger.close())
   await t.exception(stranger.link('release-1', 'current'))
+  // The server's firewall drops an unlisted key before any handler runs, so not even
+  // `onFailure` is called for it.
+  t.alike(calls, [], 'an unauthorized client triggers no hook')
+  await t.exception(() => fs.promises.lstat(path.join(storage, 'current')), { code: 'ENOENT' })
+
   // The exact policy code is asserted on fake sockets: a real stream may be reset before a
   // non-hook failure record is read, so only the rejection itself is stable here.
   await t.exception(client.link('release-9', 'current'))
-  t.alike(calls, [], 'no hook runs for a request that changed no link')
+  // An authorized request that was refused did reach the server's handlers, so the failed
+  // operation is reported once to the detached `onFailure`, after its answer. Waiting for that
+  // call is deterministic; nothing else may have run, and no link was made.
+  await waitFor(() => failures.length === 1)
+  t.alike(calls, ['onFailure'], 'afterLink never runs for a request that changed no link')
+  t.is(failures[0].operation, 'link')
+  t.is(failures[0].phase, 'link')
+  t.is(failures[0].path, null, 'no path is made up for a failure before any link exists')
+  t.is(failures[0].artifact, null, 'the missing target resolved to no artifact')
+  t.alike(failures[0].request, { name: 'current', target: 'release-9' })
+  t.alike(failures[0].outcome, {
+    status: 'failed',
+    code: ERRORS.LINK_TARGET_NOT_FOUND,
+    phase: 'link'
+  })
+  await t.exception(() => fs.promises.lstat(path.join(storage, 'current')), { code: 'ENOENT' })
 })
 
 test('the link-publisher example publishes each link change through a no-shell publisher', async (t) => {

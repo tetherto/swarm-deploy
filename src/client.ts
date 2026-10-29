@@ -111,14 +111,18 @@ export type ClientLinkStatus = 'LINKED' | 'UNCHANGED'
 export type ClientLinkHookFailure = 'rollback' | 'keep'
 export interface ClientLinkOptions {
   /**
-   * What happens to the link when the server's `afterLink` hook fails. The
-   * request waits for the hook either way, and a failed hook is still a
-   * `HOOK_FAILED` error. `'rollback'` (the default) restores the previous local
-   * link and its ownership record, or removes a link the request created, before
-   * the error is returned; `'keep'` leaves the new link in place. Neither undoes
-   * the uploaded artifact or anything the hook did elsewhere. The policy is
-   * always sent, so a server older than 0.6.0 rejects the request and the call
-   * fails instead of keeping a link you expected to be rolled back.
+   * What happens to the link when the server's `afterLink` hook fails. The policy
+   * applies only where the server declares that hook `response`: it is then awaited
+   * before the answer in both modes, and a failed hook is still a `HOOK_FAILED`
+   * error. `'rollback'` (the default) restores the previous local link and its
+   * ownership record, or removes a link the request created, before the error is
+   * returned; `'keep'` leaves the new link in place. Neither undoes the uploaded
+   * artifact or anything the hook did elsewhere. A server whose `afterLink` is
+   * `detached` (the server's default) does not wait for the hook: it answers first,
+   * the hook cannot fail the response or roll the link back, and this policy has no
+   * effect. The policy is always sent, so a server older than 0.6.0 rejects the
+   * request and the call fails instead of keeping a link you expected to be rolled
+   * back.
    */
   hookFailure?: ClientLinkHookFailure
   /**
