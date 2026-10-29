@@ -1,11 +1,55 @@
 import { onAbort, type AbortSignalLike } from './abort.js'
-import { ERRORS, SwarmDeployError } from './errors.js'
+import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
 import { copyHookResult, type HookResult } from './hook-result.js'
 import type { ReleaseCoordinates } from './release.js'
 import type { ArtifactKind } from './types.js'
 
+/**
+ * Where an operation failed. `link` is an explicit link request that failed
+ * before or outside its `afterLink` hook (a policy rejection, a missing target, a
+ * conflict, a storage failure); the others describe an upload.
+ */
 export type HookFailurePhase =
-  'offer' | 'transfer' | 'verification' | 'beforeCommit' | 'commit' | 'afterCommit' | 'afterLink'
+  | 'offer'
+  | 'transfer'
+  | 'verification'
+  | 'beforeCommit'
+  | 'commit'
+  | 'afterCommit'
+  | 'afterLink'
+  | 'link'
+
+/**
+ * How a post-operation hook takes part in the operation's answer, declared per
+ * hook and never inferred from the callback.
+ *
+ * - `detached` (the default): the callback runs on its own after the answer was
+ *   written. Nothing waits for it, its return value is never read, and a failure
+ *   of it is logged and can never change an answer already sent.
+ * - `response`: the callback is awaited before the answer. It may return a plain
+ *   JSON object (see `HookResult`) or `undefined` (no extra data), and a failure
+ *   or an unusable value fails the operation.
+ */
+export type HookResponse = 'response' | 'detached'
+
+/** The post-operation hooks that take a `HookResponse` declaration. */
+export interface HookModes {
+  afterCommit?: HookResponse
+  afterLink?: HookResponse
+  onFailure?: HookResponse
+}
+
+/** How the operation a hook observes ended, as far as that hook can know. */
+export type OperationOutcome =
+  | { readonly status: 'succeeded' }
+  | {
+      readonly status: 'failed'
+      /** The stable code of the failure the operation's answer reports. */
+      readonly code: ErrorCode
+      readonly phase: HookFailurePhase
+    }
+
+export type FailedOutcome = Extract<OperationOutcome, { status: 'failed' }>
 
 /** Immutable, secret-free description of the artifact a hook is observing. */
 export interface HookArtifact {
@@ -35,6 +79,13 @@ export interface AfterCommitContext {
   path: string
   resumed: boolean
   alreadyCommitted: boolean
+  /**
+   * `succeeded` for a `response` hook, which runs before the upload's answer. A
+   * `detached` hook runs after the answer and sees how the upload ended: `failed`
+   * when a later awaited step (another `response` hook) failed the upload after
+   * the artifact was committed.
+   */
+  outcome: OperationOutcome
 }
 
 /** Who owns a managed link: a server rule, or an explicit client request. */
@@ -79,12 +130,24 @@ export interface AfterLinkContext {
   artifact: HookArtifact
   status: HookLinkStatus
   trigger: HookLinkTrigger
+  /** As for `AfterCommitContext.outcome`. */
+  outcome: OperationOutcome
 }
 
+/** What `onFailure` is told about a failed operation. */
 export interface HookFailureContext {
-  artifact: HookArtifact
+  /** The operation that failed: an upload connection or an explicit link request. */
+  operation: 'upload' | 'link'
   /**
-   * The best known absolute path, or `null` before one exists. For
+   * The artifact the operation concerned. For an upload it comes from the decoded
+   * offer, so it is not yet verified content. For a link request it is the
+   * target's durable commit record, or `null` when the request failed before its
+   * target was resolved.
+   */
+  artifact: HookArtifact | null
+  /**
+   * The best known absolute path, or `null` when none exists, which is the case
+   * for every failure before a durable artifact or link: none is made up. For
    * `afterLink` it is the path of the link.
    */
   path: string | null
@@ -94,20 +157,32 @@ export interface HookFailureContext {
   error: unknown
   /** Present only when `phase` is `afterLink`. */
   link?: HookLink
+  /** Present only for a link request: the name and target it asked for. */
+  request?: { readonly name: string; readonly target: string }
+  /** Always `failed`: the stable code the operation's answer reports and where it failed. */
+  outcome: FailedOutcome
 }
 
+/**
+ * The post-operation hooks (`afterCommit`, `afterLink`, `onFailure`) are
+ * `detached` unless a `HookModes` declaration makes them `response`. A callback
+ * may return `void`, `undefined`, or a promise of either; only a `response` hook
+ * may return data (a plain JSON object, see `HookResult`), and only when it is
+ * declared so. A `detached` hook's return value is never read. `beforeCommit` is
+ * not post-operation: it is a validation gate that is always awaited.
+ */
 export interface ServerHooks {
   beforeCommit?(context: BeforeCommitContext): void | Promise<void>
-  afterCommit?(context: AfterCommitContext): void | Promise<void>
-  /**
-   * May return a plain JSON object (see `HookResult`) that you choose to hand
-   * back to an explicit `Client.link` caller that asked for it. Nothing is
-   * derived from the context, the error, or the environment. The value is read
-   * only for such a request: an upload's automatic links and a request that did
-   * not opt in ignore it, even when it is not valid.
-   */
+  afterCommit?(context: AfterCommitContext): void | HookResult | Promise<void | HookResult>
   afterLink?(context: AfterLinkContext): void | HookResult | Promise<void | HookResult>
-  onFailure?(context: HookFailureContext): void | Promise<void>
+  /**
+   * Runs for a failed operation, including those that fail before any durable
+   * artifact or link exists (an offer, a transfer, verification, `beforeCommit`,
+   * a commit, or a link request that was refused). Declared `response`, it is
+   * awaited before the failed answer and may add data to it; its own failure is
+   * logged and never replaces the failure being reported.
+   */
+  onFailure?(context: HookFailureContext): void | HookResult | Promise<void | HookResult>
 }
 
 const WRAPPED_CALLBACK_ERRORS = new WeakMap<SwarmDeployError, unknown>()
@@ -146,6 +221,43 @@ export function snapshotHooks(hooks: ServerHooks | null | undefined): Readonly<S
   return Object.freeze(snapshot)
 }
 
+/** Every hook that takes a `HookResponse` declaration. */
+export const HOOK_MODE_NAMES = ['afterCommit', 'afterLink', 'onFailure'] as const
+
+/**
+ * Validates and freezes hook declarations against the hooks they describe. Only
+ * the post-operation hooks can be declared, only with a known mode, and only if
+ * that hook is configured, so a typo fails at construction instead of silently
+ * leaving a hook detached. Each property is read exactly once.
+ */
+export function snapshotHookModes(
+  modes: HookModes | null | undefined,
+  hooks: Readonly<ServerHooks>
+): Readonly<HookModes> {
+  if (modes === null || modes === undefined) return Object.freeze({})
+  if (typeof modes !== 'object' || Array.isArray(modes)) {
+    throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid hook modes')
+  }
+  for (const name of Reflect.ownKeys(modes)) {
+    if (!(HOOK_MODE_NAMES as readonly (string | symbol)[]).includes(name)) {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Unknown hook mode')
+    }
+  }
+  const snapshot: HookModes = {}
+  for (const name of HOOK_MODE_NAMES) {
+    const mode: unknown = modes[name]
+    if (mode === undefined) continue
+    if (mode !== 'response' && mode !== 'detached') {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, `Invalid ${name} hook mode`)
+    }
+    if (hooks[name] === undefined) {
+      throw new SwarmDeployError(ERRORS.PROTOCOL_INVALID, `Hook mode for missing ${name} hook`)
+    }
+    snapshot[name] = mode
+  }
+  return Object.freeze(snapshot)
+}
+
 /**
  * Wraps a failed callback. The message is fixed so callback text (which may
  * carry secrets) never reaches the wire; the original error stays on `cause`.
@@ -161,17 +273,20 @@ export function hookError(phase: HookFailurePhase, cause: unknown): SwarmDeployE
 }
 
 /**
- * The checked copy of what an `afterLink` hook returned, or `undefined` for a
- * hook that returned nothing. Any other value that is not a valid result fails
+ * The checked copy of what a `response` hook returned, or `undefined` for a hook
+ * that finished with nothing. Any other value that is not a valid result fails
  * like a throw: `HOOK_FAILED` with a fixed message, and the reason (never the
  * value) on `cause` for `onFailure`.
  */
-export function hookResultOf(returned: unknown): HookResult | undefined {
+export function hookResultOf(
+  returned: unknown,
+  phase: 'afterCommit' | 'afterLink'
+): HookResult | undefined {
   if (returned === undefined) return undefined
   try {
     return copyHookResult(returned)
   } catch (cause) {
-    throw hookError('afterLink', cause)
+    throw hookError(phase, cause)
   }
 }
 

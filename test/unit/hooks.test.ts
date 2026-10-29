@@ -10,14 +10,17 @@ import {
   hookResultOf,
   HookTurns,
   invokeHook,
+  snapshotHookModes,
   snapshotHooks
 } from '../../dist/hooks.js'
 import {
   copyHookResult,
+  copyUploadHookResult,
   HookResultError,
   MAX_HOOK_RESULT_BYTES,
   MAX_HOOK_RESULT_DEPTH
 } from '../../dist/hook-result.js'
+import { DetachedHooks, MAX_DETACHED_HOOKS, OperationScope } from '../../dist/post-hooks.js'
 import {
   encodeLinkResultRecord,
   MAX_CONTROL_RECORD_BYTES
@@ -424,20 +427,348 @@ test('a refused result names a reason and a path, never a value', (t) => {
 })
 
 test('hookResultOf passes undefined through and fails everything else invalid like a throw', (t) => {
-  t.is(hookResultOf(undefined), undefined)
-  t.alike(hookResultOf({ id: 'sub-1' }), { id: 'sub-1' })
-  t.alike(hookResultOf({}), {})
-  for (const returned of [null, 'ok', 7, false, [1], () => ({}), { fn: () => 1 }, nested(9)]) {
+  for (const phase of ['afterLink', 'afterCommit'] as const) {
+    t.is(hookResultOf(undefined, phase), undefined)
+    t.alike(hookResultOf({ id: 'sub-1' }, phase), { id: 'sub-1' })
+    t.alike(hookResultOf({}, phase), {})
+    for (const returned of [null, 'ok', 7, false, [1], () => ({}), { fn: () => 1 }, nested(9)]) {
+      let failure: unknown = null
+      try {
+        hookResultOf(returned, phase)
+      } catch (error) {
+        failure = error
+      }
+      t.ok(failure instanceof SwarmDeployError)
+      const failed = failure as SwarmDeployError
+      t.is(failed.code, ERRORS.HOOK_FAILED)
+      t.is(failed.message, `Deployment hook failed during ${phase}`)
+      t.ok(callbackError(failure) instanceof HookResultError, 'onFailure sees the reason')
+    }
+  }
+})
+
+test('snapshotHookModes validates, freezes, and only accepts declarations for configured post-operation hooks', (t) => {
+  const hooks = snapshotHooks({
+    afterCommit() {},
+    afterLink() {},
+    onFailure() {},
+    beforeCommit() {}
+  })
+  t.alike(snapshotHookModes(undefined, hooks), {})
+  t.alike(snapshotHookModes(null, hooks), {})
+  t.alike(snapshotHookModes({}, hooks), {})
+  const snapshot = snapshotHookModes(
+    { afterCommit: 'response', afterLink: 'detached', onFailure: 'response' },
+    hooks
+  )
+  t.alike(
+    { ...snapshot },
+    { afterCommit: 'response', afterLink: 'detached', onFailure: 'response' }
+  )
+  t.ok(Object.isFrozen(snapshot))
+
+  const bad: unknown[] = [
+    'response',
+    7,
+    [],
+    { beforeCommit: 'response' },
+    { afterCommits: 'response' },
+    { afterLink: true },
+    { afterLink: 'await' },
+    { afterLink: 'RESPONSE' },
+    { afterCommit: null },
+    { [Symbol('afterLink')]: 'response' }
+  ]
+  for (const value of bad) {
+    t.exception(() => snapshotHookModes(value as never, hooks), {
+      code: ERRORS.PROTOCOL_INVALID
+    })
+  }
+  // A mode for a hook that is not configured is a typo, not a silently detached hook.
+  const onlyCommit = snapshotHooks({ afterCommit() {} })
+  t.exception(() => snapshotHookModes({ afterLink: 'response' }, onlyCommit), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.exception(() => snapshotHookModes({ onFailure: 'detached' }, onlyCommit), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.execution(() => snapshotHookModes({ afterCommit: 'detached' }, onlyCommit))
+})
+
+test('snapshotHookModes reads each property once and never touches the callbacks', (t) => {
+  const hooks = snapshotHooks({
+    afterLink() {
+      throw new Error('never called')
+    }
+  })
+  let reads = 0
+  const modes = {
+    get afterLink(): 'response' {
+      reads++
+      return 'response'
+    }
+  }
+  const snapshot = snapshotHookModes(modes, hooks)
+  t.is(reads, 1)
+  t.is(snapshot.afterLink, 'response')
+  t.is(Object.getOwnPropertyDescriptor(snapshot, 'afterLink')?.get, undefined, 'a plain value')
+})
+
+test('copyUploadHookResult copies, bounds the combined size, and refuses anything unexpected', (t) => {
+  const entry = { name: 'latest', target: 'app-1.tar.gz', result: { id: 'a' } }
+  const full = { afterCommit: { deploy: 'd1' }, afterLink: [entry], onFailure: { ticket: 'T' } }
+  const copy = copyUploadHookResult(full)
+  t.alike(copy, full)
+  t.not(copy.afterLink, full.afterLink, 'a deep copy')
+  t.alike(copyUploadHookResult({}), {})
+  t.alike(copyUploadHookResult({ afterLink: [] }), { afterLink: [] })
+
+  const refused: unknown[] = [
+    null,
+    [],
+    'x',
+    { beforeCommit: {} },
+    { afterCommit: null },
+    { afterCommit: [] },
+    { afterCommit: { fn: () => 1 } },
+    { afterLink: {} },
+    { afterLink: [null] },
+    { afterLink: [{ name: 'a', target: 'b' }] },
+    { afterLink: [{ name: '', target: 'b', result: {} }] },
+    { afterLink: [{ name: 'a', target: 'b', result: {}, extra: 1 }] },
+    { afterLink: [{ name: 'a'.repeat(201), target: 'b', result: {} }] },
+    { afterLink: [{ name: 1, target: 'b', result: {} }] },
+    nestedAccessor()
+  ]
+  for (const value of refused) {
     let failure: unknown = null
     try {
-      hookResultOf(returned)
+      copyUploadHookResult(value)
     } catch (error) {
       failure = error
     }
-    t.ok(failure instanceof SwarmDeployError)
-    const failed = failure as SwarmDeployError
-    t.is(failed.code, ERRORS.HOOK_FAILED)
-    t.is(failed.message, 'Deployment hook failed during afterLink')
-    t.ok(callbackError(failure) instanceof HookResultError, 'onFailure sees the reason')
+    t.ok(failure instanceof HookResultError, JSON.stringify(value)?.slice(0, 60))
   }
+
+  // Each part fits on its own, but the whole answer must still fit one control record.
+  const part = (size: number): { k: string } => ({ k: 'x'.repeat(size) })
+  const each = Math.floor(MAX_HOOK_RESULT_BYTES / 2) - 200
+  t.execution(() => copyUploadHookResult({ afterCommit: part(each), afterLink: [] }))
+  let tooLarge: unknown = null
+  try {
+    copyUploadHookResult({
+      afterCommit: part(each),
+      afterLink: [
+        { name: 'a', target: 'b', result: part(each) },
+        { name: 'c', target: 'd', result: part(each) }
+      ]
+    })
+  } catch (error) {
+    tooLarge = error
+  }
+  t.ok(tooLarge instanceof HookResultError, 'the combined data is bounded, not just each part')
+  t.ok(
+    b4a.from(JSON.stringify({ v: 1, status: 'COMMITTED', hookResult: copyUploadHookResult(full) }))
+      .byteLength < MAX_CONTROL_RECORD_BYTES
+  )
 })
+
+function nestedAccessor(): unknown {
+  return {
+    get afterCommit() {
+      return { id: 1 }
+    }
+  }
+}
+
+test('OperationScope settles once and keeps the first outcome', async (t) => {
+  const scope = new OperationScope()
+  scope.settle({ status: 'failed', code: ERRORS.HOOK_FAILED, phase: 'afterLink' })
+  scope.settle({ status: 'succeeded' })
+  t.alike(await scope.outcome, { status: 'failed', code: 'HOOK_FAILED', phase: 'afterLink' })
+})
+
+/** Runs detached jobs against a scope the test controls. */
+function detachedRig(): {
+  hooks: DetachedHooks
+  controller: ReturnType<typeof createAbortController>
+  problems: string[]
+} {
+  const controller = createAbortController()
+  const problems: string[] = []
+  const hooks = new DetachedHooks(controller.signal, (problem, info) => {
+    problems.push(`${problem}:${info.hook}`)
+  })
+  return { hooks, controller, problems }
+}
+
+test('a detached job waits for its operation, is told the outcome, and ignores what it returns', async (t) => {
+  const { hooks, problems } = detachedRig()
+  const scope = new OperationScope()
+  let reads = 0
+  const seen: unknown[] = []
+  hooks.start({
+    hook: 'afterCommit',
+    callback: (context) => {
+      seen.push(context)
+      return {
+        get leaked() {
+          reads++
+          return 'sk-secret'
+        }
+      }
+    },
+    context: { artifact: 'a' },
+    outcome: scope,
+    turn: null,
+    pin: 'p1',
+    fields: {}
+  })
+  await tick()
+  t.alike(seen, [], 'nothing starts before the operation settles')
+  t.alike([...hooks.pins()], ['p1'], 'the artifact is pinned from registration')
+  scope.settle({ status: 'failed', code: ERRORS.HOOK_FAILED, phase: 'afterLink' })
+  await hooks.drain()
+  t.alike(seen, [
+    { artifact: 'a', outcome: { status: 'failed', code: 'HOOK_FAILED', phase: 'afterLink' } }
+  ])
+  t.ok(Object.isFrozen(seen[0]))
+  t.is(reads, 0, 'the returned value is never read')
+  t.alike([...hooks.pins()], [], 'the pin ends with the call')
+  t.alike(problems, [])
+})
+
+test('a detached job that throws or rejects is reported by hook name only, and never rejects the queue', async (t) => {
+  const { hooks, problems } = detachedRig()
+  for (const callback of [
+    () => {
+      throw new Error('sk-secret thrown')
+    },
+    () => Promise.reject(new Error('sk-secret rejected')),
+    async () => {
+      throw new Error('sk-secret async')
+    }
+  ]) {
+    hooks.start({
+      hook: 'afterLink',
+      callback,
+      context: {},
+      outcome: { status: 'succeeded' },
+      turn: null,
+      pin: null,
+      fields: {}
+    })
+  }
+  // `drain` resolving (it never rejects) shows no failure escaped the queue; the report
+  // carries the hook name and never the callback's text.
+  await hooks.drain()
+  await tick()
+  t.alike(problems, ['failed:afterLink', 'failed:afterLink', 'failed:afterLink'])
+  t.is(hooks.size, 0)
+})
+
+test('detached jobs sharing a turn line run one after another in reservation order', async (t) => {
+  const { hooks } = detachedRig()
+  const turns = new HookTurns()
+  const order: string[] = []
+  const first = gateOf()
+  const reserved = ['a', 'b', 'c'].map((name) => ({ name, turn: turns.reserve('line') }))
+  for (const { name, turn } of reserved) {
+    hooks.start({
+      hook: 'afterLink',
+      callback: async () => {
+        order.push(`${name}:start`)
+        if (name === 'a') await first.wait
+        order.push(`${name}:end`)
+      },
+      context: {},
+      outcome: { status: 'succeeded' },
+      turn,
+      pin: null,
+      fields: {}
+    })
+  }
+  await tick()
+  t.alike(order, ['a:start'], 'the next call waits for the one ahead')
+  first.open()
+  await hooks.drain()
+  t.alike(order, ['a:start', 'a:end', 'b:start', 'b:end', 'c:start', 'c:end'])
+  await tick() // a released line is forgotten a few microtasks after its last release
+  t.is(turns.size, 0)
+})
+
+test('detached work is bounded: past the limit a call is dropped, logged, and gives its turn back', async (t) => {
+  const { hooks, controller, problems } = detachedRig()
+  const turns = new HookTurns()
+  const scope = new OperationScope()
+  for (let index = 0; index < MAX_DETACHED_HOOKS; index++) {
+    hooks.start({
+      hook: 'afterCommit',
+      callback: () => {},
+      context: {},
+      outcome: scope,
+      turn: null,
+      pin: `p${index % 4}`,
+      fields: {}
+    })
+  }
+  t.is(hooks.size, MAX_DETACHED_HOOKS)
+  const turn = turns.reserve('line')
+  hooks.start({
+    hook: 'afterLink',
+    callback: () => {},
+    context: {},
+    outcome: scope,
+    turn,
+    pin: 'overflow',
+    fields: {}
+  })
+  t.alike(problems, ['dropped:afterLink'])
+  t.is(hooks.size, MAX_DETACHED_HOOKS, 'the dropped call was never queued')
+  t.absent([...hooks.pins()].includes('overflow'), 'and pinned nothing')
+  // The drop released its turn at once; a released line is only forgotten a few microtasks
+  // later (see `HookTurns`), so this waits one timer tick, which runs them all, like the
+  // `HookTurns` tests above.
+  await tick()
+  t.is(turns.size, 0, 'its place in the line was released')
+
+  // Closing drops what is queued and ends promptly; nothing waits on hook code.
+  controller.abort()
+  await hooks.drain()
+  t.is(hooks.size, 0)
+  t.is(problems.filter((problem) => problem === 'skipped:afterCommit').length, MAX_DETACHED_HOOKS)
+  t.alike([...hooks.pins()], [])
+})
+
+test('closing abandons a detached call that is still running without waiting for it', async (t) => {
+  const { hooks, controller, problems } = detachedRig()
+  let finished = false
+  const never = gateOf()
+  hooks.start({
+    hook: 'afterCommit',
+    callback: async () => {
+      await never.wait
+      finished = true
+    },
+    context: {},
+    outcome: { status: 'succeeded' },
+    turn: null,
+    pin: 'p',
+    fields: {}
+  })
+  await tick()
+  controller.abort()
+  await hooks.drain()
+  t.absent(finished, 'drain did not wait for the callback')
+  t.alike(problems, [], 'an abandoned callback is not a failure')
+  t.alike([...hooks.pins()], [])
+  never.open()
+})
+
+function gateOf(): { wait: Promise<void>; open(): void } {
+  let open = (): void => {}
+  const wait = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  return { wait, open }
+}

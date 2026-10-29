@@ -421,6 +421,70 @@ test('the hook-result opt-in is a strict capability on the request and optional 
   )
 })
 
+test('the hook failure policy is a strict optional request field, independent of the result opt-in', (t) => {
+  const base = { v: 1, kind: 'link', target: 'release-1.2.3', name: 'current' } as const
+  // Absent is what an older client sends: the same four fields as ever.
+  t.is(
+    b4a.toString(encodeLinkRequestRecord({ ...base })),
+    '{"v":1,"kind":"link","target":"release-1.2.3","name":"current"}'
+  )
+  for (const hookFailure of ['rollback', 'keep'] as const) {
+    const request: LinkRequestRecord = { ...base, hookFailure }
+    const bytes = encodeLinkRequestRecord(request)
+    t.is(
+      b4a.toString(bytes),
+      `{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookFailure":"${hookFailure}"}`
+    )
+    t.alike(decodeLinkRequestRecord(bytes), request)
+    t.alike(decodeFirstControlRecord(bytes), request)
+    t.exception(() => decodeAnyMetadataRecord(bytes), { code: ERRORS.PROTOCOL_INVALID })
+
+    const both: LinkRequestRecord = { ...base, hookFailure, hookResult: true }
+    const bothBytes = encodeLinkRequestRecord(both)
+    t.is(
+      b4a.toString(bothBytes),
+      `{"v":1,"kind":"link","target":"release-1.2.3","name":"current","hookFailure":"${hookFailure}","hookResult":true}`
+    )
+    t.alike(decodeLinkRequestRecord(bothBytes), both)
+  }
+
+  // Exactly the two policies, spelled exactly; nothing else stands in for a missing field.
+  for (const hookFailure of [
+    'ROLLBACK',
+    'Keep',
+    '',
+    'none',
+    'delete',
+    true,
+    false,
+    null,
+    1,
+    {},
+    []
+  ]) {
+    const bad = { ...base, hookFailure } as unknown as LinkRequestRecord
+    t.exception(() => encodeLinkRequestRecord(bad), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  for (const body of [
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":"ROLLBACK"}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":null}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookfailure":"keep"}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":"keep","onFailure":"keep"}',
+    '{"v":1,"kind":"link","target":"a","name":"b","hookFailure":"keep","hookResult":false}'
+  ]) {
+    t.exception(() => decodeLinkRequestRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID })
+    t.exception(() => decodeFirstControlRecord(b4a.from(body)), { code: ERRORS.PROTOCOL_INVALID })
+  }
+  // Answers never carry the policy.
+  for (const status of ['LINKED', 'UNCHANGED']) {
+    t.exception(
+      () =>
+        decodeLinkResultRecord(b4a.from(`{"v":1,"status":"${status}","hookFailure":"rollback"}`)),
+      { code: ERRORS.PROTOCOL_INVALID }
+    )
+  }
+})
+
 test('a link result record refuses malformed or misplaced hook-result data', (t) => {
   const record = (hookResult: string, status = 'LINKED'): Buffer =>
     b4a.from(`{"v":1,"status":"${status}","hookResult":${hookResult}}`)
@@ -445,16 +509,56 @@ test('a link result record refuses malformed or misplaced hook-result data', (t)
   const deepest = '{"a":{"b":{"c":{"d":{"e":{"f":{"g":{}}}}}}}}'
   t.execution(() => decodeLinkResultRecord(record(deepest)))
 
-  // A failure carries only its code, and no other field joins a success.
+  // A failure always names its code; with one, it may also carry the failure hook's data,
+  // which is checked like any other. Data without a code, or any other field, is refused.
   t.exception(() => decodeLinkResultRecord(record('{"a":1}', 'FAILED')), {
     code: ERRORS.PROTOCOL_INVALID
   })
+  const failureReceipt: LinkResultRecord = {
+    v: 1,
+    status: 'FAILED',
+    code: ERRORS.HOOK_FAILED,
+    hookResult: { a: 1, nested: { list: ['x', null, true] } }
+  }
+  t.alike(decodeLinkResultRecord(encodeLinkResultRecord(failureReceipt)), failureReceipt)
+  t.alike(
+    decodeLinkResultRecord(
+      b4a.from('{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"a":1}}')
+    ),
+    { v: 1, status: 'FAILED', code: 'HOOK_FAILED', hookResult: { a: 1 } },
+    'a failure keeps its primary code and carries the data'
+  )
+  t.alike(
+    decodeLinkResultRecord(b4a.from('{"v":1,"status":"FAILED","code":"HOOK_FAILED"}')),
+    { v: 1, status: 'FAILED', code: 'HOOK_FAILED' },
+    'and without data it is what it always was'
+  )
+  for (const body of [
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":null}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":"text"}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":[]}',
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"__proto__":{"admin":true}}}',
+    `{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"k":"${'x'.repeat(MAX_HOOK_RESULT_BYTES)}"}}`,
+    '{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{},"x":1}',
+    '{"v":1,"status":"FAILED","code":"NOT_A_CODE","hookResult":{}}',
+    '{"v":1,"status":"FAILED","hookResult":{}}'
+  ]) {
+    t.exception(
+      () => decodeLinkResultRecord(b4a.from(body)),
+      { code: ERRORS.PROTOCOL_INVALID },
+      body.slice(0, 60)
+    )
+  }
   t.exception(
     () =>
-      decodeLinkResultRecord(
-        b4a.from('{"v":1,"status":"FAILED","code":"HOOK_FAILED","hookResult":{"a":1}}')
-      ),
-    { code: ERRORS.PROTOCOL_INVALID }
+      encodeLinkResultRecord({
+        v: 1,
+        status: 'FAILED',
+        code: ERRORS.HOOK_FAILED,
+        hookResult: 'x'
+      } as unknown as LinkResultRecord),
+    { code: ERRORS.PROTOCOL_INVALID },
+    'nothing unsafe is encoded on a failure either'
   )
   t.exception(
     () => decodeLinkResultRecord(b4a.from('{"v":1,"status":"LINKED","hookResult":{},"x":1}')),

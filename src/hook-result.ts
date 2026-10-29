@@ -21,6 +21,27 @@ export const MAX_HOOK_RESULT_BYTES = 3 * 1024
 /** The returned object is depth 1; each nested object or array adds one. */
 export const MAX_HOOK_RESULT_DEPTH = 8
 
+/** What one response-declared automatic `afterLink` call returned for an upload. */
+export interface UploadLinkResult {
+  readonly name: string
+  readonly target: string
+  readonly result: HookResult
+}
+
+/**
+ * The extra data an upload's answer carries: what the response-declared hooks
+ * returned, keyed by hook, and only the keys of hooks that returned an object. A
+ * failed upload carries at most `onFailure`.
+ */
+export interface UploadHookResult {
+  readonly afterCommit?: HookResult
+  readonly afterLink?: readonly UploadLinkResult[]
+  readonly onFailure?: HookResult
+}
+
+/** Link names and targets are safe basenames of at most this many bytes. */
+const MAX_NAME_LENGTH = 200
+
 /** Why a returned value was refused. Carries a reason and a path, never a value. */
 export class HookResultError extends Error {
   constructor(reason: string, where: string) {
@@ -128,6 +149,68 @@ export function copyHookResult(value: unknown): HookResult {
   }
   const copy = copyValue(value, 1, '$', { bytes: 0 }) as HookResult
   // The running total is only a lower bound; the exact compact size decides.
+  if (b4a.from(JSON.stringify(copy)).byteLength > MAX_HOOK_RESULT_BYTES) {
+    throw new HookResultError('too large', '$')
+  }
+  return copy
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function ownDataKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  where: string
+): void {
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key === 'symbol' || !allowed.includes(key)) {
+      throw new HookResultError('unexpected key', where)
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+      throw new HookResultError('accessor property', `${where}.${key}`)
+    }
+  }
+}
+
+function safeName(value: unknown, where: string): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_NAME_LENGTH) {
+    throw new HookResultError('invalid name', where)
+  }
+  return value
+}
+
+/**
+ * Checks and deep-copies an upload's combined hook data. Each component is a
+ * `HookResult` of its own, and the combined compact JSON is held to the same
+ * `MAX_HOOK_RESULT_BYTES` so the whole answer still fits one control record. It
+ * throws `HookResultError` for anything else, never including a value.
+ */
+export function copyUploadHookResult(value: unknown): UploadHookResult {
+  if (!isPlainRecord(value)) throw new HookResultError('not an object', '$')
+  ownDataKeys(value, ['afterCommit', 'afterLink', 'onFailure'], '$')
+  const copy: { -readonly [K in keyof UploadHookResult]: UploadHookResult[K] } = {}
+  if (value.afterCommit !== undefined) copy.afterCommit = copyHookResult(value.afterCommit)
+  if (value.onFailure !== undefined) copy.onFailure = copyHookResult(value.onFailure)
+  if (value.afterLink !== undefined) {
+    if (!Array.isArray(value.afterLink)) throw new HookResultError('not an array', '$.afterLink')
+    const links: UploadLinkResult[] = []
+    for (const [index, entry] of (value.afterLink as unknown[]).entries()) {
+      const where = `$.afterLink[${index}]`
+      if (!isPlainRecord(entry)) throw new HookResultError('not an object', where)
+      ownDataKeys(entry, ['name', 'target', 'result'], where)
+      links.push({
+        name: safeName(entry.name, `${where}.name`),
+        target: safeName(entry.target, `${where}.target`),
+        result: copyHookResult(entry.result)
+      })
+    }
+    copy.afterLink = links
+  }
   if (b4a.from(JSON.stringify(copy)).byteLength > MAX_HOOK_RESULT_BYTES) {
     throw new HookResultError('too large', '$')
   }

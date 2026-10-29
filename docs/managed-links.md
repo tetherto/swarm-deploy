@@ -102,8 +102,11 @@ compare-and-swap, which the storage adapter does not offer: a process that edits
 the storage root while the server runs can still have its change replaced in
 that window, so do not edit a running server's storage root. If the server stops
 after the swap and before the record is written, repeat the same request: it
-takes the link over again and returns `LINKED`. A failing `afterLink` hook
-leaves the taken-over link in place, and the retry returns `UNCHANGED`.
+takes the link over again and returns `LINKED`. A failing `response` `afterLink`
+hook leaves the taken-over link in place only when the request asked to `keep` it, and
+the retry then returns `UNCHANGED`. By default the old symlink comes back with its
+exact text and the retry returns `LINKED` (see
+[Rollback and its limits](hooks.md#rollback-and-its-limits)).
 
 **Case-insensitive volumes.** Ownership records are keyed by the exact spelling
 of a link name, but on a case-insensitive filesystem (the default on macOS and
@@ -136,6 +139,15 @@ the server. Never edit the ledger while the server runs. Removing all automatic
 rules intentionally reconciles proven stale automatic links away; malformed or
 conflicting ledgers still fail closed on the default symlink-capable storage.
 
+A link request that is waiting for its hook, or whose restore could not be
+finished, also has a rollback journal, `.swarm-deploy/links/<sha256(link-name)>.rollback.json`.
+It is removed by the server when the request is finalized or restored, and a
+server stopped normally leaves none. If one remains because the link or record was
+changed from outside, or the journal itself was edited, requests for that name fail with `LINK_FAILED` and the
+journal keeps the artifacts it names from retention. After making the symlink and
+its ownership record what you want, stop the server and remove that one journal
+file; do not edit it.
+
 ## Safe promotion workflow
 
 1. Upload a versioned artifact such as `app-2.4.1.tar.gz`.
@@ -148,11 +160,19 @@ conflicting ledgers still fail closed on the default symlink-capable storage.
 The explicit link operation is a control request, not an upload. It supports
 files and directories and is idempotent. It runs none of the upload hooks
 (`beforeCommit`, `afterCommit`), but a server with an `afterLink` hook runs it
-after the link is durable and before the result is returned; see
-[Link publication hooks](hooks.md#link-publication-hooks). A request can also ask
-for the JSON object the hook returned (`swarm-deploy link --json`, or
+after the link is durable; see
+[Link publication hooks](hooks.md#link-publication-hooks). A `response` hook
+(declared with `hookModes` or `--hook-mode afterLink=response`) is awaited before
+the result is returned, and if it fails the
+previous link and ownership record are restored by default, or kept with
+`swarm-deploy link --hook-failure keep` (`hookFailure: 'keep'`). A `detached` hook,
+the default, runs after the result was sent, so nothing is journaled and a failure
+can neither change the result nor restore the link. Requests for one
+link name run one at a time, from decision through a response hook to finalize or
+restore, while other links, uploads, and retention carry on. A request can also ask
+for the JSON object a response hook returned (`swarm-deploy link --json`, or
 `Client.link(target, name, { hookResult: true })`); that needs a server of
-version 0.5.0 or later.
+version 0.5.0 or later, and the failure policy needs 0.6.0 or later.
 
 `symlinks` requires `StorageAdapter.symlink` and `readlink`; the Node and Bare
 default adapters provide them; a custom adapter without symlink rules stays

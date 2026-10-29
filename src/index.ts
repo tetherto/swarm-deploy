@@ -23,6 +23,7 @@ export type {
   AfterCommitContext,
   AfterLinkContext,
   BeforeCommitContext,
+  FailedOutcome,
   HookArtifact,
   HookFailureContext,
   HookFailurePhase,
@@ -30,9 +31,17 @@ export type {
   HookLinkMode,
   HookLinkStatus,
   HookLinkTrigger,
+  HookModes,
+  HookResponse,
+  OperationOutcome,
   ServerHooks
 } from './hooks.js'
-export type { HookResult, HookResultValue } from './hook-result.js'
+export type {
+  HookResult,
+  HookResultValue,
+  UploadHookResult,
+  UploadLinkResult
+} from './hook-result.js'
 export { fixedSeriesKey, type ReleaseCoordinates, type VersionGranularity } from './release.js'
 export { parseAllowlist } from './allowlist.js'
 export type { ArtifactKind } from './types.js'
@@ -61,6 +70,7 @@ export {
   type ClientEventMap,
   type ClientEventName,
   type ClientLinkEvent,
+  type ClientLinkHookFailure,
   type ClientLinkOptions,
   type ClientLinkResult,
   type ClientLinkStatus,
@@ -68,6 +78,7 @@ export {
   type ClientOptions,
   type ClientProgressEvent,
   type ClientResultEvent,
+  type ClientUploadOptions,
   type ClientUploadResult,
   type UploadResult,
   type UploadStatus

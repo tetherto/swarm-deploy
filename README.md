@@ -37,7 +37,8 @@ protocol for stored artifacts.
 - **Managed symlinks:** automatic newest-match aliases and explicit client
   promotions such as `latest`.
 - **Trusted hooks:** server-side `beforeCommit`, `afterCommit`, `afterLink`, and
-  `onFailure` callbacks.
+  `onFailure` callbacks. The post-operation ones run after the answer (`detached`)
+  unless declared `response`, in which case they are awaited and may add JSON to it.
 - **CLI and API:** the `swarm-deploy` command and a strict-TypeScript API on
   Node.js and Bare.
 
@@ -187,8 +188,8 @@ the npm package, so these links point to GitHub.
   automatic and manual links, ownership rules, removal, and the promotion
   workflow.
 - [Deployment hooks](https://github.com/tetherto/swarm-deploy/blob/main/docs/hooks.md):
-  lifecycle points, invocation sequences, link publication, `onFailure`, and
-  hook modules.
+  response and detached hooks, lifecycle points, invocation sequences, link
+  publication, `onFailure`, hook modules, and the 0.6.0 migration.
 - [Protocol specification](https://github.com/tetherto/swarm-deploy/blob/main/docs/spec/swarm-deploy.md):
   the complete transport, deterministic TAR, resumability, storage,
   replacement, recovery, retention, threat-model, and package requirements.

@@ -1,6 +1,11 @@
 import b4a from 'b4a'
 import { ERRORS, SwarmDeployError, type ErrorCode } from '../errors.js'
-import { copyHookResult, type HookResult } from '../hook-result.js'
+import {
+  copyHookResult,
+  copyUploadHookResult,
+  type HookResult,
+  type UploadHookResult
+} from '../hook-result.js'
 import { MAX_TREE_ENTRIES } from './tree-path.js'
 import { deterministicTarSize, MAX_USTAR_FILE_BYTES, TAR_BLOCK_BYTES } from './ustar.js'
 
@@ -22,6 +27,12 @@ export interface MetadataRecord {
   tarSha256: string
   transferId: string
   reset: boolean
+  /**
+   * Opt-in: asks for the data the server's response-declared hooks return. Sent
+   * only when `true`, so an older strict server rejects an opted-in offer. It is
+   * not part of the transfer identity or the session.
+   */
+  hookResult?: true
 }
 
 /**
@@ -40,6 +51,8 @@ export interface TreeMetadataRecord {
   tarSha256: string
   transferId: string
   reset: boolean
+  /** As for `MetadataRecord.hookResult`. */
+  hookResult?: true
 }
 
 export type AnyMetadataRecord = MetadataRecord | TreeMetadataRecord
@@ -48,27 +61,42 @@ export function isTreeMetadata(value: AnyMetadataRecord): value is TreeMetadataR
   return (value as TreeMetadataRecord).kind === 'directory'
 }
 
+/**
+ * What the server does with a link it just made when `afterLink` fails:
+ * `rollback` restores the previous link and ownership metadata (or removes a
+ * link that did not exist), `keep` leaves the new link in place.
+ */
+export type LinkHookFailurePolicy = 'rollback' | 'keep'
+
 export interface LinkRequestRecord {
   v: typeof CONTROL_VERSION
   kind: 'link'
   target: string
   name: string
   /**
+   * The failure policy. A current client always sends it, so an older strict
+   * server rejects the request instead of silently keeping a link the caller
+   * expects to be rolled back. A request without it, from an older client, is
+   * handled as `rollback`.
+   */
+  hookFailure?: LinkHookFailurePolicy
+  /**
    * Opt-in: asks the server to return what its `afterLink` hook returned. The
-   * field is sent only when `true`, so a default request keeps its exact
-   * four-field shape and an older strict server rejects an opted-in one.
+   * field is sent only when `true`, so an older strict server rejects an
+   * opted-in request.
    */
   hookResult?: true
 }
 
 /**
  * `hookResult` appears only on an answer to a request that asked for it, and
- * only when the hook returned an object.
+ * only when a response-declared hook returned an object: `afterLink`'s on
+ * success, `onFailure`'s on a failure, whose `code` is always the primary one.
  */
 export type LinkResultRecord =
   | { v: typeof CONTROL_VERSION; status: 'LINKED'; hookResult?: HookResult }
   | { v: typeof CONTROL_VERSION; status: 'UNCHANGED'; hookResult?: HookResult }
-  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode }
+  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode; hookResult?: HookResult }
 
 /**
  * The first direct control frame may be an upload offer or a link request.
@@ -85,12 +113,18 @@ export type AdmissionRecord =
       prefixSha256: string
     }
   | { v: typeof CONTROL_VERSION; status: 'VERIFIED' }
-  | { v: typeof CONTROL_VERSION; status: 'ALREADY_COMMITTED' }
-  | { v: typeof CONTROL_VERSION; status: 'REJECTED'; code: ErrorCode }
+  | { v: typeof CONTROL_VERSION; status: 'ALREADY_COMMITTED'; hookResult?: UploadHookResult }
+  | {
+      v: typeof CONTROL_VERSION
+      status: 'REJECTED'
+      code: ErrorCode
+      hookResult?: UploadHookResult
+    }
 
+/** `hookResult` as for `LinkResultRecord`, in the upload's combined shape. */
 export type FinalRecord =
-  | { v: typeof CONTROL_VERSION; status: 'COMMITTED' }
-  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode }
+  | { v: typeof CONTROL_VERSION; status: 'COMMITTED'; hookResult?: UploadHookResult }
+  | { v: typeof CONTROL_VERSION; status: 'FAILED'; code: ErrorCode; hookResult?: UploadHookResult }
 
 function invalid(message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
@@ -167,6 +201,57 @@ function encodeRecord<T>(value: T, validate: (value: unknown) => T): Buffer {
   return encoded
 }
 
+function hasKey(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+/** An offer's receipt request: absent, or exactly `true` (`false` would be a second spelling of absent). */
+function assertReceiptRequest(value: Record<string, unknown>): void {
+  if (hasKey(value, 'hookResult') && value.hookResult !== true) {
+    throw invalid('Invalid hook result request')
+  }
+}
+
+/**
+ * Checks the upload data an answer carries, when it carries any. A successful answer
+ * carries only what the awaited `afterCommit` and `afterLink` hooks returned, and a
+ * failed one only what `onFailure` returned, so the keys of the other side are
+ * refused. A receipt names at least one hook and an `afterLink` list at least one
+ * call: a hook that returned an empty object is real data (`{ afterCommit: {} }`),
+ * but a receipt with nothing in it is never sent.
+ */
+function assertUploadReceipt(value: Record<string, unknown>, side: 'success' | 'failure'): void {
+  if (!hasKey(value, 'hookResult')) return
+  let receipt: UploadHookResult
+  try {
+    receipt = copyUploadHookResult(value.hookResult)
+  } catch (error) {
+    throw invalid('Invalid hook result', error)
+  }
+  const misplaced =
+    side === 'success'
+      ? receipt.onFailure !== undefined
+      : receipt.afterCommit !== undefined || receipt.afterLink !== undefined
+  if (
+    Object.keys(receipt).length === 0 ||
+    misplaced ||
+    (receipt.afterLink !== undefined && receipt.afterLink.length === 0)
+  ) {
+    throw invalid('Invalid hook result')
+  }
+}
+
+/** Checks the link data an answer carries, when it carries any. */
+function assertLinkReceipt(value: Record<string, unknown>): void {
+  if (!hasKey(value, 'hookResult')) return
+  try {
+    // Decoded input is a fresh parse, so the checked original is what is returned.
+    copyHookResult(value.hookResult)
+  } catch (error) {
+    throw invalid('Invalid hook result', error)
+  }
+}
+
 function validateMetadata(value: unknown): MetadataRecord {
   if (!isRecord(value)) throw invalid('Metadata record must be an object')
   const expected = [
@@ -182,7 +267,9 @@ function validateMetadata(value: unknown): MetadataRecord {
   if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
     expected.push('sourceParent')
   }
+  if (hasKey(value, 'hookResult')) expected.push('hookResult')
   exactKeys(value, expected)
+  assertReceiptRequest(value)
   assertVersion(value.v)
   assertName(value.name)
   if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) {
@@ -237,7 +324,9 @@ function validateTreeMetadata(value: unknown): TreeMetadataRecord {
     'reset'
   ]
   if (Object.prototype.hasOwnProperty.call(value, 'sourceParent')) expected.push('sourceParent')
+  if (hasKey(value, 'hookResult')) expected.push('hookResult')
   exactKeys(value, expected)
+  assertReceiptRequest(value)
   assertVersion(value.v)
   if (value.kind !== 'directory') throw invalid('Invalid artifact kind')
   assertName(value.name)
@@ -267,12 +356,20 @@ const LINK_REQUEST_KEYS = ['v', 'kind', 'target', 'name']
 
 function validateLinkRequest(value: unknown): LinkRequestRecord {
   if (!isRecord(value)) throw invalid('Link request record must be an object')
+  const hasPolicy = Object.prototype.hasOwnProperty.call(value, 'hookFailure')
   const asksForResult = Object.prototype.hasOwnProperty.call(value, 'hookResult')
-  exactKeys(value, asksForResult ? [...LINK_REQUEST_KEYS, 'hookResult'] : LINK_REQUEST_KEYS)
+  exactKeys(value, [
+    ...LINK_REQUEST_KEYS,
+    ...(hasPolicy ? ['hookFailure'] : []),
+    ...(asksForResult ? ['hookResult'] : [])
+  ])
   assertVersion(value.v)
   if (value.kind !== 'link') throw invalid('Invalid control request kind')
   assertName(value.target)
   assertName(value.name)
+  if (hasPolicy && value.hookFailure !== 'rollback' && value.hookFailure !== 'keep') {
+    throw invalid('Invalid hook failure policy')
+  }
   // Only `true` opts in; `false` would be a second spelling of the default.
   if (asksForResult && value.hookResult !== true) throw invalid('Invalid hook result request')
   return value as unknown as LinkRequestRecord
@@ -294,11 +391,18 @@ function validateAdmission(value: unknown): AdmissionRecord {
     assertSafeUint(value.offset, 'resume offset')
     if (value.offset === 0) throw invalid('Invalid resume offset')
     assertHex32(value.prefixSha256, 'prefix digest')
-  } else if (value.status === 'VERIFIED' || value.status === 'ALREADY_COMMITTED') {
+  } else if (value.status === 'VERIFIED') {
     exactKeys(value, ['v', 'status'])
+  } else if (value.status === 'ALREADY_COMMITTED') {
+    exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
+    assertUploadReceipt(value, 'success')
   } else if (value.status === 'REJECTED') {
-    exactKeys(value, ['v', 'status', 'code'])
+    exactKeys(
+      value,
+      hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
+    )
     assertStableCode(value.code)
+    assertUploadReceipt(value, 'failure')
   } else {
     throw invalid('Invalid admission status')
   }
@@ -309,10 +413,15 @@ function validateFinal(value: unknown): FinalRecord {
   if (!isRecord(value)) throw invalid('Final record must be an object')
   assertVersion(value.v)
   if (value.status === 'COMMITTED') {
-    exactKeys(value, ['v', 'status'])
+    exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
+    assertUploadReceipt(value, 'success')
   } else if (value.status === 'FAILED') {
-    exactKeys(value, ['v', 'status', 'code'])
+    exactKeys(
+      value,
+      hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
+    )
     assertStableCode(value.code)
+    assertUploadReceipt(value, 'failure')
   } else {
     throw invalid('Invalid final status')
   }
@@ -323,19 +432,15 @@ function validateLinkResult(value: unknown): LinkResultRecord {
   if (!isRecord(value)) throw invalid('Link result record must be an object')
   assertVersion(value.v)
   if (value.status === 'LINKED' || value.status === 'UNCHANGED') {
-    const hasResult = Object.prototype.hasOwnProperty.call(value, 'hookResult')
-    exactKeys(value, hasResult ? ['v', 'status', 'hookResult'] : ['v', 'status'])
-    if (hasResult) {
-      try {
-        // Decoded input is a fresh parse, so the checked original is what is returned.
-        copyHookResult(value.hookResult)
-      } catch (error) {
-        throw invalid('Invalid hook result', error)
-      }
-    }
+    exactKeys(value, hasKey(value, 'hookResult') ? ['v', 'status', 'hookResult'] : ['v', 'status'])
+    assertLinkReceipt(value)
   } else if (value.status === 'FAILED') {
-    exactKeys(value, ['v', 'status', 'code'])
+    exactKeys(
+      value,
+      hasKey(value, 'hookResult') ? ['v', 'status', 'code', 'hookResult'] : ['v', 'status', 'code']
+    )
     assertStableCode(value.code)
+    assertLinkReceipt(value)
   } else {
     throw invalid('Invalid link result status')
   }

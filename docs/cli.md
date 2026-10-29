@@ -53,7 +53,7 @@ swarm-deploy server \
   [--max-count <count>] \
   [--max-versions <count> --version-granularity <major|minor>] \
   [--symlink <selector> [<link-name>]]... \
-  [--hooks <module>]
+  [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...]
 ```
 
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>` to provide the
@@ -101,9 +101,19 @@ Optional options:
 - `--hooks <module>`: JavaScript module (`.js`, `.mjs`, or `.cjs`) exporting
   trusted lifecycle callbacks. The path is resolved against the working
   directory. See [Deployment hooks](hooks.md).
+- `--hook-mode <hook>=<mode>`: declares whether one post-operation hook
+  (`afterCommit`, `afterLink`, or `onFailure`) is `response` (awaited before the
+  answer, may return data, and fails the operation when it fails) or `detached`
+  (runs after the answer and cannot change it). Repeatable, once per hook, and
+  it overrides the module's own `hookModes` export for that hook. Every
+  post-operation hook is `detached` unless declared, so mark a publishing or
+  deployment step that must succeed `response`. It requires `--hooks`, and the
+  hook it names must be one the module exports. See
+  [Response and detached hooks](hooks.md#response-and-detached-hooks).
 
 All counts are positive safe integers. Invalid combinations, malformed or
-duplicate templates, and unloadable hook modules are configuration errors that
+duplicate templates, a malformed or repeated `--hook-mode`, and unloadable hook
+modules are configuration errors that
 exit `2` before the server listens. Each hooks-module error names only the
 module basename with a fixed reason, never module content.
 
@@ -118,6 +128,7 @@ swarm-deploy upload \
   --server-key <64-lower-hex> \
   [--idle-timeout <milliseconds>] \
   [--no-source-parent] \
+  [--json] \
   <file-or-directory>
 ```
 
@@ -143,6 +154,17 @@ seed inline.
   Nothing is silently skipped.
 - On success the CLI prints one line: `<name> <kind> <status>` (for example
   `0.18.1 directory COMMITTED`).
+- `--json` takes no value. It asks the server for the data its `response`
+  hooks returned and prints one JSON object on one line instead of that line:
+  `{ "name", "kind", "status", "hookResult"? }`. `hookResult` is
+  `{ "afterCommit"?, "afterLink"? }` (see
+  [Returning data in the answer](hooks.md#link-publication-hooks)) and is present
+  only when a `response` hook returned something. `--json` only asks for the data
+  and formats the output: whether the server waits for a hook is its own
+  declaration. When the request fails and the server's `response` `onFailure`
+  returned data, it is printed as `{ "code", "hookResult": { "onFailure" } }`
+  before the usual stderr diagnostic and exit status `1`. It needs a server of
+  version 0.6.0 or later; an older one rejects the opted-in offer.
 
 Accepted names start with an ASCII letter or digit, contain only letters,
 digits, `.`, `_`, and `-`, and occupy at most 100 UTF-8 bytes. `history-` is
@@ -159,6 +181,7 @@ swarm-deploy link \
   --seed-file <seed-file> \
   --server-key <64-lower-hex> \
   [--idle-timeout <milliseconds>] \
+  [--hook-failure <rollback|keep>] \
   [--json] \
   <target> <link-name>
 ```
@@ -166,8 +189,8 @@ swarm-deploy link \
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>`, or use
 `SWARM_DEPLOY_CLIENT_SEED`, exactly as for `upload`. `--server-key` pins the
 server identity, and `--idle-timeout` has the same 60-second default and
-inactivity semantics as upload. `--json` takes no value and belongs to `link`
-alone; see [JSON output](#json-output).
+inactivity semantics as upload. `--hook-failure` takes `rollback` (the default)
+or `keep` and `--json` takes no value; both belong to `link` alone.
 
 The command asks the authenticated server to point `<link-name>` at the
 existing managed file or directory `<target>`. The target must match a
@@ -188,19 +211,37 @@ requested link and the server owns it from then on; the first such run prints
 file or directory at that name is never replaced and fails with `LINK_CONFLICT`.
 See [Managed symlinks](managed-links.md#selection-and-ownership-rules).
 
-When the server has an `afterLink` hook, success is printed only after the hook
-returns, for as long as `--idle-timeout` allows. If the hook fails, the command
-exits `1` and prints `HOOK_FAILED`; the link itself has already changed, and
-running the same command again is safe and re-runs the hook. A hook slower than
-`--idle-timeout` makes the command fail with a timeout instead, though the
-server still finishes the hook (see
-[Link publication hooks](hooks.md#link-publication-hooks)). The rules behind
-manual links are in [Managed symlinks](managed-links.md).
+When the server's `afterLink` hook is declared `response`, success is printed only
+after the hook returns, for as long as `--idle-timeout` allows. If the hook fails,
+the command exits `1` and prints `HOOK_FAILED`, in both modes, and running the same
+command again is safe and re-runs the hook. A `detached` hook (the default) is
+not waited for: success is printed at once, and a later failure of the hook can
+neither change it nor roll the link back. A hook slower than `--idle-timeout` makes
+the command fail with a timeout instead, though the server still finishes the
+hook (see [Link publication hooks](hooks.md#link-publication-hooks)). The rules
+behind manual links are in [Managed symlinks](managed-links.md).
+
+### Hook failure policy
+
+This policy applies only when the server's `afterLink` is a `response` hook; with
+a detached one nothing can fail the command and there is nothing to restore.
+By default (`--hook-failure rollback`, or no flag) a failed hook restores the
+previous local link and its ownership record before the command exits, or removes
+a link the command created, so a rerun links afresh and prints `LINKED`. With
+`--hook-failure keep` the new link stays, as in 0.5.x, and a rerun prints
+`UNCHANGED`. Either way the command waits for the hook, exits `1` with
+`HOOK_FAILED`, and nothing the hook did elsewhere is undone. If the restore
+cannot be proven or fails, the command prints `LINK_FAILED` and the server leaves
+what it found; see
+[Rollback and its limits](hooks.md#rollback-and-its-limits). The policy is always
+sent, so a server older than 0.6.0 rejects the command instead of silently
+keeping the link: upgrade servers before clients. `--hook-failure` and `--json`
+are independent.
 
 ### JSON output
 
-With `--json` the command asks the server for what its `afterLink` hook returned
-and prints one JSON object on one line instead of the text line:
+With `--json` the command asks the server for what its `response` `afterLink` hook
+returned and prints one JSON object on one line instead of the text line:
 
 ```json
 {
@@ -215,8 +256,12 @@ and prints one JSON object on one line instead of the text line:
 object has just `target`, `name`, and `status`. It is data the hook chose to
 report, such as an accepted submission's ID, not proof that anything was
 published; see [Link publication hooks](hooks.md#link-publication-hooks). A
-failure prints nothing on stdout, a stable code on stderr, and exits `1`, as
-without the flag, and diagnostics stay on stderr. `--idle-timeout` is still the
+failure prints a stable code on stderr and exits `1`, as without the flag, and
+diagnostics stay on stderr; stdout stays empty unless the server's `response`
+`onFailure` returned data, in which case it is
+`{ "target", "name", "code", "hookResult" }` with the primary code.
+`--json` only asks for the data and formats the output; it never decides whether
+the server waits for a hook. `--idle-timeout` is still the
 whole time budget. Without `--json` the command asks for nothing and prints
 exactly the text line above. `--json` needs a server of version 0.5.0 or later:
 an older server rejects the request, so the command fails instead of printing a
