@@ -500,7 +500,7 @@ const closeHooks = {
   }
 } satisfies ServerHooks
 const syncCloseHooks: ServerHooks = { beforeClose: () => {} }
-const asyncCloseHooks: ServerHooks = { beforeClose: async () => {} }
+const asyncCloseHooks: ServerHooks = { beforeClose: () => Promise.resolve() }
 const bothHooks: ServerHooks = { afterLink: () => {}, beforeClose: () => {} }
 const closeHookOptions = {
   seed: serverSeed,

@@ -2274,6 +2274,14 @@ export class Server extends EventEmitter {
     await this.transport?.close().catch(() => {})
     this.transport = null
     await Promise.allSettled([...this.receives])
+    // Scheduled retention stops here, before the detached calls are drained and so before
+    // their pins are released, and before the unbounded wait on the cleanup below. Once the
+    // pins are gone nothing else protects what an abandoned callback is still using, so no
+    // retention pass may start after that: the interval is cleared and a pass already running
+    // is waited for (it began with the pins held). The stores and the storage lock stay in
+    // place until the cleanup settles; only the scheduler goes.
+    await this.retention?.stop().catch(() => {})
+    this.retention = null
     // The signal is already aborted, so queued detached calls are dropped and a running one
     // is abandoned (its callback keeps running detached); this waits for neither hook code
     // nor anything that could hang.
@@ -2286,8 +2294,6 @@ export class Server extends EventEmitter {
     this.active.clear()
     this.activeTransfers.clear()
     this.pendingAfterCommit.clear()
-    await this.retention?.stop().catch(() => {})
-    this.retention = null
     this.links = null
     await this.sessions?.close().catch(() => {})
     this.sessions = null

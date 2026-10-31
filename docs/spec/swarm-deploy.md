@@ -323,9 +323,11 @@ declaration (a `hookModes` entry or `--hook-mode` for it is refused as an unknow
 key), and changes no wire record. `close()` runs, in this order: admission stops
 (`closed`); `beforeClose` is called synchronously in that same call, so it can
 cancel external work first; the server's own operations are aborted as they
-always were and finish; then `beforeClose` and those operations are both awaited
-before the stores and retention are closed, the storage lock is released and
-`close` is emitted. Every call returns one promise and the hook runs once, even
+always were and finish; scheduled retention is then stopped (a pass already
+running is waited for) before the detached calls release their pins and before the
+wait on `beforeClose`, so no pass can start while it drains, and the stores and the
+storage lock stay in place; `beforeClose` and the operations are both awaited
+before the stores are closed, the storage lock is released and `close` is emitted. Every call returns one promise and the hook runs once, even
 when `close()` is called again, concurrently, or re-entrantly from inside the hook.
 It is called for any close, served or not, and by a failed `listen()` only when
 that start had already created the transport. The server adds no timeout and never

@@ -1676,6 +1676,51 @@ test('CLI refuses a hook mode for beforeClose and a beforeClose that is not a fu
   }
 })
 
+test('CLI signal shutdown exits 1 with the fixed Cleanup failed when Server.close rejects, and leaks nothing', async (t) => {
+  const secret = 'beforeClose sk-secret callback text'
+  // What a failing beforeClose makes Server.close() reject with, and a bare error as well:
+  // neither text may reach the operator's terminal.
+  const failures: Array<[string, () => Error]> = [
+    [
+      'the server error',
+      () =>
+        new SwarmDeployError(
+          ERRORS.HOOK_FAILED,
+          'Deployment hook failed during beforeClose',
+          new Error(secret)
+        )
+    ],
+    ['a bare error', () => new Error(secret)]
+  ]
+  for (const [label, failure] of failures) {
+    let listens = 0
+    let closes = 0
+    class FailingClose {
+      publicKey = SERVER_KEY
+      listen() {
+        listens++
+        return Promise.resolve(this)
+      }
+      close() {
+        closes++
+        return Promise.reject(failure())
+      }
+    }
+    // `runServerCli` waits for the server to be ready, sends SIGINT, and returns once `main`
+    // resolves: it does not return at all if the signal path hangs on a rejected close.
+    const result = await runServerCli(await createTempDir(t), [], {
+      Server: FailingClose as unknown as ServerConstructor
+    })
+    t.is(result.code, 1, `${label}: main resolves with exit 1`)
+    t.is(result.stderr, 'Cleanup failed\n', `${label}: the fixed message and nothing else`)
+    t.absent(result.stderr.includes(secret), `${label}: no callback text`)
+    t.absent(result.stderr.includes('Deployment hook failed'), `${label}: not the error's message`)
+    t.ok(result.stdout.endsWith('ready\n'), `${label}: it had started serving`)
+    t.is(listens, 1, label)
+    t.is(closes, 1, `${label}: closed once, by the signal, not again at exit`)
+  }
+})
+
 test('CLI rejects a missing, empty, or repeated --hooks option before construction', async (t) => {
   const root = await createTempDir(t)
   await fs.promises.writeFile(path.join(root, 'a.cjs'), 'module.exports = { onFailure () {} }\n')

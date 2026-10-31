@@ -187,9 +187,14 @@ What the server guarantees, in this order, on the first `close()`:
 2. It calls `beforeClose`, synchronously inside that `close()` call, so the callback
    can cancel external work before anything else of the close proceeds.
 3. It aborts its own operations, as it always did, and they finish.
-4. It waits for `beforeClose` and the operations. Only then does it close its
-   stores and retention, release the storage lock, and emit `close`. Another server
-   cannot take the storage root while `beforeClose` is still draining.
+4. It stops scheduled retention, waiting for a pass that is already running, and
+   only then lets the detached calls give up their artifact pins. No retention pass
+   can therefore start while `beforeClose` is still draining, and delete what a
+   callback that is being cancelled is still using. The stores and the storage lock
+   stay in place.
+5. It waits for `beforeClose`. Only then does it close its stores, release the
+   storage lock, and emit `close`. Another server cannot take the storage root
+   while `beforeClose` is still draining.
 
 Every `close()` call returns one and the same promise, and `beforeClose` is called
 once, even if `close()` is called again, concurrently, or from inside the callback

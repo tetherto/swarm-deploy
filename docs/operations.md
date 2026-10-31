@@ -379,9 +379,10 @@ server's teardown callback. Without it nothing changes: closing aborts the waits
 operation hooks, abandons a callback that is still running, and stays bounded even
 if that callback never settles. With it, the first `close()` (including the one a
 `SIGINT` or `SIGTERM` triggers) stops admission, calls the hook at once, aborts the
-operations as before, and releases the storage lock and emits `close` only after the
-hook and the operations finished, so another server cannot take the root while the
-hook is still draining external work.
+operations as before, stops scheduled retention (so no pass can delete what a
+cancelled callback is still using while the hook drains), and releases the storage
+lock and emits `close` only after the hook and the operations finished, so another
+server cannot take the root while the hook is still draining external work.
 
 - **The hook owns its bounds.** The server adds no timeout and never abandons it: a
   `beforeClose` that never settles keeps the process from exiting and the root
