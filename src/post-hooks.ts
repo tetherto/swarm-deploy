@@ -74,6 +74,11 @@ export class DetachedHooks {
   private readonly report: (problem: DetachedProblem, info: DetachedInfo) => void
   private readonly jobs = new Set<Promise<void>>()
   private readonly pinned = new Map<string, number>()
+  /**
+   * While the server is closing: the artifacts that were pinned when `hold()` was
+   * called, and those pinned since, kept in `pins()` after their calls ended.
+   */
+  private held: Set<string> | null = null
 
   constructor(
     signal: AbortSignalLike,
@@ -88,9 +93,34 @@ export class DetachedHooks {
     return this.jobs.size
   }
 
-  /** Transfer IDs of artifacts a queued or running call still needs, for retention. */
+  /**
+   * Transfer IDs of the artifacts retention must keep for detached calls: those a
+   * queued or running call still needs, and, once `hold()` was called and until
+   * `release()`, those that were held when it was called or since, even though their
+   * calls have already ended.
+   */
   pins(): Iterable<string> {
-    return this.pinned.keys()
+    if (this.held === null) return this.pinned.keys()
+    return new Set([...this.pinned.keys(), ...this.held])
+  }
+
+  /**
+   * Called synchronously when the server starts to close, before its signal is
+   * aborted and before anything else can end a call. Aborting ends every queued or
+   * running call at once, and each ends by releasing its pin, long before retention
+   * has stopped; a retention pass that starts, or that is already running and has not
+   * read its pins yet, would then find the artifact unprotected while a cancelled
+   * callback may still be using it. This keeps those artifacts, and any a call
+   * registers while the server closes, in `pins()` until `release()`. Calling it again
+   * keeps the first snapshot.
+   */
+  hold(): void {
+    if (this.held === null) this.held = new Set(this.pinned.keys())
+  }
+
+  /** Ends `hold()`: the server has stopped retention, so nothing reads the pins any more. */
+  release(): void {
+    this.held = null
   }
 
   /**
@@ -105,7 +135,11 @@ export class DetachedHooks {
       this.tell('dropped', job)
       return
     }
-    if (job.pin !== null) this.pinned.set(job.pin, (this.pinned.get(job.pin) ?? 0) + 1)
+    if (job.pin !== null) {
+      this.pinned.set(job.pin, (this.pinned.get(job.pin) ?? 0) + 1)
+      // A call registered while the server closes ends at once, but retention may still run.
+      this.held?.add(job.pin)
+    }
     const run = this.run(job)
     this.jobs.add(run)
     const done = (): void => {

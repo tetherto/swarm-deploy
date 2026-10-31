@@ -378,11 +378,16 @@ A hooks module (or `ServerOptions.hooks`) may now register `beforeClose`, the
 server's teardown callback. Without it nothing changes: closing aborts the waits on
 operation hooks, abandons a callback that is still running, and stays bounded even
 if that callback never settles. With it, the first `close()` (including the one a
-`SIGINT` or `SIGTERM` triggers) stops admission, calls the hook at once, aborts the
-operations as before, stops scheduled retention (so no pass can delete what a
-cancelled callback is still using while the hook drains), and releases the storage
-lock and emits `close` only after the hook and the operations finished, so another
-server cannot take the root while the hook is still draining external work.
+`SIGINT` or `SIGTERM` triggers) stops admission, notes the artifacts its detached
+calls hold, calls the hook at once, aborts the operations as before, stops scheduled
+retention (waiting for a pass that is already running) before the wait on the hook,
+and releases the storage lock and emits `close` only after the hook and the
+operations finished, so another server cannot take the root while the hook is still
+draining external work. The noted artifacts stay protected from retention until its
+stop has completed, so a pass that runs while the transport is still closing cannot
+delete what a cancelled callback is still using; the callbacks themselves end, and
+give up their own pins, at the abort. A long retention pass that is running when the
+server closes delays the lock release (and not the hook, which was called first).
 
 - **The hook owns its bounds.** The server adds no timeout and never abandons it: a
   `beforeClose` that never settles keeps the process from exiting and the root

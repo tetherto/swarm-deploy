@@ -321,13 +321,20 @@ load is attempted.
 it is called with no arguments, at most once, is always awaited, takes no
 declaration (a `hookModes` entry or `--hook-mode` for it is refused as an unknown
 key), and changes no wire record. `close()` runs, in this order: admission stops
-(`closed`); `beforeClose` is called synchronously in that same call, so it can
-cancel external work first; the server's own operations are aborted as they
-always were and finish; scheduled retention is then stopped (a pass already
-running is waited for) before the detached calls release their pins and before the
-wait on `beforeClose`, so no pass can start while it drains, and the stores and the
-storage lock stay in place; `beforeClose` and the operations are both awaited
-before the stores are closed, the storage lock is released and `close` is emitted. Every call returns one promise and the hook runs once, even
+(`closed`); the artifacts of the queued and running detached calls are noted;
+`beforeClose` is called synchronously in that same call, so it can cancel external
+work first; the server's own operations are aborted as they always were and finish
+(which ends every detached call at once, each releasing its own pin); scheduled
+retention is then stopped, which clears its interval and waits for a pass already
+running (it is not cancelled), before the wait on `beforeClose`. The noted artifacts
+stay pinned for retention until that stop has completed, so a pass that starts, or
+is already running and has not yet read its pins, cannot delete what a cancelled
+callback still uses; once it has completed no pass can run, and the notes are
+dropped. The stores and the storage lock stay in place; `beforeClose` and the
+operations are both awaited before the stores are closed, the storage lock is
+released and `close` is emitted. The notes cover detached calls only: the other
+pins retention uses (managed link targets, rollback journals) are persistent and
+unaffected by closing. Every call returns one promise and the hook runs once, even
 when `close()` is called again, concurrently, or re-entrantly from inside the hook.
 It is called for any close, served or not, and by a failed `listen()` only when
 that start had already created the transport. The server adds no timeout and never

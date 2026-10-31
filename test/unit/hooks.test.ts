@@ -845,6 +845,38 @@ test('closing abandons a detached call that is still running without waiting for
   never.open()
 })
 
+test('hold keeps the pins of calls an abort ended, and of calls registered since, until release', async (t) => {
+  const { hooks, controller } = detachedRig()
+  const never = gateOf()
+  const register = (pin: string): void =>
+    hooks.start({
+      hook: 'afterCommit',
+      callback: () => never.wait,
+      context: {},
+      outcome: { status: 'succeeded' },
+      turn: null,
+      pin,
+      fields: {}
+    })
+  register('before')
+  register('before')
+  await tick()
+  hooks.hold()
+  hooks.hold()
+  controller.abort()
+  // A call registered while closing ends at once, and its pin is still kept.
+  register('during')
+  await hooks.drain()
+  t.alike([...hooks.pins()].sort(), ['before', 'during'], 'the ended calls are still pinned')
+
+  hooks.release()
+  t.alike([...hooks.pins()], [], 'nothing is held after the release')
+  hooks.hold()
+  t.alike([...hooks.pins()], [], 'a later snapshot starts from what is pinned then')
+  hooks.release()
+  never.open()
+})
+
 function gateOf(): { wait: Promise<void>; open(): void } {
   let open = (): void => {}
   const wait = new Promise<void>((resolve) => {

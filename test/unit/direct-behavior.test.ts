@@ -122,6 +122,8 @@ class FakeServerNode implements DirectDhtNode {
   handleClosed = false
   /** When set, `listen()` on the server handle rejects with it, after the transport exists. */
   listenError: Error | null = null
+  /** When set, closing the server handle (so `transport.close()`) waits for it. */
+  closeGate: Promise<void> | null = null
   private firewall: ((remotePublicKey: Buffer) => boolean) | null = null
   private connection: ((socket: DirectDhtSocket) => void) | null = null
 
@@ -145,7 +147,7 @@ class FakeServerNode implements DirectDhtNode {
       },
       close() {
         node.handleClosed = true
-        return Promise.resolve()
+        return node.closeGate ?? Promise.resolve()
       }
     }
   }
@@ -5953,7 +5955,42 @@ test('a cancellable publisher cannot continue after close() resolves, and no oth
   t.is(next.listening, true, 'another server takes the root only after the drain')
 })
 
-test('scheduled retention is stopped before the beforeClose wait, so it cannot delete what a cancelled hook still uses', async (t) => {
+interface RetentionRig {
+  server: Server
+  node: FakeServerNode
+  /** The interval callbacks retention registered; nothing fires them but the test. */
+  ticks: Array<() => void>
+  /** The interval handles retention cleared. */
+  cleared: unknown[]
+  /** The outcomes of the scheduled retention passes, as the `retention` events told them. */
+  scheduled: string[]
+  /** Opens to let the abandoned `afterLink` call return. */
+  held: ReturnType<typeof gate>
+  /** Opens to let `beforeClose` return. */
+  cleanup: ReturnType<typeof gate>
+  /**
+   * The transfer IDs of `app-1` and `app-2`, sorted, which the two detached publications pin.
+   * The one of `app-2` is queued behind the one of `app-1` on the link name `current`.
+   */
+  pinned: string[]
+  /** What retention is told to keep for detached calls, a close() snapshot included. */
+  pins(): string[]
+  /** The pins of the calls that have not ended: unlike `pins()`, no snapshot. */
+  live(): string[]
+  there(name: string): Promise<boolean>
+}
+
+/**
+ * A server whose retention interval fires only when the test fires it, and on which `app-1` is
+ * kept by nothing but a detached `afterLink` call that is still running: `current` has moved on
+ * to `app-2` (the link record no longer points at `app-1`), and a third release makes
+ * `maxCount: 2` want to delete the oldest. A retention pass that does not count that call's pin
+ * deletes `app-1` from under a publication a `beforeClose` is still cancelling.
+ */
+async function retentionRig(
+  t: Assert,
+  options: Partial<ConstructorParameters<typeof Server>[0]> = {}
+): Promise<RetentionRig> {
   const cleanup = gate()
   const held = gate()
   let started = 0
@@ -5986,14 +6023,20 @@ test('scheduled retention is stopped before the beforeClose wait, so it cannot d
         await cleanup.wait
       }
     },
-    hookModes: { afterLink: 'detached' }
+    hookModes: { afterLink: 'detached' },
+    ...options
   })
   const scheduled: string[] = []
   server.on('retention', (event) => {
     if (event.trigger === 'scheduled') scheduled.push(event.status)
   })
-  const pins = (): string[] =>
-    [...(server as unknown as { detached: { pins(): Iterable<string> } }).detached.pins()].sort()
+  const detached = (
+    server as unknown as {
+      detached: { pins(): Iterable<string>; pinned: Map<string, number> }
+    }
+  ).detached
+  const pins = (): string[] => [...detached.pins()].sort()
+  const live = (): string[] => [...detached.pinned.keys()].sort()
   const there = (name: string): Promise<boolean> =>
     fs.promises.lstat(path.join(server.storageDir, name)).then(
       () => true,
@@ -6001,40 +6044,129 @@ test('scheduled retention is stopped before the beforeClose wait, so it cannot d
     )
   t.is(ticks.length, 1, 'retention scheduled its interval through the injected scheduler')
 
-  const app1 = await manifest(t, 'app-1.0.0.bin', 'aa')
-  t.absent(finalCode(await uploadAll(node, app1)))
-  t.absent(finalCode(await uploadAll(node, await manifest(t, 'app-2.0.0.bin', 'aa'))))
+  const first = await manifest(t, 'app-1.0.0.bin', 'aa')
+  const second = await manifest(t, 'app-2.0.0.bin', 'aa')
+  const pinned = [
+    metadataFromManifest(first.manifest).transferId,
+    metadataFromManifest(second.manifest).transferId
+  ].sort()
+  t.absent(finalCode(await uploadAll(node, first)))
+  t.absent(finalCode(await uploadAll(node, second)))
   // `current` is published at app-1, then moved to app-2: from then on only the publication of
   // app-1, which is still running, holds app-1 (the link record points at app-2).
-  const first = linkRequest(node, 'app-1.0.0.bin', 'current')
+  const publish = linkRequest(node, 'app-1.0.0.bin', 'current')
   await waitFor(() => started === 1)
-  t.alike(linkFrame(first), { v: 1, status: 'LINKED' })
-  const second = linkRequest(node, 'app-2.0.0.bin', 'current')
-  await waitFor(() => second.writes.length === 1)
-  t.alike(linkFrame(second), { v: 1, status: 'LINKED' })
+  t.alike(linkFrame(publish), { v: 1, status: 'LINKED' })
+  const move = linkRequest(node, 'app-2.0.0.bin', 'current')
+  await waitFor(() => move.writes.length === 1)
+  t.alike(linkFrame(move), { v: 1, status: 'LINKED' })
   // A third release makes retention keep the newest two, so app-1 would go if nothing held it.
   t.absent(finalCode(await uploadAll(node, await manifest(t, 'app-3.0.0.bin', 'aa'))))
   t.is(await there('app-1.0.0.bin'), true, 'the running publication holds it')
-  t.ok(pins().includes(metadataFromManifest(app1.manifest).transferId), 'by its detached pin')
+  t.alike(live(), pinned, 'by its detached pin')
+  return { server, node, ticks, cleared, scheduled, held, cleanup, pinned, pins, live, there }
+}
 
+test('scheduled retention is stopped before the beforeClose wait, so it cannot delete what a cancelled hook still uses', async (t) => {
+  const rig = await retentionRig(t)
   let finished = false
-  const closing = server.close().then(() => {
+  const closing = rig.server.close().then(() => {
     finished = true
   })
-  // The abandoned publication gives its pin up when the detached calls drain. The cleanup is
-  // still waiting on its gate, and the retention timer was cleared before that happened.
-  await waitFor(() => pins().length === 0)
+  // Retention is stopped, and only then are the pins close() kept for it released; the wait on
+  // beforeClose comes after both and is still on its gate.
+  await waitFor(() => rig.pins().length === 0)
+  t.is(rig.cleared.length, 1, 'scheduled retention was stopped before the pins were released')
   t.is(finished, false, 'the cleanup is still draining')
-  t.is(cleared.length, 1, 'scheduled retention was stopped before the cleanup wait')
 
-  // A scheduled pass that fires now, with the pin gone, must not run: it would find app-1
-  // unprotected.
-  for (const tick of ticks) tick()
-  cleanup.open()
-  held.open()
+  // A scheduled pass that fires now must not run: the interval is gone, and with it the tick.
+  for (const tick of rig.ticks) tick()
+  rig.cleanup.open()
+  rig.held.open()
   await closing
-  t.is(await there('app-1.0.0.bin'), true, 'what the cancelled publication used was not deleted')
-  t.alike(scheduled, [], 'no scheduled retention pass ran during the drain')
+  t.is(
+    await rig.there('app-1.0.0.bin'),
+    true,
+    'what the cancelled publication used was not deleted'
+  )
+  t.alike(rig.scheduled, [], 'no scheduled retention pass ran during the drain')
+})
+
+test('a retention pass that starts while the transport is still closing keeps what a cancelled hook uses', async (t) => {
+  const rig = await retentionRig(t)
+  const transport = gate()
+  rig.node.closeGate = transport.wait
+  let finished = false
+  const closing = rig.server.close().then(() => {
+    finished = true
+  })
+  // close() aborted the detached calls, so the publication of app-1 has returned and let its own
+  // pin go. The transport close is stuck on its gate, so retention has not been stopped yet: the
+  // interval is live and nothing but close()'s snapshot protects app-1.
+  await waitFor(() => rig.node.handleClosed)
+  await waitFor(() => rig.live().length === 0)
+  t.is(rig.cleared.length, 0, 'retention is not stopped yet')
+  t.alike(rig.pins(), rig.pinned, 'close() kept the pins in force')
+
+  for (const tick of rig.ticks) tick()
+  await waitFor(() => rig.scheduled.length === 1)
+  t.alike(rig.scheduled, ['completed'], 'the scheduled pass ran, while the transport was closing')
+  t.is(await rig.there('app-1.0.0.bin'), true, 'and it kept what the cancelled publication uses')
+  t.is(finished, false)
+  t.is(rig.cleared.length, 0, 'the transport close is still what close() waits on')
+
+  transport.open()
+  await waitFor(() => rig.pins().length === 0)
+  t.is(rig.cleared.length, 1, 'the pins went only once retention was stopped')
+  t.is(finished, false, 'the beforeClose wait is still draining')
+  rig.cleanup.open()
+  rig.held.open()
+  await closing
+  t.is(await rig.there('app-1.0.0.bin'), true)
+  t.alike(rig.pins(), [], 'nothing is held once the server closed')
+})
+
+test('a retention pass that is already running when close() starts still counts the pins close() kept', async (t) => {
+  // The first storage operation of the scheduled pass is held, so the pass has started but has
+  // not yet read the pins it deletes by.
+  const pass = { armed: false, reached: gate(), proceed: gate() }
+  let taken = false
+  const storage = createStorage({
+    beforeOperation() {
+      if (!pass.armed || taken) return
+      taken = true
+      pass.reached.open()
+      return pass.proceed.wait
+    }
+  })
+  const rig = await retentionRig(t, { storage })
+  pass.armed = true
+  for (const tick of rig.ticks) tick()
+  await pass.reached.wait
+  t.alike(rig.scheduled, [], 'the pass is under way')
+
+  let finished = false
+  const closing = rig.server.close().then(() => {
+    finished = true
+  })
+  // The cancelled publication gave its own pin up, and retention's stop is waiting for the pass.
+  await waitFor(() => rig.live().length === 0)
+  t.alike(rig.pins(), rig.pinned, 'close() kept the pins in force for the pass that is running')
+  t.is(finished, false)
+
+  pass.proceed.open()
+  await waitFor(() => rig.scheduled.length === 1)
+  t.alike(rig.scheduled, ['completed'])
+  t.is(await rig.there('app-1.0.0.bin'), true, 'the pass kept what the cancelled publication uses')
+
+  // Once the pass is over and retention stopped, the pins go, before the beforeClose wait ends.
+  await waitFor(() => rig.pins().length === 0)
+  t.is(rig.cleared.length, 1)
+  t.is(finished, false, 'the beforeClose wait is still draining')
+  rig.cleanup.open()
+  rig.held.open()
+  await closing
+  t.is(await rig.there('app-1.0.0.bin'), true)
 })
 
 test('a listen that fails after the transport exists calls beforeClose once, holds the root until it drained, and a later close reports its failure', async (t) => {

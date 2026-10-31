@@ -127,7 +127,10 @@ failed answer was attempted, even when writing it failed.
   whose target was resolved); a failure before anything durable exists pins
   nothing, since an unverified offer or a staging path is not protected. A call
   can still see a snapshot: a replacement can change what is at the path, so open
-  or copy what you need promptly.
+  or copy what you need promptly. Closing the server ends every detached call at
+  once, but the artifacts that were pinned when `close()` began stay pinned until
+  scheduled retention has stopped (see
+  [`beforeClose`](#shutdown-cleanup-beforeclose)).
 - Closing the server aborts the waits: queued calls are dropped (logged as
   `Detached hook skipped`), a running callback is abandoned and keeps running on its
   own, and closing never waits for hook code, unless the hooks register a
@@ -184,17 +187,32 @@ export async function beforeClose() {
 What the server guarantees, in this order, on the first `close()`:
 
 1. It stops admitting connections.
-2. It calls `beforeClose`, synchronously inside that `close()` call, so the callback
+2. It notes which artifacts the queued and running detached calls hold, so that
+   retention keeps protecting them for as long as it can still run.
+3. It calls `beforeClose`, synchronously inside that `close()` call, so the callback
    can cancel external work before anything else of the close proceeds.
-3. It aborts its own operations, as it always did, and they finish.
-4. It stops scheduled retention, waiting for a pass that is already running, and
-   only then lets the detached calls give up their artifact pins. No retention pass
-   can therefore start while `beforeClose` is still draining, and delete what a
-   callback that is being cancelled is still using. The stores and the storage lock
-   stay in place.
-5. It waits for `beforeClose`. Only then does it close its stores, release the
+4. It aborts its own operations, as it always did, and they finish. Aborting ends
+   every detached call at once, and each one gives up its own artifact pin right
+   there; the artifacts noted in step 2 stay protected regardless.
+5. It stops scheduled retention: the interval is cleared and a pass that is already
+   running is waited for (it is not cancelled). Until that has finished, a pass that
+   starts, or one that is already running and has not yet read what to keep, still
+   keeps the noted artifacts, so none of them is deleted from under a callback that
+   is being cancelled. After it, no pass can run, and the notes are dropped. This
+   happens before the wait on `beforeClose` in step 6, so a `beforeClose` that
+   drains for a long time does not leave retention running. The stores and the
+   storage lock stay in place.
+6. It waits for `beforeClose`. Only then does it close its stores, release the
    storage lock, and emit `close`. Another server cannot take the storage root
    while `beforeClose` is still draining.
+
+What the notes cover: the artifacts of detached calls that were queued or running
+when `close()` began, and of any registered while it closes. The other things
+retention keeps (the targets of managed links, the artifacts named in a rollback
+journal) are persistent records that closing does not touch. Retention itself keeps
+running from the start of `close()` until step 5, and a pass that is already
+running when step 5 begins is waited for, so a long pass delays steps 5 and 6; it
+does not delay `beforeClose`, which was called first.
 
 Every `close()` call returns one and the same promise, and `beforeClose` is called
 once, even if `close()` is called again, concurrently, or from inside the callback

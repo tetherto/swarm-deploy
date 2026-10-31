@@ -779,7 +779,9 @@ export class Server extends EventEmitter {
   /**
    * Pins the artifact of every queued or running detached call, from the moment
    * it was registered until it finishes, so retention cannot remove what the
-   * callback is about to read. The set lives in memory only.
+   * callback is about to read. While the server closes, the artifacts its calls held
+   * when `close()` began stay pinned after those calls were cut off, until retention
+   * has stopped. The set lives in memory only.
    */
   private pinDetachedHooks(pins: Set<string>): void {
     for (const transferId of this.detached.pins()) pins.add(transferId)
@@ -2258,10 +2260,12 @@ export class Server extends EventEmitter {
   /**
    * Tears the server's own resources down. Connections are cut and the transport
    * closed at once, and the operations that were running finish (the signal is
-   * already aborted, so their waits end). `cleanup`, the `beforeClose` hook's outcome,
-   * is awaited before anything an operation or an external publisher could still be
-   * using is closed: the stores, retention and, last, the storage lock. It returns
-   * the cleanup failure, if there was one, after the teardown has run regardless.
+   * already aborted, so their waits end). Scheduled retention is stopped as soon as
+   * they have, which is before the wait on `cleanup`, the `beforeClose` hook's
+   * outcome. That wait comes before the stores are closed and, last, the storage lock
+   * is released, so nothing an operation or an external publisher could still be
+   * using goes first. It returns the cleanup failure, if there was one, after the
+   * teardown has run regardless.
    */
   private async dispose(
     cleanup: Promise<SwarmDeployError | null> | null = null
@@ -2274,14 +2278,18 @@ export class Server extends EventEmitter {
     await this.transport?.close().catch(() => {})
     this.transport = null
     await Promise.allSettled([...this.receives])
-    // Scheduled retention stops here, before the detached calls are drained and so before
-    // their pins are released, and before the unbounded wait on the cleanup below. Once the
-    // pins are gone nothing else protects what an abandoned callback is still using, so no
-    // retention pass may start after that: the interval is cleared and a pass already running
-    // is waited for (it began with the pins held). The stores and the storage lock stay in
-    // place until the cleanup settles; only the scheduler goes.
+    // Scheduled retention stops here, before the unbounded wait on the cleanup below: the
+    // interval is cleared and a pass that is already running is waited for. The detached
+    // calls ended, and gave up their live pins, when close() aborted, which was earlier than
+    // this (the transport close and the operations' rollbacks came in between), so the pins
+    // retention read until now were the ones `close()` snapshotted before it aborted. They
+    // stay in force until this stop has completed, so a pass that starts, or that is already
+    // running and has not read its pins yet, still keeps what an abandoned callback was using;
+    // they are released only after it. The stores and the storage lock stay in place until
+    // the cleanup settles; only the scheduler goes.
     await this.retention?.stop().catch(() => {})
     this.retention = null
+    this.detached.release()
     // The signal is already aborted, so queued detached calls are dropped and a running one
     // is abandoned (its callback keeps running detached); this waits for neither hook code
     // nor anything that could hang.
@@ -2304,12 +2312,14 @@ export class Server extends EventEmitter {
   }
 
   /**
-   * Closes the server. Admission stops first (`closed`); the `beforeClose` hook is
-   * then called, in this very call, before the server's own operations are aborted;
-   * and the close completes, resources released and the `close` event emitted, only
-   * after that hook and the running operations have finished. Every call returns the
-   * same promise and the hook is called once, even when called again from inside it.
-   * It rejects when the hook failed, after the same teardown.
+   * Closes the server. Admission stops first (`closed`); the artifacts the detached
+   * calls hold are snapshotted for retention; the `beforeClose` hook is then called,
+   * in this very call, before the server's own operations are aborted; scheduled
+   * retention stops once the operations have finished, and the close completes (the
+   * stores closed, the storage lock released, the `close` event emitted) only after
+   * that hook and the running operations have finished. Every call returns the same
+   * promise and the hook is called once, even when called again from inside it. It
+   * rejects when the hook failed, after the same teardown.
    */
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise
@@ -2322,6 +2332,9 @@ export class Server extends EventEmitter {
     this.closePromise = new Promise<void>((resolve, reject) => {
       finish = { resolve, reject }
     })
+    // Before anything can end a detached call: the abort below ends them all at once, and
+    // each gives its live pin up, while retention is still running until `dispose` stops it.
+    this.detached.hold()
     const cleanup = this.beginCleanup()
     this.abort.abort()
     void (async () => {
