@@ -137,7 +137,20 @@ export type AllowlistKey = PublicKeyInput | string
 
 export interface ServerOptions {
   seed: SeedInput
+  /**
+   * The output root: published artifacts and managed public links only. Nothing
+   * private is ever stored inside it, so it may be served by a web server.
+   */
   storageDir: string
+  /**
+   * Absolute path of the private state directory (staging, sessions, commit and link
+   * records, journals, locks, archives). It must be outside `storageDir` and on the same
+   * filesystem, and is kept at mode 0700. When omitted, state lives in
+   * `~/.swarm-deploy/<id>` under the home directory of the user running the server, where
+   * `<id>` is derived from the real path of `storageDir`. Every instance and every
+   * `reset-storage` run for one output root must use the same location. Never serve it.
+   */
+  stateDir?: string
   allowedKeys: Iterable<AllowlistKey>
   maxFileBytes: number
   maxStagingBytes: number
@@ -356,6 +369,8 @@ export interface Server {
 export class Server extends EventEmitter {
   readonly publicKey: PublicKey
   readonly storageDir: string
+  /** The configured state directory, or undefined when the default under the user's home is used. */
+  readonly stateDir: string | undefined
   readonly maxFileBytes: number
   readonly maxStagingBytes: number
   readonly maxConnections: number
@@ -443,6 +458,15 @@ export class Server extends EventEmitter {
         : (() => {
             throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid storage directory')
           })()
+    if (
+      options.stateDir !== undefined &&
+      (typeof options.stateDir !== 'string' ||
+        options.stateDir.length === 0 ||
+        !path.isAbsolute(options.stateDir))
+    ) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid state directory: it must be an absolute path')
+    }
+    this.stateDir = options.stateDir
     this.maxFileBytes = positive(options.maxFileBytes, 'maxFileBytes')
     this.maxStagingBytes = positive(options.maxStagingBytes, 'maxStagingBytes')
     this.maxConnections = positive(
@@ -1992,7 +2016,8 @@ export class Server extends EventEmitter {
 
   private async start(): Promise<this> {
     try {
-      this.layout = initLayout(this.storageDir)
+      this.layout = initLayout(this.storageDir, this.stateDir)
+      this.logger.info('Private state directory', { stateDir: this.layout.internal })
       this.releaseLock = await acquireStorageLock(this.layout, { storage: this.storage })
       await assertNoPendingStorageReset(this.layout, this.storage)
       this.sessions = new SessionStore({

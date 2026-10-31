@@ -73,10 +73,10 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...]',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> [--state-dir <dir>] --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] [--json] <file-or-directory>',
   '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--hook-failure <rollback|keep>] [--json] <target> <link-name>',
-  '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]]',
+  '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]] [--state-dir <dir>]',
   '',
   'Use exactly one seed source. A command-specific environment variable is also accepted.'
 ].join('\n')
@@ -618,6 +618,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--seed-file',
       '--seed',
       '--storage',
+      '--state-dir',
       '--allow-key',
       '--max-file-bytes',
       '--max-staging-bytes',
@@ -639,6 +640,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
+  const stateDir = options['--state-dir']
   const maxFileBytes = parsePositiveSafeInteger(
     requireOption(options, '--max-file-bytes'),
     'max-file-bytes'
@@ -728,6 +730,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     server = new ServerImpl({
       seed,
       storageDir,
+      ...(stateDir === undefined ? {} : { stateDir }),
       allowedKeys,
       maxFileBytes,
       maxStagingBytes,
@@ -1067,7 +1070,11 @@ function describeHoldings(held: ArchiveHoldings): string {
 
 /** One `key: value` line per fact, so operators and scripts can read the same output. */
 function formatResetReport(report: StorageResetReport): string[] {
-  const lines = [`storage: ${report.root}`, `lock: ${formatLockState(report.lock)}`]
+  const lines = [
+    `storage: ${report.root}`,
+    `state: ${report.state}`,
+    `lock: ${formatLockState(report.lock)}`
+  ]
   if (report.resetPending) {
     const archive =
       report.pendingArchive === null ? '' : ` (resumes archive ${report.pendingArchive})`
@@ -1144,13 +1151,14 @@ function formatResetReport(report: StorageResetReport): string[] {
 async function runResetStorage(args: string[], io: CliIo): Promise<number> {
   const { options, flagOptions, positionals } = parseOptions(
     args,
-    new Set(['--storage', '--apply', '--wait']),
+    new Set(['--storage', '--state-dir', '--apply', '--wait']),
     new Set(),
     new Set(),
     new Set(['--apply'])
   )
   requirePositionals(positionals, 0, 'reset-storage does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
+  const stateDir = options['--state-dir']
   const apply = flagOptions['--apply'] === true
   if (!apply && options['--wait'] !== undefined) {
     throw usageError('--wait requires --apply')
@@ -1159,6 +1167,7 @@ async function runResetStorage(args: string[], io: CliIo): Promise<number> {
     options['--wait'] === undefined ? 0 : parsePositiveSafeInteger(options['--wait'], 'wait')
   const resetOptions = {
     storageDir,
+    ...(stateDir === undefined ? {} : { stateDir }),
     wait,
     storage: io.storage,
     isProcessAlive: io.isProcessAlive,

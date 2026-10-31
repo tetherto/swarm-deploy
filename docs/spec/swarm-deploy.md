@@ -183,7 +183,7 @@ artifacts, history artifacts, commit sidecars, and v2 journals, which remain
 subject to normal validation and recovery.
 
 File sessions remain at persisted versions 2 and 3. Directory sessions use
-version 4 and verify into `.swarm-deploy/staging/<transfer-id>.tree/` by
+version 4 and verify into `<state>/staging/<transfer-id>.tree/` by
 rebuilding canonical headers and recomputing the tree digest independently.
 
 ## Release identity, rotation, and hooks
@@ -528,6 +528,45 @@ managed symlinks are not downgrade-compatible. Drain uploads before upgrading
 and do not roll back after committing a directory artifact without restoring
 from backup.
 
+## Storage layout and private state
+
+The output root (`storageDir`) holds published artifacts, replacement history
+artifacts, and managed public links only. Every other piece of server state is
+private and lives in the state directory `<state>`: `staging`, `sessions`,
+`commits`, `journals`, `publications`, `links`, `trash`, the `lock` directory
+and its retired or abandoned residue, `archive` (written by `reset-storage`),
+`reset-pending.json`, and `.swarm-deploy-state.json`. Nothing private is stored
+anywhere inside the output root, so a web server may serve the root. The state
+holds session and commit metadata (uploader public keys, digests, optional
+source-parent paths), lock records (a process ID and a random token), managed
+link ownership and rollback records, and incomplete partial artifact payloads.
+It holds no seed by default.
+
+`<state>` is `ServerOptions.stateDir` / `--state-dir`, an absolute path, or
+else `<home>/.swarm-deploy/<id>`, where `<home>` is the home directory of the
+user running the process and `<id>` is the first 32 hexadecimal characters of the
+SHA-256 of the real path of the output root. It never depends on the working
+directory. Startup, and `reset-storage`, which resolves it identically, require:
+
+- the output root has no `.swarm-deploy` entry (the pre-0.6.1 location); if it
+  does, the process refuses with offline migration instructions and neither
+  reads, moves, nor deletes it;
+- `<state>` is not the output root, inside it, or above it, judged on real
+  paths so symlink aliases are caught, and its final component is a real
+  directory, not a symlink;
+- `<state>` and every metadata directory share a filesystem with the output
+  root, since publication, link replacement, tree rename, retention trash, and
+  recovery use `rename` and hard links between them; otherwise startup fails
+  before anything is staged, with guidance to pass `--state-dir`, and there is no
+  cross-device copy or visible temporary fallback;
+- `<state>` is mode `0700` and, once written, names the real path of the one
+  output root it serves in `.swarm-deploy-state.json`; a different root is
+  refused, and a directory that is neither empty nor Swarm Deploy state is
+  refused.
+
+The storage lock is in `<state>/lock`, so every server and `reset-storage` run
+for one output root must use the same state directory.
+
 ## Storage accounting
 
 `maxFileBytes` limits the extracted artifact size. Required
@@ -564,7 +603,7 @@ dotfiles, or extra symlinks). If a committed tree changes, startup hash scrub
 drops the sidecar while leaving bytes in place, the name stays occupied
 (`FILE_EXISTS`), the tree falls outside quota and rotation, and a managed
 `latest` link can repoint to an older release.
-Deletion renames a managed directory into `.swarm-deploy/trash/<transfer-id>.tree`
+Deletion renames a managed directory into `<state>/trash/<transfer-id>.tree`
 before recursive removal without following symlinks; startup sweeps proven trash.
 
 The existing create-only commit behavior and retained replacement/history
@@ -751,7 +790,7 @@ rewriting the visible symlink.
 ### Ownership, recovery, and isolation
 
 Ownership records live at
-`.swarm-deploy/links/<sha256(link-name)>.json`. Version 1 has the exact fields
+`<state>/links/<sha256(link-name)>.json`. Version 1 has the exact fields
 `version`, `name`, `target`, `transferId`, and `targetKind`; it is read as
 automatic ownership. Version 2 adds the exact `mode` field, whose only values
 are `automatic` and `manual`. Unknown versions, fields, modes, unsafe values,
@@ -775,7 +814,7 @@ claim it.
 A manual request with the `rollback` policy whose server has an `afterLink` hook
 and whose change is more than nothing (a link or record would change, including a
 record-only refresh) writes one durable journal before changing anything:
-`.swarm-deploy/links/<sha256(link-name)>.rollback.json`, which never matches the
+`<state>/links/<sha256(link-name)>.rollback.json`, which never matches the
 ownership-record filename pattern. It is at most 32 KiB and has the exact fields
 `version` (1), `name`, `token` (32 lowercase hex), `intended` (`target`,
 `targetKind`, `transferId`), `prior`, and `applied`. `prior.link` is `{ state:
@@ -869,7 +908,7 @@ v0.2.0.
 
 There is no unlink RPC. An operator removes a managed link only while the
 server is stopped: remove the visible symlink and its matching
-`.swarm-deploy/links/<sha256(link-name)>.json` ownership record, then restart.
+`<state>/links/<sha256(link-name)>.json` ownership record, then restart.
 The ledger must never be edited while the server runs.
 
 At startup the default Node and Bare adapters load the entire ledger, including
@@ -924,12 +963,13 @@ link the caller expects to be rolled back, while an older client against a curre
 server sends no policy and gets `rollback`, which is a change of default for it
 (a failed hook now restores the link, and the retry returns `LINKED`). Upgrade
 servers before clients. A server older than 0.6.0 ignores `.rollback.json` files
-in `.swarm-deploy/links`, so roll back to one only after no journal remains. This
+in `<state>/links`, so roll back to one only after no journal remains. This
 version reads
 v1 automatic ledgers and writes v2 mode-aware ledgers. After an upgraded server
 creates, repairs, or repoints any managed link, v0.2.0 cannot read its v2
 record. Rollback then requires restoring the complete pre-upgrade storage
-backup, including visible links and `.swarm-deploy/links`, or staying on the
+backup, including visible links and the state directory's `links` (the
+`.swarm-deploy/links` directory inside the root before 0.6.1), or staying on the
 upgraded server.
 
 ## Public API, CLI, and observability migration

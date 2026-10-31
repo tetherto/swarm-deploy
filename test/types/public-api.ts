@@ -562,3 +562,23 @@ void skippedEvent
 // @ts-expect-error There is no user-facing atomic-directory option.
 const atomicOptions: ServerOptions = { ...symlinkServerOptions, atomicDirectory: true }
 void atomicOptions
+
+// The private state directory is optional and a path string; the layout helpers stay internal.
+const stateServerOptions = {
+  seed: serverSeed,
+  storageDir: '/srv/artifacts',
+  stateDir: '/var/lib/swarm-deploy/artifacts',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096
+} satisfies ServerOptions
+const configuredState: string | undefined = new Server(stateServerOptions).stateDir
+void [stateServerOptions, configuredState]
+// @ts-expect-error The state directory is a path, not a flag.
+const flagState: ServerOptions['stateDir'] = true
+void flagState
+declare const publicApi: typeof import('../../dist/index.js')
+// @ts-expect-error The storage layout helpers are internal, not public exports.
+void publicApi.initLayout
+// @ts-expect-error The storage layout helpers are internal, not public exports.
+void publicApi.resolveLayout

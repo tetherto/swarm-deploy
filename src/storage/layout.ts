@@ -26,12 +26,13 @@ function storageError(message: string, cause: unknown | null = null): SwarmDeplo
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
 }
 
-function assertDirectorySync(directory: string): void {
+function assertDirectorySync(directory: string, create = true): void {
   let stat: StorageStat
   try {
     stat = fs.lstatSync(directory)
   } catch (error: unknown) {
     if (errorCode(error) !== 'ENOENT') throw error
+    if (!create) throw storageError(`Missing storage directory: ${directory}`, error)
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
     stat = fs.lstatSync(directory)
   }
@@ -73,8 +74,35 @@ export async function assertSafeFile(
   return stat
 }
 
-export const INTERNAL_DIRECTORY_NAME = '.swarm-deploy'
+/** Directory under the user's home that holds default private state, one entry per output root. */
+export const STATE_HOME_NAME = '.swarm-deploy'
+/** Where releases before 0.6.1 kept private state: inside the output root, where it can be served. */
+export const LEGACY_STATE_NAME = '.swarm-deploy'
+/**
+ * Private record of the output root a state directory belongs to. The leading dot
+ * keeps it from ever being a valid artifact name, so an output root cannot hold one.
+ */
+export const STATE_ROOT_NAME = '.swarm-deploy-state.json'
 export const RESET_PENDING_NAME = 'reset-pending.json'
+/** The private metadata directories, in the order a reset archives them. */
+export const METADATA_DIRECTORY_NAMES = [
+  'staging',
+  'sessions',
+  'commits',
+  'journals',
+  'publications',
+  'links',
+  'trash'
+] as const
+
+const MAX_STATE_ROOT_BYTES = 4 * 1024
+const STATE_ENTRIES = new Set<string>([
+  ...METADATA_DIRECTORY_NAMES,
+  'archive',
+  'lock',
+  RESET_PENDING_NAME,
+  STATE_ROOT_NAME
+])
 
 /** Refuse recovery against metadata only partly moved by an interrupted reset. */
 export async function assertNoPendingStorageReset(
@@ -92,14 +120,21 @@ export async function assertNoPendingStorageReset(
   )
 }
 
-/** Computes every layout path without touching the filesystem. */
-export function resolveLayout(storageDir: string): StorageLayout {
+/**
+ * Computes every layout path without touching the filesystem. `internal` is the
+ * private state directory; it is never under `root`, which holds only published
+ * artifacts and managed links.
+ */
+export function resolveLayout(storageDir: string, stateDir: string): StorageLayout {
   if (typeof storageDir !== 'string' || storageDir.length === 0) {
     throw storageError('Invalid storage directory')
   }
+  if (typeof stateDir !== 'string' || stateDir.length === 0) {
+    throw storageError('Invalid state directory')
+  }
 
   const root = path.resolve(storageDir)
-  const internal = path.join(root, INTERNAL_DIRECTORY_NAME)
+  const internal = path.resolve(stateDir)
   return {
     root,
     internal,
@@ -114,21 +149,279 @@ export function resolveLayout(storageDir: string): StorageLayout {
   }
 }
 
-export function initLayout(storageDir: string): StorageLayout {
-  const layout = resolveLayout(storageDir)
-  const { root, internal } = layout
+function statOrNull(target: string): StorageStat | null {
+  try {
+    return fs.statSync(target)
+  } catch (error: unknown) {
+    if (errorCode(error) === 'ENOENT' || errorCode(error) === 'ENOTDIR') return null
+    throw error
+  }
+}
 
-  assertDirectorySync(root)
-  assertDirectorySync(internal)
-  assertDirectorySync(layout.staging)
-  assertDirectorySync(layout.sessions)
-  assertDirectorySync(layout.commits)
-  assertDirectorySync(layout.journals)
-  assertDirectorySync(layout.publications)
-  assertDirectorySync(layout.links)
-  assertDirectorySync(layout.trash)
+function unsafeStatePath(target: string, cause: unknown = null): SwarmDeployError {
+  return storageError(`Unsafe state directory path: ${target}`, cause)
+}
 
+/** The real path of `target`; symlinks in every existing ancestor are resolved and a missing tail is kept. */
+function canonicalPath(target: string): string {
+  const tail: string[] = []
+  for (let current = target; ; current = path.dirname(current)) {
+    let present = true
+    try {
+      fs.lstatSync(current)
+    } catch (error: unknown) {
+      if (errorCode(error) !== 'ENOENT' && errorCode(error) !== 'ENOTDIR') throw error
+      present = false
+    }
+    if (present) {
+      try {
+        return path.join(fs.realpathSync(current), ...tail)
+      } catch (error: unknown) {
+        // A dangling symlink exists but resolves nowhere yet, so it could point anywhere later.
+        throw unsafeStatePath(target, error)
+      }
+    }
+    if (path.dirname(current) === current) throw unsafeStatePath(target)
+    tail.unshift(path.basename(current))
+  }
+}
+
+/** True when `candidate`, or a directory above it, is the very directory `container` names. */
+function isWithin(candidate: string, container: StorageIdentity): boolean {
+  for (let current = candidate; ; current = path.dirname(current)) {
+    const stat = statOrNull(current)
+    if (stat !== null) {
+      const found = directoryIdentity(stat, current)
+      if (found.dev === container.dev && found.ino === container.ino) return true
+    }
+    if (path.dirname(current) === current) return false
+  }
+}
+
+/** Identifies an output root by its real path, so every alias of it shares one state directory. */
+function rootId(canonicalRoot: string): string {
+  const digest = b4a.allocUnsafe(sodium.crypto_hash_sha256_BYTES)
+  sodium.crypto_hash_sha256(digest, b4a.from(canonicalRoot))
+  return b4a.toString(digest, 'hex').slice(0, 32)
+}
+
+/**
+ * Where private state lives when no state directory is configured: under the
+ * home directory of the user running the process, keyed by the real path of the
+ * output root. It never depends on the working directory.
+ */
+export function defaultStateDirectory(canonicalRoot: string): string {
+  const home = os.homedir()
+  if (typeof home !== 'string' || !path.isAbsolute(home)) {
+    throw storageError('Unable to determine the home directory for private state; pass --state-dir')
+  }
+  return path.join(home, STATE_HOME_NAME, rootId(canonicalRoot))
+}
+
+function legacyStateError(legacy: string, state: string): SwarmDeployError {
+  return storageError(
+    [
+      `Legacy private state found inside the output root: ${legacy}`,
+      'Releases before 0.6.1 kept it there, where a web server that serves the output root can expose it.',
+      'This release does not read, move, or delete it. Stop every swarm-deploy server and reset-storage for this root, then move it out of the output root:',
+      `  mkdir -p "${path.dirname(state)}" && mv "${legacy}" "${state}"`,
+      `To roll back, stop the server and move "${state}" back to "${legacy}" before starting an older release.`,
+      'The destination must not exist yet and must be on the same filesystem as the output root; pass --state-dir to choose another location.'
+    ].join('\n')
+  )
+}
+
+function crossDeviceError(root: string, state: string): SwarmDeployError {
+  return storageError(
+    `Private state directory ${state} is on a different filesystem than the output root ${root}. ` +
+      'Publication, link replacement, and retention move files between the two with atomic renames and hard links, which cannot cross filesystems. ' +
+      'Pass --state-dir (ServerOptions.stateDir) a directory outside the output root on the same filesystem.'
+  )
+}
+
+function assertNoLegacyState(root: string, state: string): void {
+  const legacy = path.join(root, LEGACY_STATE_NAME)
+  try {
+    fs.lstatSync(legacy)
+  } catch (error: unknown) {
+    if (errorCode(error) === 'ENOENT') return
+    throw error
+  }
+  throw legacyStateError(legacy, state)
+}
+
+/** The state directory must not be the output root, inside it, above it, or reach it through a symlink. */
+function assertStateOutsideRoot(root: string, canonicalRoot: string, state: string): void {
+  const rootStat = statOrNull(root)
+  if (rootStat === null) throw storageError(`Missing storage directory: ${root}`)
+  const rootIdentity = directoryIdentity(rootStat, root)
+  for (const candidate of new Set([state, canonicalPath(state)])) {
+    if (isWithin(candidate, rootIdentity)) {
+      throw storageError(
+        `Private state directory ${state} must be outside the output root ${root}; it is the root, inside it, or reaches it through a symlink. Pass a different --state-dir`
+      )
+    }
+  }
+  const stateStat = statOrNull(state)
+  if (stateStat !== null && isWithin(canonicalRoot, directoryIdentity(stateStat, state))) {
+    throw storageError(
+      `Private state directory ${state} must not contain the output root ${root}. Pass a different --state-dir`
+    )
+  }
+}
+
+/** Compares the device of `target`, or of its nearest existing ancestor, with the output root's. */
+function assertSameFilesystem(root: string, target: string, state: string): void {
+  const device = directoryIdentity(fs.statSync(root), root).dev
+  for (let current = target; ; current = path.dirname(current)) {
+    const stat = statOrNull(current)
+    if (stat !== null) {
+      if (directoryIdentity(stat, current).dev !== device) throw crossDeviceError(root, state)
+      return
+    }
+    if (path.dirname(current) === current) return
+  }
+}
+
+function restrictToOwner(directory: string): void {
+  if ((fs.lstatSync(directory).mode & 0o077) === 0) return
+  try {
+    fs.chmodSync(directory, 0o700)
+  } catch (error: unknown) {
+    throw storageError(
+      `Private state directory is accessible to other users and could not be restricted to its owner: ${directory}`,
+      error
+    )
+  }
+}
+
+function isStateEntry(name: string): boolean {
+  return (
+    STATE_ENTRIES.has(name) || name.startsWith('lock.') || name.startsWith(`${STATE_ROOT_NAME}.`)
+  )
+}
+
+/**
+ * A state directory serves exactly one output root. An existing record must name
+ * this root; a directory without one is adopted only when it is empty or holds
+ * nothing but Swarm Deploy state, such as a migrated legacy directory.
+ */
+function bindStateRoot(state: string, canonicalRoot: string, write: boolean): void {
+  const marker = path.join(state, STATE_ROOT_NAME)
+  let stat: StorageStat | null = null
+  try {
+    stat = fs.lstatSync(marker)
+  } catch (error: unknown) {
+    if (errorCode(error) !== 'ENOENT') throw error
+  }
+  if (stat !== null) {
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_ROOT_BYTES) {
+      throw storageError(`Unsafe storage file: ${marker}`)
+    }
+    let bound: unknown
+    try {
+      bound = JSON.parse(fs.readFileSync(marker, 'utf8'))
+    } catch (error: unknown) {
+      throw storageError(`Malformed state directory record: ${marker}`, error)
+    }
+    const owner = typeof bound === 'object' && bound !== null && 'root' in bound ? bound.root : null
+    if (typeof owner !== 'string') throw storageError(`Malformed state directory record: ${marker}`)
+    if (owner !== canonicalRoot) {
+      throw storageError(
+        `State directory ${state} belongs to output root ${owner}, not ${canonicalRoot}. Give every output root its own --state-dir`
+      )
+    }
+    return
+  }
+  const foreign = fs.readdirSync(state).find((name) => !isStateEntry(name))
+  if (foreign !== undefined) {
+    throw storageError(
+      `State directory ${state} is not empty and does not hold Swarm Deploy state (found ${foreign}). Choose an empty directory`
+    )
+  }
+  if (!write) return
+  const temporary = `${marker}.${randomToken().slice(0, 16)}.tmp`
+  fs.writeFileSync(temporary, JSON.stringify({ version: 1, root: canonicalRoot }), {
+    flag: 'wx',
+    mode: 0o600
+  })
+  fs.renameSync(temporary, marker)
+}
+
+/**
+ * Resolves and validates where state lives for an output root. With `create` it
+ * makes the output root, the private state directory, and its metadata
+ * directories; without it nothing is written and a missing state directory is
+ * an error. Either way it refuses before touching state when the output root
+ * still holds legacy state, when the state directory is not safely outside the
+ * root on the same filesystem, or when it already serves another root.
+ */
+function locateLayout(
+  storageDir: string,
+  stateDir: string | undefined,
+  create: boolean
+): StorageLayout {
+  if (typeof storageDir !== 'string' || storageDir.length === 0) {
+    throw storageError('Invalid storage directory')
+  }
+  if (
+    stateDir !== undefined &&
+    (typeof stateDir !== 'string' || stateDir.length === 0 || !path.isAbsolute(stateDir))
+  ) {
+    throw storageError('Invalid state directory: it must be an absolute path')
+  }
+
+  const root = path.resolve(storageDir)
+  assertDirectorySync(root, create)
+  if (statOrNull(path.join(root, STATE_ROOT_NAME)) !== null) {
+    throw storageError(`Refusing to use a private state directory as the output root: ${root}`)
+  }
+  const canonicalRoot = fs.realpathSync(root)
+  const state =
+    stateDir === undefined ? defaultStateDirectory(canonicalRoot) : path.resolve(stateDir)
+  assertNoLegacyState(root, state)
+
+  const present = (() => {
+    try {
+      return fs.lstatSync(state)
+    } catch (error: unknown) {
+      if (errorCode(error) === 'ENOENT') return null
+      throw error
+    }
+  })()
+  if (present !== null && (present.isSymbolicLink() || !present.isDirectory())) {
+    throw storageError(`Unsafe storage directory: ${state}`)
+  }
+  if (present === null && !create) {
+    throw storageError(
+      `Not an initialized storage root: ${root} (no private state at ${state}; pass --state-dir if it lives elsewhere)`
+    )
+  }
+  assertStateOutsideRoot(root, canonicalRoot, state)
+  assertSameFilesystem(root, state, state)
+
+  if (present === null) assertDirectorySync(state)
+  if (create) restrictToOwner(state)
+  bindStateRoot(state, canonicalRoot, create)
+
+  const layout = resolveLayout(root, state)
+  if (create) {
+    for (const name of METADATA_DIRECTORY_NAMES) {
+      assertDirectorySync(layout[name])
+      assertSameFilesystem(root, layout[name], state)
+    }
+  }
   return layout
+}
+
+/** Creates the output root and the private state directory when missing; used by the server. */
+export function initLayout(storageDir: string, stateDir?: string): StorageLayout {
+  return locateLayout(storageDir, stateDir, true)
+}
+
+/** Resolves an existing layout without creating or changing anything; used by reset-storage. */
+export function findLayout(storageDir: string, stateDir?: string): StorageLayout {
+  return locateLayout(storageDir, stateDir, false)
 }
 
 /** Every protected directory a storage operation revalidates before mutating. */

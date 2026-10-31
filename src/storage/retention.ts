@@ -488,9 +488,7 @@ class RetentionManager {
       this.storage.readdir(this.layout.root)
     )
     const linkNames = this.managedLinkNames ? this.managedLinkNames() : new Set<string>()
-    const unknown = rootNames
-      .filter((name) => name !== '.swarm-deploy' && !knownNames.has(name) && !linkNames.has(name))
-      .sort()
+    const unknown = rootNames.filter((name) => !knownNames.has(name) && !linkNames.has(name)).sort()
     for (const name of unknown) {
       report(this.logger, 'warn', 'Ignoring unknown committed path', { name })
     }

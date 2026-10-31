@@ -97,6 +97,16 @@ Required `ServerOptions`:
 
 Optional operational limits and policies:
 
+- `stateDir?: string`: absolute path of the private state directory (also
+  readable as `server.stateDir`). `storageDir` is the output root and holds only
+  published artifacts and managed links, so it may be served; everything private
+  lives in the state directory. Omitted, it is `~/.swarm-deploy/<id>` under the
+  home directory of the user running the server, with `<id>` derived from the
+  real path of `storageDir`. A custom directory must be outside `storageDir` and
+  on the same filesystem, is kept at mode `0700`, and serves one `storageDir`
+  only; `listen()` rejects otherwise, and also while `<storageDir>/.swarm-deploy`
+  from 0.6.0 or earlier still exists. Every instance for one root must use the
+  same value. See [Private state](../README.md#private-state).
 - `maxConnections`, `maxActiveUploads`, `idleTimeout`
 - `cleanupInterval`, `resumeTtl`, `minFreeBytes`
 - `maxAge`, `maxStorageBytes`, `replaceNames`

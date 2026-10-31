@@ -445,7 +445,8 @@ This section is about a `response` `afterLink`; with a `detached` one nothing is
 journaled or restored, and `hookFailure` has no effect. A link request that
 changes something writes a small durable journal first: the
 previous visible state (no link, or the symlink's exact text) and the previous
-ownership record, beside the ownership records in `.swarm-deploy/links`. It is
+ownership record, beside the ownership records in `<state>/links` (the private
+state directory, never inside the storage root). It is
 removed once the hook has succeeded (before the answer is written, so a failed
 write never undoes a successful hook) or the change has been restored. A request
 that changes nothing writes no journal and has nothing to restore.
@@ -702,13 +703,18 @@ replaces the original failure.
 
 `path` by phase:
 
-| Situation                                                          | `path`                                                  |
-| ------------------------------------------------------------------ | ------------------------------------------------------- |
-| `offer`                                                            | `null`                                                  |
-| `transfer`; fresh-upload `verification`                            | `<storage>/.swarm-deploy/staging/<transferId>.tar.part` |
-| `beforeCommit`, `commit`; `verification` of a `VERIFIED` reconnect | `<storage>/.swarm-deploy/staging/<transferId>.part`     |
-| `afterCommit` (including already committed)                        | `<storage>/<name>`                                      |
-| `afterLink`                                                        | `<storage>/<link-name>`                                 |
+| Situation                                                          | `path`                                  |
+| ------------------------------------------------------------------ | --------------------------------------- |
+| `offer`                                                            | `null`                                  |
+| `transfer`; fresh-upload `verification`                            | `<state>/staging/<transferId>.tar.part` |
+| `beforeCommit`, `commit`; `verification` of a `VERIFIED` reconnect | `<state>/staging/<transferId>.part`     |
+| `afterCommit` (including already committed)                        | `<storage>/<name>`                      |
+| `afterLink`                                                        | `<storage>/<link-name>`                 |
+
+`<state>` is the private state directory (see
+[Private state](../README.md#private-state)), outside `<storage>`. Staged paths
+exist only until the artifact is published or the session ends, and hook code
+must treat them as private: never serve or copy them out.
 
 ## Hook modules
 

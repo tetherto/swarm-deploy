@@ -9,26 +9,20 @@ import { SodiumSha256 } from '../tar-protocol/hash.js'
 import { MAX_SESSION_METADATA_BYTES, readJson, writeAtomic } from './atomic-file.js'
 import { assertCommitRecord, MAX_COMMIT_METADATA_BYTES } from './commit-journal.js'
 import {
-  INTERNAL_DIRECTORY_NAME,
+  LEGACY_STATE_NAME,
+  METADATA_DIRECTORY_NAMES,
   RESET_PENDING_NAME,
+  STATE_ROOT_NAME,
   acquireStorageLock,
   assertSafeDirectory,
+  findLayout,
   inspectStorageLock,
-  isProcessAlive as defaultIsProcessAlive,
-  resolveLayout
+  isProcessAlive as defaultIsProcessAlive
 } from './layout.js'
 import type { StorageAdapter, StorageLayout, StorageStats } from './types.js'
 
 /** Every private metadata directory a reset archives, in archive order. */
-export const METADATA_DIRECTORIES = [
-  'staging',
-  'sessions',
-  'commits',
-  'journals',
-  'publications',
-  'links',
-  'trash'
-] as const
+export const METADATA_DIRECTORIES = METADATA_DIRECTORY_NAMES
 
 export type MetadataDirectoryName = (typeof METADATA_DIRECTORIES)[number]
 
@@ -66,6 +60,8 @@ const OBSOLETE_LOCK = /^lock\.(?:retired|candidate)-[0-9a-f]+$/
 
 export interface StorageResetOptions {
   storageDir: string
+  /** The server's state directory; omit it when the server uses the default under its user's home. */
+  stateDir?: string
   /** Archive the metadata. Without it the reset is a read-only preview. */
   apply?: boolean
   /** Milliseconds to keep polling a live lock before failing closed. */
@@ -102,6 +98,8 @@ export interface ArchiveSummary {
 
 export interface StorageResetReport {
   root: string
+  /** The private state directory the reset inspects or archives within. */
+  state: string
   applied: boolean
   lock: ResetLockState
   /** Entry counts per private metadata directory before the reset. */
@@ -109,7 +107,7 @@ export interface StorageResetReport {
   commits: { records: number; missingPayloads: string[]; invalid: number }
   links: { records: number; invalid: number }
   obsoleteLocks: number
-  /** Entries in the internal directory the reset does not recognise and leaves alone. */
+  /** Entries in the state directory the reset does not recognise and leaves alone. */
   unknownInternal: string[]
   archives: ArchiveSummary[]
   /** Visible root entries the reset never touches; they stay after the reset. */
@@ -156,6 +154,7 @@ function randomSuffix(bytes = 4): string {
 
 function settle({
   storageDir,
+  stateDir,
   wait = 0,
   storage = fs.promises,
   isProcessAlive = defaultIsProcessAlive,
@@ -164,7 +163,12 @@ function settle({
   pollInterval = DEFAULT_POLL_INTERVAL,
   sleep = defaultSleep
 }: StorageResetOptions): Settings {
-  const layout = resolveLayout(storageDir)
+  if (typeof storageDir !== 'string' || storageDir.length === 0) {
+    throw storageError('Invalid storage directory')
+  }
+  assertSafeRootPath(path.resolve(storageDir))
+  // The same resolution the server uses, so a reset can never act on another location.
+  const layout = findLayout(storageDir, stateDir)
   if (!Number.isSafeInteger(wait) || wait < 0) throw storageError('Invalid reset wait')
   if (!Number.isSafeInteger(pid) || pid <= 0) throw storageError('Invalid reset PID')
   if (!Number.isSafeInteger(pollInterval) || pollInterval <= 0) {
@@ -173,12 +177,12 @@ function settle({
   return { layout, storage, isProcessAlive, clock, pid, wait, pollInterval, sleep }
 }
 
-/** The root must be a real directory that is neither a filesystem root nor the internal directory. */
+/** The root must be a real directory that is neither a filesystem root nor a legacy state directory. */
 function assertSafeRootPath(root: string): void {
   if (path.dirname(root) === root) {
     throw storageError(`Refusing to reset a filesystem root: ${root}`)
   }
-  if (path.basename(root) === INTERNAL_DIRECTORY_NAME) {
+  if (path.basename(root) === LEGACY_STATE_NAME) {
     throw storageError(`Refusing to reset an internal directory as a storage root: ${root}`)
   }
 }
@@ -291,7 +295,6 @@ async function inspectRoot(
 ): Promise<StorageResetReport['remaining']> {
   const remaining = { payloads: [] as string[], symlinks: [] as string[], other: [] as string[] }
   for (const name of (await storage.readdir(layout.root)).sort()) {
-    if (name === INTERNAL_DIRECTORY_NAME) continue
     const stat = await lstatOrNull(path.join(layout.root, name), storage)
     if (stat === null) continue
     if (stat.isSymbolicLink()) remaining.symlinks.push(name)
@@ -427,7 +430,8 @@ async function inspect(settings: Settings): Promise<StorageResetReport> {
     if (
       name === path.basename(layout.lock) ||
       name === ARCHIVE_DIRECTORY_NAME ||
-      name === RESET_PENDING_NAME
+      name === RESET_PENDING_NAME ||
+      name === STATE_ROOT_NAME
     ) {
       continue
     }
@@ -438,6 +442,7 @@ async function inspect(settings: Settings): Promise<StorageResetReport> {
   const pending = await readPendingReset(layout, storage)
   return {
     root: layout.root,
+    state: layout.internal,
     applied: false,
     lock: await lockState(settings),
     metadata,
@@ -800,7 +805,7 @@ export function inspectStorageReset(options: StorageResetOptions): Promise<Stora
 
 /**
  * Archives every private metadata directory of a storage root into
- * `.swarm-deploy/archive/<reset-stamp>/` and recreates them empty, under the
+ * `<state>/archive/<reset-stamp>/` and recreates them empty, under the
  * storage lock. Visible payloads and symlinks in the root are never touched,
  * and nothing is deleted: the archive is restorable by moving it back.
  */

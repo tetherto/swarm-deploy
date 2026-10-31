@@ -22,6 +22,7 @@
     "test/unit/link-store.test.ts",
     "test/unit/cli.test.ts",
     "test/unit/storage-reset.test.ts",
+    "test/unit/private-state.test.ts",
     "test/unit/direct-behavior.test.ts",
     "test/unit/direct-dht.test.ts",
     "test/unit/files.test.ts",
@@ -36,6 +37,7 @@
     "test/integration/direct-upload.test.ts",
     "test/integration/source-parent-optout.test.ts",
     "test/integration/behavior-observability.test.ts",
-    "test/integration/link-hooks.test.ts"
+    "test/integration/link-hooks.test.ts",
+    "test/integration/private-state.test.ts"
   ]
 }

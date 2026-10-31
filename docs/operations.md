@@ -11,6 +11,7 @@ reset a storage root, and how to upgrade or roll back. Back to the
 - [Storage, replacement, and retention](#storage-replacement-and-retention)
 - [Resetting storage with `reset-storage`](#resetting-storage-with-reset-storage)
 - [Rollout and compatibility](#rollout-and-compatibility)
+  - [Private state moved out of the storage root (0.6.1)](#private-state-moved-out-of-the-storage-root-061)
   - [Managed-link rollback warning](#managed-link-rollback-warning)
   - [Link hooks and compatibility](#link-hooks-and-compatibility)
   - [Overlapping retries now get `FILE_BUSY`](#overlapping-retries-now-get-file_busy)
@@ -27,24 +28,30 @@ rollback procedure are in [RELEASING.md](../RELEASING.md).
 ## Production operations
 
 - Run the server under a dedicated non-root account.
-- Restrict the server seed and storage root to that account.
+- Restrict the server seed and the private state directory to that account. The
+  state directory (default `~/.swarm-deploy/<id>`, or `--state-dir`) must never
+  be served and must be on the same filesystem as the storage root; see
+  [Private state](../README.md#private-state).
 - Supervise the process and wait for the final `ready` line before marking it
   healthy.
 - Upgrade servers before clients; see
   [Rollout and compatibility](#rollout-and-compatibility).
 - Restart with the same seed, allowlist, limits, replacement names, artifact
-  patterns, rotation limits, hooks module, and storage root so interrupted
-  sessions and commit journals can recover.
+  patterns, rotation limits, hooks module, storage root, and state directory (the
+  same `--state-dir`, or the same user's default) so interrupted sessions and
+  commit journals can recover. Every server and `reset-storage` run for one
+  storage root must use the same state settings, because the lock lives in the
+  state directory.
 - Alert on nonzero CLI exits and failed authentication, recovery, verification,
   commit, retention, and cleanup events.
-- Never edit `.swarm-deploy/` while the server is running.
+- Never edit the private state directory while the server is running.
 - To start a storage root over, stop the server, preview with
-  `swarm-deploy reset-storage --storage <dir>`, remove leftover visible
-  payloads and symlinks by hand if a true empty start is wanted, then run it
-  again with `--apply`; see
+  `swarm-deploy reset-storage --storage <dir> [--state-dir <dir>]`, remove
+  leftover visible payloads and symlinks by hand if a true empty start is wanted,
+  then run it again with `--apply`; see
   [`reset-storage`](#resetting-storage-with-reset-storage).
-- Stop the server cleanly before backing up or restoring the complete storage
-  root.
+- Stop the server cleanly before backing up or restoring the storage root
+  together with its state directory.
 - Publish stored artifacts through a separately configured artifact service or
   web server.
 - Roll out an exact package version to a canary before wider deployment.
@@ -84,11 +91,12 @@ verification are protected from expiry.
 
 ## Storage, replacement, and retention
 
-The storage root contains visible current and historical artifacts plus the
-reserved `.swarm-deploy/` internal directory. Do not modify that directory
-while the server is running. `.swarm-deploy/archive/` holds the archives
-written by [`reset-storage`](#resetting-storage-with-reset-storage); the server
-ignores it.
+The storage root contains visible current and historical artifacts and managed
+public links, and nothing else: all internal state lives in the separate private
+state directory (default `~/.swarm-deploy/<id>`, or `--state-dir`; see
+[Private state](../README.md#private-state)). Do not modify that directory while
+the server is running. Its `archive/` directory holds the archives written by
+[`reset-storage`](#resetting-storage-with-reset-storage); the server ignores it.
 
 Names are create-only by default:
 
@@ -127,8 +135,8 @@ Optional retention applies to managed artifacts only:
   startup hash scrub drops the sidecar while leaving the bytes in place, the
   name stays occupied (`FILE_EXISTS`), the tree falls outside quota and rotation,
   and a managed `latest` link can move to an older release.
-- Managed directories are deleted by renaming into `.swarm-deploy/trash` before
-  recursive removal. Startup sweeps proven trash residue.
+- Managed directories are deleted by renaming into the state directory's `trash`
+  before recursive removal. Startup sweeps proven trash residue.
 - Startup recovery re-hashes managed files and recursively verifies directory
   tree digests. Scheduled and pre-commit passes validate type, sidecar, and root
   identity without re-hashing entire trees on every tick.
@@ -164,6 +172,7 @@ locks, and deletes nothing, and prints one `key: value` line per fact:
 
 ```text
 storage: /srv/artifacts
+state: /home/artifacts/.swarm-deploy/0123456789abcdef0123456789abcdef
 lock: free
 commits: 3 records (2 missing payloads)
 staging: 1 entries
@@ -182,18 +191,25 @@ note: remaining symlinks have no ownership record after the reset; an automatic 
 result: preview only, nothing changed; re-run with --apply to archive this metadata
 ```
 
-With `--apply` the command takes the storage lock, moves
-`.swarm-deploy/staging`, `sessions`, `commits`, `journals`, `publications`,
-`links`, and `trash` plus retired or abandoned lock directories into
-`.swarm-deploy/archive/reset-<timestamp>-<random>/`, recreates the seven
+The `state:` line is the exact private state directory being inspected. It is
+resolved exactly as the server resolves it: pass the same `--state-dir` the
+server uses, or none when the server uses the default under its user's home. A
+missing state directory, a legacy `<storage>/.swarm-deploy` that has not been
+[migrated](../README.md#upgrading-from-060-or-earlier), or a state directory that
+belongs to another storage root makes the command exit `2` without changing
+anything.
+
+With `--apply` the command takes the storage lock, moves the state directory's
+`staging`, `sessions`, `commits`, `journals`, `publications`, `links`, and
+`trash` plus retired or abandoned lock directories into
+`<state>/archive/reset-<timestamp>-<random>/`, recreates the seven
 directories empty, writes a `reset.json` marker with `status: "completed"`,
 releases the lock, and prints the same report followed by `archive: <path>`.
-Every move is a rename inside the storage root,
-so nothing is copied, nothing is deleted, and an archive is restored by
-stopping the server and moving its directories back over the empty ones.
-Each completed reset creates its own archive; earlier archives, unrecognised
-files inside `.swarm-deploy/`, and everything visible in the root are left
-untouched.
+Every move is a rename inside the state directory, so nothing is copied, nothing
+is deleted, and an archive is restored by stopping the server and moving its
+directories back over the empty ones. Each completed reset creates its own
+archive; earlier archives, unrecognised files inside the state directory, and
+everything visible in the root are left untouched.
 
 What the reset does not do, and the report says so:
 
@@ -203,8 +219,8 @@ What the reset does not do, and the report says so:
   its ownership record, so an automatic `--symlink` rule for that name fails
   closed with `LINK_CONFLICT`, while an explicit `link` request replaces it
   (see [Managed symlinks](managed-links.md)). `fresh start: yes` is
-  printed only when the root holds nothing besides `.swarm-deploy/`; remove
-  leftovers by hand before or after the reset to get there.
+  printed only when the root holds nothing at all; remove leftovers by hand
+  before or after the reset to get there.
 - It never signals a process. The lock records only a PID, and a PID proves
   nothing about which program owns it, so the reset cannot verify that a live
   holder is the server for this exact root. A live holder makes `--apply`
@@ -223,7 +239,7 @@ missing payload alone does not need a reset. The reset is for clearing the
 rest of the private state at once, with an archive to fall back on.
 
 An interrupted `--apply` leaves a partly filled archive and a
-`.swarm-deploy/reset-pending.json` marker that names it. This holds for a
+`<state>/reset-pending.json` marker that names it. This holds for a
 crash, kill, or power loss as well as for an error, because every move is a
 single rename and the archive directory itself is the record of what moved.
 This version of the server refuses startup while that marker exists, before
@@ -289,22 +305,24 @@ sudo -u artifacts -- swarm-deploy reset-storage --storage /srv/artifacts --apply
 
 Use the full path to `swarm-deploy` if it is not on that account's `PATH`. The
 command does not check which user runs it. If it was applied as the wrong user,
-stop the service, return ownership of the internal directory, and start it
-again:
+stop the service, return ownership of the state directory (the `state:` line
+of the preview), and start it again. When state is under a home directory, run
+the reset as the service user so it resolves that user's home:
 
 ```sh
-sudo chown -R artifacts:artifacts /srv/artifacts/.swarm-deploy
+sudo chown -R artifacts:artifacts /var/lib/swarm-deploy/artifacts
 ```
 
 The report is refreshed after acquiring the lock, so an upload completed while
 `--wait` was waiting appears among the retained payloads.
 
-A symlinked storage root or ancestor, a symlinked `.swarm-deploy/`, a metadata
-directory replaced by a symlink or file, a filesystem root, a missing root, or
-a root without `.swarm-deploy/` is rejected before any metadata is moved. Use
-the canonical storage path (for example `/private/tmp` rather than macOS's
-`/tmp` alias). A malformed pending-reset marker is also refused for manual
-reconciliation.
+A symlinked storage root or ancestor, a symlinked state directory, a metadata
+directory replaced by a symlink or file, a filesystem root, a missing root, a
+root without private state, a state directory inside or aliasing the root or on
+another filesystem, or a root that still holds legacy `.swarm-deploy/` state is
+rejected before any metadata is moved. Use the canonical storage path (for
+example `/private/tmp` rather than macOS's `/tmp` alias). A malformed
+pending-reset marker is also refused for manual reconciliation.
 
 ## Rollout and compatibility
 
@@ -321,13 +339,24 @@ count or version rotated.
 Roll out the server, then the pattern configuration, then clients that stage
 into conforming folders.
 
+### Private state moved out of the storage root (0.6.1)
+
+Through 0.6.0 the private state sat in `<storage>/.swarm-deploy`. From 0.6.1 it
+lives outside the storage root (see [Private state](../README.md#private-state)),
+and a server or `reset-storage` that finds the old directory refuses to run until
+you move it with the server stopped. To roll the server back to 0.6.0 or earlier,
+stop it, move the state directory back to `<storage>/.swarm-deploy`, and start the
+older release; deleting the old directory instead loses ownership and recovery
+data that cannot be restored automatically.
+
 ### Managed-link rollback warning
 
 **Do not roll a server back to v0.2.0 after an upgraded server has created,
 repaired, or repointed any managed link.** Those operations write a v2
 ownership record, which v0.2.0 cannot read. Rollback requires restoring the
-complete pre-upgrade storage backup (including visible links and
-`.swarm-deploy/links`), or keeping the upgraded server in place.
+complete pre-upgrade storage backup (including visible links and the
+`links` directory of the state directory, or `.swarm-deploy/links` before 0.6.1),
+or keeping the upgraded server in place.
 
 `swarm-deploy link` requires an upgraded server; v0.2.0 does not recognize
 link control requests.
@@ -404,7 +433,7 @@ unchanged.
   rather than `UNCHANGED`. Automation that relied on the link surviving a failed
   hook should pass `keep`.
 - **Persisted state.** A request that changes a link writes a journal,
-  `.swarm-deploy/links/<sha256(link-name)>.rollback.json` (at most 32 KiB), before
+  `<state>/links/<sha256(link-name)>.rollback.json` (at most 32 KiB), before
   it changes anything, and removes it when the request is finalized or restored.
   An idle, normally stopped server has none. After a crash the next start restores
   the previous link and record before retention runs or any client connects, and
@@ -420,7 +449,7 @@ since`), its artifacts stay pinned, and the rest of the server starts; see
 names could not be refreshed` with the link name; it does not change the answer
   or the link.
 - **Rolling back the server** to a version before 0.6.0 is safe once no journal
-  remains (stop the server normally and check `.swarm-deploy/links`): an older
+  remains (stop the server normally and check `<state>/links`): an older
   server ignores the file and cannot restore a link whose request was interrupted.
 - **Time.** Requests for one link name now queue from decision through hook to
   finalize or restore, so a slow hook delays later requests for the same name

@@ -10,7 +10,6 @@ import {
   Client,
   ERRORS,
   keyPairFromSeed,
-  Server,
   SwarmDeployError,
   type AfterCommitContext,
   type AfterLinkContext,
@@ -56,10 +55,12 @@ import {
   type TarManifest
 } from '../../dist/tar-protocol/manifest.js'
 import { historyName } from '../../dist/files.js'
-import { acquireStorageLock, initLayout } from '../../dist/storage/layout.js'
+import { acquireStorageLock } from '../../dist/storage/layout.js'
 import type { CommitStore } from '../../dist/storage/commit-store.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
-import { createTempDir } from '../helpers/files.js'
+import { createTempDir, stateDirFor } from '../helpers/files.js'
+import { initLayout } from '../helpers/layout.js'
+import { Server } from '../helpers/server.js'
 import { createStorage } from '../helpers/storage.js'
 import { waitFor } from '../helpers/testnet.js'
 
@@ -1138,7 +1139,7 @@ test('Server commits and rotates a fixed-series {version}/payments.tar.gz patter
   const sidecar = JSON.parse(
     b4a.toString(
       await fs.promises.readFile(
-        path.join(storageDir, '.swarm-deploy', 'commits', `${stored.transferId}.json`)
+        path.join(stateDirFor(storageDir), 'commits', `${stored.transferId}.json`)
       )
     )
   ) as { release: { series: string; version: string } }
@@ -1344,7 +1345,7 @@ test('Server runs beforeCommit and afterCommit around a fresh durable commit', a
   t.is(path.isAbsolute(before.path), true)
   t.is(
     before.path,
-    path.join(path.resolve(storageDir), '.swarm-deploy', 'staging', `${metadata.transferId}.part`),
+    path.join(stateDirFor(path.resolve(storageDir)), 'staging', `${metadata.transferId}.part`),
     'beforeCommit receives the extracted artifact, not the TAR'
   )
   t.is(existence.before, 'fresh hook payload')
@@ -1535,7 +1536,7 @@ test('Server reports onFailure once with phase, path and the original error for 
     hooks: recordingHooks(calls, { current: null })
   })
   const commits = (server as unknown as { commits: CommitStore }).commits
-  const stagingDir = path.join(path.resolve(server.storageDir), '.swarm-deploy', 'staging')
+  const stagingDir = path.join(stateDirFor(path.resolve(server.storageDir)), 'staging')
 
   const offerInput = await manifest(t, 'offer-fail.txt', 'offer failure payload')
   await fs.promises.writeFile(path.join(server.storageDir, 'offer-fail.txt'), 'something else')
@@ -1773,8 +1774,7 @@ test('Server reports a VERIFIED reconnect read failure with the extracted .part 
   t.is(
     context.path,
     path.join(
-      path.resolve(server.storageDir),
-      '.swarm-deploy',
+      stateDirFor(path.resolve(server.storageDir)),
       'staging',
       `${metadata.transferId}.part`
     )
@@ -3500,9 +3500,14 @@ async function uploadEach(t: Assert, node: FakeServerNode, names: string[]): Pro
 
 const LINKS_DIRECTORY = path.join('.swarm-deploy', 'links')
 
+/** The private managed-link directory of a test storage root; it is never inside the root. */
+function linksDirectory(storageDir: string): string {
+  return path.join(stateDirFor(storageDir), 'links')
+}
+
 /** Every file in the managed-link directory, ownership records and rollback journals alike. */
 async function linkFiles(storageDir: string): Promise<string[]> {
-  return (await fs.promises.readdir(path.join(storageDir, LINKS_DIRECTORY))).sort()
+  return (await fs.promises.readdir(linksDirectory(storageDir))).sort()
 }
 
 async function journalFiles(storageDir: string): Promise<string[]> {
@@ -3517,7 +3522,7 @@ async function ownership(
   const hash = b4a.toString(sodiumSha256(b4a.from(name)), 'hex')
   try {
     const text = await fs.promises.readFile(
-      path.join(storageDir, LINKS_DIRECTORY, `${hash}.json`),
+      path.join(linksDirectory(storageDir), `${hash}.json`),
       'utf8'
     )
     return JSON.parse(text) as Record<string, unknown>
@@ -3820,7 +3825,7 @@ async function interruptedRequest(
   await waitFor(() => hung)
   await deadline(server.close(), 'the old server to close')
   // A killed process leaves its lock behind; this process is still alive, so drop it by hand.
-  await fs.promises.rm(path.join(storageDir, '.swarm-deploy', 'lock'), {
+  await fs.promises.rm(path.join(stateDirFor(storageDir), 'lock'), {
     recursive: true,
     force: true
   })
@@ -3927,7 +3932,7 @@ test('a corrupt journal stops the server from starting rather than guessing what
   const storageDir = await createTempDir(t)
   await interruptedRequest(t, 'missing', storageDir)
   const [journal] = await journalFiles(storageDir)
-  const file = path.join(storageDir, LINKS_DIRECTORY, journal)
+  const file = path.join(linksDirectory(storageDir), journal)
   await fs.promises.writeFile(file, '{"version":1}')
   const restarted = new Server({
     seed: SERVER_SEED,
@@ -4330,7 +4335,7 @@ test('a journal replaced during the hook is never erased or acted on by the requ
         afterLink: async ({ link }) => {
           if (link.target !== 'r2') return
           // Another request's journal (or an operator's edit) takes its place on disk.
-          const file = path.join(storageDir, LINKS_DIRECTORY, (await journalFiles(storageDir))[0])
+          const file = path.join(linksDirectory(storageDir), (await journalFiles(storageDir))[0])
           const journal = JSON.parse(await fs.promises.readFile(file, 'utf8')) as object
           replacement = JSON.stringify({
             ...journal,
@@ -4358,7 +4363,7 @@ test('a journal replaced during the hook is never erased or acted on by the requ
     t.is((await ownership(storageDir, 'current'))?.target, 'r2', `${outcome}: and its record`)
     const [journal] = await journalFiles(storageDir)
     t.is(
-      await fs.promises.readFile(path.join(storageDir, LINKS_DIRECTORY, journal), 'utf8'),
+      await fs.promises.readFile(path.join(linksDirectory(storageDir), journal), 'utf8'),
       replacement,
       `${outcome}: the other journal is exactly as it was`
     )
@@ -4590,7 +4595,7 @@ test('closing the server aborts a pending afterLink and a queued one and frees t
   await t.exception(() => fs.promises.lstat(path.join(server.storageDir, 'current')), {
     code: 'ENOENT'
   })
-  t.alike(await fs.promises.readdir(path.join(server.storageDir, '.swarm-deploy', 'links')), [])
+  t.alike(await fs.promises.readdir(linksDirectory(server.storageDir)), [])
 })
 
 test('an authenticated link request replaces an unrecorded symlink and survives hook failure, restart, and retention', async (t) => {

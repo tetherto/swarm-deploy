@@ -7,7 +7,6 @@ import fs from '#fs'
 import path from '#path'
 import { ERRORS } from '../../dist/errors.js'
 import { historyName } from '../../dist/files.js'
-import { initLayout } from '../../dist/storage/layout.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import {
@@ -33,6 +32,7 @@ import {
   treeMetadataFromManifest
 } from '../../dist/tar-protocol/tree-manifest.js'
 import { createTempDir } from '../helpers/files.js'
+import { initLayout } from '../helpers/layout.js'
 import { createStorage } from '../helpers/storage.js'
 import { writeTree } from '../helpers/trees.js'
 

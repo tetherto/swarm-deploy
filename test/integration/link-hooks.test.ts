@@ -8,7 +8,6 @@ import path from '#path'
 import {
   Client,
   ERRORS,
-  Server,
   SwarmDeployError,
   keyPairFromSeed,
   type AfterLinkContext,
@@ -21,6 +20,7 @@ import {
 import { main } from '../../dist/cli.js'
 import { loadHooksModule } from '../../dist/hooks-module.js'
 import { createTempDir } from '../helpers/files.js'
+import { Server } from '../helpers/server.js'
 import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
 
 const SERVER_SEED = b4a.alloc(32, 0xd1)

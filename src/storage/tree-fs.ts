@@ -138,9 +138,12 @@ function isProtectedPath(target: string, options: TreeContainmentOptions): boole
   const { layout } = options
   if (!layout) return false
   if ([...protectedDirectories(layout), layout.lock].includes(target)) return true
-  // Never address an ancestor of the storage root: that would contain everything.
+  // Never address an ancestor of the storage root or of the private state directory:
+  // that would contain everything.
   const prefix = target.endsWith(path.sep) ? target : `${target}${path.sep}`
-  return layout.root === target || layout.root.startsWith(prefix)
+  return [layout.root, layout.internal].some(
+    (protectedPath) => protectedPath === target || protectedPath.startsWith(prefix)
+  )
 }
 
 /** A mutable tree root: normalized, absolute, and not itself a protected directory. */

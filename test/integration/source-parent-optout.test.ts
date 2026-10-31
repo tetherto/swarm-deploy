@@ -5,9 +5,10 @@ import test from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import { Client, ERRORS, Server, keyPairFromSeed } from '../../dist/index.js'
+import { Client, ERRORS, keyPairFromSeed } from '../../dist/index.js'
 import { buildTarManifest } from '../../dist/tar-protocol/manifest.js'
 import { createTempDir } from '../helpers/files.js'
+import { Server } from '../helpers/server.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 
 async function releaseArtifact(t: Parameters<Parameters<typeof test>[1]>[0]): Promise<string> {
