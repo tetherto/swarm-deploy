@@ -169,9 +169,39 @@ export interface HookFailureContext {
  * may return `void`, `undefined`, or a promise of either; only a `response` hook
  * may return data (a plain JSON object, see `HookResult`), and only when it is
  * declared so. A `detached` hook's return value is never read. `beforeCommit` is
- * not post-operation: it is a validation gate that is always awaited.
+ * not post-operation: it is a validation gate that is always awaited. `beforeClose`
+ * is not an operation hook at all: it is the server's teardown callback.
  */
 export interface ServerHooks {
+  /**
+   * Teardown callback, called with no arguments, at most once, when the server
+   * closes. It is always awaited, and it takes no `HookResponse` declaration: it is
+   * not part of any answer and nothing is sent to a client for it.
+   *
+   * Use it to cancel and fully drain work your other hooks started outside the
+   * server (an external publisher, a child process, a remote store), so that none of
+   * it can continue after the server has finished closing. The server runs it in
+   * this order: it stops admitting connections and calls `beforeClose` at once,
+   * synchronously inside `close()` (so it can cancel before anything else proceeds),
+   * then aborts its own operations, and only after `beforeClose` has settled and the
+   * operations have finished does it close its stores, release the storage lock and
+   * emit `close`. Another server can therefore not take the storage root while
+   * `beforeClose` is still draining.
+   *
+   * The server cannot cancel your work for you: an operation hook that is still
+   * running when the server closes is otherwise only abandoned (it keeps running on
+   * its own), which is what `beforeClose` exists to prevent. The callback owns its
+   * own cancellation and time bounds; the server adds no timeout, and a callback that
+   * never settles keeps `close()` from completing. It must not wait for the server's
+   * own `close()`, which is waiting for it.
+   *
+   * If it throws or rejects, `close()` rejects with a `HOOK_FAILED` error whose
+   * message is fixed (the raw error is only its `cause`), and the `close` event
+   * reports `failed`. The server still tears down its own resources, including the
+   * storage lock, because nothing more can be waited for: the rejection is the
+   * report that cleanup was not proven.
+   */
+  beforeClose?(): void | Promise<void>
   beforeCommit?(context: BeforeCommitContext): void | Promise<void>
   afterCommit?(context: AfterCommitContext): void | HookResult | Promise<void | HookResult>
   afterLink?(context: AfterLinkContext): void | HookResult | Promise<void | HookResult>
@@ -187,7 +217,13 @@ export interface ServerHooks {
 
 const WRAPPED_CALLBACK_ERRORS = new WeakMap<SwarmDeployError, unknown>()
 /** Every callback name a hooks object or hooks module may carry. */
-export const HOOK_NAMES = ['beforeCommit', 'afterCommit', 'afterLink', 'onFailure'] as const
+export const HOOK_NAMES = [
+  'beforeCommit',
+  'afterCommit',
+  'afterLink',
+  'onFailure',
+  'beforeClose'
+] as const
 
 /**
  * Validates and freezes caller hooks. Each property is read exactly once and no

@@ -493,6 +493,34 @@ const gateDeclaration: HookModes = { beforeCommit: 'response' }
 const flagDeclaration: HookModes = { afterLink: true }
 void [badMode, gateDeclaration, flagDeclaration]
 
+// beforeClose is the server's teardown callback: no context, no data, no declaration.
+const closeHooks = {
+  beforeClose() {
+    return Promise.resolve()
+  }
+} satisfies ServerHooks
+const syncCloseHooks: ServerHooks = { beforeClose: () => {} }
+const asyncCloseHooks: ServerHooks = { beforeClose: async () => {} }
+const bothHooks: ServerHooks = { afterLink: () => {}, beforeClose: () => {} }
+const closeHookOptions = {
+  seed: serverSeed,
+  storageDir: '/srv/swarm-deploy',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096,
+  hooks: closeHooks
+} satisfies ServerOptions
+void [syncCloseHooks, asyncCloseHooks, bothHooks, closeHookOptions]
+// @ts-expect-error beforeClose receives no context.
+const closeWithContext: ServerHooks = { beforeClose: (context: HookFailureContext) => void context }
+// @ts-expect-error beforeClose returns nothing: no data goes to a client for it.
+const closeWithData: ServerHooks = { beforeClose: () => ({ id: 1 }) }
+// @ts-expect-error beforeClose is a function, not a flag.
+const closeFlag: ServerHooks = { beforeClose: true }
+// @ts-expect-error beforeClose is not an operation hook and takes no declaration.
+const closeDeclaration: HookModes = { beforeClose: 'response' }
+void [closeWithContext, closeWithData, closeFlag, closeDeclaration]
+
 // What a hook is told about how the operation ended.
 const succeeded: OperationOutcome = { status: 'succeeded' }
 const failedOutcome: OperationOutcome = {

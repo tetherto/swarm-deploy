@@ -126,6 +126,86 @@ test('snapshotHooks accepts afterLink as a validated, frozen callback', (t) => {
   t.exception(() => snapshotHooks({ afterLinks() {} } as never), { code: ERRORS.PROTOCOL_INVALID })
 })
 
+test('snapshotHooks accepts beforeClose as a validated, frozen teardown callback', (t) => {
+  const beforeClose = (): void => {}
+  const snapshot = snapshotHooks({ beforeClose })
+  t.is(snapshot.beforeClose, beforeClose)
+  t.alike(Object.keys(snapshot), ['beforeClose'])
+  t.is(Object.isFrozen(snapshot), true)
+  for (const value of [1, 'run', {}, [], true, null]) {
+    t.exception(() => snapshotHooks({ beforeClose: value } as never), {
+      code: ERRORS.PROTOCOL_INVALID
+    })
+  }
+  // A near miss is an unknown hook, never silently ignored.
+  for (const typo of ['beforeClosed', 'beforeclose', 'onClose', 'afterClose']) {
+    t.exception(() => snapshotHooks({ [typo]() {} } as never), { code: ERRORS.PROTOCOL_INVALID })
+  }
+
+  let reads = 0
+  const hook = (): void => {}
+  const read = snapshotHooks({
+    get beforeClose() {
+      reads++
+      return hook
+    }
+  })
+  t.is(reads, 1, 'read exactly once')
+  t.is(read.beforeClose, hook)
+
+  const original = { beforeClose }
+  const kept = snapshotHooks(original)
+  original.beforeClose = () => {
+    throw new Error('replacement must not run')
+  }
+  t.is(kept.beforeClose, beforeClose, 'later mutation has no effect')
+
+  const all = snapshotHooks({
+    beforeCommit: hook,
+    afterCommit: hook,
+    afterLink: hook,
+    onFailure: hook,
+    beforeClose: hook
+  })
+  t.alike(Object.keys(all).sort(), [
+    'afterCommit',
+    'afterLink',
+    'beforeClose',
+    'beforeCommit',
+    'onFailure'
+  ])
+})
+
+test('hook modes never take beforeClose: it is the teardown callback, not an operation hook', (t) => {
+  const hooks = snapshotHooks({ beforeClose() {}, afterLink() {} })
+  for (const mode of ['response', 'detached', undefined]) {
+    t.exception(() => snapshotHookModes({ beforeClose: mode } as never, hooks), {
+      code: ERRORS.PROTOCOL_INVALID
+    })
+  }
+  t.execution(() => snapshotHookModes({ afterLink: 'response' }, hooks))
+  t.alike({ ...snapshotHookModes({}, snapshotHooks({ beforeClose() {} })) }, {})
+  // A declaration needs the operation hook it names, whatever else is configured.
+  t.exception(
+    () => snapshotHookModes({ afterLink: 'response' }, snapshotHooks({ beforeClose() {} })),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+
+  t.exception(
+    () =>
+      new Server({
+        ...baseOptions(),
+        hooks: { beforeClose() {} },
+        hookModes: { beforeClose: 'response' } as never
+      }),
+    { code: ERRORS.PROTOCOL_INVALID }
+  )
+  t.exception(() => new Server({ ...baseOptions(), hooks: { beforeClose: 3 as never } }), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+  t.execution(() => new Server({ ...baseOptions(), hooks: { beforeClose() {} } }))
+})
+
 test('hookError names the afterLink phase without callback text', (t) => {
   const cause = new Error('publisher token sk-secret rejected')
   const error = hookError('afterLink', cause)

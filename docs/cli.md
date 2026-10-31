@@ -125,8 +125,14 @@ Optional options:
   artifact basenames; anything else is an exact managed basename. See
   [Managed symlinks](managed-links.md).
 - `--hooks <module>`: JavaScript module (`.js`, `.mjs`, or `.cjs`) exporting
-  trusted lifecycle callbacks. The path is resolved against the working
-  directory. See [Deployment hooks](hooks.md).
+  trusted lifecycle callbacks (`beforeCommit`, `afterCommit`, `afterLink`,
+  `onFailure`, and, from 0.6.2, `beforeClose`). The path is resolved against the
+  working directory. `beforeClose` is the server's teardown callback: awaited by
+  `close()` before the storage lock is released, it takes no `--hook-mode`, and a
+  server older than 0.6.2 ignores the export. The server stopping on SIGINT or
+  SIGTERM goes through the same `close()`, so a `beforeClose` that never settles
+  keeps the process from exiting. See [Deployment hooks](hooks.md) and
+  [Shutdown cleanup](hooks.md#shutdown-cleanup-beforeclose).
 - `--hook-mode <hook>=<mode>`: declares whether one post-operation hook
   (`afterCommit`, `afterLink`, or `onFailure`) is `response` (awaited before the
   answer, may return data, and fails the operation when it fails) or `detached`

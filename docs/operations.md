@@ -12,6 +12,7 @@ reset a storage root, and how to upgrade or roll back. Back to the
 - [Resetting storage with `reset-storage`](#resetting-storage-with-reset-storage)
 - [Rollout and compatibility](#rollout-and-compatibility)
   - [Private state moved out of the storage root (0.6.1)](#private-state-moved-out-of-the-storage-root-061)
+  - [Shutdown cleanup hook (0.6.2)](#shutdown-cleanup-hook-062)
   - [Managed-link rollback warning](#managed-link-rollback-warning)
   - [Link hooks and compatibility](#link-hooks-and-compatibility)
   - [Overlapping retries now get `FILE_BUSY`](#overlapping-retries-now-get-file_busy)
@@ -370,6 +371,28 @@ or keeping the upgraded server in place.
 
 `swarm-deploy link` requires an upgraded server; v0.2.0 does not recognize
 link control requests.
+
+### Shutdown cleanup hook (0.6.2)
+
+A hooks module (or `ServerOptions.hooks`) may now register `beforeClose`, the
+server's teardown callback. Without it nothing changes: closing aborts the waits on
+operation hooks, abandons a callback that is still running, and stays bounded even
+if that callback never settles. With it, the first `close()` (including the one a
+`SIGINT` or `SIGTERM` triggers) stops admission, calls the hook at once, aborts the
+operations as before, and releases the storage lock and emits `close` only after the
+hook and the operations finished, so another server cannot take the root while the
+hook is still draining external work.
+
+- **The hook owns its bounds.** The server adds no timeout and never abandons it: a
+  `beforeClose` that never settles keeps the process from exiting and the root
+  locked. Give it a cancellation and a deadline of its own.
+- **Failure.** If it throws or rejects, `close()` rejects with `HOOK_FAILED` (fixed
+  message), the `close` event reports `failed`, the log names only the code, and the
+  server still releases its own resources, lock included; the CLI exits `1` with
+  `Cleanup failed`. Treat it as "external cleanup not proven".
+- **Upgrade.** The callback needs 0.6.2. An older server ignores a `beforeClose`
+  module export without error, so a module that needs it must require 0.6.2 or
+  newer. No wire format, persisted state or dependency changes.
 
 ### Detached post-operation hooks (0.6.0)
 

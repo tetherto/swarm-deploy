@@ -249,6 +249,11 @@ export interface RetentionEvent {
   storageDeleted?: number
 }
 export interface ServerCloseEvent {
+  /**
+   * Emitted once, after the storage lock was released. `failed` means the
+   * `beforeClose` hook threw or rejected (and `close()` rejected with it): the
+   * server's own resources are closed, but the hook's cleanup is not proven.
+   */
   status: 'closed' | 'failed'
 }
 export interface ServerLinkEvent extends FingerprintEvent {
@@ -468,6 +473,12 @@ export class Server extends EventEmitter {
   private releaseLock: (() => Promise<void>) | null = null
   private listenPromise: Promise<this> | null = null
   private closePromise: Promise<void> | null = null
+  /**
+   * The `beforeClose` hook's outcome once it was called: `null` when it settled, the
+   * failure when it did not. Set before the hook is invoked, so a call that
+   * re-enters `close()` from inside it finds this and cannot call the hook again.
+   */
+  private cleanup: Promise<SwarmDeployError | null> | null = null
 
   constructor(options: ServerOptions) {
     super()
@@ -2193,7 +2204,12 @@ export class Server extends EventEmitter {
       this.logger.info('Direct DHT server listening', { publicKeyId: fingerprint(this.publicKey) })
       return this
     } catch (error) {
-      await this.dispose()
+      // The storage lock goes only after the `beforeClose` hook has drained. A close() that
+      // raced this start has begun it already; a failed start that had begun accepting
+      // connections (so an operation hook could be running) begins it here. One that never
+      // reached the transport served nothing, so there is nothing to clean up yet and a later
+      // close() still calls the hook once.
+      await this.dispose(this.transport !== null ? this.beginCleanup() : this.cleanup)
       throw error
     }
   }
@@ -2201,7 +2217,55 @@ export class Server extends EventEmitter {
     if (this.closed) return Promise.reject(fail(ERRORS.ABORTED, 'Server is closed'))
     return (this.listenPromise ||= this.start())
   }
-  private async dispose(): Promise<void> {
+
+  /**
+   * Calls the `beforeClose` hook, once. The outcome is recorded before the hook is
+   * invoked, so a call that re-enters `close()` from inside the hook gets the same
+   * outcome rather than calling it again, and the hook is called synchronously, in the
+   * caller's turn, so it can cancel external work before anything else of the close
+   * proceeds. It is called with no receiver and no arguments, and what it returns is
+   * only awaited. A throw or a rejection becomes a `HOOK_FAILED` error with a fixed
+   * message and the raw error as its `cause`; the failure is logged by code only.
+   */
+  private beginCleanup(): Promise<SwarmDeployError | null> {
+    if (this.cleanup !== null) return this.cleanup
+    const hook = this.hooks.beforeClose
+    if (hook === undefined) {
+      const none = Promise.resolve<SwarmDeployError | null>(null)
+      this.cleanup = none
+      return none
+    }
+    let settle: (failure: SwarmDeployError | null) => void = () => {}
+    const outcome = new Promise<SwarmDeployError | null>((resolve) => {
+      settle = resolve
+    })
+    // Recorded before the hook is called, so nothing it does can call it again.
+    this.cleanup = outcome
+    const failed = (cause: unknown): void => {
+      this.logger.warn('Server cleanup hook failed', { reason: ERRORS.HOOK_FAILED })
+      settle(fail(ERRORS.HOOK_FAILED, 'Deployment hook failed during beforeClose', cause))
+    }
+    let returned: Promise<unknown>
+    try {
+      returned = Promise.resolve(hook())
+    } catch (cause) {
+      returned = Promise.reject(cause)
+    }
+    void returned.then(() => settle(null), failed)
+    return outcome
+  }
+
+  /**
+   * Tears the server's own resources down. Connections are cut and the transport
+   * closed at once, and the operations that were running finish (the signal is
+   * already aborted, so their waits end). `cleanup`, the `beforeClose` hook's outcome,
+   * is awaited before anything an operation or an external publisher could still be
+   * using is closed: the stores, retention and, last, the storage lock. It returns
+   * the cleanup failure, if there was one, after the teardown has run regardless.
+   */
+  private async dispose(
+    cleanup: Promise<SwarmDeployError | null> | null = null
+  ): Promise<SwarmDeployError | null> {
     for (const socket of this.active.keys()) {
       try {
         socket.destroy()
@@ -2214,6 +2278,11 @@ export class Server extends EventEmitter {
     // is abandoned (its callback keeps running detached); this waits for neither hook code
     // nor anything that could hang.
     await this.detached.drain()
+    // The registered cleanup, unlike an operation hook, is waited for to the end: it owns
+    // its own cancellation and time bounds, and the server never gives up on it, because
+    // releasing the storage lock earlier would let another server start while the work it
+    // is draining could still change something outside.
+    const failure = cleanup === null ? null : await cleanup
     this.active.clear()
     this.activeTransfers.clear()
     this.pendingAfterCommit.clear()
@@ -2225,16 +2294,36 @@ export class Server extends EventEmitter {
     if (this.releaseLock) await this.releaseLock().catch(() => {})
     this.releaseLock = null
     this.listening = false
+    return failure
   }
+
+  /**
+   * Closes the server. Admission stops first (`closed`); the `beforeClose` hook is
+   * then called, in this very call, before the server's own operations are aborted;
+   * and the close completes, resources released and the `close` event emitted, only
+   * after that hook and the running operations have finished. Every call returns the
+   * same promise and the hook is called once, even when called again from inside it.
+   * It rejects when the hook failed, after the same teardown.
+   */
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise
     this.closed = true
+    let finish: { resolve(): void; reject(error: unknown): void } = {
+      resolve() {},
+      reject() {}
+    }
+    // Assigned before anything below can run, so a hook that calls close() gets this promise.
+    this.closePromise = new Promise<void>((resolve, reject) => {
+      finish = { resolve, reject }
+    })
+    const cleanup = this.beginCleanup()
     this.abort.abort()
-    this.closePromise = (async () => {
+    void (async () => {
       await this.listenPromise?.catch(() => {})
-      await this.dispose()
-      this.emitSafe('close', { status: 'closed' })
-    })()
+      const failure = await this.dispose(cleanup)
+      this.emitSafe('close', { status: failure === null ? 'closed' : 'failed' })
+      if (failure !== null) throw failure
+    })().then(finish.resolve, finish.reject)
     return this.closePromise
   }
 }

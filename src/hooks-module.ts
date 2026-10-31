@@ -77,8 +77,10 @@ function defaultHooks(namespace: Record<string, unknown>): Record<string, unknow
 /**
  * Loads a JavaScript hooks module (`.js`, `.mjs` or `.cjs`) and returns the
  * validated, frozen hook snapshot and the validated `hookModes` declaration.
- * Only `beforeCommit`, `afterCommit`, `afterLink`, `onFailure` and `hookModes`
- * are picked, by own property name; other exports are ignored. `hookModes` is
+ * Only `beforeCommit`, `afterCommit`, `afterLink`, `onFailure`, `beforeClose` and
+ * `hookModes` are picked, by own property name; other exports are ignored.
+ * `beforeClose` is the server's teardown callback (see `ServerHooks`); it takes no
+ * `hookModes` declaration, and one for it is refused like any unknown key. `hookModes` is
  * read as data (`{ afterCommit?, afterLink?, onFailure? }`, each `'response'` or
  * `'detached'`), never guessed from the callbacks.
  * Defined named exports take precedence over the default export's callbacks and

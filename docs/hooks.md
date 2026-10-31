@@ -8,6 +8,7 @@ seeds, secret keys, TAR bytes, or session material. Back to the
 ## Contents
 
 - [Response and detached hooks](#response-and-detached-hooks)
+- [Shutdown cleanup: beforeClose](#shutdown-cleanup-beforeclose)
 - [Lifecycle points](#lifecycle-points)
 - [Invocation sequences](#invocation-sequences)
 - [Link publication hooks](#link-publication-hooks)
@@ -129,7 +130,10 @@ failed answer was attempted, even when writing it failed.
   or copy what you need promptly.
 - Closing the server aborts the waits: queued calls are dropped (logged as
   `Detached hook skipped`), a running callback is abandoned and keeps running on its
-  own, and closing never waits for hook code. A detached hook's failure or
+  own, and closing never waits for hook code, unless the hooks register a
+  [`beforeClose`](#shutdown-cleanup-beforeclose) callback, which is how a hook
+  cancels and drains work it started outside the server before the server lets go
+  of its storage. A detached hook's failure or
   rejection is caught and logged as `Detached hook failed` with the hook, the
   link or artifact name, and `HOOK_FAILED`; it never reaches `onFailure`, so
   there is no recursion.
@@ -146,6 +150,75 @@ post-commit retention pass, [managed symlinks](managed-links.md) for the links
 `afterLink` publishes, and the [runtime API](api.md) for the exported hook
 types. A runnable Node-only example is in
 [`examples/link-publisher`](../examples/link-publisher).
+
+## Shutdown cleanup: beforeClose
+
+Closing a server aborts the waits on its operation hooks, and a hook callback that
+is still running is **abandoned**: it keeps running on its own after the server has
+rolled back what it changed locally, released the storage lock and finished closing.
+For a hook that only observes that is harmless. For a hook that changes something
+outside the server (a publisher that submits to an external store in several steps)
+it means the store can still be changed after the server, and any other server that
+has since taken the storage root, believes the work is over.
+
+`beforeClose` is the callback that closes that gap. It is the server's teardown
+callback, not an operation hook: it takes no arguments, returns nothing, is not
+`response` or `detached` and takes no `--hook-mode` or `hookModes` entry (one is
+refused like any unknown key), and nothing is sent to a client for it. Export it
+from a hooks module next to the others, or pass it in `ServerOptions.hooks`:
+
+```js
+// hooks.mjs
+const publisher = createPublisher() // your code: cancellable, with its own time bounds
+
+export async function afterLink({ link, artifact }) {
+  await publisher.publish(link.name, artifact.transferId) // stops writing once cancelled
+}
+
+export async function beforeClose() {
+  // Cancel in-flight publications now, then resolve once none of them can write any more.
+  await publisher.cancelAndDrain()
+}
+```
+
+What the server guarantees, in this order, on the first `close()`:
+
+1. It stops admitting connections.
+2. It calls `beforeClose`, synchronously inside that `close()` call, so the callback
+   can cancel external work before anything else of the close proceeds.
+3. It aborts its own operations, as it always did, and they finish.
+4. It waits for `beforeClose` and the operations. Only then does it close its
+   stores and retention, release the storage lock, and emit `close`. Another server
+   cannot take the storage root while `beforeClose` is still draining.
+
+Every `close()` call returns one and the same promise, and `beforeClose` is called
+once, even if `close()` is called again, concurrently, or from inside the callback
+itself (which must not wait for the server's own `close()`, since that is waiting
+for it). It is called for any close, whether or not the server ever served an
+operation, and by a failed `listen()` only if that start had already begun
+accepting connections.
+
+**The callback owns its own bounds.** The server adds no timeout to `beforeClose`
+and never abandons it: a callback that never settles keeps `close()` from
+completing and the storage root locked, because releasing the root earlier is what
+this callback exists to prevent. Make it cancel, and give whatever it waits on a
+deadline of its own. Hooks that register no `beforeClose` keep the existing bounded
+close, even if an operation hook never settles; nothing else waits on hook
+promises.
+
+**A failure is reported, not hidden.** If `beforeClose` throws or rejects, `close()`
+rejects with `HOOK_FAILED` and the fixed message `Deployment hook failed during
+beforeClose` (the raw error is only its `cause`, and the log names the code only),
+and the `close` event reports `failed`. The server still tears its own resources
+down, including the storage lock, because there is nothing left to wait for: the
+rejection is the report that cleanup was not proven, and a process that must not
+reuse the root after it should treat it as fatal. The CLI exits `1` with
+`Cleanup failed`.
+
+**Minimum version.** `beforeClose` needs 0.6.2. An older server ignores an
+unrecognized module export, so a hooks module that depends on it will load there
+and never be called; require 0.6.2 or newer in the package that ships the module.
+`ServerOptions.hooks` on an older server refuses the unknown key at construction.
 
 ## Lifecycle points
 
@@ -761,9 +834,11 @@ module.exports = {
 
 Loader rules:
 
-- Only the own properties `beforeCommit`, `afterCommit`, `afterLink`, `onFailure`
-  and `hookModes` are read. Other exports (helpers, configuration) are ignored,
-  including a harmless non-object default export.
+- Only the own properties `beforeCommit`, `afterCommit`, `afterLink`, `onFailure`,
+  `beforeClose` and `hookModes` are read. Other exports (helpers, configuration)
+  are ignored, including a harmless non-object default export. A `beforeClose`
+  export is the [teardown callback](#shutdown-cleanup-beforeclose); it needs
+  swarm-deploy 0.6.2 or newer, and an older server ignores it silently.
 - `hookModes` is read as data, never derived from the callbacks:
   `{ afterCommit?, afterLink?, onFailure? }`, each `'response'` or `'detached'`, a
   plain object. Named exports take precedence over the default export's
@@ -783,7 +858,7 @@ Loader rules:
   trusted.
 
 `ServerOptions.hooks` is stricter: it must be a hook object whose own keys are
-only the four callbacks, every callback a function. Unknown keys and
+only the five callbacks, every callback a function. Unknown keys and
 non-function values throw `PROTOCOL_INVALID`. The object is snapshotted at
 construction, so later mutation has no effect. `ServerOptions.hookModes` is
 validated the same way (only `afterCommit`, `afterLink` and `onFailure`, each
