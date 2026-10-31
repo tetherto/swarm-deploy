@@ -113,7 +113,9 @@ Optional operational limits and policies:
   names another (a default that cannot be examined is ignored).
   Every instance for one root must use the same user, `HOME`, and value. While
   a server runs, `<storageDir>/.swarm-deploy` reappearing makes it refuse new
-  uploads, link requests, and retention passes and log one error. See
+  uploads, link requests, and retention passes. It logs one legacy-state alert,
+  without a path, when it first sees the directory, and each refused scheduled
+  retention pass logs its own failure (also without a path). See
   [Private state](../README.md#private-state).
 - `initializeState?: boolean` (also readable as `server.initializeState`): a
   one-time acknowledgement. `listen()` rejects when it would start new state, or

@@ -596,7 +596,10 @@ must use the same user, `HOME`, and state settings; the guards above catch the
 common ways to differ, but two instances started at the same moment on an empty
 root with different settings are not detected. While a server runs, a
 `.swarm-deploy` entry that appears in the output root makes it refuse new
-uploads, link requests, and retention passes and log one error without a path.
+uploads, link requests, and retention passes. It logs one legacy-state alert,
+without a path, when an admission check first sees the entry (and again only if
+the entry disappears and returns), and each refused scheduled retention pass
+logs its own failure, also without a path.
 
 ## Storage accounting
 
