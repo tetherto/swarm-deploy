@@ -1121,6 +1121,9 @@ export class Server extends EventEmitter {
   ): Promise<void> {
     let emitted = false
     let resultWriteStarted = false
+    // Set only when this request was refused because legacy state is in the output root. That
+    // refusal changes nothing, so its answer is delivered the way a failed hook's is.
+    let refusedForLegacyState = false
     // Held in an object because closures set it.
     const state: LinkRequestState = {
       artifact: null,
@@ -1150,7 +1153,10 @@ export class Server extends EventEmitter {
     try {
       // A link request has no payload: EOF is the required no-trailing-data boundary.
       await reader.requireEnd(this.signal, this.idleTimeout)
-      if (this.legacyStateReappeared()) throw fail(ERRORS.LINK_FAILED, LEGACY_REAPPEARED_MESSAGE)
+      if (this.legacyStateReappeared()) {
+        refusedForLegacyState = true
+        throw fail(ERRORS.LINK_FAILED, LEGACY_REAPPEARED_MESSAGE)
+      }
       if (request.target === request.name) {
         throw fail(ERRORS.LINK_NOT_ALLOWED, 'Manual link cannot target itself')
       }
@@ -1240,7 +1246,7 @@ export class Server extends EventEmitter {
           : undefined,
         state.rolledBack
       )
-      if (answered && reason === ERRORS.HOOK_FAILED) {
+      if (answered && (reason === ERRORS.HOOK_FAILED || refusedForLegacyState)) {
         this.closeAfterAnswer(socket)
       } else {
         try {
@@ -1424,12 +1430,14 @@ export class Server extends EventEmitter {
   }
 
   /**
-   * Closes a connection after its `HOOK_FAILED` answer was written. Destroying
-   * the stream right behind the write can reset it before the peer has read the
-   * record, so the caller would see a reset instead of the stable code. The
-   * write side is ended first and the connection is destroyed once the peer
-   * closes it, or after a grace period if it never does. The work that failed
-   * is already durable, so lingering costs only the connection.
+   * Closes a connection after an answer whose code the caller must be able to read: a
+   * `HOOK_FAILED` answer, and the refusal of a link request while legacy state is in the
+   * output root. Destroying the stream right behind the write can reset it before the peer has
+   * read the record, so the caller would see a reset instead of the stable code. The write
+   * side is ended first and the connection is destroyed once the peer closes it, or after a
+   * grace period if it never does. In both cases the work that failed is already durable or
+   * was never started, so lingering costs only the connection. Every other failure still
+   * destroys the stream at once.
    */
   private closeAfterAnswer(socket: DirectDhtSocket): void {
     let timer: ReturnType<typeof setTimeout> | undefined

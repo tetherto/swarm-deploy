@@ -269,11 +269,29 @@ function legacyStateError(legacy: string, state: string): SwarmDeployError {
   )
 }
 
-function crossDeviceError(root: string, state: string): SwarmDeployError {
+/**
+ * A state directory outside the output root can share the root's mount only when the root
+ * is a directory inside a mount. When the root is the mount point itself (a volume mounted
+ * directly at `--storage`), nothing outside it shares that mount, so the way out is to mount
+ * a common parent and use two subdirectories of it. `rootIsMountPoint` says whether that is
+ * known to be the case; otherwise the advice is conditional.
+ */
+function commonParentAdvice(rootIsMountPoint: boolean): string {
+  return rootIsMountPoint
+    ? ' The output root is itself a mount point, so no directory outside it can share its mount: mount a common parent directory instead and use one subdirectory of it for --storage and another for --state-dir.'
+    : ' If the output root is itself a mount point (a volume mounted directly at --storage), no directory outside it shares its mount: mount a common parent directory and use subdirectories of it for --storage and --state-dir.'
+}
+
+function crossDeviceError(
+  root: string,
+  state: string,
+  rootIsMountPoint: boolean
+): SwarmDeployError {
   return storageError(
     `Private state directory ${state} is on a different filesystem than the output root ${root}. ` +
       'Publication, link replacement, and retention move files between the two with atomic renames and hard links, which cannot cross filesystems. ' +
-      'Pass --state-dir (ServerOptions.stateDir) a directory outside the output root on the same filesystem and mount.'
+      'Pass --state-dir (ServerOptions.stateDir) a directory outside the output root on the same filesystem and mount.' +
+      commonParentAdvice(rootIsMountPoint)
   )
 }
 
@@ -286,7 +304,8 @@ function crossMountError(
   return storageError(
     `Private state directory ${state} is on a different mount (${stateMount.mountPoint}) than the output root ${root} (${rootMount.mountPoint}), although both report the same filesystem. ` +
       'Linux rename(2) and link(2) fail with EXDEV between distinct mount points even of one filesystem, so publication, link replacement, and retention would fail after an upload was received. ' +
-      'Pass --state-dir a directory outside the output root on the same mount (not a separate bind mount or volume).'
+      'Pass --state-dir a directory outside the output root on the same mount (not a separate bind mount or volume).' +
+      commonParentAdvice(rootMount.mountPoint === root)
   )
 }
 
@@ -309,14 +328,19 @@ export function legacyStatePresent(root: string): boolean {
  * `onCrossMount` before the error is rethrown unchanged. It is how a publication that fails
  * across a filesystem or mount boundary, which no startup check can rule out in every
  * environment, is reported with the way out instead of as a generic failure.
+ *
+ * Every other method and getter runs with the original adapter as its receiver, so a class
+ * adapter with `#private` fields, or one that assigns to `this`, behaves exactly as when it is
+ * used directly. A capability the adapter lacks stays absent, so `typeof storage.symlink`
+ * checks give the same answer.
  */
 export function diagnoseCrossMount(
   storage: StorageAdapter,
   onCrossMount: () => void
 ): StorageAdapter {
-  const diagnosed = Object.create(storage) as StorageAdapter
-  for (const name of ['rename', 'link'] as const) {
-    diagnosed[name] = async (from: string, to: string): Promise<void> => {
+  const diagnose =
+    (name: 'rename' | 'link') =>
+    async (from: string, to: string): Promise<void> => {
       try {
         await storage[name](from, to)
       } catch (error: unknown) {
@@ -324,8 +348,17 @@ export function diagnoseCrossMount(
         throw error
       }
     }
-  }
-  return diagnosed
+  const diagnosed = { rename: diagnose('rename'), link: diagnose('link') }
+  // The proxy's own target is empty, so no property invariant of the adapter (a frozen object,
+  // say) can conflict with the bound methods returned for it.
+  return new Proxy({} as StorageAdapter, {
+    get(_target, property) {
+      if (property === 'rename' || property === 'link') return diagnosed[property]
+      const value: unknown = Reflect.get(storage, property, storage)
+      return typeof value === 'function' ? value.bind(storage) : value
+    },
+    has: (_target, property) => property in storage
+  })
 }
 
 /** What a running server says when legacy state reappears. It names no path. */
@@ -387,7 +420,10 @@ function assertSameFilesystem(
   for (let current = target; ; current = path.dirname(current)) {
     const stat = statOrNull(current)
     if (stat !== null) {
-      if (stat.dev !== device) throw crossDeviceError(root, state)
+      if (stat.dev !== device) {
+        const rootMount = mounts === null ? null : mountFor(mounts, canonicalRoot)
+        throw crossDeviceError(root, state, rootMount?.mountPoint === canonicalRoot)
+      }
       break
     }
     if (path.dirname(current) === current) break
@@ -511,20 +547,25 @@ function assertInitializationAcknowledged(
  * An explicit state location must not fork the state this user's default location already
  * keeps for this root: that would give one output root two independent sets of ownership
  * records, and nothing locks them against each other.
+ *
+ * The probe of the default location is best effort. A hardened service (`ProtectHome`, a
+ * home directory the service user cannot enter) has no readable default and so cannot have
+ * forked anything it can see; an explicit `stateDir` is the way out of such a setup and must
+ * keep working. Only a default that can be read, and is bound to this root, is a conflict.
  */
 export function assertNoDefaultStateConflict(
   canonicalRoot: string,
   state: string,
   defaultState: string
 ): void {
-  const stateStat = statOrNull(state)
-  const defaultStat = statOrNull(defaultState)
-  if (defaultStat === null || !defaultStat.isDirectory()) return
-  const sameDirectory =
-    stateStat !== null && stateStat.dev === defaultStat.dev && stateStat.ino === defaultStat.ino
-  if (sameDirectory) return
   let owner: string | null
   try {
+    const defaultStat = statOrNull(defaultState)
+    if (defaultStat === null || !defaultStat.isDirectory()) return
+    const stateStat = statOrNull(state)
+    const sameDirectory =
+      stateStat !== null && stateStat.dev === defaultStat.dev && stateStat.ino === defaultStat.ino
+    if (sameDirectory) return
     owner = readBinding(path.join(defaultState, STATE_ROOT_NAME))
   } catch {
     return

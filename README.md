@@ -132,12 +132,19 @@ directory:
   directory, so both must be on one filesystem. On Linux they must also be on one
   mount: `rename` and `link` fail with `EXDEV` between two mount points, such as
   a bind mount or a container volume, even of one filesystem, and the server
-  reads `/proc/self/mountinfo` to refuse that at startup. Otherwise the server
-  refuses to start and tells you to pass `--state-dir`; there is no copy
-  fallback. A home directory on another filesystem than `--storage` needs an
-  explicit `--state-dir`. If a publication is still refused with `EXDEV` (for
-  example where `/proc` is hidden), the server logs one error naming
-  `--state-dir`.
+  reads `/proc/self/mountinfo` (at most 4 MiB of it) to refuse that at startup.
+  Otherwise the server refuses to start and tells you to pass `--state-dir`;
+  there is no copy fallback. A home directory on another filesystem than
+  `--storage` needs an explicit `--state-dir`. If the table cannot be used
+  (`/proc` is hidden or unreadable, or the table is larger than the cap) only the
+  device check runs, and a publication that is then refused with `EXDEV` makes the
+  server log one error naming `--state-dir`.
+
+  If a volume is mounted directly at `--storage`, the output root is itself a
+  mount point and no directory outside it shares its mount. Mount a common
+  parent instead, and use one subdirectory of it for `--storage` and another for
+  `--state-dir` (for example `/srv/data/public` and `/srv/data/private`).
+
 - **Outside the root:** it cannot be the output root, inside it, above it, or
   reach it through a symlink, and its final directory cannot be a symlink.
   It is created, and kept, at mode `0700`, and it records the output root it
@@ -151,19 +158,24 @@ directory:
   output root. Three checks catch the usual ways to get this wrong, and none of
   them is a lock:
   - Starting new state, or binding a directory that holds entries but no record
-    of its root, is refused while the output root already holds entries, unless
-    you pass `--initialize-state` (`ServerOptions.initializeState`). Use it once,
+    of its root, is refused while the output root holds entries, and also while
+    that directory itself holds entries, unless you pass `--initialize-state`
+    (`ServerOptions.initializeState`). Use it once,
     when you are sure no other instance manages that root (after deleting state
     on purpose, or for a migrated or restored directory), and leave it out of
     normal startup. State that is already bound needs no flag, and a flag left in
     place would let a mistaken `--state-dir` or `HOME` start a second set of state
     silently.
   - An explicit `--state-dir` is refused when your default location for this
-    root already holds state bound to it, so the default is never forked.
+    root can be read and already holds state bound to it, so the default is never
+    forked. A default location the process cannot examine (a service that cannot
+    enter its home directory, for example) is not a conflict, and an explicit
+    `--state-dir` is how such a service is configured.
   - If `<storage>/.swarm-deploy` appears while the server runs, because an older
     release or another writer is using the root, new uploads and link requests
-    and retention passes are refused and one error is logged, until you resolve
-    it.
+    and retention passes are refused until you resolve it. One error is logged
+    when it is first seen, and each scheduled retention pass that is refused logs
+    its own failure.
 
   Two instances that start at the same moment on an empty output root with
   different state settings are not detected. That is unsupported, as is running

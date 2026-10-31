@@ -83,11 +83,15 @@ Optional options:
   user running the server (`os.homedir()`, which honors `HOME`), with `<id>`
   derived from the real path of `--storage`. A custom directory must be outside
   `--storage` and on the same filesystem (and, on Linux, the same mount), is kept
-  at mode `0700`, and serves one storage root only. It is refused when your
-  default location for the root already holds state bound to it. Use the same
-  value, user, and `HOME` for every server and `reset-storage` run for that root;
-  never serve it. See [Private state](../README.md#private-state), including how
-  to move the state of a 0.6.0 or earlier server out of `<storage>/.swarm-deploy`.
+  at mode `0700`, and serves one storage root only. If a volume is mounted
+  directly at `--storage`, nothing outside it shares its mount: mount a common
+  parent and use one subdirectory for `--storage` and another for `--state-dir`.
+  It is refused when your default location for the root can be read and already
+  holds state bound to it; a default the process cannot examine (an inaccessible
+  home directory) is ignored. Use the same value, user, and `HOME` for every
+  server and `reset-storage` run for that root; never serve it. See
+  [Private state](../README.md#private-state), including how to move the state of
+  a 0.6.0 or earlier server out of `<storage>/.swarm-deploy`.
 - `--initialize-state`: a one-time acknowledgement, a flag without a value. The
   server refuses to start new state, or to bind a state directory that holds
   entries but no record of its output root (migrated or restored state), while the

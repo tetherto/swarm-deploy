@@ -563,13 +563,18 @@ and `reset-storage`, which resolves it identically, require:
   directory and, for the device, a different filesystem;
 - `<state>` and every metadata directory share a filesystem with the output
   root, and on Linux a mount (the mount ID of the longest mount point containing
-  each, read from a bounded `/proc/self/mountinfo`), since publication, link
-  replacement, tree rename, retention trash, and recovery use `rename` and hard
-  links between them, which fail with `EXDEV` between distinct mount points even
-  of one filesystem; otherwise startup fails before anything is staged, with
-  guidance to pass `--state-dir`, and there is no cross-device copy or visible
-  temporary fallback. When no mount table is available, an `EXDEV` from
-  publication is logged once with the same guidance;
+  each, from `/proc/self/mountinfo` read as bytes through at most 4 MiB plus one
+  byte, never sized by `stat`), since publication, link replacement, tree rename,
+  retention trash, and recovery use `rename` and hard links between them, which
+  fail with `EXDEV` between distinct mount points even of one filesystem;
+  otherwise startup fails before anything is staged, with guidance to pass
+  `--state-dir`, and there is no cross-device copy or visible temporary fallback.
+  An output root that is itself a mount point has no directory outside it on its
+  mount, so the guidance is then to mount a common parent and use one
+  subdirectory for the output root and another for `<state>`. When the table is
+  unavailable (not openable or readable, or larger than the cap) only the device
+  check runs, and an `EXDEV` from publication is logged once with the same
+  guidance;
 - an existing `<state>` is inspected read-only before anything about it changes.
   It is mode `0700` and, once written, names the real path of the one output
   root it serves in `.swarm-deploy-state.json`; a different root, an unreadable
@@ -582,7 +587,8 @@ and `reset-storage`, which resolves it identically, require:
   empty state directory, unless the operator passes `--initialize-state`
   (`ServerOptions.initializeState`); bound state needs no flag;
 - an explicit `<state>` is refused when the user's default location for this root
-  already holds state bound to it.
+  can be read and already holds state bound to it. Failing to examine that
+  location (a home directory the process cannot enter) is not a conflict.
 
 The storage lock is in `<state>/lock`, so it excludes only instances that share
 the state directory. Every server and `reset-storage` run for one output root

@@ -302,6 +302,10 @@ test('a state directory on another filesystem fails before anything is published
     t.is(failure?.code, ERRORS.PROTOCOL_INVALID)
     t.ok(failure?.message.includes('different filesystem than the output root'))
     t.ok(failure?.message.includes('--state-dir'), 'the message names the way out')
+    t.ok(
+      failure?.message.includes('mount a common parent directory'),
+      'and what to do when the output root is itself a volume'
+    )
     await t.exception(() => server.listen(), {
       code: ERRORS.PROTOCOL_INVALID,
       message: /Pass --state-dir/

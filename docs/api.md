@@ -104,10 +104,13 @@ Optional operational limits and policies:
   home directory the runtime reports for the user running the server
   (`os.homedir()`, which honors `HOME`), with `<id>` derived from the real path of
   `storageDir`. A custom directory must be outside `storageDir` and on the same
-  filesystem (and, on Linux, the same mount), is kept at mode `0700`, and serves
+  filesystem (and, on Linux, the same mount; a volume mounted directly at
+  `storageDir` shares its mount with nothing outside it, so mount a common
+  parent and use one subdirectory for each), is kept at mode `0700`, and serves
   one `storageDir` only; `listen()` rejects otherwise, while
   `<storageDir>/.swarm-deploy` from 0.6.0 or earlier still exists, and when the
-  user's default state for the root already exists and `stateDir` names another.
+  user's default state for the root can be read, is bound to it, and `stateDir`
+  names another (a default that cannot be examined is ignored).
   Every instance for one root must use the same user, `HOME`, and value. While
   a server runs, `<storageDir>/.swarm-deploy` reappearing makes it refuse new
   uploads, link requests, and retention passes and log one error. See

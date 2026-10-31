@@ -23,7 +23,13 @@ import {
   shellQuote,
   sweepClaimTemporaries
 } from '../../dist/storage/layout.js'
-import { mountFor, parseMountInfo, readMountInfo } from '../../dist/storage/mounts.js'
+import {
+  MAX_MOUNTINFO_BYTES,
+  mountFor,
+  parseMountInfo,
+  readBoundedText,
+  readMountInfo
+} from '../../dist/storage/mounts.js'
 import type { StorageAdapter } from '../../dist/storage/types.js'
 import { createTempDir } from '../helpers/files.js'
 import { Server } from '../helpers/server.js'
@@ -483,6 +489,7 @@ test('an unrepresentable identity on an unrelated ancestor never hides the files
     crossDevice?.message.includes('different filesystem than the output root'),
     crossDevice?.message
   )
+  t.ok(crossDevice?.message.includes('mount a common parent directory'))
   t.absent(crossDevice?.message.includes('identity is unavailable'))
   t.ok(crossDevice?.message.includes('--state-dir'))
   t.absent(await exists(path.join(scratch, 'private')), 'nothing was created')
@@ -645,6 +652,55 @@ test('an explicit state directory cannot fork the default state already bound to
   )
 })
 
+test('an explicit state directory still works when the default location cannot be examined', async (t) => {
+  const scratch = await createTempDir(t)
+  const root = path.join(scratch, 'out')
+  const home = path.join(scratch, 'home')
+  const defaultState = path.join(home, 'id')
+  const marker = path.join(defaultState, STATE_ROOT_NAME)
+  const custom = path.join(scratch, 'custom')
+  // A default left bound to this root, as an earlier run of the same user would leave it.
+  initLayout(root, defaultState)
+  const probe = (): Error | null =>
+    failureOf(() => assertNoDefaultStateConflict(root, custom, defaultState))
+  t.ok(probe()?.message.includes('already exists at'), 'readable and bound, it is a conflict')
+
+  // Every step of the probe can be refused, as under ProtectHome or for an inaccessible home.
+  const refusals: Array<[string, string, string]> = [
+    ['the default directory cannot be stat', 'statSync', defaultState],
+    ['its record cannot be stat', 'lstatSync', marker],
+    ['its record cannot be opened', 'readFileSync', marker]
+  ]
+  for (const [label, name, denied] of refusals) {
+    const outcome = await withPatchedFs(
+      name,
+      (original) =>
+        (...args) => {
+          if (String(args[0]) === denied) throw errno('EACCES')
+          return original(...args)
+        },
+      probe
+    )
+    t.is(outcome, null, `${label}: no conflict can be seen`)
+  }
+
+  // And a directory the process really cannot enter. A process that may enter it anyway (it
+  // runs with extra privilege) sees a readable default, and then the conflict stands.
+  await fs.promises.chmod(home, 0o000)
+  try {
+    const reachable = await fs.promises.stat(defaultState).then(
+      () => true,
+      () => false
+    )
+    const outcome = probe()
+    if (reachable) t.ok(outcome !== null, 'a default that can be read is still a conflict')
+    else t.is(outcome, null, 'an inaccessible default does not block an explicit state directory')
+  } finally {
+    await fs.promises.chmod(home, 0o700)
+  }
+  t.ok(probe() !== null, 'the conflict is detected again once it can be read')
+})
+
 const MOUNTINFO = [
   '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw',
   '31 22 8:1 /srv/data /srv/artifacts rw,relatime shared:1 master:2 - ext4 /dev/sda1 rw',
@@ -695,6 +751,11 @@ test('two mounts of one filesystem are different places for publication', (t) =>
   t.ok(failure?.message.includes('(/srv/artifacts)'))
   t.ok(failure?.message.includes('EXDEV'))
   t.ok(failure?.message.includes('--state-dir'))
+  t.ok(
+    failure?.message.includes('If the output root is itself a mount point'),
+    'a root inside a mount is given conditional guidance'
+  )
+  t.absent(failure?.message.includes('The output root is itself a mount point'))
   t.is(
     failureOf(() =>
       assertSameMount('/srv/artifacts/out', '/srv/artifacts/state', '/srv/artifacts/state', mounts)
@@ -711,12 +772,62 @@ test('two mounts of one filesystem are different places for publication', (t) =>
   )
 })
 
-test('the Linux mount table is read where it exists and ignored elsewhere', async (t) => {
+// Container layouts: volumes mounted straight at the output root and at a state directory
+// report one device, and different mount IDs.
+const VOLUMES = [
+  '501 450 0:42 / / rw,relatime - overlay overlay rw',
+  '510 501 8:1 /data/public /srv/artifacts rw,relatime - ext4 /dev/sda1 rw',
+  '511 501 8:1 /data/private /var/lib/swarm-deploy rw,relatime - ext4 /dev/sda1 rw',
+  '520 501 8:1 /data /srv/shared rw,relatime - ext4 /dev/sda1 rw'
+].join('\n')
+
+test('an output root that is itself a mount point is told to mount a common parent', (t) => {
+  const mounts = parseMountInfo(VOLUMES)
+  const volumeRoot = failureOf(() =>
+    assertSameMount(
+      '/srv/artifacts',
+      '/var/lib/swarm-deploy/state',
+      '/var/lib/swarm-deploy/state',
+      mounts
+    )
+  )
+  t.ok(volumeRoot?.message.includes('different mount (/var/lib/swarm-deploy)'), volumeRoot?.message)
+  t.ok(volumeRoot?.message.includes('The output root is itself a mount point'))
+  t.ok(volumeRoot?.message.includes('no directory outside it can share its mount'))
+  t.ok(volumeRoot?.message.includes('mount a common parent directory'))
+  t.ok(
+    volumeRoot?.message.includes('one subdirectory of it for --storage and another for --state-dir')
+  )
+
+  // The layout that advice leads to: one volume, a public and a private subdirectory.
+  t.is(
+    failureOf(() =>
+      assertSameMount('/srv/shared/public', '/srv/shared/private', '/srv/shared/private', mounts)
+    ),
+    null,
+    'two subdirectories of one mount share it'
+  )
+  t.not(
+    mountFor(mounts, '/srv/artifacts')?.id,
+    mountFor(mounts, '/var/lib/swarm-deploy')?.id,
+    'the two volumes share a device but not a mount'
+  )
+})
+
+test('the Linux mount table is read within its cap where it exists and ignored elsewhere', async (t) => {
   const mounts = readMountInfo()
   if (os.platform() !== 'linux') {
     t.is(mounts, null, 'other platforms rely on the device check alone')
     return
   }
+  // The fallback to the device check would hide an unreadable virtual file, so read it directly.
+  const table = readBoundedText('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES)
+  t.ok(table !== null && table.length > 0, 'the real table is read through the bounded reader')
+  t.is(
+    readBoundedText('/proc/self/mountinfo', 10),
+    null,
+    'a generated file reports no size, and a read past the cap is still refused'
+  )
   t.ok(mounts !== null && mounts.length > 0, 'the real table is readable')
   const tmp = await fs.promises.realpath(os.tmpdir())
   t.ok(mounts !== null && mountFor(mounts, tmp) !== null, 'the temporary directory is on a mount')
@@ -727,28 +838,113 @@ test('the Linux mount table is read where it exists and ignored elsewhere', asyn
   await fs.promises.mkdir(root)
   const escaped = (value: string): string => value.replace(/\\/g, '\\134').replace(/ /g, '\\040')
   const canonical = await fs.promises.realpath(root)
+  // The kernel file is replaced by fixture files of the same format at the moment it is opened.
   const serve =
-    (table: string) =>
+    (fixture: string) =>
     (original: Call) =>
     (...args: unknown[]) =>
-      args[0] === '/proc/self/mountinfo' ? table : original(...args)
+      original(...(args[0] === '/proc/self/mountinfo' ? [fixture, ...args.slice(1)] : args))
 
   // The output root is its own mount of the same device; the state would be on the parent mount.
-  const split = [
-    '1 0 8:1 / / rw - ext4 /dev/x rw',
-    `2 1 8:1 /out ${escaped(canonical)} rw - ext4 /dev/x rw`
-  ].join('\n')
-  const refused = await withPatchedFs('readFileSync', serve(split), () =>
+  const split = path.join(scratch, 'split.mountinfo')
+  await fs.promises.writeFile(
+    split,
+    [
+      '1 0 8:1 / / rw - ext4 /dev/x rw',
+      `2 1 8:1 /out ${escaped(canonical)} rw - ext4 /dev/x rw`,
+      ''
+    ].join('\n')
+  )
+  const refused = await withPatchedFs('openSync', serve(split), () =>
     failureOf(() => initLayout(root, state))
   )
   t.ok(refused?.message.includes('different mount'), refused?.message)
+  t.ok(
+    refused?.message.includes('The output root is itself a mount point'),
+    'the root is the mount point, so the advice is to mount a common parent'
+  )
   t.absent(await exists(path.join(scratch, 'private')), 'nothing was created')
 
-  const whole = '1 0 8:1 / / rw - ext4 /dev/x rw\n'
-  const accepted = await withPatchedFs('readFileSync', serve(whole), () =>
+  const whole = path.join(scratch, 'whole.mountinfo')
+  await fs.promises.writeFile(whole, '1 0 8:1 / / rw - ext4 /dev/x rw\n')
+  const accepted = await withPatchedFs('openSync', serve(whole), () =>
     failureOf(() => initLayout(root, state))
   )
   t.is(accepted, null, 'one mount is accepted')
+})
+
+test('the bounded reader reads at most the cap plus one byte and always closes', async (t) => {
+  const scratch = await createTempDir(t)
+  const write = async (name: string, contents: string): Promise<string> => {
+    const file = path.join(scratch, name)
+    await fs.promises.writeFile(file, contents)
+    return file
+  }
+
+  const six = await write('six', 'abcdef')
+  t.is(readBoundedText(six, 6), 'abcdef', 'exactly the cap is read in full')
+  t.is(readBoundedText(six, 5), null, 'one byte over the cap is refused')
+  t.is(readBoundedText(six, 100), 'abcdef')
+  const empty = await write('empty', '')
+  t.is(readBoundedText(empty, 0), '', 'an empty file is empty at any cap')
+  t.is(readBoundedText(await write('one', 'x'), 0), null, 'a cap of zero admits no byte')
+
+  // The cap counts bytes, not UTF-16 code units, and a character may straddle two reads.
+  const accent = await write('accent', 'é')
+  t.is(readBoundedText(accent, 2), 'é')
+  t.is(readBoundedText(accent, 1), null, 'two bytes exceed a cap of one')
+  // One ASCII byte first puts a read boundary (64 KiB) in the middle of a two-byte character.
+  const wide = `a${'é'.repeat(40_000)}`
+  const large = await write('large', wide)
+  t.is(readBoundedText(large, 80_001), wide, 'a character split between two reads decodes whole')
+  t.is(
+    readBoundedText(large, 80_000),
+    null,
+    'one byte over the cap is refused past a read boundary'
+  )
+
+  // Descriptors: one open, one close, however the read ends.
+  const counts = { open: 0, close: 0 }
+  const track =
+    (kind: 'open' | 'close') =>
+    (original: Call) =>
+    (...args: unknown[]) => {
+      counts[kind]++
+      return original(...args)
+    }
+  const missing = await withPatchedFs('openSync', track('open'), () =>
+    withPatchedFs('closeSync', track('close'), () =>
+      failureOf(() => readBoundedText(path.join(scratch, 'absent'), 10))
+    )
+  )
+  t.is(missing?.code, 'ENOENT', 'an open failure is thrown')
+  t.alike(counts, { open: 1, close: 0 }, 'nothing was opened, so nothing is closed')
+
+  counts.open = 0
+  counts.close = 0
+  const broken = await withPatchedFs('openSync', track('open'), () =>
+    withPatchedFs('closeSync', track('close'), () =>
+      withPatchedFs(
+        'readSync',
+        () => () => {
+          throw errno('EIO')
+        },
+        () => failureOf(() => readBoundedText(six, 10))
+      )
+    )
+  )
+  t.is(broken?.code, 'EIO', 'a read failure is thrown')
+  t.alike(counts, { open: 1, close: 1 }, 'and the descriptor is closed')
+
+  counts.open = 0
+  counts.close = 0
+  await withPatchedFs('openSync', track('open'), () =>
+    withPatchedFs('closeSync', track('close'), () => {
+      readBoundedText(six, 5)
+      readBoundedText(six, 6)
+    })
+  )
+  t.alike(counts, { open: 2, close: 2 }, 'overflow and success both close')
 })
 
 test('a rename or link refused across mounts is reported once and rethrown unchanged', async (t) => {
@@ -778,4 +974,85 @@ test('a rename or link refused across mounts is reported once and rethrown uncha
   t.is((other as { code: string }).code, 'EIO', 'other failures pass through')
   t.is(notified, 1, 'and are not reported as a mount problem')
   t.is(await diagnosed.lstat('p'), 'lstat result' as never, 'everything else is delegated')
+})
+
+/** An adapter whose methods only work on the instance itself: `#private` state and `this`. */
+class StatefulAdapter {
+  #calls = 0
+  readonly seen: string[] = []
+
+  get calls(): number {
+    return this.#calls
+  }
+
+  lstat(target: string): Promise<string> {
+    this.#calls++
+    this.seen.push(`lstat ${target}`)
+    return Promise.resolve('lstat result')
+  }
+
+  rename(from: string, _to: string): Promise<void> {
+    this.#calls++
+    this.seen.push(`rename ${from}`)
+    return Promise.reject(errno('EXDEV'))
+  }
+
+  link(from: string, _to: string): Promise<void> {
+    this.#calls++
+    this.seen.push(`link ${from}`)
+    return Promise.resolve()
+  }
+}
+
+class SymlinkingAdapter extends StatefulAdapter {
+  symlink(target: string, _path: string): Promise<void> {
+    this.seen.push(`symlink ${target}`)
+    return Promise.resolve()
+  }
+}
+
+test('every method and getter keeps the adapter as its receiver, so class adapters work', async (t) => {
+  const adapter = new SymlinkingAdapter()
+  let notified = 0
+  const diagnosed = diagnoseCrossMount(adapter as unknown as StorageAdapter, () => {
+    notified++
+  })
+
+  // Without the original receiver the first call throws a TypeError on the `#calls` field.
+  t.is(await diagnosed.lstat('p'), 'lstat result' as never)
+  t.is(adapter.calls, 1, 'the method ran on the adapter')
+  t.is((diagnosed as unknown as StatefulAdapter).calls, 1, 'a getter reads the adapter’s state')
+
+  const crossed = await diagnosed.rename('a', 'b').then(
+    () => null,
+    (error: unknown) => error as { code?: string }
+  )
+  t.is(crossed?.code, 'EXDEV', 'the failure is rethrown unchanged')
+  t.is(notified, 1, 'and reported once')
+  await diagnosed.link('c', 'd')
+  t.is(notified, 1, 'a link that works is not reported')
+  t.is(adapter.calls, 3, 'rename and link ran on the adapter too')
+
+  // An optional capability is present and bound where the adapter has it.
+  t.is(typeof diagnosed.symlink, 'function')
+  await diagnosed.symlink!('target', 'name')
+  t.alike(adapter.seen, ['lstat p', 'rename a', 'link c', 'symlink target'])
+
+  // And absent where it does not: callers that test for it get the same answer.
+  const plain = diagnoseCrossMount(new StatefulAdapter() as unknown as StorageAdapter, () => {})
+  t.is(typeof plain.symlink, 'undefined')
+  t.absent('symlink' in plain)
+  t.absent('readlink' in plain)
+
+  // An adapter object whose own methods are frozen can still be wrapped.
+  const frozen = Object.freeze({
+    lstat: () => Promise.resolve('frozen result'),
+    rename: () => Promise.resolve(),
+    link: () => Promise.resolve()
+  }) as unknown as StorageAdapter
+  t.is(
+    await diagnoseCrossMount(frozen, () => {}).lstat('p'),
+    'frozen result' as never,
+    'a frozen adapter works too'
+  )
 })
