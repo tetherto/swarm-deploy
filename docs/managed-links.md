@@ -134,13 +134,15 @@ persisted managed-link name.
 
 There is no unlink RPC. To remove a managed link safely, stop the server,
 remove the visible symlink and its matching
-`.swarm-deploy/links/<sha256(link-name)>.json` ownership record, then restart
-the server. Never edit the ledger while the server runs. Removing all automatic
+`<state>/links/<sha256(link-name)>.json` ownership record (`<state>` is the
+private state directory, never inside the storage root; see
+[Private state](../README.md#private-state)), then restart the server. Never
+edit the ledger while the server runs. Removing all automatic
 rules intentionally reconciles proven stale automatic links away; malformed or
 conflicting ledgers still fail closed on the default symlink-capable storage.
 
 A link request that is waiting for its hook, or whose restore could not be
-finished, also has a rollback journal, `.swarm-deploy/links/<sha256(link-name)>.rollback.json`.
+finished, also has a rollback journal, `<state>/links/<sha256(link-name)>.rollback.json`.
 It is removed by the server when the request is finalized or restored, and a
 server stopped normally leaves none. If one remains because the link or record was
 changed from outside, or the journal itself was edited, requests for that name fail with `LINK_FAILED` and the

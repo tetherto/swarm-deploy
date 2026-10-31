@@ -19,8 +19,8 @@ import {
   type DirectoryCommitJournal
 } from '../../dist/storage/commit-journal.js'
 import { MAX_TREE_ENTRIES } from '../../dist/tar-protocol/tree.js'
-import { initLayout } from '../../dist/storage/layout.js'
 import { createTempDir } from '../helpers/files.js'
+import { initLayout } from '../helpers/layout.js'
 import { createStorage } from '../helpers/storage.js'
 
 const ID = 'a'.repeat(64)

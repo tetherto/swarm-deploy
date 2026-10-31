@@ -5,7 +5,7 @@ import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS, SwarmDeployError } from '../../dist/errors.js'
-import { initLayout, protectedDirectories } from '../../dist/storage/layout.js'
+import { protectedDirectories } from '../../dist/storage/layout.js'
 import {
   assertSymlinkCapable,
   createTreeRoot,
@@ -22,6 +22,7 @@ import {
 import { treeDigest } from '../../dist/tar-protocol/tree.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createTempDir } from '../helpers/files.js'
+import { initLayout } from '../helpers/layout.js'
 import { createMemoryStorage } from '../helpers/memory-storage.js'
 import { createStorage, type StorageOperationHook, type TestStorage } from '../helpers/storage.js'
 import type { StorageAdapter, StorageStats } from '../../dist/storage/types.js'
@@ -289,9 +290,9 @@ test('tree-root operations refuse every target that is not a safe direct child o
   for (const [label, treePath, parent, code, needsLayout] of cases) {
     for (const options of [{}, { layout }]) {
       for (const [name, operation] of operations) {
-        // Without the layout, only removal can recognise a storage root (by its
-        // private directory); creation and inspection need the layout to know.
-        if (needsLayout && name !== 'removeTree' && !('layout' in options)) continue
+        // The storage root holds no private entries, so nothing but the layout can tell
+        // that a directory is the root; every operation needs it to refuse one.
+        if (needsLayout && !('layout' in options)) continue
         await t.exception(
           () => operation(treePath, parent, storage, options),
           { code },

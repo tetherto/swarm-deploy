@@ -84,7 +84,9 @@ export type SymlinkCapableStorage = StorageAdapter & {
 }
 
 export interface StorageLayout {
+  /** The output root: published artifacts and managed links only, never private state. */
   root: string
+  /** The private state directory: outside `root`, on the same filesystem, mode 0700. */
   internal: string
   staging: string
   sessions: string

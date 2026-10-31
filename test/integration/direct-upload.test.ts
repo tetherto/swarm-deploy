@@ -5,7 +5,7 @@ import test from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import { Client, ERRORS, Server, keyPairFromSeed } from '../../dist/index.js'
+import { Client, ERRORS, keyPairFromSeed } from '../../dist/index.js'
 import {
   buildTarManifest,
   deterministicTarSize,
@@ -15,6 +15,7 @@ import {
 import type { SessionStore } from '../../dist/storage/session-store.js'
 import type { StorageAdapter } from '../../dist/storage/types.js'
 import { createTempDir } from '../helpers/files.js'
+import { Server } from '../helpers/server.js'
 import { createStorage } from '../helpers/storage.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 

@@ -47,6 +47,7 @@ protocol for stored artifacts.
 - [Requirements](#requirements)
 - [Install](#install)
 - [Security and identity model](#security-and-identity-model)
+- [Private state](#private-state)
 - [Provision identities](#provision-identities)
 - [Quick start](#quick-start)
 - [Documentation](#documentation)
@@ -57,7 +58,8 @@ protocol for stored artifacts.
 
 - Node.js 22 or 24, or the current stable Bare runtime.
 - A persistent server seed and at least one independently generated client seed.
-- A dedicated server storage directory.
+- A dedicated output directory (`--storage`) and a private state directory on the
+  same filesystem (see [Private state](#private-state)).
 - Network access suitable for HyperDHT.
 
 ## Install
@@ -103,12 +105,140 @@ separate client seeds when independent authorization is required.
 Operator essentials:
 
 - Run the server under a dedicated non-root account with a dedicated storage
-  root, and restrict the seed and storage root to that account.
+  root, and restrict the seed and private state directory to that account.
 - Protect the startup allowlist as security-sensitive configuration.
-- Never edit `.swarm-deploy/` while the server is running, and stop the server
-  cleanly before backing up or restoring the complete storage root.
+- Never serve the private state directory, never edit it while the server is
+  running, and stop the server cleanly before backing up or restoring the output
+  root together with its state directory.
 - Report vulnerabilities privately as described in
   [SECURITY.md](https://github.com/tetherto/swarm-deploy/blob/main/SECURITY.md).
+
+## Private state
+
+`--storage` is the output root. It holds published artifacts and managed public
+links only, so a web server may serve it. Staging, sessions, commit and link
+records, journals, locks, and reset archives are private state in a separate
+directory:
+
+- **Default:** `~/.swarm-deploy/<id>`, under the home directory the runtime
+  reports for the user running the server (`os.homedir()`, which honors a `HOME`
+  set by the service manager), never the working directory. `<id>` is a hash of
+  the real path of `--storage`, so every output root has its own state, and the
+  same state is found again after a restart or through an alias of the path.
+- **Override:** `--state-dir <absolute-dir>` (`ServerOptions.stateDir`), for
+  example `/var/lib/swarm-deploy/artifacts`.
+- **Same filesystem and mount:** publication, link replacement, and retention
+  use atomic renames and hard links between the output root and the state
+  directory, so both must be on one filesystem. On Linux they must also be on one
+  mount: `rename` and `link` fail with `EXDEV` between two mount points, such as
+  a bind mount or a container volume, even of one filesystem, and the server
+  reads `/proc/self/mountinfo` (at most 4 MiB of it) to refuse that at startup.
+  Otherwise the server refuses to start and tells you to pass `--state-dir`;
+  there is no copy fallback. A home directory on another filesystem than
+  `--storage` needs an explicit `--state-dir`. If the table cannot be used
+  (`/proc` is hidden or unreadable, or the table is larger than the cap) only the
+  device check runs, and a publication that is then refused with `EXDEV` makes the
+  server log one error naming `--state-dir`.
+
+  If a volume is mounted directly at `--storage`, the output root is itself a
+  mount point and no directory outside it shares its mount. Mount a common
+  parent instead, and use one subdirectory of it for `--storage` and another for
+  `--state-dir` (for example `/srv/data/public` and `/srv/data/private`).
+
+- **Outside the root:** it cannot be the output root, inside it, above it, or
+  reach it through a symlink, and its final directory cannot be a symlink.
+  It is created, and kept, at mode `0700`, and it records the output root it
+  serves, so it is never reused for another root. A directory that is refused
+  because it holds other files, another root's state, or a nested legacy
+  directory is not changed, not even its permissions.
+- **One setting per root:** the lock lives in the state directory. Run every
+  server and every `reset-storage` for one output root as the same user, with the
+  same `HOME` and the same `--state-dir`, or the same default. The lock only
+  excludes instances that share the state directory; there is no lock inside the
+  output root. Three checks catch the usual ways to get this wrong, and none of
+  them is a lock:
+  - Starting new state, or binding a directory that holds entries but no record
+    of its root, is refused while the output root holds entries, and also while
+    that directory itself holds entries, unless you pass `--initialize-state`
+    (`ServerOptions.initializeState`). Use it once,
+    when you are sure no other instance manages that root (after deleting state
+    on purpose, or for a migrated or restored directory), and leave it out of
+    normal startup. State that is already bound needs no flag, and a flag left in
+    place would let a mistaken `--state-dir` or `HOME` start a second set of state
+    silently.
+  - An explicit `--state-dir` is refused when your default location for this
+    root can be read and already holds state bound to it, so the default is never
+    forked. A default location the process cannot examine (a service that cannot
+    enter its home directory, for example) is not a conflict, and an explicit
+    `--state-dir` is how such a service is configured.
+  - If `<storage>/.swarm-deploy` appears while the server runs, because an older
+    release or another writer is using the root, new uploads and link requests
+    and retention passes are refused until you resolve it. One error is logged
+    when it is first seen, and each scheduled retention pass that is refused logs
+    its own failure.
+
+  Two instances that start at the same moment on an empty output root with
+  different state settings are not detected. That is unsupported, as is running
+  an older release against the same root.
+
+- **Moving the root:** state is tied to the real path of the output root. After
+  renaming or moving `--storage`, a default location would start empty and a custom
+  `--state-dir` refuses the new path. To keep the state, stop the server, set
+  `root` in the state directory's `.swarm-deploy-state.json` to the new real path,
+  and pass that state directory as `--state-dir`. Edit it only when the state
+  really belongs to the moved root.
+- **Finding it:** `reset-storage --storage <dir>` (the preview changes nothing)
+  prints a `state:` line, and its error for a root without state, like the
+  server's refusals, names the location it looked at. `reset-storage` resolves
+  the location exactly as the server does, so pass it the same `--state-dir`. The
+  server does not log the path.
+
+### Upgrading from 0.6.0 or earlier
+
+Earlier releases kept this state in `<storage>/.swarm-deploy`, inside the output
+root, where a web server that serves the root can expose it. This release refuses
+to start, and `reset-storage` refuses to run, while that directory exists. It
+never reads, moves, or deletes it. Migrate it offline:
+
+1. Stop every server and `reset-storage` run for the root.
+2. Run `swarm-deploy server …` with your usual options once. It exits with the
+   commands for your resolved state location. Every path in them is a
+   single-quoted shell literal, so unusual directory names are safe to paste:
+
+   ```sh
+   [ ! -e '/home/artifacts/.swarm-deploy/<id>' ] && [ ! -L '/home/artifacts/.swarm-deploy/<id>' ] \
+     && mkdir -p -- '/home/artifacts/.swarm-deploy' \
+     && mv -- '/srv/artifacts/.swarm-deploy' '/home/artifacts/.swarm-deploy/<id>'
+   ```
+
+   (Printed on one line.) The command refuses to run if the destination already
+   exists, including as a dangling symlink, because `mv` would otherwise put the
+   legacy directory inside it. In that case the error says so instead: choose a
+   destination that does not exist (a new `--state-dir`), or remove an empty
+   directory you created for it. Add `--state-dir` to every command to choose
+   another location, and keep it on the same filesystem and mount as the output
+   root.
+
+3. Start the server **once** with `--initialize-state` (and the same
+   `--state-dir`, if any). The moved directory holds your ownership and recovery
+   data, intact, but no record of its output root yet, and this flag binds it.
+   Then stop and start without the flag.
+
+To roll back, stop the server and run the rollback command from the same error
+message, which moves the directory back to `<storage>/.swarm-deploy` and refuses
+to run if that path exists again, then start the previous release.
+
+If you delete `<storage>/.swarm-deploy` instead, the next start creates fresh
+state, and only if you start once with `--initialize-state`, because the output
+root still holds your published files. Ownership and recovery data cannot be
+restored automatically: unfinished uploads start over, existing artifacts become
+unmanaged (their names stay occupied until you remove them; they are never
+adopted or deleted), and managed links lose their ownership records. The same
+one-time command applies whenever you deliberately delete a root's state:
+
+```sh
+swarm-deploy server … --storage /srv/artifacts --initialize-state
+```
 
 ## Provision identities
 

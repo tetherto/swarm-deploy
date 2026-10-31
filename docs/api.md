@@ -97,6 +97,34 @@ Required `ServerOptions`:
 
 Optional operational limits and policies:
 
+- `stateDir?: string`: absolute path of the private state directory (also
+  readable as `server.stateDir`). `storageDir` is the output root and holds only
+  published artifacts and managed links, so it may be served; everything private
+  lives in the state directory. Omitted, it is `~/.swarm-deploy/<id>` under the
+  home directory the runtime reports for the user running the server
+  (`os.homedir()`, which honors `HOME`), with `<id>` derived from the real path of
+  `storageDir`. A custom directory must be outside `storageDir` and on the same
+  filesystem (and, on Linux, the same mount; a volume mounted directly at
+  `storageDir` shares its mount with nothing outside it, so mount a common
+  parent and use one subdirectory for each), is kept at mode `0700`, and serves
+  one `storageDir` only; `listen()` rejects otherwise, while
+  `<storageDir>/.swarm-deploy` from 0.6.0 or earlier still exists, and when the
+  user's default state for the root can be read, is bound to it, and `stateDir`
+  names another (a default that cannot be examined is ignored).
+  Every instance for one root must use the same user, `HOME`, and value. While
+  a server runs, `<storageDir>/.swarm-deploy` reappearing makes it refuse new
+  uploads, link requests, and retention passes. It logs one legacy-state alert,
+  without a path, when it first sees the directory, and each refused scheduled
+  retention pass logs its own failure (also without a path). See
+  [Private state](../README.md#private-state).
+- `initializeState?: boolean` (also readable as `server.initializeState`): a
+  one-time acknowledgement. `listen()` rejects when it would start new state, or
+  bind a directory that holds entries but no record of its root, while
+  `storageDir` already holds entries, unless this is `true`. Set it once after
+  deleting state on purpose or migrating from 0.6.0 or earlier, then leave it
+  unset: state already bound to the root needs no flag, and keeping it would let
+  a mistaken `stateDir` or `HOME` start a second set of state. Published files are
+  never adopted or deleted.
 - `maxConnections`, `maxActiveUploads`, `idleTimeout`
 - `cleanupInterval`, `resumeTtl`, `minFreeBytes`
 - `maxAge`, `maxStorageBytes`, `replaceNames`

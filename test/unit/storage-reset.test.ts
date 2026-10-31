@@ -7,16 +7,14 @@ import fs from '#fs'
 import path from '#path'
 import process from '#process'
 import { main, USAGE } from '../../dist/cli.js'
-import { Client, ERRORS, Server, keyPairFromSeed, type SymlinkRule } from '../../dist/index.js'
-import {
-  acquireStorageLock,
-  assertNoPendingStorageReset,
-  initLayout
-} from '../../dist/storage/layout.js'
+import { Client, ERRORS, keyPairFromSeed, type SymlinkRule } from '../../dist/index.js'
+import { acquireStorageLock, assertNoPendingStorageReset } from '../../dist/storage/layout.js'
 import { inspectStorageReset, resetStorage } from '../../dist/storage/reset.js'
 import type { StorageLayout } from '../../dist/storage/types.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
-import { createTempDir } from '../helpers/files.js'
+import { createTempDir, stateDirFor } from '../helpers/files.js'
+import { initLayout } from '../helpers/layout.js'
+import { Server } from '../helpers/server.js'
 import { createStorage, type StorageOperationName } from '../helpers/storage.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 
@@ -150,11 +148,19 @@ function recordingStorage() {
   return { storage, mutations }
 }
 
+/** Points reset-storage at the test's isolated state directory unless the test names one. */
+function withStateDir(args: string[]): string[] {
+  const at = args.indexOf('--storage')
+  const storage = at < 0 ? undefined : args[at + 1]
+  if (storage === undefined || args.includes('--state-dir')) return args
+  return [...args, '--state-dir', stateDirFor(path.resolve(storage))]
+}
+
 async function runReset(args: string[], io: Partial<CliIo> = {}) {
   const stdout = output()
   const stderr = output()
   const code = await main(
-    ['reset-storage', ...args],
+    ['reset-storage', ...withStateDir(args)],
     {},
     {
       stdout: stdout.stream,
@@ -197,8 +203,9 @@ function archivePath(lines: string[]): string {
 }
 
 test('reset-storage preview reports metadata left behind by a manual payload deletion without mutating storage', async (t) => {
-  const { root } = await seedStorage(t)
+  const { root, layout } = await seedStorage(t)
   const before = await snapshot(root)
+  const stateBefore = await snapshot(layout.internal)
   const { storage, mutations } = recordingStorage()
 
   const result = await runReset(['--storage', root], { storage })
@@ -206,6 +213,7 @@ test('reset-storage preview reports metadata left behind by a manual payload del
   t.is(result.stderr, '')
   t.alike(result.lines, [
     `storage: ${root}`,
+    `state: ${stateDirFor(root)}`,
     'lock: free',
     'commits: 2 records (1 missing payloads)',
     'staging: 1 entries',
@@ -226,9 +234,11 @@ test('reset-storage preview reports metadata left behind by a manual payload del
   ])
   t.alike(mutations, [], 'preview performs no mutating storage operation')
   t.alike(await snapshot(root), before)
+  t.alike(await snapshot(layout.internal), stateBefore, 'the state directory is unchanged')
 
-  const report = await inspectStorageReset({ storageDir: root })
+  const report = await inspectStorageReset({ storageDir: root, stateDir: stateDirFor(root) })
   t.alike(report.commits.missingPayloads, ['deleted.txt'])
+  t.is(report.state, stateDirFor(root))
   t.is(report.applied, false)
   t.is(report.archive, null)
 })
@@ -471,8 +481,13 @@ test('reset-storage rejects unsafe roots and symlink escapes before touching any
   await fs.promises.mkdir(plain)
   const uninitialized = await runReset(['--storage', plain, '--apply'])
   t.is(uninitialized.code, 2)
-  t.is(uninitialized.stderr, `Not an initialized storage root: ${plain}\n`)
+  t.is(
+    uninitialized.stderr,
+    `Not an initialized storage root: ${plain} (no private state at ${stateDirFor(plain)}; ` +
+      'pass --state-dir if it lives elsewhere)\n'
+  )
   t.alike(await fs.promises.readdir(plain), [], 'no internal directory is created')
+  t.absent(await exists(stateDirFor(plain)), 'no state directory is created either')
 
   const filesystemRoot = await runReset(['--storage', '/', '--apply'])
   t.is(filesystemRoot.code, 2)
@@ -533,7 +548,7 @@ test('reset-storage rejects unsafe roots and symlink escapes before touching any
   await fs.promises.symlink(layout.internal, path.join(internalLink, '.swarm-deploy'))
   const viaInternalLink = await runReset(['--storage', internalLink, '--apply'])
   t.is(viaInternalLink.code, 2)
-  t.ok(viaInternalLink.stderr.startsWith('Unsafe storage directory'))
+  t.ok(viaInternalLink.stderr.startsWith('Legacy private state found inside the output root'))
   t.absent(await exists(path.join(layout.internal, 'archive')))
 
   for (const args of [
@@ -947,7 +962,7 @@ test('hundreds of retired locks keep the marker small, and an interrupted reset 
   )
   t.absent(await exists(path.join(layout.internal, 'reset-pending.json')))
 
-  const completed = await inspectStorageReset({ storageDir: root })
+  const completed = await inspectStorageReset({ storageDir: root, stateDir: stateDirFor(root) })
   t.is(completed.archives.length, 1)
   t.is(completed.archives[0].status, 'completed', 'a completed archive is never reported unknown')
   t.alike(completed.archives[0].held.lockEntries, 301)
@@ -1199,7 +1214,7 @@ test('a reset after manual payload deletion unblocks a fresh re-upload and link,
 
   // A reset archives the ledger, but the committed payload and the dangling
   // symlink remain, and the report says so.
-  const reset = await resetStorage({ storageDir: root })
+  const reset = await resetStorage({ storageDir: root, stateDir: stateDirFor(root) })
   t.is(reset.applied, true)
   t.is(reset.freshStart, false)
   t.alike(reset.remaining.payloads, ['release-1'])

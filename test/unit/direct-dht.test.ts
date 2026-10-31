@@ -11,7 +11,8 @@ import {
   type DirectDhtNode,
   type DirectDhtSocket
 } from '../../dist/direct-dht.js'
-import { Client, ERRORS, generateSeed, keyPairFromSeed, Server } from '../../dist/index.js'
+import { Client, ERRORS, generateSeed, keyPairFromSeed } from '../../dist/index.js'
+import { Server } from '../helpers/server.js'
 import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
 
 const SERVER_SEED = b4a.alloc(32, 41)

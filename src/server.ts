@@ -59,7 +59,14 @@ import {
   type LinkReconcileResult,
   type ManualLinkTransaction
 } from './storage/link-store.js'
-import { acquireStorageLock, assertNoPendingStorageReset, initLayout } from './storage/layout.js'
+import {
+  LEGACY_REAPPEARED_MESSAGE,
+  acquireStorageLock,
+  assertNoPendingStorageReset,
+  diagnoseCrossMount,
+  initLayout,
+  legacyStatePresent
+} from './storage/layout.js'
 import { withNameLease, withRootLease } from './storage/root-coordinator.js'
 import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
 import {
@@ -137,7 +144,31 @@ export type AllowlistKey = PublicKeyInput | string
 
 export interface ServerOptions {
   seed: SeedInput
+  /**
+   * The output root: published artifacts and managed public links only. Nothing
+   * private is ever stored inside it, so it may be served by a web server.
+   */
   storageDir: string
+  /**
+   * Absolute path of the private state directory (staging, sessions, commit and link
+   * records, journals, locks, archives). It must be outside `storageDir` and on the same
+   * filesystem, and is kept at mode 0700. When omitted, state lives in
+   * `~/.swarm-deploy/<id>` under the home directory of the user running the server, where
+   * `<id>` is derived from the real path of `storageDir`. Every instance and every
+   * `reset-storage` run for one output root must use the same location. Never serve it.
+   */
+  stateDir?: string
+  /**
+   * One-time acknowledgement that starting private state that is not yet bound to
+   * `storageDir` is intended. Without it the server refuses to bind new state for an output
+   * root that already holds entries, or from a directory that already holds entries (state
+   * migrated from `<storageDir>/.swarm-deploy`, restored, or deliberately started over after
+   * its metadata was deleted). Published files are never adopted or deleted either way:
+   * without their old records they stay unmanaged. State already bound to the root needs no
+   * flag, so leave this unset in normal startup; keeping it would let a changed `stateDir`,
+   * user, or `HOME` silently start a second, independent set of state for the same root.
+   */
+  initializeState?: boolean
   allowedKeys: Iterable<AllowlistKey>
   maxFileBytes: number
   maxStagingBytes: number
@@ -356,6 +387,10 @@ export interface Server {
 export class Server extends EventEmitter {
   readonly publicKey: PublicKey
   readonly storageDir: string
+  /** The configured state directory, or undefined when the default under the user's home is used. */
+  readonly stateDir: string | undefined
+  /** Whether this start acknowledges binding new or migrated state; see `ServerOptions`. */
+  readonly initializeState: boolean
   readonly maxFileBytes: number
   readonly maxStagingBytes: number
   readonly maxConnections: number
@@ -384,6 +419,10 @@ export class Server extends EventEmitter {
   readonly linkNames: ReadonlySet<string>
   private managedLinkNamesSnapshot: ReadonlySet<string>
   private links: LinkStore | null = null
+  /** Set while legacy state sits in the output root, so one alert is logged, not one per request. */
+  private legacyAlerted = false
+  /** Set after the first cross-mount publication failure was reported, so it is logged once. */
+  private crossMountReported = false
   listening = false
   closed = false
   private readonly keyPair
@@ -443,6 +482,19 @@ export class Server extends EventEmitter {
         : (() => {
             throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid storage directory')
           })()
+    if (
+      options.stateDir !== undefined &&
+      (typeof options.stateDir !== 'string' ||
+        options.stateDir.length === 0 ||
+        !path.isAbsolute(options.stateDir))
+    ) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid state directory: it must be an absolute path')
+    }
+    this.stateDir = options.stateDir
+    if (options.initializeState !== undefined && typeof options.initializeState !== 'boolean') {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid initializeState')
+    }
+    this.initializeState = options.initializeState === true
     this.maxFileBytes = positive(options.maxFileBytes, 'maxFileBytes')
     this.maxStagingBytes = positive(options.maxStagingBytes, 'maxStagingBytes')
     this.maxConnections = positive(
@@ -577,6 +629,32 @@ export class Server extends EventEmitter {
       this.emit(type, payload)
     } catch {}
   }
+  /** Logs, once, that publication was refused across a filesystem or mount boundary. */
+  private reportCrossMount(): void {
+    if (this.crossMountReported) return
+    this.crossMountReported = true
+    this.logger.error('Storage operation refused across a filesystem or mount boundary', {
+      reason: 'EXDEV',
+      hint: 'Place the private state directory on the same filesystem and mount as the output root (--state-dir)'
+    })
+  }
+
+  /**
+   * Whether legacy private state is in the output root now: an older release or another
+   * writer recreated it after startup. New work is refused while it is there, and one alert
+   * is logged for as long as it stays. It names no path.
+   */
+  private legacyStateReappeared(): boolean {
+    const present = this.layout !== null && legacyStatePresent(this.layout.root)
+    if (present && !this.legacyAlerted) {
+      this.logger.error('Legacy private state reappeared in the output root; new work is refused', {
+        reason: ERRORS.PROTOCOL_INVALID
+      })
+    }
+    this.legacyAlerted = present
+    return present
+  }
+
   private allowed(owner: Uint8Array | null): owner is Buffer {
     if (!owner || !b4a.isBuffer(owner) || owner.byteLength !== 32) return false
     let accepted = false
@@ -1043,6 +1121,9 @@ export class Server extends EventEmitter {
   ): Promise<void> {
     let emitted = false
     let resultWriteStarted = false
+    // Set only when this request was refused because legacy state is in the output root. That
+    // refusal changes nothing, so its answer is delivered the way a failed hook's is.
+    let refusedForLegacyState = false
     // Held in an object because closures set it.
     const state: LinkRequestState = {
       artifact: null,
@@ -1072,6 +1153,10 @@ export class Server extends EventEmitter {
     try {
       // A link request has no payload: EOF is the required no-trailing-data boundary.
       await reader.requireEnd(this.signal, this.idleTimeout)
+      if (this.legacyStateReappeared()) {
+        refusedForLegacyState = true
+        throw fail(ERRORS.LINK_FAILED, LEGACY_REAPPEARED_MESSAGE)
+      }
       if (request.target === request.name) {
         throw fail(ERRORS.LINK_NOT_ALLOWED, 'Manual link cannot target itself')
       }
@@ -1161,7 +1246,7 @@ export class Server extends EventEmitter {
           : undefined,
         state.rolledBack
       )
-      if (answered && reason === ERRORS.HOOK_FAILED) {
+      if (answered && (reason === ERRORS.HOOK_FAILED || refusedForLegacyState)) {
         this.closeAfterAnswer(socket)
       } else {
         try {
@@ -1345,12 +1430,14 @@ export class Server extends EventEmitter {
   }
 
   /**
-   * Closes a connection after its `HOOK_FAILED` answer was written. Destroying
-   * the stream right behind the write can reset it before the peer has read the
-   * record, so the caller would see a reset instead of the stable code. The
-   * write side is ended first and the connection is destroyed once the peer
-   * closes it, or after a grace period if it never does. The work that failed
-   * is already durable, so lingering costs only the connection.
+   * Closes a connection after an answer whose code the caller must be able to read: a
+   * `HOOK_FAILED` answer, and the refusal of a link request while legacy state is in the
+   * output root. Destroying the stream right behind the write can reset it before the peer has
+   * read the record, so the caller would see a reset instead of the stable code. The write
+   * side is ended first and the connection is destroyed once the peer closes it, or after a
+   * grace period if it never does. In both cases the work that failed is already durable or
+   * was never started, so lingering costs only the connection. Every other failure still
+   * destroys the stream at once.
    */
   private closeAfterAnswer(socket: DirectDhtSocket): void {
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -1529,6 +1616,11 @@ export class Server extends EventEmitter {
       artifact = this.hookArtifact(metadata, null)
       if (isTreeMetadata(metadata)) assertTreeMetadataTransferId(owner, metadata)
       else assertMetadataTransferId(owner, metadata)
+      // Legacy state reappearing in the output root means another writer is using it.
+      if (this.legacyStateReappeared()) {
+        await rejectEarly(ERRORS.PROTOCOL_INVALID, LEGACY_REAPPEARED_MESSAGE)
+        return
+      }
       // The transfer ID is authenticated from here on, so it is safe to key
       // the single-owner guard on it.
       if (this.activeTransfers.has(metadata.transferId)) {
@@ -1992,15 +2084,20 @@ export class Server extends EventEmitter {
 
   private async start(): Promise<this> {
     try {
-      this.layout = initLayout(this.storageDir)
+      this.layout = initLayout(this.storageDir, this.stateDir, {
+        initializeState: this.initializeState
+      })
       this.releaseLock = await acquireStorageLock(this.layout, { storage: this.storage })
-      await assertNoPendingStorageReset(this.layout, this.storage)
+      // The stores see the same adapter, except that a rename or link refused with EXDEV is
+      // reported once with the way out (the state directory must share the root's mount).
+      const storage = diagnoseCrossMount(this.storage, () => this.reportCrossMount())
+      await assertNoPendingStorageReset(this.layout, storage)
       this.sessions = new SessionStore({
         layout: this.layout,
         maxStagingBytes: this.maxStagingBytes,
         minFreeBytes: this.minFreeBytes,
         resumeTtl: this.resumeTtl,
-        storage: this.storage,
+        storage,
         isSessionActive: (session) =>
           [...this.active.values()].some(
             (active) => active.transfer === (session as { id: string }).id
@@ -2008,7 +2105,7 @@ export class Server extends EventEmitter {
       })
       this.commits = new CommitStore({
         layout: this.layout,
-        storage: this.storage,
+        storage,
         logger: this.logger
       })
       if (
@@ -2017,7 +2114,7 @@ export class Server extends EventEmitter {
       ) {
         this.links = new LinkStore({
           layout: this.layout,
-          storage: this.storage as SymlinkCapableStorage
+          storage: storage as SymlinkCapableStorage
         })
       }
       this.emitSafe('recovery', { status: 'started' })
@@ -2059,7 +2156,7 @@ export class Server extends EventEmitter {
         maxStorageBytes: this.maxStorageBytes,
         resumeTtl: this.resumeTtl,
         cleanupInterval: this.cleanupInterval,
-        storage: this.storage,
+        storage,
         scheduler: this.scheduler,
         isSessionActive: (session) =>
           [...this.active.values()].some(

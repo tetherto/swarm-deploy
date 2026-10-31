@@ -3,7 +3,13 @@ import { errorCode, isMissing } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS, SwarmDeployError } from '../errors.js'
-import { assertSafeDirectory, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
+import {
+  LEGACY_REAPPEARED_MESSAGE,
+  assertSafeDirectory,
+  legacyStatePresent,
+  openSafeRegularFile,
+  withSafeDirectoryIdentity
+} from './layout.js'
 import { digestMatches, SodiumSha256 } from '../tar-protocol/hash.js'
 import { assertSafeUint } from '../validation.js'
 import { withRootLease } from './root-coordinator.js'
@@ -488,9 +494,7 @@ class RetentionManager {
       this.storage.readdir(this.layout.root)
     )
     const linkNames = this.managedLinkNames ? this.managedLinkNames() : new Set<string>()
-    const unknown = rootNames
-      .filter((name) => name !== '.swarm-deploy' && !knownNames.has(name) && !linkNames.has(name))
-      .sort()
+    const unknown = rootNames.filter((name) => !knownNames.has(name) && !linkNames.has(name)).sort()
     for (const name of unknown) {
       report(this.logger, 'warn', 'Ignoring unknown committed path', { name })
     }
@@ -590,6 +594,10 @@ class RetentionManager {
     trigger = 'manual'
   }: RetentionRunOptions = {}): Promise<RetentionResult> {
     assertSafeUint(incomingBytes, 'incomingBytes')
+    // Legacy state in the output root means an older release or another writer is using this
+    // root. Deleting by this instance's records could then remove that writer's files, so no
+    // maintenance runs until an operator resolves it.
+    if (legacyStatePresent(this.layout.root)) throw storageError(LEGACY_REAPPEARED_MESSAGE)
     if (this.maxStorageBytes !== undefined && incomingBytes > this.maxStorageBytes) {
       throw new SwarmDeployError(
         ERRORS.FILE_TOO_LARGE,

@@ -5,9 +5,10 @@ import test from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import { Client, ERRORS, keyPairFromSeed, Server } from '../../dist/index.js'
+import { Client, ERRORS, keyPairFromSeed } from '../../dist/index.js'
 import { DirectDhtClient } from '../../dist/direct-dht.js'
 import { createTempDir } from '../helpers/files.js'
+import { Server } from '../helpers/server.js'
 import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
 
 const SERVER_SEED = b4a.alloc(32, 0xc1)

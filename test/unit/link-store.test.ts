@@ -5,7 +5,6 @@ import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
 import { ERRORS } from '../../dist/errors.js'
-import { initLayout } from '../../dist/storage/layout.js'
 import {
   LinkStore,
   type ManagedSymlinkRecord,
@@ -15,6 +14,7 @@ import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import type { DesiredLink } from '../../dist/symlinks.js'
 import type { StorageAdapter, StorageLayout } from '../../dist/storage/types.js'
 import { createTempDir } from '../helpers/files.js'
+import { initLayout } from '../helpers/layout.js'
 import { createStorage, type CreateStorageOptions } from '../helpers/storage.js'
 
 async function createStore(
@@ -232,7 +232,7 @@ test('an ownership record with an unsafe name or target is rejected before any p
     await t.exception(() => links.reconcile([], new Set()), { code: ERRORS.LINK_FAILED }, label)
     await fs.promises.unlink(recordFile(layout, name))
   }
-  t.alike(await fs.promises.readdir(layout.root), ['.swarm-deploy'])
+  t.alike(await fs.promises.readdir(layout.root), [], 'the output root holds no private entries')
 })
 
 test('storage failures surface as stable link errors without paths or errno text', async (t) => {

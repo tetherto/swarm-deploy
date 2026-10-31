@@ -42,6 +42,7 @@ Reads a seed file or canonical seed string and prints its public key.
 swarm-deploy server \
   --seed-file <seed-file> \
   --storage <directory> \
+  [--state-dir <absolute-directory>] \
   --allow-key <64-lower-hex> \
   --max-file-bytes <bytes> \
   --max-staging-bytes <bytes> \
@@ -53,7 +54,8 @@ swarm-deploy server \
   [--max-count <count>] \
   [--max-versions <count> --version-granularity <major|minor>] \
   [--symlink <selector> [<link-name>]]... \
-  [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...]
+  [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...] \
+  [--initialize-state]
 ```
 
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>` to provide the
@@ -63,7 +65,8 @@ Required options:
 
 - Exactly one seed source: `--seed-file`, `--seed`, or
   `SWARM_DEPLOY_SERVER_SEED`.
-- `--storage`: dedicated artifact and internal-state root.
+- `--storage`: the dedicated output root. It holds published artifacts and
+  managed links only, so it may be served. It never holds private state.
 - `--allow-key`: authorized client public key. Repeat for multiple identities;
   duplicates and malformed keys are rejected.
 - `--max-file-bytes`: maximum extracted artifact size.
@@ -74,6 +77,29 @@ Required options:
 
 Optional options:
 
+- `--state-dir <absolute-directory>`: where the private state lives (staging,
+  sessions, commit and link records, journals, locks, reset archives). The default
+  is `~/.swarm-deploy/<id>` under the home directory the runtime reports for the
+  user running the server (`os.homedir()`, which honors `HOME`), with `<id>`
+  derived from the real path of `--storage`. A custom directory must be outside
+  `--storage` and on the same filesystem (and, on Linux, the same mount), is kept
+  at mode `0700`, and serves one storage root only. If a volume is mounted
+  directly at `--storage`, nothing outside it shares its mount: mount a common
+  parent and use one subdirectory for `--storage` and another for `--state-dir`.
+  It is refused when your default location for the root can be read and already
+  holds state bound to it; a default the process cannot examine (an inaccessible
+  home directory) is ignored. Use the same value, user, and `HOME` for every
+  server and `reset-storage` run for that root; never serve it. See
+  [Private state](../README.md#private-state), including how to move the state of
+  a 0.6.0 or earlier server out of `<storage>/.swarm-deploy`.
+- `--initialize-state`: a one-time acknowledgement, a flag without a value. The
+  server refuses to start new state, or to bind a state directory that holds
+  entries but no record of its output root (migrated or restored state), while the
+  output root already holds entries, because state settings that differ from the
+  instance managing the root would otherwise start a second, independent writer.
+  Pass it once after deleting state on purpose or migrating from 0.6.0 or earlier,
+  then remove it: state already bound to the root needs no flag. Published files
+  are never adopted or deleted; without their old records they stay unmanaged.
 - `--max-storage-bytes`: maximum total managed committed storage. Oldest
   eligible artifacts are removed first.
 - `--max-age-days`: remove eligible committed artifacts at or beyond this age.
@@ -270,18 +296,20 @@ result without the data.
 ## `reset-storage`
 
 ```sh
-swarm-deploy reset-storage --storage <directory>
-swarm-deploy reset-storage --storage <directory> --apply [--wait <milliseconds>]
+swarm-deploy reset-storage --storage <directory> [--state-dir <absolute-directory>]
+swarm-deploy reset-storage --storage <directory> --apply [--wait <milliseconds>] [--state-dir <absolute-directory>]
 ```
 
-Archives every piece of private server state under one storage root so the
+Archives every piece of private server state for one storage root so the
 next server start begins with empty metadata. It needs no seed and never
-contacts the network.
+contacts the network. It resolves the state directory exactly as the server does,
+so pass the same `--state-dir` (or none, with the same user's home) and read the
+`state:` line of the preview before applying.
 
 - Without `--apply` the command is a read-only preview: it creates, moves,
   locks, and deletes nothing.
 - `--apply` takes the storage lock and moves the metadata directories into a
-  new `.swarm-deploy/archive/reset-<timestamp>-<random>/` directory. Nothing is
+  new `<state>/archive/reset-<timestamp>-<random>/` directory. Nothing is
   copied or deleted.
 - `--wait <milliseconds>` makes `--apply` poll until a live lock holder
   releases the lock instead of failing closed immediately.
