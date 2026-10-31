@@ -30,8 +30,8 @@ rollback procedure are in [RELEASING.md](../RELEASING.md).
 - Run the server under a dedicated non-root account.
 - Restrict the server seed and the private state directory to that account. The
   state directory (default `~/.swarm-deploy/<id>`, or `--state-dir`) must never
-  be served and must be on the same filesystem as the storage root; see
-  [Private state](../README.md#private-state).
+  be served and must be on the same filesystem (and, on Linux, the same mount)
+  as the storage root; see [Private state](../README.md#private-state).
 - Supervise the process and wait for the final `ready` line before marking it
   healthy.
 - Upgrade servers before clients; see
@@ -40,8 +40,12 @@ rollback procedure are in [RELEASING.md](../RELEASING.md).
   patterns, rotation limits, hooks module, storage root, and state directory (the
   same `--state-dir`, or the same user's default) so interrupted sessions and
   commit journals can recover. Every server and `reset-storage` run for one
-  storage root must use the same state settings, because the lock lives in the
-  state directory.
+  storage root must use the same user, `HOME`, and state settings: the lock lives
+  in the state directory, so it only excludes instances that share it. Keep
+  `--initialize-state` out of normal startup; it is a one-time acknowledgement for
+  new, migrated, or restored state, and state already bound to the root needs it
+  never. Alert on a logged `Legacy private state reappeared` error: an older
+  release or another writer is using the root, and the server refuses new work.
 - Alert on nonzero CLI exits and failed authentication, recovery, verification,
   commit, retention, and cleanup events.
 - Never edit the private state directory while the server is running.
@@ -344,10 +348,16 @@ into conforming folders.
 Through 0.6.0 the private state sat in `<storage>/.swarm-deploy`. From 0.6.1 it
 lives outside the storage root (see [Private state](../README.md#private-state)),
 and a server or `reset-storage` that finds the old directory refuses to run until
-you move it with the server stopped. To roll the server back to 0.6.0 or earlier,
-stop it, move the state directory back to `<storage>/.swarm-deploy`, and start the
-older release; deleting the old directory instead loses ownership and recovery
-data that cannot be restored automatically.
+you move it with the server stopped, using the quoted commands the error prints.
+Start the moved state once with `--initialize-state` to bind it to its root, and
+then without. To roll the server back to 0.6.0 or earlier, stop it, run the
+rollback command from the same error (it moves the state directory back to
+`<storage>/.swarm-deploy`), and start the older release; deleting the old
+directory instead loses ownership and recovery data that cannot be restored
+automatically, and starting fresh state beside published files needs
+`--initialize-state` too. Do not run an older release against a root that a 0.6.1
+server manages: it would recreate `<storage>/.swarm-deploy`, which the server then
+refuses to work beside.
 
 ### Managed-link rollback warning
 

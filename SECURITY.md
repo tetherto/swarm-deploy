@@ -50,8 +50,19 @@ and disclosure may use a private GitHub Security Advisory.
 - Do not manipulate the private state directory or copy an active storage root.
   Stop the server cleanly before backup or restore, preserve the output root
   together with its state directory, and let the same or newer package version
-  complete recovery before serving traffic. Run every instance and
-  `reset-storage` for one root with the same state settings.
+  complete recovery before serving traffic.
+- Run every instance and `reset-storage` for one output root as the same user, with
+  the same `HOME` and the same `--state-dir`. The storage lock lives in the private
+  state directory, because nothing private may sit in the output root, so it only
+  excludes instances that share that directory. Three checks catch common mistakes:
+  new or unbound state is refused for a root that already holds entries unless you
+  start once with `--initialize-state` (leave that flag out of normal startup); an
+  explicit `--state-dir` is refused when this user's default state for the root
+  already exists; and a `<storage>/.swarm-deploy` that reappears while the server
+  runs (an older release or another writer) makes it refuse new work and
+  maintenance and log an error. Two instances that start at the same moment on an
+  empty root with different settings are not detected, and nothing here promises
+  exclusivity across users or across releases.
 - Fingerprints and digests are not seeds, but full public keys still identify
   deployment principals. Share only the server public key with uploaders and
   only client public keys with server operators.

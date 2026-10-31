@@ -54,7 +54,8 @@ swarm-deploy server \
   [--max-count <count>] \
   [--max-versions <count> --version-granularity <major|minor>] \
   [--symlink <selector> [<link-name>]]... \
-  [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...]
+  [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...] \
+  [--initialize-state]
 ```
 
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>` to provide the
@@ -78,13 +79,23 @@ Optional options:
 
 - `--state-dir <absolute-directory>`: where the private state lives (staging,
   sessions, commit and link records, journals, locks, reset archives). The default
-  is `~/.swarm-deploy/<id>` under the home directory of the user running the
-  server, with `<id>` derived from the real path of `--storage`. A custom
-  directory must be outside `--storage` and on the same filesystem, is kept at
-  mode `0700`, and serves one storage root only. Use the same value for every
-  server and `reset-storage` run for that root; never serve it. See
-  [Private state](../README.md#private-state), including how to move the state of
-  a 0.6.0 or earlier server out of `<storage>/.swarm-deploy`.
+  is `~/.swarm-deploy/<id>` under the home directory the runtime reports for the
+  user running the server (`os.homedir()`, which honors `HOME`), with `<id>`
+  derived from the real path of `--storage`. A custom directory must be outside
+  `--storage` and on the same filesystem (and, on Linux, the same mount), is kept
+  at mode `0700`, and serves one storage root only. It is refused when your
+  default location for the root already holds state bound to it. Use the same
+  value, user, and `HOME` for every server and `reset-storage` run for that root;
+  never serve it. See [Private state](../README.md#private-state), including how
+  to move the state of a 0.6.0 or earlier server out of `<storage>/.swarm-deploy`.
+- `--initialize-state`: a one-time acknowledgement, a flag without a value. The
+  server refuses to start new state, or to bind a state directory that holds
+  entries but no record of its output root (migrated or restored state), while the
+  output root already holds entries, because state settings that differ from the
+  instance managing the root would otherwise start a second, independent writer.
+  Pass it once after deleting state on purpose or migrating from 0.6.0 or earlier,
+  then remove it: state already bound to the root needs no flag. Published files
+  are never adopted or deleted; without their old records they stay unmanaged.
 - `--max-storage-bytes`: maximum total managed committed storage. Oldest
   eligible artifacts are removed first.
 - `--max-age-days`: remove eligible committed artifacts at or beyond this age.

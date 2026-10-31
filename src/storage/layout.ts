@@ -6,6 +6,7 @@ import path from '#path'
 import process from '#process'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { mountFor, readMountInfo, type MountEntry } from './mounts.js'
 import type {
   StorageAdapter,
   StorageFileHandle,
@@ -186,14 +187,16 @@ function canonicalPath(target: string): string {
   }
 }
 
-/** True when `candidate`, or a directory above it, is the very directory `container` names. */
+/**
+ * True when `candidate`, or a directory above it, is the very directory `container` names.
+ * `container` is a validated identity. An ancestor whose device or inode number cannot be
+ * represented exactly (some macOS system volumes) can never equal it, so it is simply not
+ * the same directory and needs no validation of its own.
+ */
 function isWithin(candidate: string, container: StorageIdentity): boolean {
   for (let current = candidate; ; current = path.dirname(current)) {
     const stat = statOrNull(current)
-    if (stat !== null) {
-      const found = directoryIdentity(stat, current)
-      if (found.dev === container.dev && found.ino === container.ino) return true
-    }
+    if (stat !== null && stat.dev === container.dev && stat.ino === container.ino) return true
     if (path.dirname(current) === current) return false
   }
 }
@@ -218,15 +221,50 @@ export function defaultStateDirectory(canonicalRoot: string): string {
   return path.join(home, STATE_HOME_NAME, rootId(canonicalRoot))
 }
 
+/**
+ * One POSIX shell word that is exactly `value`: inside single quotes nothing is expanded,
+ * and a single quote itself is written as `'\''`. Every path in a printed command goes
+ * through this, so an unusual directory name can never run or become another argument.
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function lstatOrNull(target: string): StorageStat | null {
+  try {
+    return fs.lstatSync(target)
+  } catch (error: unknown) {
+    if (errorCode(error) === 'ENOENT' || errorCode(error) === 'ENOTDIR') return null
+    throw error
+  }
+}
+
 function legacyStateError(legacy: string, state: string): SwarmDeployError {
+  const [quotedLegacy, quotedState] = [shellQuote(legacy), shellQuote(state)]
+  const header = [
+    `Legacy private state found inside the output root: ${legacy}`,
+    'Releases before 0.6.1 kept it there, where a web server that serves the output root can expose it.'
+  ]
+  if (lstatOrNull(state) !== null) {
+    // `mv` would move the legacy directory inside an existing destination and hide its records.
+    return storageError(
+      [
+        ...header,
+        `The planned private state location already exists, so moving the legacy directory there would nest it inside: ${state}`,
+        'This release does not read, move, or delete either one. Choose a location that does not exist: stop every swarm-deploy server and reset-storage for this root, then pass --state-dir a new absolute path and run the command printed for it.',
+        `If that existing location is an empty directory you created for this purpose, you may remove it first (the command fails if it is not empty): rmdir -- ${quotedState}`
+      ].join('\n')
+    )
+  }
   return storageError(
     [
-      `Legacy private state found inside the output root: ${legacy}`,
-      'Releases before 0.6.1 kept it there, where a web server that serves the output root can expose it.',
-      'This release does not read, move, or delete it. Stop every swarm-deploy server and reset-storage for this root, then move it out of the output root:',
-      `  mkdir -p "${path.dirname(state)}" && mv "${legacy}" "${state}"`,
-      `To roll back, stop the server and move "${state}" back to "${legacy}" before starting an older release.`,
-      'The destination must not exist yet and must be on the same filesystem as the output root; pass --state-dir to choose another location.'
+      ...header,
+      'This release does not read, move, or delete it. Stop every swarm-deploy server and reset-storage for this root, then run this POSIX shell command. Each path is a quoted literal, and it refuses to run if the destination already exists, so it can never nest the directory:',
+      `  [ ! -e ${quotedState} ] && [ ! -L ${quotedState} ] && mkdir -p -- ${shellQuote(path.dirname(state))} && mv -- ${quotedLegacy} ${quotedState}`,
+      'The moved directory has no record of its output root yet, so start the server once with --initialize-state to bind it; leave that flag out of normal startup afterwards.',
+      'To roll back, stop the server and run this before starting an older release (it refuses if the legacy path exists again):',
+      `  [ ! -e ${quotedLegacy} ] && [ ! -L ${quotedLegacy} ] && mv -- ${quotedState} ${quotedLegacy}`,
+      'The destination must be on the same filesystem and mount as the output root; pass --state-dir to choose another location.'
     ].join('\n')
   )
 }
@@ -235,20 +273,64 @@ function crossDeviceError(root: string, state: string): SwarmDeployError {
   return storageError(
     `Private state directory ${state} is on a different filesystem than the output root ${root}. ` +
       'Publication, link replacement, and retention move files between the two with atomic renames and hard links, which cannot cross filesystems. ' +
-      'Pass --state-dir (ServerOptions.stateDir) a directory outside the output root on the same filesystem.'
+      'Pass --state-dir (ServerOptions.stateDir) a directory outside the output root on the same filesystem and mount.'
+  )
+}
+
+function crossMountError(
+  root: string,
+  state: string,
+  rootMount: MountEntry,
+  stateMount: MountEntry
+): SwarmDeployError {
+  return storageError(
+    `Private state directory ${state} is on a different mount (${stateMount.mountPoint}) than the output root ${root} (${rootMount.mountPoint}), although both report the same filesystem. ` +
+      'Linux rename(2) and link(2) fail with EXDEV between distinct mount points even of one filesystem, so publication, link replacement, and retention would fail after an upload was received. ' +
+      'Pass --state-dir a directory outside the output root on the same mount (not a separate bind mount or volume).'
   )
 }
 
 function assertNoLegacyState(root: string, state: string): void {
   const legacy = path.join(root, LEGACY_STATE_NAME)
-  try {
-    fs.lstatSync(legacy)
-  } catch (error: unknown) {
-    if (errorCode(error) === 'ENOENT') return
-    throw error
-  }
-  throw legacyStateError(legacy, state)
+  if (lstatOrNull(legacy) !== null) throw legacyStateError(legacy, state)
 }
+
+/**
+ * Whether legacy private state is in the output root now. Used while a server runs: an
+ * older release, or another writer, can recreate it after startup checked, and that is a
+ * second writer to refuse and report, never an unknown entry to ignore.
+ */
+export function legacyStatePresent(root: string): boolean {
+  return lstatOrNull(path.join(root, LEGACY_STATE_NAME)) !== null
+}
+
+/**
+ * The same adapter, except that a `rename` or `link` refused with EXDEV tells
+ * `onCrossMount` before the error is rethrown unchanged. It is how a publication that fails
+ * across a filesystem or mount boundary, which no startup check can rule out in every
+ * environment, is reported with the way out instead of as a generic failure.
+ */
+export function diagnoseCrossMount(
+  storage: StorageAdapter,
+  onCrossMount: () => void
+): StorageAdapter {
+  const diagnosed = Object.create(storage) as StorageAdapter
+  for (const name of ['rename', 'link'] as const) {
+    diagnosed[name] = async (from: string, to: string): Promise<void> => {
+      try {
+        await storage[name](from, to)
+      } catch (error: unknown) {
+        if (errorCode(error) === 'EXDEV') onCrossMount()
+        throw error
+      }
+    }
+  }
+  return diagnosed
+}
+
+/** What a running server says when legacy state reappears. It names no path. */
+export const LEGACY_REAPPEARED_MESSAGE =
+  'Legacy private state reappeared in the output root; another writer or an older release is using it. Stop every instance and migrate it as described in the README'
 
 /** The state directory must not be the output root, inside it, above it, or reach it through a symlink. */
 function assertStateOutsideRoot(root: string, canonicalRoot: string, state: string): void {
@@ -270,17 +352,47 @@ function assertStateOutsideRoot(root: string, canonicalRoot: string, state: stri
   }
 }
 
-/** Compares the device of `target`, or of its nearest existing ancestor, with the output root's. */
-function assertSameFilesystem(root: string, target: string, state: string): void {
+/**
+ * On Linux, `rename` and `link` also fail between two mounts of one filesystem, which share
+ * a device number. When the mount table is known, the root and `canonicalTarget` must be on
+ * the same mount; a path the table cannot place is left to the device check.
+ */
+export function assertSameMount(
+  canonicalRoot: string,
+  canonicalTarget: string,
+  state: string,
+  mounts: readonly MountEntry[]
+): void {
+  const rootMount = mountFor(mounts, canonicalRoot)
+  const targetMount = mountFor(mounts, canonicalTarget)
+  if (rootMount === null || targetMount === null || rootMount.id === targetMount.id) return
+  throw crossMountError(canonicalRoot, state, rootMount, targetMount)
+}
+
+/**
+ * `target`, or its nearest existing ancestor, must be on the output root's filesystem and,
+ * where the mount table is known, on its mount. Only the root's own identity has to be
+ * representable: another path whose device number cannot be represented exactly is a
+ * different device from the root's, which is what the operator needs to hear, not an
+ * identity error.
+ */
+function assertSameFilesystem(
+  root: string,
+  canonicalRoot: string,
+  target: string,
+  state: string,
+  mounts: readonly MountEntry[] | null
+): void {
   const device = directoryIdentity(fs.statSync(root), root).dev
   for (let current = target; ; current = path.dirname(current)) {
     const stat = statOrNull(current)
     if (stat !== null) {
-      if (directoryIdentity(stat, current).dev !== device) throw crossDeviceError(root, state)
-      return
+      if (stat.dev !== device) throw crossDeviceError(root, state)
+      break
     }
-    if (path.dirname(current) === current) return
+    if (path.dirname(current) === current) break
   }
+  if (mounts !== null) assertSameMount(canonicalRoot, canonicalPath(target), state, mounts)
 }
 
 function restrictToOwner(directory: string): void {
@@ -301,37 +413,63 @@ function isStateEntry(name: string): boolean {
   )
 }
 
-/**
- * A state directory serves exactly one output root. An existing record must name
- * this root; a directory without one is adopted only when it is empty or holds
- * nothing but Swarm Deploy state, such as a migrated legacy directory.
- */
-function bindStateRoot(state: string, canonicalRoot: string, write: boolean): void {
-  const marker = path.join(state, STATE_ROOT_NAME)
-  let stat: StorageStat | null = null
-  try {
-    stat = fs.lstatSync(marker)
-  } catch (error: unknown) {
-    if (errorCode(error) !== 'ENOENT') throw error
+type Binding = 'bound' | 'unbound'
+
+function boundElsewhereError(
+  state: string,
+  owner: string,
+  canonicalRoot: string
+): SwarmDeployError {
+  return storageError(
+    `State directory ${state} belongs to output root ${owner}, not ${canonicalRoot}. Give every output root its own --state-dir`
+  )
+}
+
+/** The output root a state directory records, or null when it has no record yet. */
+function readBinding(marker: string): string | null {
+  const stat = lstatOrNull(marker)
+  if (stat === null) return null
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_ROOT_BYTES) {
+    throw storageError(`Unsafe storage file: ${marker}`)
   }
-  if (stat !== null) {
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_ROOT_BYTES) {
-      throw storageError(`Unsafe storage file: ${marker}`)
-    }
-    let bound: unknown
-    try {
-      bound = JSON.parse(fs.readFileSync(marker, 'utf8'))
-    } catch (error: unknown) {
-      throw storageError(`Malformed state directory record: ${marker}`, error)
-    }
-    const owner = typeof bound === 'object' && bound !== null && 'root' in bound ? bound.root : null
-    if (typeof owner !== 'string') throw storageError(`Malformed state directory record: ${marker}`)
-    if (owner !== canonicalRoot) {
-      throw storageError(
-        `State directory ${state} belongs to output root ${owner}, not ${canonicalRoot}. Give every output root its own --state-dir`
-      )
-    }
-    return
+  let bound: unknown
+  try {
+    bound = JSON.parse(fs.readFileSync(marker, 'utf8'))
+  } catch (error: unknown) {
+    throw storageError(`Malformed state directory record: ${marker}`, error)
+  }
+  const owner = typeof bound === 'object' && bound !== null && 'root' in bound ? bound.root : null
+  if (typeof owner !== 'string') throw storageError(`Malformed state directory record: ${marker}`)
+  return owner
+}
+
+function nestedLegacyError(state: string): SwarmDeployError {
+  const nested = path.join(state, LEGACY_STATE_NAME)
+  const aside = `${state}.migrating`
+  return storageError(
+    [
+      `Legacy private state is nested inside the state directory: ${nested}`,
+      'An earlier move put the pre-0.6.1 directory inside a destination that already existed, so its records are not where this release looks for them. This release does not read, move, or delete either directory.',
+      'Stop every swarm-deploy server and reset-storage for this root. If the state directory holds nothing else you need, this POSIX shell command puts the nested directory in place (it refuses if the temporary name exists, and stops at rmdir if the state directory still holds other entries):',
+      `  [ ! -e ${shellQuote(aside)} ] && [ ! -L ${shellQuote(aside)} ] && mv -- ${shellQuote(nested)} ${shellQuote(aside)} && rmdir -- ${shellQuote(state)} && mv -- ${shellQuote(aside)} ${shellQuote(state)}`,
+      `If it stops there, the legacy directory is at ${aside}: merge it with the state directory by hand, keeping every record, or choose a new --state-dir.`
+    ].join('\n')
+  )
+}
+
+/**
+ * Read-only. Says whether `state` is already bound to this output root and throws for
+ * anything that must never be adopted: a record naming another root, an unreadable record,
+ * a nested legacy directory, or contents that are not Swarm Deploy state. A directory
+ * without a record is `unbound` only when it is empty or holds nothing but state, such as
+ * a migrated legacy directory.
+ */
+function inspectBinding(state: string, canonicalRoot: string): Binding {
+  if (lstatOrNull(path.join(state, LEGACY_STATE_NAME)) !== null) throw nestedLegacyError(state)
+  const owner = readBinding(path.join(state, STATE_ROOT_NAME))
+  if (owner !== null) {
+    if (owner !== canonicalRoot) throw boundElsewhereError(state, owner, canonicalRoot)
+    return 'bound'
   }
   const foreign = fs.readdirSync(state).find((name) => !isStateEntry(name))
   if (foreign !== undefined) {
@@ -339,13 +477,150 @@ function bindStateRoot(state: string, canonicalRoot: string, write: boolean): vo
       `State directory ${state} is not empty and does not hold Swarm Deploy state (found ${foreign}). Choose an empty directory`
     )
   }
-  if (!write) return
+  return 'unbound'
+}
+
+/**
+ * Starting unbound state is refused for a root that already holds entries, or when the
+ * state itself is not empty (a migrated or restored directory), unless the operator said so.
+ * Settings that differ from the instance that has been managing a root would otherwise
+ * quietly create a second, independent writer for the same files.
+ */
+function assertInitializationAcknowledged(
+  root: string,
+  state: string,
+  stateExists: boolean,
+  acknowledged: boolean
+): void {
+  if (acknowledged) return
+  const reasons: string[] = []
+  if (fs.readdirSync(root).length > 0) reasons.push('the output root already holds entries')
+  if (stateExists && fs.readdirSync(state).length > 0) {
+    reasons.push('the state directory already holds entries')
+  }
+  if (reasons.length === 0) return
+  throw storageError(
+    `Private state at ${state} is not bound to the output root ${root} yet, and ${reasons.join(' and ')}. ` +
+      'Starting with state settings that differ from the instance that has been managing this root (another --state-dir, user, or HOME) would create a second, independent writer for the same files. ' +
+      'If this is intended because the state was deleted or a migrated or restored directory is being bound for the first time, stop every instance for this root and start once with --initialize-state (ServerOptions.initializeState), then remove that flag. ' +
+      'Published files are never adopted or deleted: without their old records they stay unmanaged.'
+  )
+}
+
+/**
+ * An explicit state location must not fork the state this user's default location already
+ * keeps for this root: that would give one output root two independent sets of ownership
+ * records, and nothing locks them against each other.
+ */
+export function assertNoDefaultStateConflict(
+  canonicalRoot: string,
+  state: string,
+  defaultState: string
+): void {
+  const stateStat = statOrNull(state)
+  const defaultStat = statOrNull(defaultState)
+  if (defaultStat === null || !defaultStat.isDirectory()) return
+  const sameDirectory =
+    stateStat !== null && stateStat.dev === defaultStat.dev && stateStat.ino === defaultStat.ino
+  if (sameDirectory) return
+  let owner: string | null
+  try {
+    owner = readBinding(path.join(defaultState, STATE_ROOT_NAME))
+  } catch {
+    return
+  }
+  if (owner !== canonicalRoot) return
+  throw storageError(
+    `A private state directory for this output root already exists at ${defaultState}, the default for this user, but --state-dir chose ${state}. ` +
+      'Using both would give the root two independent sets of state. ' +
+      'Omit --state-dir or pass the default location, or stop every instance and move or remove that default directory deliberately first.'
+  )
+}
+
+/** Marker temporaries older than this belong to an initializer that never finished. */
+const CLAIM_TEMPORARY_MAX_AGE = 10 * 60 * 1000
+const CLAIM_TEMPORARY = /^\.swarm-deploy-state\.json\.[0-9a-f]{16}\.tmp$/
+
+/**
+ * Removes marker temporaries an interrupted initializer left behind. A recent one may
+ * belong to an initializer that is about to publish it, so only old regular files go.
+ */
+export function sweepClaimTemporaries(
+  state: string,
+  now: number = Date.now(),
+  olderThan: number = CLAIM_TEMPORARY_MAX_AGE
+): number {
+  let removed = 0
+  for (const name of fs.readdirSync(state)) {
+    if (!CLAIM_TEMPORARY.test(name)) continue
+    const target = path.join(state, name)
+    const stat = lstatOrNull(target)
+    if (stat === null || !stat.isFile() || now - (stat.mtimeMs ?? now) < olderThan) continue
+    try {
+      fs.unlinkSync(target)
+      removed++
+    } catch {}
+  }
+  return removed
+}
+
+function syncDirectoryEntries(directory: string): void {
+  const fd = fs.openSync(directory, 'r')
+  try {
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Records the output root in a state directory without ever replacing a record another
+ * initializer published first. The record is written and synced under a private name, then
+ * hard-linked into place: `link` fails with EEXIST rather than overwrite, so exactly one
+ * initializer wins. The directory is synced so the name survives a crash, and the record
+ * actually in place is read back and must name this root. A different winner is refused.
+ */
+function claimStateRoot(state: string, canonicalRoot: string): void {
+  const marker = path.join(state, STATE_ROOT_NAME)
   const temporary = `${marker}.${randomToken().slice(0, 16)}.tmp`
-  fs.writeFileSync(temporary, JSON.stringify({ version: 1, root: canonicalRoot }), {
-    flag: 'wx',
-    mode: 0o600
-  })
-  fs.renameSync(temporary, marker)
+  const bytes = b4a.from(JSON.stringify({ version: 1, root: canonicalRoot }))
+  try {
+    try {
+      const fd = fs.openSync(temporary, 'wx', 0o600)
+      try {
+        let written = 0
+        while (written < bytes.byteLength) {
+          written += fs.writeSync(fd, bytes, written, bytes.byteLength - written)
+        }
+        fs.fsyncSync(fd)
+      } finally {
+        fs.closeSync(fd)
+      }
+      try {
+        fs.linkSync(temporary, marker)
+      } catch (error: unknown) {
+        if (errorCode(error) !== 'EEXIST') throw error
+      }
+    } finally {
+      // Only this call's own temporary, whether or not it was published.
+      try {
+        fs.unlinkSync(temporary)
+      } catch {}
+    }
+    syncDirectoryEntries(state)
+  } catch (error: unknown) {
+    if (error instanceof SwarmDeployError) throw error
+    throw storageError(
+      `Unable to record the output root in the private state directory ${state}; hard links and fsync are required`,
+      error
+    )
+  }
+  const owner = readBinding(marker)
+  if (owner !== canonicalRoot) {
+    throw owner === null
+      ? storageError(`Malformed state directory record: ${marker}`)
+      : boundElsewhereError(state, owner, canonicalRoot)
+  }
 }
 
 /**
@@ -359,7 +634,8 @@ function bindStateRoot(state: string, canonicalRoot: string, write: boolean): vo
 function locateLayout(
   storageDir: string,
   stateDir: string | undefined,
-  create: boolean
+  create: boolean,
+  initializeState: boolean
 ): StorageLayout {
   if (typeof storageDir !== 'string' || storageDir.length === 0) {
     throw storageError('Invalid storage directory')
@@ -380,15 +656,17 @@ function locateLayout(
   const state =
     stateDir === undefined ? defaultStateDirectory(canonicalRoot) : path.resolve(stateDir)
   assertNoLegacyState(root, state)
-
-  const present = (() => {
+  if (stateDir !== undefined) {
+    let defaultState: string | null = null
     try {
-      return fs.lstatSync(state)
-    } catch (error: unknown) {
-      if (errorCode(error) === 'ENOENT') return null
-      throw error
+      defaultState = defaultStateDirectory(canonicalRoot)
+    } catch {
+      // No home directory is known, so there is no default location to conflict with.
     }
-  })()
+    if (defaultState !== null) assertNoDefaultStateConflict(canonicalRoot, state, defaultState)
+  }
+
+  const present = lstatOrNull(state)
   if (present !== null && (present.isSymbolicLink() || !present.isDirectory())) {
     throw storageError(`Unsafe storage directory: ${state}`)
   }
@@ -398,30 +676,60 @@ function locateLayout(
     )
   }
   assertStateOutsideRoot(root, canonicalRoot, state)
-  assertSameFilesystem(root, state, state)
+  const mounts = readMountInfo()
+  assertSameFilesystem(root, canonicalRoot, state, state, mounts)
 
-  if (present === null) assertDirectorySync(state)
-  if (create) restrictToOwner(state)
-  bindStateRoot(state, canonicalRoot, create)
+  // Nothing below changes an existing directory until it is known to be this root's state:
+  // the read-only inspection runs first, and permissions are restricted only after it.
+  const existed = present !== null
+  let binding: Binding = existed ? inspectBinding(state, canonicalRoot) : 'unbound'
+  if (create && binding === 'unbound') {
+    assertInitializationAcknowledged(root, state, existed, initializeState)
+  }
+  if (!existed) {
+    assertDirectorySync(state)
+    binding = inspectBinding(state, canonicalRoot)
+  }
+  if (create) {
+    restrictToOwner(state)
+    if (binding === 'unbound') claimStateRoot(state, canonicalRoot)
+  }
 
   const layout = resolveLayout(root, state)
   if (create) {
     for (const name of METADATA_DIRECTORY_NAMES) {
       assertDirectorySync(layout[name])
-      assertSameFilesystem(root, layout[name], state)
+      assertSameFilesystem(root, canonicalRoot, layout[name], state, mounts)
+    }
+    try {
+      sweepClaimTemporaries(state)
+    } catch {
+      // Residue from an interrupted initializer is harmless; it never blocks startup.
     }
   }
   return layout
 }
 
+export interface InitLayoutOptions {
+  /**
+   * Acknowledges that unbound state may be started for a root that already holds entries, or
+   * from a directory that already holds entries. One-time: bound state needs no flag.
+   */
+  initializeState?: boolean
+}
+
 /** Creates the output root and the private state directory when missing; used by the server. */
-export function initLayout(storageDir: string, stateDir?: string): StorageLayout {
-  return locateLayout(storageDir, stateDir, true)
+export function initLayout(
+  storageDir: string,
+  stateDir?: string,
+  options: InitLayoutOptions = {}
+): StorageLayout {
+  return locateLayout(storageDir, stateDir, true, options.initializeState === true)
 }
 
 /** Resolves an existing layout without creating or changing anything; used by reset-storage. */
 export function findLayout(storageDir: string, stateDir?: string): StorageLayout {
-  return locateLayout(storageDir, stateDir, false)
+  return locateLayout(storageDir, stateDir, false, false)
 }
 
 /** Every protected directory a storage operation revalidates before mutating. */

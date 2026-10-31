@@ -568,12 +568,17 @@ const stateServerOptions = {
   seed: serverSeed,
   storageDir: '/srv/artifacts',
   stateDir: '/var/lib/swarm-deploy/artifacts',
+  initializeState: true,
   allowedKeys: parseAllowlist('00'.repeat(32)),
   maxFileBytes: 1024,
   maxStagingBytes: 4096
 } satisfies ServerOptions
 const configuredState: string | undefined = new Server(stateServerOptions).stateDir
-void [stateServerOptions, configuredState]
+const initializing: boolean = new Server(stateServerOptions).initializeState
+void [stateServerOptions, configuredState, initializing]
+// @ts-expect-error Initialization is acknowledged with a boolean, not a word.
+const wordInitialization: ServerOptions['initializeState'] = 'yes'
+void wordInitialization
 // @ts-expect-error The state directory is a path, not a flag.
 const flagState: ServerOptions['stateDir'] = true
 void flagState

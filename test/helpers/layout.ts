@@ -6,8 +6,16 @@ import { stateDirFor } from './files.js'
 /**
  * Initializes a layout whose private state lives in the test's isolated state directory
  * (a sibling of the root), so no test writes under the real home directory. An explicit
- * `stateDir` still wins.
+ * `stateDir` still wins. Fixtures often start state for a root that already holds files, so
+ * initialization is acknowledged here; the tests of that guard pass `initializeState: false`.
  */
-export function initLayout(storageDir: string, stateDir?: string): StorageLayout {
-  return initPrivateLayout(storageDir, stateDir ?? stateDirFor(path.resolve(storageDir)))
+export function initLayout(
+  storageDir: string,
+  stateDir?: string,
+  options: { initializeState?: boolean } = {}
+): StorageLayout {
+  return initPrivateLayout(storageDir, stateDir ?? stateDirFor(path.resolve(storageDir)), {
+    initializeState: true,
+    ...options
+  })
 }

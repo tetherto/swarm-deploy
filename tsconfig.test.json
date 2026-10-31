@@ -23,6 +23,7 @@
     "test/unit/cli.test.ts",
     "test/unit/storage-reset.test.ts",
     "test/unit/private-state.test.ts",
+    "test/unit/private-state-guards.test.ts",
     "test/unit/direct-behavior.test.ts",
     "test/unit/direct-dht.test.ts",
     "test/unit/files.test.ts",

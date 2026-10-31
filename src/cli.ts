@@ -73,7 +73,7 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> [--state-dir <dir>] --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...]',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> [--state-dir <dir>] --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...] [--initialize-state]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] [--json] <file-or-directory>',
   '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--hook-failure <rollback|keep>] [--json] <target> <link-name>',
   '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]] [--state-dir <dir>]',
@@ -612,13 +612,14 @@ function parseHookModes(values: readonly string[]): HookModes {
 }
 
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, repeatedOptions, pairOptions, positionals } = parseOptions(
+  const { options, repeatedOptions, pairOptions, flagOptions, positionals } = parseOptions(
     args,
     new Set([
       '--seed-file',
       '--seed',
       '--storage',
       '--state-dir',
+      '--initialize-state',
       '--allow-key',
       '--max-file-bytes',
       '--max-staging-bytes',
@@ -635,12 +636,13 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
     ]),
     new Set(['--replace-name', '--allow-key', '--artifact-pattern', '--symlink', '--hook-mode']),
     new Set(['--allow-key', '--seed']),
-    new Set(),
+    new Set(['--initialize-state']),
     new Set(['--symlink'])
   )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
   const stateDir = options['--state-dir']
+  const initializeState = flagOptions['--initialize-state'] === true
   const maxFileBytes = parsePositiveSafeInteger(
     requireOption(options, '--max-file-bytes'),
     'max-file-bytes'
@@ -731,6 +733,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       seed,
       storageDir,
       ...(stateDir === undefined ? {} : { stateDir }),
+      ...(initializeState ? { initializeState } : {}),
       allowedKeys,
       maxFileBytes,
       maxStagingBytes,

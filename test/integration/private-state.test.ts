@@ -10,6 +10,7 @@ import { Client, ERRORS, keyPairFromSeed, type SwarmDeployError } from '../../di
 import { STATE_ROOT_NAME } from '../../dist/storage/layout.js'
 import { createTempDir, stateDirFor } from '../helpers/files.js'
 import { Server } from '../helpers/server.js'
+import { createStorage } from '../helpers/storage.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 import { writeTree } from '../helpers/trees.js'
 
@@ -268,4 +269,164 @@ test('retention rotates artifacts without leaving private entries in the served 
   const records = await fs.promises.readdir(path.join(state, 'commits'))
   t.is(records.length, 1, 'the commit records are private state, one per remaining artifact')
   t.alike(await fs.promises.readdir(path.join(state, 'trash')), [])
+})
+
+interface LogRecord {
+  level: 'info' | 'warn' | 'error'
+  message: string
+  details: Record<string, unknown> | undefined
+}
+
+function recordingLogger(records: LogRecord[]) {
+  return {
+    info(message: string, details?: Record<string, unknown>) {
+      records.push({ level: 'info', message, details })
+    },
+    warn(message: string, details?: Record<string, unknown>) {
+      records.push({ level: 'warn', message, details })
+    },
+    error(message: string, details?: Record<string, unknown>) {
+      records.push({ level: 'error', message, details })
+    }
+  }
+}
+
+test('legacy state that reappears while the server runs refuses new work and maintenance and is reported', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 0xf5)
+  const clientSeed = b4a.alloc(32, 0xf6)
+  const root = await createTempDir(t)
+  const source = await createTempDir(t)
+  const records: LogRecord[] = []
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: root,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    symlinks: [{ selector: 'release-1' }],
+    logger: recordingLogger(records),
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    idleTimeout: 10_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+  await server.listen()
+  const upload = async (name: string): Promise<unknown> => {
+    const file = path.join(source, name)
+    await fs.promises.writeFile(file, name)
+    return client.upload(file).then(
+      () => null,
+      (error: unknown) => error
+    )
+  }
+  const alerts = (): number =>
+    records.filter((record) => record.message.includes('Legacy private state reappeared')).length
+
+  t.is(await upload('release-1'), null)
+  t.is((await client.link('release-1', 'current')).status, 'LINKED')
+  const published = await listServable(t, root, 'before')
+
+  // An older release, or another writer, recreates the directory inside the served root.
+  await fs.promises.mkdir(path.join(root, '.swarm-deploy', 'commits'), { recursive: true })
+  const refused = (await upload('release-2')) as SwarmDeployError | null
+  t.is(refused?.code, ERRORS.PROTOCOL_INVALID, 'a new upload is refused')
+  t.absent(await exists(path.join(root, 'release-2')), 'and nothing was published')
+  const linkFailure = await client.link('release-1', 'other').then(
+    () => null,
+    (error: unknown) => error as SwarmDeployError
+  )
+  t.is(linkFailure?.code, ERRORS.LINK_FAILED, 'a new link request is refused')
+  t.absent(await exists(path.join(root, 'other')))
+  await upload('release-3')
+  t.is(alerts(), 1, 'one alert is logged for as long as the directory stays')
+  t.absent(JSON.stringify(records).includes(root), 'and it names no path')
+
+  // Maintenance refuses too: this instance's records must not delete a second writer's files.
+  const retention = (server as unknown as { retention: { run(o: object): Promise<unknown> } })
+    .retention
+  await t.exception(() => retention.run({ trigger: 'manual' }), {
+    code: ERRORS.PROTOCOL_INVALID,
+    message: /Legacy private state reappeared/
+  })
+  t.alike(
+    (await walk(root)).filter((name) => !name.startsWith('.swarm-deploy')),
+    published,
+    'no artifact or link was touched'
+  )
+
+  // Once the operator resolves it, work resumes and a later reappearance is reported again.
+  await fs.promises.rm(path.join(root, '.swarm-deploy'), { recursive: true })
+  t.is(await upload('release-2'), null)
+  await t.execution(() => retention.run({ trigger: 'manual' }))
+  await fs.promises.mkdir(path.join(root, '.swarm-deploy'))
+  await upload('release-4')
+  t.is(alerts(), 2)
+})
+
+test('a publication refused across mounts is reported once with the way out', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const serverSeed = b4a.alloc(32, 0xf7)
+  const clientSeed = b4a.alloc(32, 0xf8)
+  const root = await createTempDir(t)
+  const source = await createTempDir(t)
+  const records: LogRecord[] = []
+  const storage = createStorage({
+    beforeOperation(name, _target, ...rest) {
+      if (name === 'link' && String(rest[0]).startsWith(`${root}${path.sep}`)) {
+        throw Object.assign(new Error('injected cross-device link'), { code: 'EXDEV' })
+      }
+    }
+  })
+  const server = new Server({
+    seed: serverSeed,
+    storageDir: root,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    storage,
+    logger: recordingLogger(records),
+    dht: testnet.createNode()
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    idleTimeout: 10_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+  await server.listen()
+
+  for (const name of ['first.bin', 'second.bin']) {
+    const file = path.join(source, name)
+    await fs.promises.writeFile(file, name)
+    const failure = await client.upload(file).then(
+      () => null,
+      (error: unknown) => error
+    )
+    t.ok(failure !== null, `${name} fails when publication crosses a mount`)
+  }
+  t.alike(await listServable(t, root, 'after the failures'), [], 'nothing was published')
+  const reports = records.filter((record) =>
+    record.message.includes('across a filesystem or mount')
+  )
+  t.is(reports.length, 1, 'the problem is reported once')
+  t.is(reports[0].level, 'error')
+  t.is(reports[0].details?.reason, 'EXDEV')
+  t.ok(String(reports[0].details?.hint).includes('--state-dir'))
+  t.absent(JSON.stringify(records).includes(root), 'and no log carries a path')
 })

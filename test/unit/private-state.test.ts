@@ -14,7 +14,8 @@ import {
   STATE_ROOT_NAME,
   defaultStateDirectory,
   findLayout,
-  initLayout
+  initLayout,
+  shellQuote
 } from '../../dist/storage/layout.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
 import { createTempDir, stateDirFor } from '../helpers/files.js'
@@ -271,15 +272,20 @@ test('a state directory serves exactly one output root, and each root keeps sepa
   t.ok(refused?.message.includes('does not hold Swarm Deploy state (found notes.txt)'))
   t.absent(await exists(path.join(foreign, STATE_ROOT_NAME)), 'a foreign directory is not claimed')
 
-  // A migrated legacy directory holds only state, so it is adopted and bound to its root.
+  // A migrated legacy directory holds only state, so it can be bound to its root, but only by
+  // an operator who says so: it has no record of its root yet.
   const migrated = path.join(scratch, 'migrated')
   await fs.promises.mkdir(path.join(migrated, 'archive'), { recursive: true })
   await fs.promises.mkdir(path.join(migrated, 'commits'))
   await fs.promises.mkdir(path.join(migrated, `lock.retired-${'ab'.repeat(32)}`))
   await fs.promises.writeFile(path.join(migrated, 'archive', 'kept.txt'), 'kept')
-  initLayout(rootC, migrated)
+  const unacknowledged = failureOf(() => initLayout(rootC, migrated))
+  t.ok(unacknowledged?.message.includes('--initialize-state'))
+  t.absent(await exists(path.join(migrated, STATE_ROOT_NAME)), 'nothing was bound')
+  initLayout(rootC, migrated, { initializeState: true })
   t.is(await fs.promises.readFile(path.join(migrated, 'archive', 'kept.txt'), 'utf8'), 'kept')
   t.ok(await exists(path.join(migrated, STATE_ROOT_NAME)))
+  await t.execution(() => initLayout(rootC, migrated), 'bound state needs no flag')
 })
 
 test('a state directory on another filesystem fails before anything is published', async (t) => {
@@ -324,8 +330,15 @@ test('legacy state inside the output root stops the server and reset-storage and
     message: /Legacy private state found inside the output root/
   })
   const message = failureOf(() => initLayout(root, state))?.message ?? ''
-  t.ok(message.includes(`mv "${legacy}" "${state}"`), 'it spells out the offline move')
-  t.ok(message.includes(`move "${state}" back to "${legacy}"`), 'and the rollback')
+  t.ok(
+    message.includes(`mv -- ${shellQuote(legacy)} ${shellQuote(state)}`),
+    'it spells out the offline move with quoted literal paths'
+  )
+  t.ok(
+    message.includes(`mv -- ${shellQuote(state)} ${shellQuote(legacy)}`),
+    'and the rollback, quoted the same way'
+  )
+  t.ok(message.includes('--initialize-state'), 'and says how to bind the moved state')
   t.ok(message.includes('--state-dir'))
   t.is(unused.calls(), 0)
   t.alike(await snapshot(root), before, 'the legacy directory is exactly as it was')
@@ -340,7 +353,19 @@ test('legacy state inside the output root stops the server and reset-storage and
   await fs.promises.mkdir(path.dirname(state), { recursive: true })
   await fs.promises.rename(legacy, state)
   const testnet = await createLocalTestnet(t)
-  const migrated = new Server(serverOptions(root, { dht: testnet.createNode() }))
+  // The moved directory has no record of its root, so binding it takes the explicit flag.
+  const unbound = new Server(
+    serverOptions(root, { initializeState: false, dht: testnet.createNode() })
+  )
+  t.teardown(() => unbound.close())
+  await t.exception(() => unbound.listen(), {
+    code: ERRORS.PROTOCOL_INVALID,
+    message: /--initialize-state/
+  })
+  t.absent(await exists(path.join(state, STATE_ROOT_NAME)), 'nothing was bound')
+  const migrated = new Server(
+    serverOptions(root, { initializeState: true, dht: testnet.createNode() })
+  )
   await migrated.listen()
   t.is(await fs.promises.readFile(path.join(state, 'archive', 'sentinel.txt'), 'utf8'), 'kept')
   t.alike(await fs.promises.readdir(root), [], 'the output root holds nothing private')
@@ -473,7 +498,7 @@ test('swarm-deploy server passes --state-dir through and documents it', async (t
     '--max-staging-bytes',
     '4096'
   ]
-  for (const extra of [['--state-dir', state], []]) {
+  for (const extra of [['--state-dir', state], [], ['--initialize-state']]) {
     const stderr = output()
     const code = await main(
       [...base, ...extra],
@@ -491,6 +516,10 @@ test('swarm-deploy server passes --state-dir through and documents it', async (t
   }
   t.is(captured[0].stateDir, state)
   t.is(captured[1].stateDir, undefined, 'omitting it selects the default under the home directory')
+  t.is(captured[0].initializeState, undefined, 'initialization is never implied')
+  t.is(captured[1].initializeState, undefined)
+  t.is(captured[2].initializeState, true, '--initialize-state reaches the server')
+  t.ok(USAGE.includes(' [--initialize-state]'), 'the flag is in the usage')
   t.ok(USAGE.includes('--storage <dir> [--state-dir <dir>] --allow-key'))
   t.ok(USAGE.includes('[--apply [--wait <milliseconds>]] [--state-dir <dir>]'))
 })

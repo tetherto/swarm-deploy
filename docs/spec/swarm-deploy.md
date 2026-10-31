@@ -543,29 +543,54 @@ link ownership and rollback records, and incomplete partial artifact payloads.
 It holds no seed by default.
 
 `<state>` is `ServerOptions.stateDir` / `--state-dir`, an absolute path, or
-else `<home>/.swarm-deploy/<id>`, where `<home>` is the home directory of the
-user running the process and `<id>` is the first 32 hexadecimal characters of the
-SHA-256 of the real path of the output root. It never depends on the working
-directory. Startup, and `reset-storage`, which resolves it identically, require:
+else `<home>/.swarm-deploy/<id>`, where `<home>` is the home directory the
+runtime reports for the user running the process (`os.homedir()`, which honors
+`HOME`) and `<id>` is the first 32 hexadecimal characters of the SHA-256 of the
+real path of the output root. It never depends on the working directory. Startup,
+and `reset-storage`, which resolves it identically, require:
 
 - the output root has no `.swarm-deploy` entry (the pre-0.6.1 location); if it
-  does, the process refuses with offline migration instructions and neither
-  reads, moves, nor deletes it;
+  does, the process refuses and prints offline migration and rollback commands in
+  which every path is a single-quoted POSIX shell literal and the migration
+  command itself refuses an existing or dangling-symlink destination; if the
+  planned destination exists it prints separate guidance instead. It neither
+  reads, moves, nor deletes the directory, and a state directory that already
+  holds a nested `.swarm-deploy` is refused rather than ignored;
 - `<state>` is not the output root, inside it, or above it, judged on real
   paths so symlink aliases are caught, and its final component is a real
-  directory, not a symlink;
+  directory, not a symlink. Only the output root's own device and inode numbers
+  must be representable; another path whose numbers are not is a different
+  directory and, for the device, a different filesystem;
 - `<state>` and every metadata directory share a filesystem with the output
-  root, since publication, link replacement, tree rename, retention trash, and
-  recovery use `rename` and hard links between them; otherwise startup fails
-  before anything is staged, with guidance to pass `--state-dir`, and there is no
-  cross-device copy or visible temporary fallback;
-- `<state>` is mode `0700` and, once written, names the real path of the one
-  output root it serves in `.swarm-deploy-state.json`; a different root is
-  refused, and a directory that is neither empty nor Swarm Deploy state is
-  refused.
+  root, and on Linux a mount (the mount ID of the longest mount point containing
+  each, read from a bounded `/proc/self/mountinfo`), since publication, link
+  replacement, tree rename, retention trash, and recovery use `rename` and hard
+  links between them, which fail with `EXDEV` between distinct mount points even
+  of one filesystem; otherwise startup fails before anything is staged, with
+  guidance to pass `--state-dir`, and there is no cross-device copy or visible
+  temporary fallback. When no mount table is available, an `EXDEV` from
+  publication is logged once with the same guidance;
+- an existing `<state>` is inspected read-only before anything about it changes.
+  It is mode `0700` and, once written, names the real path of the one output
+  root it serves in `.swarm-deploy-state.json`; a different root, an unreadable
+  record, or contents that are neither empty nor Swarm Deploy state are refused
+  without changing the directory, permissions included. The record is written to
+  a private name, synced, published by a no-clobber hard link, the directory
+  synced, and the record read back: of several initializers exactly one wins and
+  a loser whose root differs is refused. Abandoned temporary names are swept;
+- unbound state (no record) is started only for an empty output root and an
+  empty state directory, unless the operator passes `--initialize-state`
+  (`ServerOptions.initializeState`); bound state needs no flag;
+- an explicit `<state>` is refused when the user's default location for this root
+  already holds state bound to it.
 
-The storage lock is in `<state>/lock`, so every server and `reset-storage` run
-for one output root must use the same state directory.
+The storage lock is in `<state>/lock`, so it excludes only instances that share
+the state directory. Every server and `reset-storage` run for one output root
+must use the same user, `HOME`, and state settings; the guards above catch the
+common ways to differ, but two instances started at the same moment on an empty
+root with different settings are not detected. While a server runs, a
+`.swarm-deploy` entry that appears in the output root makes it refuse new
+uploads, link requests, and retention passes and log one error without a path.
 
 ## Storage accounting
 
