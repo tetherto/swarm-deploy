@@ -307,8 +307,8 @@ CLI exit code 2.
 
 ### Hooks
 
-A server may be configured with `beforeCommit`, `afterCommit`, `afterLink`, and
-`onFailure` callbacks. Direct `ServerOptions.hooks` accepts only a hook object whose own keys
+A server may be configured with `beforeCommit`, `afterCommit`, `afterLink`,
+`onFailure`, and `beforeClose` callbacks. Direct `ServerOptions.hooks` accepts only a hook object whose own keys
 are those names and whose values are functions; it is snapshotted at
 construction. The CLI `--hooks` option loads a module before the server listens,
 selecting only those names (named exports win over a default object; one
@@ -316,6 +316,37 @@ selecting only those names (named exports win over a default object; one
 with exit code 2 on any load or shape error. The path's extension must be
 exactly `.js`, `.mjs`, or `.cjs`; any other extension is rejected before the
 load is attempted.
+
+`beforeClose` (0.6.2) is the server's teardown callback, not an operation hook:
+it is called with no arguments, at most once, is always awaited, takes no
+declaration (a `hookModes` entry or `--hook-mode` for it is refused as an unknown
+key), and changes no wire record. `close()` runs, in this order: admission stops
+(`closed`); the artifacts of the queued and running detached calls are noted;
+`beforeClose` is called synchronously in that same call, so it can cancel external
+work first; the server's own operations are aborted as they always were and finish
+(which ends every detached call at once, each releasing its own pin); scheduled
+retention is then stopped, which clears its interval and waits for a pass already
+running (it is not cancelled), before the wait on `beforeClose`. The noted artifacts
+stay pinned for retention until that stop has completed, so a pass that starts, or
+is already running and has not yet read its pins, cannot delete what a cancelled
+callback still uses; once it has completed no pass can run, and the notes are
+dropped. The stores and the storage lock stay in place; `beforeClose` and the
+operations are both awaited before the stores are closed, the storage lock is
+released and `close` is emitted. The notes cover detached calls only: the other
+pins retention uses (managed link targets, rollback journals) are persistent and
+unaffected by closing. Every call returns one promise and the hook runs once, even
+when `close()` is called again, concurrently, or re-entrantly from inside the hook.
+It is called for any close, served or not, and by a failed `listen()` only when
+that start had already created the transport. The server adds no timeout and never
+abandons it: the hook owns its own cancellation and bounds, and one that never
+settles keeps `close()` pending and the root locked. If it throws or rejects,
+`close()` rejects with `HOOK_FAILED` and the fixed message `Deployment hook failed
+during beforeClose` (the raw error only as `cause`; the log carries the code), the
+`close` event reports `failed`, and the server's own teardown, lock release
+included, still runs. A hooks set without `beforeClose` keeps the bounded close:
+an operation hook that never settles is abandoned, and nothing else waits on hook
+promises. A server older than 0.6.2 refuses the key in `ServerOptions.hooks` and
+ignores a module export of that name.
 
 `beforeCommit` is a validation gate and is always awaited. `afterCommit`,
 `afterLink` and `onFailure` are post-operation hooks, each `detached` (the

@@ -1598,6 +1598,129 @@ test('the server usage documents --hook-mode and the upload usage documents --js
   )
 })
 
+test('CLI loads a beforeClose export from CommonJS, named ESM, and default ESM as the teardown callback', async (t) => {
+  const root = await createTempDir(t)
+  const record = (name: string) => `globalThis.${HOOK_LOG}.push('${name}')`
+  await fs.promises.writeFile(
+    path.join(root, 'close.cjs'),
+    `module.exports = { beforeClose: async () => { ${record('cjs:close')} } }\n`
+  )
+  await fs.promises.writeFile(
+    path.join(root, 'close.mjs'),
+    `export async function beforeClose () { ${record('mjs:close')} }\n`
+  )
+  await fs.promises.writeFile(
+    path.join(root, 'close-default.mjs'),
+    `export default { beforeClose () { ${record('default:close')} }, afterLink () {} }\n`
+  )
+  await fs.promises.writeFile(
+    path.join(root, 'close-mixed.mjs'),
+    `export function beforeClose () { ${record('named:close')} }
+export default { beforeClose () { ${record('default:close')} }, afterCommit () {} }\n`
+  )
+
+  const cases: [string, string[], string[]][] = [
+    ['close.cjs', ['beforeClose'], ['cjs:close']],
+    ['close.mjs', ['beforeClose'], ['mjs:close']],
+    ['close-default.mjs', ['afterLink', 'beforeClose'], ['default:close']],
+    ['close-mixed.mjs', ['afterCommit', 'beforeClose'], ['named:close']]
+  ]
+  for (const [file, names, expected] of cases) {
+    const log = hookLog()
+    const result = await runServerCli(root, ['--hooks', file], { cwd: root })
+    t.is(result.code, 0, file)
+    t.is(result.stderr, '', file)
+    const hooks = result.options?.hooks
+    t.ok(Object.isFrozen(hooks), `${file} snapshot is frozen`)
+    t.alike(Object.keys(hooks || {}).sort(), names, `${file} hook names`)
+    await hooks?.beforeClose?.()
+    t.alike(log, expected, `${file}: the exported callback is the one passed to the server`)
+    // It is a lifecycle callback, not an operation hook, so it needs no declaration.
+    t.alike({ ...result.options?.hookModes }, {}, `${file}: no mode is implied`)
+  }
+})
+
+test('CLI refuses a hook mode for beforeClose and a beforeClose that is not a function', async (t) => {
+  const root = await createTempDir(t)
+  const secret = 'before-close-secret-text'
+  const modules: Record<string, string> = {
+    'close.cjs': 'module.exports = { beforeClose () {} }\n',
+    'declared.cjs': `module.exports = { beforeClose () {}, hookModes: { beforeClose: 'response' } }\n`,
+    'declared-detached.mjs': `export function beforeClose () {}\nexport const hookModes = { beforeClose: 'detached' }\n`,
+    'not-function.cjs': `module.exports = { beforeClose: '${secret}' }\n`,
+    'not-function.mjs': `export const beforeClose = 42\nexport default { afterLink () {} }\n`,
+    'typo.cjs': `module.exports = { beforeClosed () {} }\n`
+  }
+  for (const [name, source] of Object.entries(modules)) {
+    await fs.promises.writeFile(path.join(root, name), source)
+  }
+  for (const name of Object.keys(modules).filter((name) => name !== 'close.cjs')) {
+    const result = await runServerCli(root, ['--hooks', name], { cwd: root })
+    t.is(result.code, 2, name)
+    t.is(result.constructed, 0, `${name} never constructs the server`)
+    t.ok(result.stderr.includes(name), `${name} is named in the error`)
+    t.absent(result.stderr.includes(secret), `${name} does not leak module content`)
+    t.absent(result.stderr.includes(root), `${name} does not leak the module directory`)
+  }
+
+  // On the command line it is not a hook that takes a mode either, whatever the value.
+  for (const mode of ['response', 'detached']) {
+    const result = await runServerCli(
+      root,
+      ['--hooks', 'close.cjs', '--hook-mode', `beforeClose=${mode}`],
+      { cwd: root }
+    )
+    t.is(result.code, 2, mode)
+    t.is(result.constructed, 0, `${mode} never constructs the server`)
+    t.ok(result.stderr.length > 0, mode)
+  }
+})
+
+test('CLI signal shutdown exits 1 with the fixed Cleanup failed when Server.close rejects, and leaks nothing', async (t) => {
+  const secret = 'beforeClose sk-secret callback text'
+  // What a failing beforeClose makes Server.close() reject with, and a bare error as well:
+  // neither text may reach the operator's terminal.
+  const failures: Array<[string, () => Error]> = [
+    [
+      'the server error',
+      () =>
+        new SwarmDeployError(
+          ERRORS.HOOK_FAILED,
+          'Deployment hook failed during beforeClose',
+          new Error(secret)
+        )
+    ],
+    ['a bare error', () => new Error(secret)]
+  ]
+  for (const [label, failure] of failures) {
+    let listens = 0
+    let closes = 0
+    class FailingClose {
+      publicKey = SERVER_KEY
+      listen() {
+        listens++
+        return Promise.resolve(this)
+      }
+      close() {
+        closes++
+        return Promise.reject(failure())
+      }
+    }
+    // `runServerCli` waits for the server to be ready, sends SIGINT, and returns once `main`
+    // resolves: it does not return at all if the signal path hangs on a rejected close.
+    const result = await runServerCli(await createTempDir(t), [], {
+      Server: FailingClose as unknown as ServerConstructor
+    })
+    t.is(result.code, 1, `${label}: main resolves with exit 1`)
+    t.is(result.stderr, 'Cleanup failed\n', `${label}: the fixed message and nothing else`)
+    t.absent(result.stderr.includes(secret), `${label}: no callback text`)
+    t.absent(result.stderr.includes('Deployment hook failed'), `${label}: not the error's message`)
+    t.ok(result.stdout.endsWith('ready\n'), `${label}: it had started serving`)
+    t.is(listens, 1, label)
+    t.is(closes, 1, `${label}: closed once, by the signal, not again at exit`)
+  }
+})
+
 test('CLI rejects a missing, empty, or repeated --hooks option before construction', async (t) => {
   const root = await createTempDir(t)
   await fs.promises.writeFile(path.join(root, 'a.cjs'), 'module.exports = { onFailure () {} }\n')

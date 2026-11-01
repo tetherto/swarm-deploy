@@ -120,6 +120,10 @@ class FakeSocket extends EventEmitter {
 class FakeServerNode implements DirectDhtNode {
   destroyed = false
   handleClosed = false
+  /** When set, `listen()` on the server handle rejects with it, after the transport exists. */
+  listenError: Error | null = null
+  /** When set, closing the server handle (so `transport.close()`) waits for it. */
+  closeGate: Promise<void> | null = null
   private firewall: ((remotePublicKey: Buffer) => boolean) | null = null
   private connection: ((socket: DirectDhtSocket) => void) | null = null
 
@@ -139,11 +143,11 @@ class FakeServerNode implements DirectDhtNode {
         return this
       },
       listen() {
-        return Promise.resolve(this)
+        return node.listenError === null ? Promise.resolve(this) : Promise.reject(node.listenError)
       },
       close() {
         node.handleClosed = true
-        return Promise.resolve()
+        return node.closeGate ?? Promise.resolve()
       }
     }
   }
@@ -5626,4 +5630,609 @@ test('a detached onFailure pins the durable artifact it concerns, from its commi
   await promptly(server.close(), 'a close with a pending failure hook')
   t.alike(pins(), [], 'the pin is gone once the server closed')
   held.open()
+})
+
+/** A server on an existing root, the way a restart or a second process would start one. */
+function serverOn(
+  storageDir: string,
+  options: Partial<ConstructorParameters<typeof Server>[0]> = {}
+): Server {
+  return new Server({
+    seed: SERVER_SEED,
+    storageDir,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 16 * 1024,
+    maxStagingBytes: 64 * 1024,
+    minFreeBytes: 0,
+    dht: new FakeServerNode(),
+    ...options
+  })
+}
+
+/**
+ * An external publisher that writes to a "store" in two steps, waiting between them on
+ * `proceed`, and that can be cancelled. Nothing here is timing: each step is a gate.
+ */
+function publisherRig(): {
+  store: string[]
+  state: { running: boolean; cancelled: boolean }
+  proceed: ReturnType<typeof gate>
+  cancellation: ReturnType<typeof gate>
+  drained: ReturnType<typeof gate>
+  started: ReturnType<typeof gate>
+  publish(): Promise<void>
+} {
+  const store: string[] = []
+  const state = { running: false, cancelled: false }
+  const proceed = gate()
+  const cancellation = gate()
+  const drained = gate()
+  const started = gate()
+  async function publish(): Promise<void> {
+    state.running = true
+    store.push('submit')
+    started.open()
+    try {
+      await Promise.race([proceed.wait, cancellation.wait])
+      // A cancelled publisher never writes again.
+      if (state.cancelled) throw new Error('publisher cancelled')
+      store.push('finalize')
+    } finally {
+      state.running = false
+      drained.open()
+    }
+  }
+  return { store, state, proceed, cancellation, drained, started, publish }
+}
+
+test('without a beforeClose hook, close stays bounded and abandons an operation hook that is still running', async (t) => {
+  const rig = publisherRig()
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    hooks: { afterLink: () => rig.publish() }
+  })
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'release-1', 'first'))))
+  linkRequest(node, 'release-1', 'current')
+  await rig.started.wait
+
+  // The hook never settles on its own, and closing does not wait for it.
+  await promptly(server.close(), 'a close while an operation hook is still running')
+  t.is(rig.state.running, true, 'the callback was abandoned, not waited for')
+
+  // It keeps running by itself afterwards. This is what `beforeClose` exists to prevent.
+  rig.proceed.open()
+  await rig.drained.wait
+  t.alike(rig.store, ['submit', 'finalize'], 'it kept writing after the server had closed')
+})
+
+test('close waits for a delayed beforeClose before releasing the storage lock and emitting close', async (t) => {
+  const delay = gate()
+  const seen: { closed?: boolean; listening?: boolean } = {}
+  const holder: { server: Server | null } = { server: null }
+  const calls: string[] = []
+  const { server, node } = await createServer(t, {
+    hooks: {
+      beforeClose: async () => {
+        calls.push('beforeClose')
+        seen.closed = holder.server!.closed
+        seen.listening = holder.server!.listening
+        await delay.wait
+        calls.push('cleaned')
+      }
+    }
+  })
+  holder.server = server
+  const events: string[] = []
+  server.on('close', (event) => events.push(event.status))
+  let finished = false
+  const closing = server.close().then(() => {
+    finished = true
+  })
+
+  t.alike(calls, ['beforeClose'], 'it is called inside close(), before anything else proceeds')
+  t.is(seen.closed, true, 'admission has already stopped')
+  t.is(seen.listening, true, 'and the server has not started tearing down')
+  const late = new FakeSocket(CLIENT_KEY)
+  node.accept(late)
+  t.is(late.destroyed, true, 'a connection that arrives meanwhile is refused')
+
+  // The root is still owned: another server cannot take it while the cleanup is draining.
+  const second = serverOn(server.storageDir)
+  t.teardown(() => second.close())
+  await t.exception(second.listen(), { code: ERRORS.FILE_BUSY })
+  t.is(finished, false, 'close has not completed')
+  t.alike(events, [], 'and has not announced itself')
+
+  delay.open()
+  await closing
+  t.alike(calls, ['beforeClose', 'cleaned'])
+  t.alike(events, ['closed'], 'close is emitted once, after the cleanup')
+  t.is(server.listening, false)
+
+  const next = serverOn(server.storageDir)
+  t.teardown(() => next.close())
+  await next.listen()
+  t.is(next.listening, true, 'the root is free once close resolved')
+})
+
+test('beforeClose is called once, from the first close(), however often and from wherever close is called', async (t) => {
+  let calls = 0
+  const seen: { reentrant: Promise<void> | null } = { reentrant: null }
+  const holder: { server: Server | null } = { server: null }
+  const { server } = await createServer(t, {
+    hooks: {
+      beforeClose: () => {
+        calls++
+        // Re-entering close() from inside the hook must not call the hook again.
+        seen.reentrant = holder.server!.close()
+      }
+    }
+  })
+  holder.server = server
+  const first = server.close()
+  t.is(calls, 1, 'called synchronously by the first close()')
+  t.is(seen.reentrant, first, 'a close() from inside the hook is the same promise')
+  t.is(server.close(), first)
+  t.is(server.close(), first)
+  await Promise.all([first, server.close(), server.close()])
+  t.is(calls, 1)
+  t.is(server.close(), first, 'the closing promise is the same after it settled, too')
+  t.is(calls, 1)
+})
+
+test('beforeClose and a server that is closed while it starts, never started, or failed to start', async (t) => {
+  // close() while listen() is in flight: the hook is called, the start is abandoned, and the
+  // storage lock this start took is released only after the hook drained.
+  {
+    const delay = gate()
+    let calls = 0
+    const storageDir = await createTempDir(t)
+    const server = serverOn(storageDir, {
+      hooks: {
+        beforeClose: async () => {
+          calls++
+          await delay.wait
+        }
+      }
+    })
+    t.teardown(() => server.close())
+    const listening = server.listen()
+    const outcome = listening.then(
+      () => 'listened',
+      (error: unknown) => code(error)
+    )
+    const closing = server.close()
+    t.is(calls, 1, 'called at once, although the server was still starting')
+    delay.open()
+    await closing
+    t.is(await outcome, ERRORS.ABORTED, 'the start that was cut off reports it')
+    t.is(calls, 1, 'once')
+    const next = serverOn(storageDir)
+    t.teardown(() => next.close())
+    await next.listen()
+    t.is(next.listening, true, 'and the root was released')
+  }
+
+  // A server that failed to start served nothing, so only close() calls the hook, once.
+  {
+    const owner = await createServer(t)
+    let calls = 0
+    const blocked = serverOn(owner.server.storageDir, {
+      hooks: {
+        beforeClose: () => {
+          calls++
+        }
+      }
+    })
+    t.teardown(() => blocked.close())
+    await t.exception(blocked.listen(), { code: ERRORS.FILE_BUSY })
+    t.is(calls, 0, 'a start that never began serving called nothing')
+    await blocked.close()
+    t.is(calls, 1, 'close() calls it once')
+    await blocked.close()
+    t.is(calls, 1)
+    await t.exception(blocked.listen(), { code: ERRORS.ABORTED })
+    t.is(owner.server.listening, true, 'closing the failed server left the owner untouched')
+  }
+
+  // A server that never listened still calls it once on close.
+  {
+    let calls = 0
+    const idle = serverOn(await createTempDir(t), {
+      hooks: {
+        beforeClose: () => {
+          calls++
+        }
+      }
+    })
+    await idle.close()
+    t.is(calls, 1)
+  }
+})
+
+test('a beforeClose that fails makes close() reject with a fixed message, after the same teardown', async (t) => {
+  const secret = 'beforeClose sk-secret text'
+  const failing: Array<[string, () => void | Promise<void>]> = [
+    [
+      'throws',
+      () => {
+        throw new Error(secret)
+      }
+    ],
+    ['rejects', () => Promise.reject(new Error(secret))]
+  ]
+  for (const [label, beforeClose] of failing) {
+    const logs: Array<Record<string, unknown>> = []
+    const storageDir = await createTempDir(t)
+    const server = serverOn(storageDir, {
+      logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+      hooks: { beforeClose }
+    })
+    // The failure is the test's own business here, so the teardown must not rethrow it.
+    t.teardown(() => server.close().catch(() => {}))
+    await server.listen()
+    const events: string[] = []
+    server.on('close', (event) => events.push(event.status))
+
+    const closing = server.close()
+    const failure: unknown = await closing.then(
+      () => null,
+      (error: unknown) => error
+    )
+    t.ok(failure instanceof SwarmDeployError, `${label}: close() rejects`)
+    const error = failure as SwarmDeployError
+    t.is(error.code, ERRORS.HOOK_FAILED, label)
+    t.is(error.message, 'Deployment hook failed during beforeClose', `${label}: a fixed message`)
+    t.absent(error.message.includes(secret), label)
+    t.ok(error.cause instanceof Error, `${label}: the raw error is only the cause`)
+    t.alike(events, ['failed'], `${label}: close reports the failure, once`)
+    t.is(server.close(), closing, `${label}: the same promise, not a second call`)
+    t.is(server.listening, false, `${label}: the server tore its own resources down`)
+    t.absent(JSON.stringify(logs).includes(secret), `${label}: the log names no callback text`)
+    t.ok(
+      logs.some((entry) => entry.message === 'Server cleanup hook failed'),
+      label
+    )
+
+    // The failure is the report; the storage lock was released all the same.
+    const next = serverOn(storageDir)
+    t.teardown(() => next.close())
+    await next.listen()
+    t.is(next.listening, true, `${label}: the root was released`)
+  }
+})
+
+test('a cancellable publisher cannot continue after close() resolves, and no other server takes the root before it drained', async (t) => {
+  const rig = publisherRig()
+  const finish = gate()
+  const { server, node } = await createServer(t, {
+    symlinks: [{ selector: '/^release-\\d+$/' }],
+    hooks: {
+      afterLink: () => rig.publish(),
+      beforeClose: async () => {
+        // Cancel the external work and wait until it has fully returned, then a deliberately
+        // slow external teardown.
+        rig.state.cancelled = true
+        rig.cancellation.open()
+        await rig.drained.wait
+        await finish.wait
+      }
+    }
+  })
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'release-1', 'first'))))
+  linkRequest(node, 'release-1', 'current')
+  await rig.started.wait
+  t.is(rig.state.running, true)
+
+  const second = serverOn(server.storageDir)
+  t.teardown(() => second.close())
+  let finished = false
+  const closing = server.close().then(() => {
+    finished = true
+  })
+  await rig.drained.wait
+  t.is(rig.state.running, false, 'the publisher noticed the cancellation and returned')
+
+  // The cleanup has not finished, so the root is still owned and close() has not resolved.
+  await t.exception(second.listen(), { code: ERRORS.FILE_BUSY })
+  t.is(finished, false)
+
+  // The external step the publisher was waiting on completes late: it can no longer write.
+  rig.proceed.open()
+  finish.open()
+  await closing
+  t.is(rig.state.running, false)
+  t.alike(rig.store, ['submit'], 'nothing was published after the cancellation')
+  t.is(
+    await visibleLink(server.storageDir, 'current'),
+    null,
+    'the request that was cut off was rolled back before the server released the root'
+  )
+
+  const next = serverOn(server.storageDir)
+  t.teardown(() => next.close())
+  await next.listen()
+  t.is(next.listening, true, 'another server takes the root only after the drain')
+})
+
+interface RetentionRig {
+  server: Server
+  node: FakeServerNode
+  /** The interval callbacks retention registered; nothing fires them but the test. */
+  ticks: Array<() => void>
+  /** The interval handles retention cleared. */
+  cleared: unknown[]
+  /** The outcomes of the scheduled retention passes, as the `retention` events told them. */
+  scheduled: string[]
+  /** Opens to let the abandoned `afterLink` call return. */
+  held: ReturnType<typeof gate>
+  /** Opens to let `beforeClose` return. */
+  cleanup: ReturnType<typeof gate>
+  /**
+   * The transfer IDs of `app-1` and `app-2`, sorted, which the two detached publications pin.
+   * The one of `app-2` is queued behind the one of `app-1` on the link name `current`.
+   */
+  pinned: string[]
+  /** What retention is told to keep for detached calls, a close() snapshot included. */
+  pins(): string[]
+  /** The pins of the calls that have not ended: unlike `pins()`, no snapshot. */
+  live(): string[]
+  there(name: string): Promise<boolean>
+}
+
+/**
+ * A server whose retention interval fires only when the test fires it, and on which `app-1` is
+ * kept by nothing but a detached `afterLink` call that is still running: `current` has moved on
+ * to `app-2` (the link record no longer points at `app-1`), and a third release makes
+ * `maxCount: 2` want to delete the oldest. A retention pass that does not count that call's pin
+ * deletes `app-1` from under a publication a `beforeClose` is still cancelling.
+ */
+async function retentionRig(
+  t: Assert,
+  options: Partial<ConstructorParameters<typeof Server>[0]> = {}
+): Promise<RetentionRig> {
+  const cleanup = gate()
+  const held = gate()
+  let started = 0
+  const ticks: Array<() => void> = []
+  const cleared: unknown[] = []
+  const scheduler: ServerScheduler = {
+    setTimeout: (callback, delay) => setTimeout(callback, delay),
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    // The retention interval never fires by itself: the test fires it, exactly when it chooses.
+    setInterval(callback) {
+      ticks.push(callback)
+      return { interval: ticks.length }
+    },
+    clearInterval(handle) {
+      cleared.push(handle)
+    }
+  }
+  const { server, node } = await createServer(t, {
+    scheduler,
+    artifactPatterns: ['{series}-{version}.bin'],
+    maxCount: 2,
+    symlinks: [{ selector: '/^app-\\d+\\.\\d+\\.\\d+\\.bin$/' }],
+    hooks: {
+      // Detached: a publication that is still running when the server closes.
+      afterLink: async () => {
+        started++
+        await held.wait
+      },
+      beforeClose: async () => {
+        await cleanup.wait
+      }
+    },
+    hookModes: { afterLink: 'detached' },
+    ...options
+  })
+  const scheduled: string[] = []
+  server.on('retention', (event) => {
+    if (event.trigger === 'scheduled') scheduled.push(event.status)
+  })
+  const detached = (
+    server as unknown as {
+      detached: { pins(): Iterable<string>; pinned: Map<string, number> }
+    }
+  ).detached
+  const pins = (): string[] => [...detached.pins()].sort()
+  const live = (): string[] => [...detached.pinned.keys()].sort()
+  const there = (name: string): Promise<boolean> =>
+    fs.promises.lstat(path.join(server.storageDir, name)).then(
+      () => true,
+      () => false
+    )
+  t.is(ticks.length, 1, 'retention scheduled its interval through the injected scheduler')
+
+  const first = await manifest(t, 'app-1.0.0.bin', 'aa')
+  const second = await manifest(t, 'app-2.0.0.bin', 'aa')
+  const pinned = [
+    metadataFromManifest(first.manifest).transferId,
+    metadataFromManifest(second.manifest).transferId
+  ].sort()
+  t.absent(finalCode(await uploadAll(node, first)))
+  t.absent(finalCode(await uploadAll(node, second)))
+  // `current` is published at app-1, then moved to app-2: from then on only the publication of
+  // app-1, which is still running, holds app-1 (the link record points at app-2).
+  const publish = linkRequest(node, 'app-1.0.0.bin', 'current')
+  await waitFor(() => started === 1)
+  t.alike(linkFrame(publish), { v: 1, status: 'LINKED' })
+  const move = linkRequest(node, 'app-2.0.0.bin', 'current')
+  await waitFor(() => move.writes.length === 1)
+  t.alike(linkFrame(move), { v: 1, status: 'LINKED' })
+  // A third release makes retention keep the newest two, so app-1 would go if nothing held it.
+  t.absent(finalCode(await uploadAll(node, await manifest(t, 'app-3.0.0.bin', 'aa'))))
+  t.is(await there('app-1.0.0.bin'), true, 'the running publication holds it')
+  t.alike(live(), pinned, 'by its detached pin')
+  return { server, node, ticks, cleared, scheduled, held, cleanup, pinned, pins, live, there }
+}
+
+test('scheduled retention is stopped before the beforeClose wait, so it cannot delete what a cancelled hook still uses', async (t) => {
+  const rig = await retentionRig(t)
+  let finished = false
+  const closing = rig.server.close().then(() => {
+    finished = true
+  })
+  // Retention is stopped, and only then are the pins close() kept for it released; the wait on
+  // beforeClose comes after both and is still on its gate.
+  await waitFor(() => rig.pins().length === 0)
+  t.is(rig.cleared.length, 1, 'scheduled retention was stopped before the pins were released')
+  t.is(finished, false, 'the cleanup is still draining')
+
+  // A scheduled pass that fires now must not run: the interval is gone, and with it the tick.
+  for (const tick of rig.ticks) tick()
+  rig.cleanup.open()
+  rig.held.open()
+  await closing
+  t.is(
+    await rig.there('app-1.0.0.bin'),
+    true,
+    'what the cancelled publication used was not deleted'
+  )
+  t.alike(rig.scheduled, [], 'no scheduled retention pass ran during the drain')
+})
+
+test('a retention pass that starts while the transport is still closing keeps what a cancelled hook uses', async (t) => {
+  const rig = await retentionRig(t)
+  const transport = gate()
+  rig.node.closeGate = transport.wait
+  let finished = false
+  const closing = rig.server.close().then(() => {
+    finished = true
+  })
+  // close() aborted the detached calls, so the publication of app-1 has returned and let its own
+  // pin go. The transport close is stuck on its gate, so retention has not been stopped yet: the
+  // interval is live and nothing but close()'s snapshot protects app-1.
+  await waitFor(() => rig.node.handleClosed)
+  await waitFor(() => rig.live().length === 0)
+  t.is(rig.cleared.length, 0, 'retention is not stopped yet')
+  t.alike(rig.pins(), rig.pinned, 'close() kept the pins in force')
+
+  for (const tick of rig.ticks) tick()
+  await waitFor(() => rig.scheduled.length === 1)
+  t.alike(rig.scheduled, ['completed'], 'the scheduled pass ran, while the transport was closing')
+  t.is(await rig.there('app-1.0.0.bin'), true, 'and it kept what the cancelled publication uses')
+  t.is(finished, false)
+  t.is(rig.cleared.length, 0, 'the transport close is still what close() waits on')
+
+  transport.open()
+  await waitFor(() => rig.pins().length === 0)
+  t.is(rig.cleared.length, 1, 'the pins went only once retention was stopped')
+  t.is(finished, false, 'the beforeClose wait is still draining')
+  rig.cleanup.open()
+  rig.held.open()
+  await closing
+  t.is(await rig.there('app-1.0.0.bin'), true)
+  t.alike(rig.pins(), [], 'nothing is held once the server closed')
+})
+
+test('a retention pass that is already running when close() starts still counts the pins close() kept', async (t) => {
+  // The first storage operation of the scheduled pass is held, so the pass has started but has
+  // not yet read the pins it deletes by.
+  const pass = { armed: false, reached: gate(), proceed: gate() }
+  let taken = false
+  const storage = createStorage({
+    beforeOperation() {
+      if (!pass.armed || taken) return
+      taken = true
+      pass.reached.open()
+      return pass.proceed.wait
+    }
+  })
+  const rig = await retentionRig(t, { storage })
+  pass.armed = true
+  for (const tick of rig.ticks) tick()
+  await pass.reached.wait
+  t.alike(rig.scheduled, [], 'the pass is under way')
+
+  let finished = false
+  const closing = rig.server.close().then(() => {
+    finished = true
+  })
+  // The cancelled publication gave its own pin up, and retention's stop is waiting for the pass.
+  await waitFor(() => rig.live().length === 0)
+  t.alike(rig.pins(), rig.pinned, 'close() kept the pins in force for the pass that is running')
+  t.is(finished, false)
+
+  pass.proceed.open()
+  await waitFor(() => rig.scheduled.length === 1)
+  t.alike(rig.scheduled, ['completed'])
+  t.is(await rig.there('app-1.0.0.bin'), true, 'the pass kept what the cancelled publication uses')
+
+  // Once the pass is over and retention stopped, the pins go, before the beforeClose wait ends.
+  await waitFor(() => rig.pins().length === 0)
+  t.is(rig.cleared.length, 1)
+  t.is(finished, false, 'the beforeClose wait is still draining')
+  rig.cleanup.open()
+  rig.held.open()
+  await closing
+  t.is(await rig.there('app-1.0.0.bin'), true)
+})
+
+test('a listen that fails after the transport exists calls beforeClose once, holds the root until it drained, and a later close reports its failure', async (t) => {
+  const delay = gate()
+  const secret = 'beforeClose sk-secret text'
+  const logs: Array<Record<string, unknown>> = []
+  let calls = 0
+  const node = new FakeServerNode()
+  node.listenError = new Error('transport refused sk-secret-transport')
+  const storageDir = await createTempDir(t)
+  const server = serverOn(storageDir, {
+    dht: node,
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) },
+    hooks: {
+      beforeClose: async () => {
+        calls++
+        await delay.wait
+        throw new Error(secret)
+      }
+    }
+  })
+  // The failure is asserted below; the teardown must not rethrow it.
+  t.teardown(() => server.close().catch(() => {}))
+  const events: string[] = []
+  server.on('close', (event) => events.push(event.status))
+  const outcome = server.listen().then(
+    () => null,
+    (error: unknown) => error
+  )
+
+  // The start failed after it created the transport (so an operation hook could have run), and
+  // it calls the hook itself, without having been closed or aborted.
+  await waitFor(() => calls === 1)
+  t.is(server.closed, false, 'nothing closed the server')
+  const second = serverOn(storageDir)
+  t.teardown(() => second.close())
+  await t.exception(second.listen(), { code: ERRORS.FILE_BUSY })
+
+  delay.open()
+  const startError = await outcome
+  t.ok(startError instanceof Error)
+  t.is((startError as Error).message, 'transport refused sk-secret-transport')
+  t.is(calls, 1, 'called once')
+  t.alike(events, [], 'a failed start announces nothing')
+
+  // The failed start's teardown released the root only after the hook drained, failure or not.
+  const next = serverOn(storageDir)
+  t.teardown(() => next.close())
+  await next.listen()
+  t.is(next.listening, true, 'the root was released once the hook settled')
+
+  // A later close() reports the cleanup failure from that start, and does not call the hook again.
+  const closing = server.close()
+  const failure: unknown = await closing.then(
+    () => null,
+    (error: unknown) => error
+  )
+  t.ok(failure instanceof SwarmDeployError, 'close() rejects with the cleanup failure')
+  const error = failure as SwarmDeployError
+  t.is(error.code, ERRORS.HOOK_FAILED)
+  t.is(error.message, 'Deployment hook failed during beforeClose', 'a fixed message')
+  t.absent(error.message.includes(secret))
+  t.alike(events, ['failed'], 'close reports it, once')
+  t.is(calls, 1, 'still once')
+  t.is(server.close(), closing, 'the same promise')
+  t.is(next.listening, true, 'closing the failed server left the next owner untouched')
+  t.absent(JSON.stringify(logs).includes(secret), 'the log names no callback text')
+  t.absent(JSON.stringify(logs).includes('sk-secret'), 'nor transport text')
 })

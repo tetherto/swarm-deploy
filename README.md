@@ -39,6 +39,8 @@ protocol for stored artifacts.
 - **Trusted hooks:** server-side `beforeCommit`, `afterCommit`, `afterLink`, and
   `onFailure` callbacks. The post-operation ones run after the answer (`detached`)
   unless declared `response`, in which case they are awaited and may add JSON to it.
+  A `beforeClose` callback (0.6.2) lets a hook cancel and drain its external work
+  before the server releases its storage.
 - **CLI and API:** the `swarm-deploy` command and a strict-TypeScript API on
   Node.js and Bare.
 

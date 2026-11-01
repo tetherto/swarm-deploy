@@ -179,7 +179,8 @@ that same pass. The exact ordering depends on [hooks](hooks.md):
   pass the same way until the commit's own awaited steps have finished, but the
   pass does not wait for the detached call (it starts after the answer): the
   artifact of a queued or running detached call is pinned against every retention
-  pass instead, from registration until the call ends, in memory only.
+  pass instead, from registration until the call ends (when the server closes, until
+  scheduled retention has stopped), in memory only.
 - The final path exists when `afterCommit` begins in the sequential server
   flow, including for an out-of-window release, and for replacement commits
   (a replaced artifact's history record is also present). It is not a lock:

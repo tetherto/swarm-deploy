@@ -165,12 +165,27 @@ const hooks: ServerHooks = {
   onFailure({ phase, path, error, outcome }) {
     // Every failed operation, including ones before anything durable exists.
     console.error(phase, path, outcome.code, error)
+  },
+  async beforeClose() {
+    // Called once by close(), before the server lets go of its storage: cancel what your
+    // hooks started outside the server and resolve once none of it can continue.
+    await publisher.cancelAndDrain()
   }
 }
 // afterCommit gates the upload, so it is a response hook; the others stay detached.
+// beforeClose is the teardown callback and takes no declaration.
 const hookModes: HookModes = { afterCommit: 'response' }
 const server = new Server({ /* ... */ hooks, hookModes })
 ```
+
+`ServerHooks.beforeClose?(): void | Promise<void>` (0.6.2 or newer) is always awaited
+by `close()`: the server stops admitting connections, calls it at once, aborts its
+operations, and releases the storage lock and emits `close` only after it settled
+and the operations finished. It is called once however often `close()` is called,
+and it owns its own cancellation and time bounds: the server never abandons it. If
+it throws or rejects, `close()` rejects with `HOOK_FAILED` (fixed message, raw error
+only as `cause`) after the same teardown, and the `close` event reports `failed`.
+See [Shutdown cleanup: beforeClose](hooks.md#shutdown-cleanup-beforeclose).
 
 Advanced integration and test seams:
 
@@ -355,7 +370,8 @@ Server events:
   Automatic links emit no `link` event.
 - `failure`: stable failure code and peer fingerprint.
 - `listening`: local server-key fingerprint.
-- `close`: closed or failed outcome.
+- `close`: closed or failed outcome, emitted once after the storage lock was
+  released; `failed` means the `beforeClose` hook threw or rejected.
 
 Client events:
 
