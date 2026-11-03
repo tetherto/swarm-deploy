@@ -298,7 +298,13 @@ concurrent commit's retention) can remove an out-of-window artifact whose
 caveat.
 `retention` events and results expose `ageDeleted`, `countDeleted`,
 `versionDeleted`, and `storageDeleted`; deletions log the stable reasons
-`MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and `MAX_STORAGE`.
+`MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and `MAX_STORAGE`. Optional
+`retentionScopes` (0.7.0, off by default) add a stage before age that matches a
+release template against each committed basename, independent of
+`artifactPatterns`, applies the same newest-N keep set and an age bound, never
+removes a pinned artifact, and reports `scopedDeleted` (reasons
+`SCOPE_MAX_COUNT` and `SCOPE_MAX_AGE`) only when configured; see
+[Artifact patterns and rotation](../artifact-patterns.md#scoped-retention).
 
 `maxCount` requires at least one template; `maxVersions` requires a template
 with `{version}` and `versionGranularity`; `versionGranularity` requires
@@ -658,6 +664,16 @@ restart, concurrency, or delayed extraction from overcommitting disk.
 Admission first expires eligible inactive sessions under serialization, then
 checks the limit. Cleanup releases reservations only after durable commit,
 durable reset/removal, or expiry.
+
+The free-disk reserve (`minFreeBytes`) is checked separately, against the free
+space the filesystem reports where staging lives. From 0.7.0 it compares that
+space with `minFreeBytes` plus what open sessions can still write plus the new
+session's peak: a receiving session owes its remaining durable TAR bytes plus its
+full extracted size (the payload stays owed through extraction), and a verified
+or deleting session owes nothing. The stored reservation, `maxStagingBytes`, and
+the retention of the TAR until commit are unchanged, so the check no longer counts
+bytes that are already on disk twice, and it does not lower a fresh upload's
+TAR-plus-payload peak.
 
 Committed retention is separate. Optional `maxAge` and `maxStorageBytes`
 account for every current and historical artifact exactly once.

@@ -51,7 +51,10 @@ function settled(): Promise<void> {
  */
 async function setup(
   t: Assert,
-  options: Pick<ServerOptions, 'symlinks'> & { hooks: ServerHooks; hookModes?: HookModes }
+  options: Pick<ServerOptions, 'symlinks' | 'retentionScopes'> & {
+    hooks: ServerHooks
+    hookModes?: HookModes
+  }
 ): Promise<{
   server: Server
   client: Client
@@ -510,6 +513,108 @@ test('an unauthorized client reaches no hook, and an authorized refused link rea
     phase: 'link'
   })
   await t.exception(() => fs.promises.lstat(path.join(storage, 'current')), { code: 'ENOENT' })
+})
+
+test('a retention scope rotates old managed betas without admission patterns and spares every pin, production, and unmanaged files', async (t) => {
+  const doomed = gate()
+  const entered: string[] = []
+  const { server, client, testnet, storage, source } = await setup(t, {
+    symlinks: [
+      { name: 'latest', selector: '/^prod-/' },
+      { name: 'beta', selector: '/^beta-/' },
+      { selector: '/^beta-/' }
+    ],
+    retentionScopes: [{ pattern: 'beta-{version}', maxCount: 1 }],
+    hooks: {
+      afterLink: async (context) => {
+        if (context.link.name !== 'doomed') return
+        entered.push(context.link.target)
+        await doomed.wait
+        throw new Error('publisher rejected the link')
+      }
+    }
+  })
+  // A second connection uploads while the first one waits for its held link request.
+  const other = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    idleTimeout: 10_000,
+    dht: testnet.createNode()
+  })
+  t.teardown(() => other.close())
+
+  const scoped: Array<number | undefined> = []
+  server.on('retention', (event) => {
+    if (event.status === 'completed') scoped.push(event.scopedDeleted)
+  })
+  const { retention } = server as unknown as {
+    retention: { run(options: object): Promise<unknown> }
+  }
+  const sweep = (): Promise<unknown> => retention.run({ trigger: 'manual' })
+  const exists = (name: string): Promise<boolean> =>
+    fs.promises.lstat(path.join(storage, name)).then(
+      () => true,
+      () => false
+    )
+  const put = async (uploader: Client, name: string): Promise<void> => {
+    t.is((await uploader.upload(await write(source, name, name))).status, 'COMMITTED', name)
+    await sweep()
+  }
+
+  // No admission pattern is configured, so every basename is accepted and none is a release;
+  // the operator's own file is not an artifact at all.
+  await write(storage, 'operator.txt', 'kept by the operator')
+  await put(client, 'prod-1.0.0')
+  await put(client, 'beta-0.9.0')
+  t.is((await client.link('beta-0.9.0', 'rc')).status, 'LINKED')
+  await put(client, 'beta-1.0.0')
+  t.ok(await exists('beta-0.9.0'), 'a beta held by a managed link outlives the newest-1 rule')
+  t.ok(await exists('beta-1.0.0'))
+
+  // While a link request for beta-1.0.0 is unresolved, newer betas arrive and rotate.
+  const pending = client.link('beta-1.0.0', 'doomed').then(
+    () => null,
+    (error: unknown) => error
+  )
+  await waitFor(() => entered.length === 1)
+  await put(other, 'beta-1.1.0')
+  await put(other, 'beta-1.2.0')
+  t.absent(await exists('beta-1.1.0'), 'an unpinned older beta is removed')
+  t.ok(await exists('beta-1.0.0'), 'the unresolved link request keeps its target')
+  t.ok(await exists('beta-0.9.0'), 'the link ledger keeps its target')
+  t.ok(await exists('beta-1.2.0'), 'the newest beta stays')
+  t.is(await fs.promises.readlink(path.join(storage, 'beta')), 'beta-1.2.0')
+  t.is(await fs.promises.readlink(path.join(storage, 'rc')), 'beta-0.9.0')
+
+  // Rolling the request back releases its pin, and only that one.
+  doomed.open()
+  const failure = await pending
+  t.ok(failure instanceof SwarmDeployError)
+  t.is((failure as SwarmDeployError).code, ERRORS.HOOK_FAILED)
+  t.absent(await exists('doomed'), 'the rolled-back link is gone')
+  await sweep()
+  t.absent(await exists('beta-1.0.0'), 'once rolled back, its target is an ordinary old beta')
+  t.ok(await exists('beta-0.9.0'), 'the managed link still holds its beta')
+  t.ok(await exists('beta-1.2.0'))
+
+  // Production releases, their link, and the unmanaged file were never candidates.
+  t.ok(await exists('prod-1.0.0'))
+  t.is(await fs.promises.readlink(path.join(storage, 'latest')), 'prod-1.0.0')
+  t.is(
+    await fs.promises.readFile(path.join(storage, 'operator.txt'), 'utf8'),
+    'kept by the operator'
+  )
+
+  t.ok(
+    scoped.every((count) => typeof count === 'number'),
+    'every pass reports scopedDeleted when scopes are enabled'
+  )
+  t.is(
+    scoped.reduce<number>((total, count) => total + (count ?? 0), 0),
+    2,
+    'exactly the two unpinned betas were removed by the scope'
+  )
 })
 
 test('the link-publisher example publishes each link change through a no-shell publisher', async (t) => {

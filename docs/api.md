@@ -126,11 +126,27 @@ Optional operational limits and policies:
   a mistaken `stateDir` or `HOME` start a second set of state. Published files are
   never adopted or deleted.
 - `maxConnections`, `maxActiveUploads`, `idleTimeout`
-- `cleanupInterval`, `resumeTtl`, `minFreeBytes`
+- `cleanupInterval`, `resumeTtl`, `minFreeBytes`. `minFreeBytes: 0` turns the
+  free-disk reserve off for API callers; the CLI has no such value. From 0.7.0 the
+  reserve check adds up what the open sessions can still write (a receiving
+  session's remaining durable TAR plus its full payload; a verified or deleting
+  session owes nothing) instead of every session's full reservation, so bytes
+  that are already on disk are no longer counted twice. It does not reduce the
+  peak of a fresh upload, which still needs its TAR and its extracted payload
+  at once; `maxStagingBytes` and the reservations themselves are unchanged.
 - `maxAge`, `maxStorageBytes`, `replaceNames`
 - `artifactPatterns?: Iterable<string>`, `maxCount?: number`,
   `maxVersions?: number`, and `versionGranularity?: 'major' | 'minor'`; see
   [Artifact patterns and rotation](artifact-patterns.md).
+- `retentionScopes?: Iterable<RetentionScope>` (0.7.0), opt-in cleanup of the
+  committed artifacts whose basename matches a release template, whether or not
+  `artifactPatterns` admitted them. `RetentionScope` is exported:
+  `{ pattern: string; maxCount?: number; maxAge?: number }`, with `maxAge` in
+  milliseconds. Omitted or empty, nothing changes. The list is validated and
+  copied when the server is constructed (read it back as
+  `server.retentionScopes`, a frozen list of plain copies), and an invalid one
+  throws `PROTOCOL_INVALID`. See
+  [Scoped retention](artifact-patterns.md#scoped-retention).
 - `symlinks?: Iterable<SymlinkRule>` with automatic
   `{ selector, name }` and manual-authorization `{ selector }` entries; see
   [Managed symlinks](managed-links.md).
@@ -358,7 +374,8 @@ Server events:
   outcomes.
 - `retention`: startup, scheduled, manual, commit, or post-commit outcomes,
   with `expiredSessions`, `scrubbed`, `ageDeleted`, `countDeleted`,
-  `versionDeleted`, and `storageDeleted` counters.
+  `versionDeleted`, and `storageDeleted` counters, plus `scopedDeleted` only
+  when `retentionScopes` are configured (0.7.0).
 - `link`: one terminal manual-link outcome with `target`, `name`, client
   fingerprint, and status `linked`, `unchanged`, `rejected`, or `failed`.
   Rejected and failed outcomes also include a stable `reason`. A failed

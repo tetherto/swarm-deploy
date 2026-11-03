@@ -27,6 +27,7 @@ import {
   type ClientUploadResult
 } from './client.js'
 import type { DirectDhtNode } from './direct-dht.js'
+import { compileRetentionScopes, type RetentionScope } from './storage/retention.js'
 import type { StorageAdapter } from './storage/types.js'
 import {
   inspectStorageReset,
@@ -73,7 +74,7 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> [--state-dir <dir>] --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...] [--initialize-state]',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> [--state-dir <dir>] --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--retention-scope <json>]... [--resume-ttl <milliseconds>] [--cleanup-interval <milliseconds>] [--min-free-bytes <bytes>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...] [--initialize-state]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] [--json] <file-or-directory>',
   '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--hook-failure <rollback|keep>] [--json] <target> <link-name>',
   '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]] [--state-dir <dir>]',
@@ -176,6 +177,71 @@ function parseMaxAgeDays(value: unknown): number {
     throw usageError('Invalid max-age-days')
   }
   return days * MS_PER_DAY
+}
+
+/** The longest interval a timer accepts, as for the server's `cleanupInterval`. */
+const MAX_CLEANUP_INTERVAL = 0x7fffffff
+
+function parseCleanupInterval(value: unknown): number {
+  const interval = parsePositiveSafeInteger(value, 'cleanup-interval')
+  if (interval > MAX_CLEANUP_INTERVAL) throw usageError('Invalid cleanup-interval')
+  return interval
+}
+
+const MAX_RETENTION_SCOPE_BYTES = 2 * 1024
+const RETENTION_SCOPE_KEYS = new Set(['pattern', 'maxCount', 'maxAgeDays'])
+
+/** A JSON number that is a positive safe integer: strings, fractions, zero and negatives are not. */
+function scopeInteger(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw usageError('Invalid --retention-scope')
+  }
+  return value
+}
+
+/**
+ * Parses every `--retention-scope` value, a JSON object `{ "pattern", "maxCount"?, "maxAgeDays"? }`
+ * of at most 2 KiB. `maxCount` and `maxAgeDays` must be positive safe integers, and `maxAgeDays`
+ * becomes the server's millisecond `maxAge`. Every problem is the same fixed message, so a value
+ * is never echoed; the server's own validation of the scopes (a literal in the template, no
+ * duplicates, at most 16) is applied here too.
+ */
+function parseRetentionScopes(values: readonly string[]): RetentionScope[] {
+  const scopes = values.map((value): RetentionScope => {
+    if (b4a.from(value).byteLength > MAX_RETENTION_SCOPE_BYTES) {
+      throw usageError('Invalid --retention-scope')
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(value)
+    } catch {
+      throw usageError('Invalid --retention-scope')
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw usageError('Invalid --retention-scope')
+    }
+    const fields = parsed as Record<string, unknown>
+    if (Object.keys(fields).some((key) => !RETENTION_SCOPE_KEYS.has(key))) {
+      throw usageError('Invalid --retention-scope')
+    }
+    if (typeof fields.pattern !== 'string') throw usageError('Invalid --retention-scope')
+    const maxCount = fields.maxCount === undefined ? undefined : scopeInteger(fields.maxCount)
+    const days = fields.maxAgeDays === undefined ? undefined : scopeInteger(fields.maxAgeDays)
+    if (days !== undefined && days > Math.floor(Number.MAX_SAFE_INTEGER / MS_PER_DAY)) {
+      throw usageError('Invalid --retention-scope')
+    }
+    return {
+      pattern: fields.pattern,
+      ...(maxCount === undefined ? {} : { maxCount }),
+      ...(days === undefined ? {} : { maxAge: days * MS_PER_DAY })
+    }
+  })
+  try {
+    compileRetentionScopes(scopes)
+  } catch {
+    throw usageError('Invalid --retention-scope')
+  }
+  return scopes
 }
 
 function envHas(env: Env, name: string): boolean {
@@ -625,6 +691,10 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--max-staging-bytes',
       '--max-storage-bytes',
       '--max-age-days',
+      '--retention-scope',
+      '--resume-ttl',
+      '--cleanup-interval',
+      '--min-free-bytes',
       '--replace-name',
       '--artifact-pattern',
       '--max-count',
@@ -634,7 +704,14 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       '--hooks',
       '--hook-mode'
     ]),
-    new Set(['--replace-name', '--allow-key', '--artifact-pattern', '--symlink', '--hook-mode']),
+    new Set([
+      '--replace-name',
+      '--allow-key',
+      '--artifact-pattern',
+      '--symlink',
+      '--hook-mode',
+      '--retention-scope'
+    ]),
     new Set(['--allow-key', '--seed']),
     new Set(['--initialize-state']),
     new Set(['--symlink'])
@@ -657,6 +734,19 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       : parsePositiveSafeInteger(options['--max-storage-bytes'], 'max-storage-bytes')
   const maxAge =
     options['--max-age-days'] === undefined ? undefined : parseMaxAgeDays(options['--max-age-days'])
+  const retentionScopes = parseRetentionScopes(repeatedOptions['--retention-scope'] || [])
+  const resumeTtl =
+    options['--resume-ttl'] === undefined
+      ? undefined
+      : parsePositiveSafeInteger(options['--resume-ttl'], 'resume-ttl')
+  const cleanupInterval =
+    options['--cleanup-interval'] === undefined
+      ? undefined
+      : parseCleanupInterval(options['--cleanup-interval'])
+  const minFreeBytes =
+    options['--min-free-bytes'] === undefined
+      ? undefined
+      : parsePositiveSafeInteger(options['--min-free-bytes'], 'min-free-bytes')
   let replaceNames: Set<string>
   try {
     replaceNames = validateReplaceNames(repeatedOptions['--replace-name'] || [])
@@ -739,6 +829,10 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       maxStagingBytes,
       maxStorageBytes,
       maxAge,
+      ...(retentionScopes.length > 0 ? { retentionScopes } : {}),
+      ...(resumeTtl === undefined ? {} : { resumeTtl }),
+      ...(cleanupInterval === undefined ? {} : { cleanupInterval }),
+      ...(minFreeBytes === undefined ? {} : { minFreeBytes }),
       replaceNames,
       artifactPatterns,
       maxCount,

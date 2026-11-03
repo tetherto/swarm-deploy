@@ -2180,6 +2180,139 @@ test('--symlink rejects a missing selector and invalid rules with exit code 2', 
   }
 })
 
+const DAY = 24 * 60 * 60 * 1000
+
+test('retention scopes and the session and disk options are passed through only when given', async (t) => {
+  const root = await createTempDir(t)
+  const none = await runServerCli(root, [])
+  t.is(none.code, 0)
+  for (const key of ['retentionScopes', 'resumeTtl', 'cleanupInterval', 'minFreeBytes']) {
+    t.absent(key in (none.options as ServerOptions), `${key} is not passed by default`)
+  }
+
+  const run = await runServerCli(root, [
+    '--retention-scope',
+    '{"pattern":"beta-{version}","maxCount":5,"maxAgeDays":7}',
+    '--retention-scope',
+    '{"pattern":"nightly-{version}","maxAgeDays":2}',
+    '--resume-ttl',
+    '3600000',
+    '--cleanup-interval',
+    '60000',
+    '--min-free-bytes',
+    '536870912'
+  ])
+  t.is(run.code, 0, run.stderr)
+  const options = run.options as ServerOptions
+  t.alike(
+    [...(options.retentionScopes as Iterable<unknown>)],
+    [
+      { pattern: 'beta-{version}', maxCount: 5, maxAge: 7 * DAY },
+      { pattern: 'nightly-{version}', maxAge: 2 * DAY }
+    ]
+  )
+  t.is(options.resumeTtl, 3_600_000)
+  t.is(options.cleanupInterval, 60_000)
+  t.is(options.minFreeBytes, 536_870_912)
+  t.is(options.artifactPatterns, undefined, 'scopes need no artifact pattern')
+
+  const stdout = output()
+  t.is(await main(['--help'], {}, { stdout: stdout.stream }), 0)
+  for (const documented of [
+    '[--retention-scope <json>]...',
+    '[--resume-ttl <milliseconds>]',
+    '[--cleanup-interval <milliseconds>]',
+    '[--min-free-bytes <bytes>]'
+  ]) {
+    t.ok(stdout.text().includes(documented), documented)
+  }
+})
+
+test('the session, interval, and reserve options accept only positive integers in range', async (t) => {
+  const root = await createTempDir(t)
+  for (const extra of [
+    ['--resume-ttl', '0'],
+    ['--resume-ttl', '-1'],
+    ['--resume-ttl', '1.5'],
+    ['--resume-ttl', 'soon'],
+    ['--resume-ttl'],
+    ['--cleanup-interval', '0'],
+    ['--cleanup-interval', '2147483648'],
+    ['--cleanup-interval', '15m'],
+    ['--min-free-bytes', '0'],
+    ['--min-free-bytes', '1e9'],
+    ['--min-free-bytes', '0x10'],
+    ['--min-free-bytes', '-5'],
+    ['--min-free-bytes', '1', '--min-free-bytes', '2']
+  ]) {
+    const run = await runServerCli(root, extra)
+    t.is(run.code, 2, extra.join(' '))
+    t.is(run.constructed, 0, extra.join(' '))
+  }
+  const edge = await runServerCli(root, [
+    '--cleanup-interval',
+    '2147483647',
+    '--min-free-bytes',
+    '1'
+  ])
+  t.is(edge.code, 0, 'the largest timer interval and the smallest reserve are accepted')
+})
+
+test('--retention-scope rejects every malformed or unsafe value without echoing it', async (t) => {
+  const root = await createTempDir(t)
+  const secret = 'SECRETMARKER'
+  const scope = (fields: Record<string, unknown>): string => JSON.stringify(fields)
+  const seventeen = Array.from({ length: 17 }, (_unused, index) => [
+    '--retention-scope',
+    scope({ pattern: `b${index}-{version}`, maxCount: 1 })
+  ]).flat()
+  const invalid: string[][] = [
+    ['--retention-scope'],
+    ['--retention-scope', `not json ${secret}`],
+    ['--retention-scope', `["${secret}-{version}"]`],
+    ['--retention-scope', 'null'],
+    ['--retention-scope', `"${secret}"`],
+    ['--retention-scope', '{}'],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}` })],
+    ['--retention-scope', scope({ pattern: '{version}', maxCount: 1 })],
+    ['--retention-scope', scope({ pattern: `${secret}/{version}`, maxCount: 1 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxCount: 1, extra: 1 })],
+    ['--retention-scope', `{"pattern":"${secret}-{version}","maxCount":1,"__proto__":{}}`],
+    ['--retention-scope', scope({ maxCount: 1 })],
+    ['--retention-scope', scope({ pattern: 5, maxCount: 1 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxCount: '5' })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxCount: 0 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxCount: 1.5 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxCount: -1 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxAgeDays: 0 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxAgeDays: '7' })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxAgeDays: 1e300 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxAgeDays: 2 ** 53 - 1 })],
+    [
+      '--retention-scope',
+      scope({ pattern: `${secret}${'x'.repeat(2048)}-{version}`, maxCount: 1 })
+    ],
+    [
+      '--retention-scope',
+      scope({ pattern: `${secret}-{version}`, maxCount: 1 }),
+      '--retention-scope',
+      scope({ pattern: `${secret}-{version}`, maxAgeDays: 1 })
+    ],
+    seventeen
+  ]
+  for (const extra of invalid) {
+    const run = await runServerCli(root, extra)
+    t.is(run.code, 2, extra.join(' ').slice(0, 80))
+    t.is(run.constructed, 0)
+    t.absent(run.stderr.includes(secret), 'the value is never echoed')
+  }
+  const ok = await runServerCli(root, [
+    '--retention-scope',
+    scope({ pattern: 'beta-{version}', maxCount: 1 })
+  ])
+  t.is(ok.code, 0, ok.stderr)
+})
+
 test('the usage text documents the repeatable optional-name symlink option', async (t) => {
   const stdout = output()
   t.is(await main(['--help'], {}, { stdout: stdout.stream }), 0)

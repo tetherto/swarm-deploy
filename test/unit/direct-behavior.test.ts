@@ -1234,6 +1234,48 @@ test('Server rejects invalid retention and artifact pattern combinations', async
   t.is(server.versionGranularity, 'minor')
 })
 
+test('Server retention scopes work without artifact patterns, are validated, and are copied', async (t) => {
+  const base = {
+    seed: SERVER_SEED,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    storageDir: '/unused'
+  }
+  const off = new Server(base)
+  t.alike([...off.retentionScopes], [], 'off by default')
+
+  const scopes = [{ pattern: 'beta-{version}', maxCount: 3, maxAge: 86_400_000 }]
+  const server = new Server({ ...base, retentionScopes: scopes })
+  scopes[0].maxCount = 99
+  scopes.push({ pattern: 'other-{version}', maxCount: 1, maxAge: 1 })
+  t.alike([...server.artifactPatterns], [], 'no admission pattern is implied or required')
+  t.alike(
+    [...server.retentionScopes],
+    [{ pattern: 'beta-{version}', maxCount: 3, maxAge: 86_400_000 }]
+  )
+  t.ok(Object.isFrozen(server.retentionScopes) && Object.isFrozen(server.retentionScopes[0]))
+
+  for (const retentionScopes of [
+    [{ pattern: '{version}', maxCount: 1 }],
+    [{ pattern: 'beta-{version}' }],
+    [{ pattern: 'beta-{version}', maxCount: 0 }],
+    [{ pattern: 'beta/{version}', maxCount: 1 }],
+    [{ pattern: 'beta-{version}', maxCount: 1, unknown: true }],
+    [
+      { pattern: 'beta-{version}', maxCount: 1 },
+      { pattern: 'beta-{version}', maxAge: 5 }
+    ]
+  ]) {
+    await t.exception(
+      () => new Server({ ...base, retentionScopes } as ConstructorParameters<typeof Server>[0]),
+      { code: ERRORS.PROTOCOL_INVALID, message: 'Invalid retention scopes' },
+      JSON.stringify(retentionScopes)
+    )
+  }
+})
+
 type HookCall = {
   hook: 'beforeCommit' | 'afterCommit' | 'onFailure'
   context: BeforeCommitContext | AfterCommitContext | HookFailureContext

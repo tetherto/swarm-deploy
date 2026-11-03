@@ -12,10 +12,12 @@ and version rotation and are configured only on the server:
 - [Source parent](#source-parent)
 - [Mandatory matching](#mandatory-matching)
 - [Selection rules](#selection-rules)
+- [Scoped retention](#scoped-retention)
 - [Configuration and CLI examples](#configuration-and-cli-examples)
 
 Related guides: [CLI reference](cli.md) for `--artifact-pattern`,
-`--max-count`, `--max-versions`, and `--version-granularity`;
+`--max-count`, `--max-versions`, `--version-granularity`, and
+`--retention-scope`;
 [managed symlinks](managed-links.md), which pin their targets against rotation;
 [deployment hooks](hooks.md), whose ordering affects the post-commit retention
 pass; and [Rollout and compatibility](operations.md#rollout-and-compatibility)
@@ -127,6 +129,8 @@ commit, and manually. After session expiry and a committed-state scrub, its
 stages run in this order, each working from the records the previous stage
 left:
 
+0. scoped retention (`retentionScopes`, only when configured; see
+   [Scoped retention](#scoped-retention));
 1. age (`maxAge`);
 2. count (`maxCount`);
 3. version (`maxVersions` with `versionGranularity`);
@@ -220,6 +224,75 @@ Every statement in the [hooks guide](hooks.md) that a failed hook is retried as
 `versionDeleted`, and `storageDeleted` next to `expiredSessions` and `scrubbed`.
 Logged deletions use the reasons `MAX_AGE`, `MAX_COUNT`, `MAX_VERSIONS`, and
 `MAX_STORAGE`.
+
+## Scoped retention
+
+Available from 0.7.0 and off unless configured. A retention scope bounds one
+family of committed artifacts, such as `beta-1.4.0` and `beta-1.5.0`, without
+requiring `artifactPatterns`. Admission is untouched: uploads are accepted
+under exactly the rules they were before, and a server with no
+`--artifact-pattern` stays that way. The scope is matched against the committed
+artifact's basename each time retention runs, so it also covers artifacts that
+were uploaded before the scope was configured.
+
+```sh
+swarm-deploy server --seed-file server.seed --storage /srv/artifacts \
+  --allow-key "$CLIENT_KEY" --max-file-bytes 1073741824 --max-staging-bytes 2147483648 \
+  --retention-scope '{"pattern":"beta-{version}","maxCount":5,"maxAgeDays":7}'
+```
+
+```ts
+new Server({
+  // ...required options
+  retentionScopes: [{ pattern: 'beta-{version}', maxCount: 5, maxAge: 7 * 24 * 60 * 60_000 }]
+})
+```
+
+- **Pattern.** The same template language as an artifact pattern (`{series}`,
+  `{version}`), matched against the final basename only, whatever
+  `artifactPatterns` admitted and whatever the record's release says. It has no
+  `/`, so it cannot describe a source parent or a path, and it needs at least
+  one literal character: a bare `{version}` or `{series}` is refused instead of
+  matching every artifact. `{version}` is strict SemVer, so `beta-1.4.0` and
+  `beta-2.0.0-rc.1` match `beta-{version}` and `beta-12` does not.
+- **Limits.** `maxCount` keeps the newest `maxCount` matching artifacts per
+  series; `maxAge` (CLI `maxAgeDays`, converted to milliseconds) removes matching
+  artifacts committed at least that long ago. At least one is required, each a
+  positive safe integer. A version-only template such as `beta-{version}` is one
+  series; `{series}-beta.{version}` keeps `maxCount` per captured series.
+  A matching artifact over either limit is removed.
+- **Newest-N is the global rule.** The keep set is the one `maxCount` uses (newest
+  `committedAt` first, with the same tie-breakers), computed over every matching
+  artifact, pinned ones included. A pinned newest artifact therefore takes one of
+  the `maxCount` places, and a pinned older artifact survives in addition, so a
+  scope with `maxCount: 1` can briefly hold more than one while an older release
+  is held by a link or a hook.
+- **Several scopes** (at most 16, no duplicates) are all judged against the same
+  snapshot: an artifact that any scope selects is removed, and one scope's removal
+  cannot change what another keeps.
+- **Never removed.** Everything that pins an artifact against every other
+  retention stage pins it here too: a `--replace-name` current artifact, the
+  target of an automatic link or of a manual link in the ledger, the artifacts
+  of a link request whose rollback journal is still open, and the artifact of a
+  queued or running detached hook. Replacement history copies (the reserved
+  `history-` names) are never matched, so a scope does not clean the history of a
+  replaced beta. Names that match no scope, other releases such as
+  `prod-1.0.0`, and files nobody uploaded stay exactly as they were: retention
+  only ever considers committed artifacts.
+- **Same machinery.** Removal goes through the same record-checked,
+  lease-held deletion as the other stages (a directory goes through the retention
+  trash), and the scoped stage runs before age and count, so what it removes is
+  not counted again.
+- **Reporting.** `retention` events and results add `scopedDeleted`, only when
+  scopes are configured; without scopes the event is unchanged. Deletions are
+  logged with the reasons `SCOPE_MAX_COUNT` and `SCOPE_MAX_AGE`, and each scope
+  is logged once at startup (`Retention scope enabled`: pattern and limits).
+
+Before enabling a scope, check which names it matches. The first pass after a
+restart removes every existing artifact it selects that is not pinned, and there
+is no dry run. A template whose only literals are separators, such as
+`{series}-{version}`, matches production artifacts too; give a scope a distinctive
+literal such as `beta-`.
 
 ## Configuration and CLI examples
 
