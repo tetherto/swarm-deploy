@@ -1425,6 +1425,20 @@ test('scoped retention is subject to every pin, and scoped directories go throug
   }
 })
 
+test('an age-only scope may use a series template and removes what is old enough', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publish('beta-nightly', b4a.from('n'))
+  harness.clock.advance(10)
+  await harness.publish('beta-weekly', b4a.from('w'))
+  await harness.publish('prod-1.0.0', b4a.from('p'))
+  harness.clock.advance(5)
+
+  // beta-nightly is 15 old, the others 5: only the matching one past the limit goes.
+  const result = await harness.manager({ scopes: [{ pattern: 'beta-{series}', maxAge: 10 }] }).run()
+  t.is(result.scopedDeleted, 1)
+  t.alike(await recordNames(harness), ['beta-weekly', 'prod-1.0.0'])
+})
+
 test('a scope never removes replacement history, even when its template matches the name', async (t) => {
   const harness = await createHarness(t)
   const superseded = await harness.publish(MUTABLE, b4a.from('old'), true)
@@ -1464,6 +1478,21 @@ test('retention scopes are validated, copied, and never echoed', async (t) => {
     ['a stray brace', [{ pattern: 'beta-{oops}', maxCount: 1 }]],
     ['an overlong pattern', [{ pattern: `${'b'.repeat(300)}-{version}`, maxCount: 1 }]],
     ['no limit', [{ pattern: 'beta-{version}' }]],
+    // Without `{version}` every name is a series of its own, so a count could never remove
+    // anything; it is refused, with or without an age beside it.
+    ['a count on a series-only template', [{ pattern: 'beta-{series}', maxCount: 1 }]],
+    [
+      'a count and an age on a series-only template',
+      [{ pattern: 'beta-{series}', maxCount: 1, maxAge: 5 }]
+    ],
+    [
+      'a count after a valid scope on a series-only template',
+      [
+        { pattern: 'beta-{version}', maxCount: 1 },
+        { pattern: 'nightly-{series}', maxCount: 2, maxAge: 5 }
+      ]
+    ],
+    ['a count on a template with no placeholder', [{ pattern: 'beta', maxCount: 1 }]],
     ['zero count', [{ pattern: 'beta-{version}', maxCount: 0 }]],
     ['negative count', [{ pattern: 'beta-{version}', maxCount: -1 }]],
     ['fractional count', [{ pattern: 'beta-{version}', maxCount: 1.5 }]],
@@ -1498,6 +1527,15 @@ test('retention scopes are validated, copied, and never echoed', async (t) => {
   }
 
   t.alike(compileRetentionScopes(undefined), [], 'omitted means off')
+  // An age needs no version, and a count is fine wherever `{version}` is present.
+  for (const allowed of [
+    [{ pattern: 'beta-{series}', maxAge: 5 }],
+    [{ pattern: '{series}-beta', maxAge: 5 }],
+    [{ pattern: 'beta-{version}', maxCount: 2 }],
+    [{ pattern: '{series}-beta-{version}', maxCount: 2, maxAge: 5 }]
+  ]) {
+    t.is(compileRetentionScopes(allowed).length, 1, JSON.stringify(allowed))
+  }
   const sixteen = Array.from({ length: 16 }, (_unused, index) => ({
     pattern: `b${index}-{version}`,
     maxCount: 1
@@ -1512,7 +1550,8 @@ test('retention scopes are validated, copied, and never echoed', async (t) => {
   t.ok(Object.isFrozen(compiled) && Object.isFrozen(compiled[0]))
   for (const options of [
     { scopes: [{ pattern: '{version}', maxCount: 1 }] },
-    { scopes: [{ pattern: 'beta-{version}' }] }
+    { scopes: [{ pattern: 'beta-{version}' }] },
+    { scopes: [{ pattern: 'beta-{series}', maxCount: 1 }] }
   ]) {
     const harness = await createHarness(t)
     await t.exception(() => harness.manager(options as Partial<RetentionOptions>), {

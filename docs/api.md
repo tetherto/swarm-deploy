@@ -126,7 +126,12 @@ Optional operational limits and policies:
   a mistaken `stateDir` or `HOME` start a second set of state. Published files are
   never adopted or deleted.
 - `maxConnections`, `maxActiveUploads`, `idleTimeout`
-- `cleanupInterval`, `resumeTtl`, `minFreeBytes`. `minFreeBytes: 0` turns the
+- `cleanupInterval`, `resumeTtl`, `minFreeBytes`. `resumeTtl` is how long an
+  inactive session (an interrupted receive, or an idle one that already finished
+  verification) is kept: past it, the session and its staged bytes are removed by
+  the next startup pass, scheduled pass, or admission, which discards the upload's
+  progress. A session with a live transfer, one being verified, and one being
+  deleted is never expired. `minFreeBytes: 0` turns the
   free-disk reserve off for API callers; the CLI has no such value. From 0.7.0 the
   reserve check adds up what the open sessions can still write (a receiving
   session's remaining durable TAR plus its full payload; a verified or deleting
@@ -142,10 +147,12 @@ Optional operational limits and policies:
   committed artifacts whose basename matches a release template, whether or not
   `artifactPatterns` admitted them. `RetentionScope` is exported:
   `{ pattern: string; maxCount?: number; maxAge?: number }`, with `maxAge` in
-  milliseconds. Omitted or empty, nothing changes. The list is validated and
-  copied when the server is constructed (read it back as
-  `server.retentionScopes`, a frozen list of plain copies), and an invalid one
-  throws `PROTOCOL_INVALID`. See
+  milliseconds. Omitted or empty, nothing changes. `maxCount` needs `{version}` in
+  the pattern (a template without it gives every name its own series, so a count
+  could never remove anything); `maxAge` works with any valid pattern. The list is
+  validated and copied when the server is constructed (read it back as
+  `server.retentionScopes`, a frozen list of plain copies), and an invalid one,
+  including a `maxCount` without `{version}`, throws `PROTOCOL_INVALID`. See
   [Scoped retention](artifact-patterns.md#scoped-retention).
 - `symlinks?: Iterable<SymlinkRule>` with automatic
   `{ selector, name }` and manual-authorization `{ selector }` entries; see

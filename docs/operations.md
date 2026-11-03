@@ -171,8 +171,14 @@ The server coalesces network fragments into 1 MiB durability batches plus the
 final remainder. A disconnect can require retransmitting only the uncheckpointed
 in-memory tail; it never advertises bytes that were not durably published.
 
-Inactive sessions expire after seven days by default. Active receives and
-verification are protected from expiry.
+Inactive sessions expire after seven days by default (`resumeTtl` /
+`--resume-ttl`): an interrupted receive, or an idle session that already finished
+verification, is removed with its staged bytes once its last activity is older
+than that, and the client then starts the upload over. A receive with a live
+transfer, a verification in progress, and a session being deleted are protected
+from expiry. A shorter TTL takes effect when the server restarts with it, through
+the startup pass, then every scheduled pass and admission, and discards any
+inactive progress older than the new value.
 
 ## Storage, replacement, and retention
 

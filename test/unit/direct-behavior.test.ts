@@ -1257,7 +1257,16 @@ test('Server retention scopes work without artifact patterns, are validated, and
   )
   t.ok(Object.isFrozen(server.retentionScopes) && Object.isFrozen(server.retentionScopes[0]))
 
+  // A series-only template is fine for an age alone; a count needs `{version}` to group by.
+  const ageOnly = new Server({
+    ...base,
+    retentionScopes: [{ pattern: 'beta-{series}', maxAge: 86_400_000 }]
+  })
+  t.alike([...ageOnly.retentionScopes], [{ pattern: 'beta-{series}', maxAge: 86_400_000 }])
+
   for (const retentionScopes of [
+    [{ pattern: 'beta-{series}', maxCount: 5 }],
+    [{ pattern: 'beta-{series}', maxCount: 5, maxAge: 86_400_000 }],
     [{ pattern: '{version}', maxCount: 1 }],
     [{ pattern: 'beta-{version}' }],
     [{ pattern: 'beta-{version}', maxCount: 0 }],

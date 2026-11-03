@@ -114,9 +114,11 @@ type RetentionEventPayload =
  * `beta-{version}`; it needs a literal character, so a bare `{version}` cannot match every
  * release. Limits are optional but at least one is required. `maxCount` keeps the newest
  * `maxCount` matching artifacts per series (newest by commit time, like the global
- * `maxCount`), and `maxAge` removes matching artifacts committed that many milliseconds ago.
- * An artifact over either limit of any scope is removed, unless it is pinned by anything that
- * pins an artifact against retention.
+ * `maxCount`) and needs `{version}` in `pattern`: a template without it gives every name its own
+ * series, so a count could never remove anything and is refused. `maxAge` removes matching
+ * artifacts committed that many milliseconds ago and works with any valid pattern. An artifact
+ * over either limit of any scope is removed, unless it is pinned by anything that pins an
+ * artifact against retention.
  */
 export interface RetentionScope {
   pattern: string
@@ -152,7 +154,8 @@ function scopeLimit(value: unknown): number | undefined {
 /**
  * Validates and snapshots retention scopes: plain objects with only `pattern`, `maxCount`, and
  * `maxAge`; a basename template with at least one literal character and no `/`; at least one
- * positive safe-integer limit; no duplicate pattern; at most 16. The result is frozen and shares
+ * positive safe-integer limit, where `maxCount` also requires `{version}` in the template; no
+ * duplicate pattern; at most 16. The result is frozen and shares
  * nothing with the input. Throws the same fixed `PROTOCOL_INVALID` message for every problem, so
  * a rejected value is never echoed.
  */
@@ -185,6 +188,7 @@ export function compileRetentionScopes(input: unknown): readonly CompiledRetenti
       pattern.includes('/') ||
       pattern.split('{series}').join('').split('{version}').join('').length === 0 ||
       (maxCount === undefined && maxAge === undefined) ||
+      (maxCount !== undefined && !pattern.includes('{version}')) ||
       seen.has(pattern)
     ) {
       throw scopeError()

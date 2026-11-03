@@ -192,8 +192,8 @@ export interface ServerOptions {
    * Optional cleanup rules for the committed artifacts whose basename matches a release template
    * such as `beta-{version}`, for example to age out beta builds quickly while production
    * artifacts and unmanaged files stay untouched. They work with `artifactPatterns` omitted and
-   * do not change what uploads may be named. Off by default; validated and copied at
-   * construction. See {@link RetentionScope}.
+   * do not change what uploads may be named. A `maxCount` needs `{version}` in its pattern. Off
+   * by default; validated and copied at construction. See {@link RetentionScope}.
    */
   retentionScopes?: Iterable<RetentionScope>
   dht?: DirectDhtNode

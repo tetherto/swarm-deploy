@@ -261,12 +261,28 @@ new Server({
   positive safe integer. A version-only template such as `beta-{version}` is one
   series; `{series}-beta.{version}` keeps `maxCount` per captured series.
   A matching artifact over either limit is removed.
+  **`maxCount` requires `{version}` in the pattern.** Without it every name is a
+  series of its own (`beta-{series}` makes `beta-a` and `beta-b` two series), so
+  the newest-N rule could never remove anything; such a scope is refused at
+  construction or CLI startup instead of being accepted and doing nothing, with or
+  without a `maxAge` beside it. `maxAge` has no such requirement: an age-only scope
+  such as `{"pattern":"beta-{series}","maxAgeDays":7}` is valid.
 - **Newest-N is the global rule.** The keep set is the one `maxCount` uses (newest
   `committedAt` first, with the same tie-breakers), computed over every matching
   artifact, pinned ones included. A pinned newest artifact therefore takes one of
   the `maxCount` places, and a pinned older artifact survives in addition, so a
-  scope with `maxCount: 1` can briefly hold more than one while an older release
-  is held by a link or a hook.
+  scope with `maxCount: 1` holds more than one artifact for as long as an older
+  one stays pinned. That is not necessarily short, and each pin ends on its own
+  terms:
+  - A manual-link target stays pinned for as long as the link ledger refers to
+    it. Removing the manual-link selector from the server's configuration does not
+    release it.
+  - A `--replace-name` pin on the name's current artifact remains while that name
+    is configured; a newer upload of the name moves the pin to the new artifact.
+  - An automatic-link target stays pinned for as long as the link refers to it.
+
+  Size the disk for the pinned artifacts as well as for `maxCount`.
+
 - **Several scopes** (at most 16, no duplicates) are all judged against the same
   snapshot: an artifact that any scope selects is removed, and one scope's removal
   cannot change what another keeps.

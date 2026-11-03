@@ -125,23 +125,37 @@ Optional options:
   `--artifact-pattern`. The value is a JSON object of at most 2 KiB,
   `{"pattern":"beta-{version}","maxCount":5,"maxAgeDays":7}`: `pattern` is
   required, at least one of `maxCount` and `maxAgeDays` is, and both must be
-  positive integers. A malformed, oversized, unknown-key, or duplicate scope is a
-  usage error (exit `2`) that names `--retention-scope` and never repeats the
-  value. Nothing is configured by default, and admission is unchanged. See
+  positive integers. `maxCount` needs `{version}` in the pattern, because it keeps
+  the newest N per series and a template without `{version}` gives every name a
+  series of its own; `maxAgeDays` works with any valid pattern, such as
+  `beta-{series}`. A malformed, oversized, unknown-key, or duplicate scope, or a
+  `maxCount` on a pattern without `{version}`, is a usage error (exit `2`) that
+  names `--retention-scope` and never repeats the value. Nothing is configured by
+  default, and admission is unchanged. See
   [Scoped retention](artifact-patterns.md#scoped-retention) for the matching
   rules, what is pinned, and why to check a pattern's matches before enabling it.
-- `--resume-ttl <milliseconds>`: how long an interrupted upload may be resumed
-  before its session and staged bytes are removed. A positive integer. Default 7
-  days (604800000). A session being received, verified, or deleted is never
-  expired.
+- `--resume-ttl <milliseconds>`: how long an interrupted upload may be resumed.
+  A positive integer. Default 7 days (604800000). A session whose last activity is
+  older than this is removed together with its staged bytes, which discards the
+  upload's progress, so a shorter value can make clients start interrupted uploads
+  over. A new value takes effect when the server restarts, and is applied at once:
+  by the startup retention pass, then by every scheduled pass and admission. A
+  session with a live transfer, one
+  being verified at that moment, and one being deleted is never expired; an idle
+  session that has already finished verification, and an idle one still
+  receiving, is eligible.
 - `--cleanup-interval <milliseconds>`: the time between scheduled retention
-  passes. A positive integer of at most 2147483647. Default 15 minutes (900000).
+  passes, each of which also expires sessions by `--resume-ttl`. A positive integer
+  of at most 2147483647. Default 15 minutes (900000).
 - `--min-free-bytes <bytes>`: the free-disk reserve that admission must leave
   free, measured where the private state's staging is. A positive integer. Default
-  1 GiB (1073741824). There is no value that turns the reserve off, and changing
-  it does not free space or trigger cleanup; a `DISK_RESERVE` refusal still needs
-  space made on that disk. Each of these three is passed to the server only when
-  given, so omitting them keeps the defaults above.
+  1 GiB (1073741824). There is no value that turns the reserve off. It frees no
+  data and does not start cleanup, so a `DISK_RESERVE` refusal still needs space
+  made on that disk.
+
+  `--resume-ttl`, `--cleanup-interval`, and `--min-free-bytes` are each passed to
+  the server only when given, so omitting them keeps the defaults above.
+
 - `--symlink <selector> [<link-name>]`: repeatable managed-symlink policy.
   With two arguments, the server automatically points `<link-name>` at the
   newest matching managed artifact. With one argument, the rule creates no

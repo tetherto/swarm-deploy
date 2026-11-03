@@ -2275,6 +2275,9 @@ test('--retention-scope rejects every malformed or unsafe value without echoing 
     ['--retention-scope', '{}'],
     ['--retention-scope', scope({ pattern: `${secret}-{version}` })],
     ['--retention-scope', scope({ pattern: '{version}', maxCount: 1 })],
+    // A count needs `{version}`: without it every name is its own series and nothing could go.
+    ['--retention-scope', scope({ pattern: `${secret}-{series}`, maxCount: 1 })],
+    ['--retention-scope', scope({ pattern: `${secret}-{series}`, maxCount: 1, maxAgeDays: 1 })],
     ['--retention-scope', scope({ pattern: `${secret}/{version}`, maxCount: 1 })],
     ['--retention-scope', scope({ pattern: `${secret}-{version}`, maxCount: 1, extra: 1 })],
     ['--retention-scope', `{"pattern":"${secret}-{version}","maxCount":1,"__proto__":{}}`],
@@ -2311,6 +2314,17 @@ test('--retention-scope rejects every malformed or unsafe value without echoing 
     scope({ pattern: 'beta-{version}', maxCount: 1 })
   ])
   t.is(ok.code, 0, ok.stderr)
+
+  // A series-only template stays valid for an age alone.
+  const ageOnly = await runServerCli(root, [
+    '--retention-scope',
+    scope({ pattern: 'beta-{series}', maxAgeDays: 7 })
+  ])
+  t.is(ageOnly.code, 0, ageOnly.stderr)
+  t.alike(
+    [...((ageOnly.options as ServerOptions).retentionScopes as Iterable<unknown>)],
+    [{ pattern: 'beta-{series}', maxAge: 7 * DAY }]
+  )
 })
 
 test('the usage text documents the repeatable optional-name symlink option', async (t) => {
