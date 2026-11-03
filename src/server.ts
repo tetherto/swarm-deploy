@@ -72,7 +72,10 @@ import { recoverStorage, prepareStorageRecovery } from './storage/recovery.js'
 import {
   RetentionManager,
   DEFAULT_CLEANUP_INTERVAL,
-  DEFAULT_RESUME_TTL
+  DEFAULT_RESUME_TTL,
+  compileRetentionScopes,
+  plainRetentionScope,
+  type RetentionScope
 } from './storage/retention.js'
 import { SessionStore } from './storage/session-store.js'
 import type { TarSession } from './storage/tar-session-store.js'
@@ -185,6 +188,14 @@ export interface ServerOptions {
   maxCount?: number
   maxVersions?: number
   versionGranularity?: VersionGranularity
+  /**
+   * Optional cleanup rules for the committed artifacts whose basename matches a release template
+   * such as `beta-{version}`, for example to age out beta builds quickly while production
+   * artifacts and unmanaged files stay untouched. They work with `artifactPatterns` omitted and
+   * do not change what uploads may be named. A `maxCount` needs `{version}` in its pattern. Off
+   * by default; validated and copied at construction. See {@link RetentionScope}.
+   */
+  retentionScopes?: Iterable<RetentionScope>
   dht?: DirectDhtNode
   dhtFactory?: DirectDhtFactory
   storage?: StorageAdapter
@@ -247,6 +258,8 @@ export interface RetentionEvent {
   countDeleted?: number
   versionDeleted?: number
   storageDeleted?: number
+  /** Present only when `retentionScopes` are configured. */
+  scopedDeleted?: number
 }
 export interface ServerCloseEvent {
   /**
@@ -412,6 +425,8 @@ export class Server extends EventEmitter {
   readonly maxCount: number | undefined
   readonly maxVersions: number | undefined
   readonly versionGranularity: VersionGranularity | undefined
+  /** The configured retention scopes: an immutable copy, empty unless scopes were given. */
+  readonly retentionScopes: readonly RetentionScope[]
   private readonly releaseMatcher: ReleaseMatcher
   private readonly allowedKeySnapshot: readonly Buffer[]
   readonly logger: SafeLogger
@@ -572,6 +587,13 @@ export class Server extends EventEmitter {
     this.maxCount = options.maxCount
     this.maxVersions = options.maxVersions
     this.versionGranularity = options.versionGranularity
+    try {
+      this.retentionScopes = Object.freeze(
+        compileRetentionScopes(options.retentionScopes).map(plainRetentionScope)
+      )
+    } catch (error) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid retention scopes', error)
+    }
     const allow: Buffer[] = []
     if (
       !options.allowedKeys ||
@@ -2193,6 +2215,7 @@ export class Server extends EventEmitter {
         maxVersions: this.maxVersions,
         versionGranularity: this.versionGranularity,
         maxStorageBytes: this.maxStorageBytes,
+        scopes: this.retentionScopes,
         resumeTtl: this.resumeTtl,
         cleanupInterval: this.cleanupInterval,
         storage,
@@ -2210,6 +2233,13 @@ export class Server extends EventEmitter {
         onEvent: ({ type, ...event }) => this.emitSafe(type, event)
       })
       await this.refreshManagedLinkNames()
+      for (const scope of this.retentionScopes) {
+        this.logger.info('Retention scope enabled', {
+          pattern: scope.pattern,
+          ...(scope.maxCount === undefined ? {} : { maxCount: scope.maxCount }),
+          ...(scope.maxAge === undefined ? {} : { maxAge: scope.maxAge })
+        })
+      }
       await this.retention.start()
       throwIfAborted(this.signal)
       this.transport = new DirectDhtServer({

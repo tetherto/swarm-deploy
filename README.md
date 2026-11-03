@@ -315,8 +315,8 @@ the npm package, so these links point to GitHub.
   storage, replacement, and retention, resetting a storage root, and rollout,
   compatibility, and rollback.
 - [Artifact patterns and rotation](https://github.com/tetherto/swarm-deploy/blob/main/docs/artifact-patterns.md):
-  pattern templates, source parent, mandatory matching, and count and version
-  rotation.
+  pattern templates, source parent, mandatory matching, count and version
+  rotation, and opt-in scoped retention (0.7.0).
 - [Managed symlinks](https://github.com/tetherto/swarm-deploy/blob/main/docs/managed-links.md):
   automatic and manual links, ownership rules, removal, and the promotion
   workflow.

@@ -11,7 +11,7 @@ import { ReleaseMatcher } from '../../dist/release.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
 import type { CommitRecord } from '../../dist/storage/commit-journal.js'
-import { RetentionManager } from '../../dist/storage/retention.js'
+import { RetentionManager, compileRetentionScopes } from '../../dist/storage/retention.js'
 import { LinkStore } from '../../dist/storage/link-store.js'
 import { compileSymlinkRules, selectDesiredLinks } from '../../dist/symlinks.js'
 import { recoverStorage } from '../../dist/storage/recovery.js'
@@ -50,6 +50,7 @@ interface RetentionEvent {
   storageDeleted?: number
   countDeleted?: number
   versionDeleted?: number
+  scopedDeleted?: number
 }
 
 interface ReleaseCoordinates {
@@ -1248,4 +1249,313 @@ test('durable manual ledger pins its target until an authorized repoint', async 
 
   t.absent((await harness.commits.list()).some((record) => record.transferId === old.transferId))
   t.ok((await harness.commits.list()).some((record) => record.transferId === current.transferId))
+})
+
+async function recordNames(harness: Harness): Promise<string[]> {
+  return (await harness.commits.list()).map((record) => record.name).sort()
+}
+
+test('a scope cleans matching artifacts without admission patterns and leaves every other name alone', async (t) => {
+  const harness = await createHarness(t)
+  const reasons: Array<[string, unknown]> = []
+  const events: RetentionEvent[] = []
+  // No release coordinates anywhere: nothing here was committed under an artifact pattern.
+  await harness.publish('beta-1.0.0', b4a.from('b1'))
+  harness.clock.advance(1)
+  await harness.publish('beta-1.1.0', b4a.from('b2'))
+  harness.clock.advance(1)
+  await harness.publish('beta-1.2.0', b4a.from('b3'))
+  await harness.publish('prod-1.0.0', b4a.from('p1'))
+  await harness.publish('prod-2.0.0', b4a.from('p2'))
+  await fs.promises.writeFile(path.join(harness.layout.root, 'operator.txt'), 'unmanaged')
+  harness.clock.advance(1_000_000)
+
+  const result = await harness
+    .manager({
+      scopes: [{ pattern: 'beta-{version}', maxCount: 2 }],
+      logger: {
+        info(_message, details) {
+          reasons.push([details.name as string, details.reason])
+        }
+      },
+      onEvent: (event) => events.push(event)
+    })
+    .run()
+
+  t.alike(result, {
+    expiredSessions: 0,
+    scrubbed: 0,
+    ageDeleted: 0,
+    countDeleted: 0,
+    versionDeleted: 0,
+    storageDeleted: 0,
+    scopedDeleted: 1
+  })
+  t.alike(reasons, [['beta-1.0.0', 'SCOPE_MAX_COUNT']])
+  t.alike(events.at(-1), { type: 'retention', trigger: 'manual', status: 'completed', ...result })
+  t.alike(await recordNames(harness), ['beta-1.1.0', 'beta-1.2.0', 'prod-1.0.0', 'prod-2.0.0'])
+  t.is(await exists(path.join(harness.layout.root, 'beta-1.0.0')), false)
+  for (const kept of ['beta-1.1.0', 'beta-1.2.0', 'prod-1.0.0', 'prod-2.0.0']) {
+    t.is(await exists(path.join(harness.layout.root, kept)), true, kept)
+  }
+  t.is(
+    await fs.promises.readFile(path.join(harness.layout.root, 'operator.txt'), 'utf8'),
+    'unmanaged',
+    'an unmanaged file is never touched'
+  )
+})
+
+test('without scopes nothing matching is touched and the result carries no scoped count', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publish('beta-1.0.0', b4a.from('b1'))
+  harness.clock.advance(1_000_000)
+  await harness.publish('beta-1.1.0', b4a.from('b2'))
+  for (const manager of [harness.manager(), harness.manager({ scopes: [] })]) {
+    const result = await manager.run()
+    t.alike(Object.keys(result).sort(), [
+      'ageDeleted',
+      'countDeleted',
+      'expiredSessions',
+      'scrubbed',
+      'storageDeleted',
+      'versionDeleted'
+    ])
+  }
+  t.alike(await recordNames(harness), ['beta-1.0.0', 'beta-1.1.0'])
+})
+
+test('scoped count keeps the newest per series pinned or not, and a pinned record always survives', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publish('beta-1.0.0', b4a.from('b1'))
+  harness.clock.advance(1)
+  await harness.publish('beta-1.1.0', b4a.from('b2'))
+  harness.clock.advance(1)
+  await harness.publish('beta-1.2.0', b4a.from('b3'))
+  harness.clock.advance(1)
+  await harness.publish('beta-1.3.0', b4a.from('b4'))
+  const pinned = new Set(['beta-1.0.0', 'beta-1.3.0'])
+  const result = await harness
+    .manager({
+      scopes: [{ pattern: 'beta-{version}', maxCount: 2 }],
+      isPinned: (record) => pinned.has(record.name)
+    })
+    .run()
+
+  // The newest two are 1.3.0 (pinned) and 1.2.0, so the pinned newest holds one of the two
+  // places: 1.1.0 is over the count and goes. 1.0.0 is over the count too, but it is pinned and
+  // survives in addition to the two kept.
+  t.is(result.scopedDeleted, 1)
+  t.alike(await recordNames(harness), ['beta-1.0.0', 'beta-1.2.0', 'beta-1.3.0'])
+})
+
+test('scoped age and count each remove what the other keeps, and a record is removed once', async (t) => {
+  const harness = await createHarness(t)
+  const reasons: Array<[string, unknown]> = []
+  await harness.publish('beta-1.0.0', b4a.from('b1'))
+  harness.clock.advance(10)
+  await harness.publish('beta-1.1.0', b4a.from('b2'))
+  harness.clock.advance(10)
+  await harness.publish('beta-1.2.0', b4a.from('b3'))
+  harness.clock.advance(10)
+  await harness.publish('beta-1.3.0', b4a.from('b4'))
+
+  // Ages are 30, 20, 10 and 0. The newest three are kept by count, so 1.0.0 is over the count;
+  // 1.1.0 is within the count but at least 15 old. 1.2.0 and 1.3.0 are neither. Two scopes
+  // that both match every beta select the same records, and each is still removed once.
+  const result = await harness
+    .manager({
+      scopes: [
+        { pattern: 'beta-{version}', maxCount: 3, maxAge: 15 },
+        { pattern: '{series}-{version}', maxAge: 15 }
+      ],
+      logger: {
+        info(_message, details) {
+          reasons.push([details.name as string, details.reason])
+        }
+      }
+    })
+    .run()
+
+  t.is(result.scopedDeleted, 2)
+  t.alike(reasons, [
+    ['beta-1.0.0', 'SCOPE_MAX_COUNT'],
+    ['beta-1.1.0', 'SCOPE_MAX_AGE']
+  ])
+  t.alike(await recordNames(harness), ['beta-1.2.0', 'beta-1.3.0'])
+
+  // The age limit is inclusive: exactly maxAge old goes, one millisecond younger stays.
+  const boundary = await createHarness(t)
+  await boundary.publish('beta-2.0.0', b4a.from('x'))
+  boundary.clock.advance(1)
+  await boundary.publish('beta-2.1.0', b4a.from('y'))
+  boundary.clock.advance(9)
+  await boundary.manager({ scopes: [{ pattern: 'beta-{version}', maxAge: 10 }] }).run()
+  t.alike(await recordNames(boundary), ['beta-2.1.0'])
+})
+
+test('scoped retention is subject to every pin, and scoped directories go through trash', async (t) => {
+  for (const fallback of [false, true]) {
+    const harness = await createHarness(t)
+    const target = await harness.publishTree('beta-1.0.0', { 'a.bin': 'a' })
+    harness.clock.advance(1)
+    await harness.publishTree('beta-1.1.0', { 'a.bin': 'b' })
+    harness.clock.advance(1)
+    const replaceable = await harness.publishTree('beta-1.2.0', { 'a.bin': 'c' })
+    harness.clock.advance(1)
+    await harness.publishTree('beta-1.3.0', { 'a.bin': 'd' })
+    const manager = harness.manager({
+      scopes: [{ pattern: 'beta-{version}', maxCount: 1 }],
+      // A link target pinned by reconciliation (or by the fallback when it fails), and a
+      // configured mutable name pinned by the server's own predicate.
+      reconcileLinks: () =>
+        fallback
+          ? Promise.reject(new Error('reconciliation failed'))
+          : Promise.resolve(new Set([target.transferId])),
+      linkPinsFallback: () => Promise.resolve(new Set([target.transferId])),
+      isPinned: (record) => record.transferId === replaceable.transferId
+    })
+    if (fallback) await t.exception(() => manager.run(), { message: 'reconciliation failed' })
+    else await manager.run()
+
+    // Only the newest is kept by count; the two pinned older directories survive and the
+    // unpinned 1.1.0 is renamed into trash and removed.
+    t.alike(await recordNames(harness), ['beta-1.0.0', 'beta-1.2.0', 'beta-1.3.0'], `${fallback}`)
+    t.is(await exists(path.join(harness.layout.root, 'beta-1.1.0')), false)
+    t.alike(await fs.promises.readdir(harness.layout.trash), [], 'trash is empty again')
+  }
+})
+
+test('an age-only scope may use a series template and removes what is old enough', async (t) => {
+  const harness = await createHarness(t)
+  await harness.publish('beta-nightly', b4a.from('n'))
+  harness.clock.advance(10)
+  await harness.publish('beta-weekly', b4a.from('w'))
+  await harness.publish('prod-1.0.0', b4a.from('p'))
+  harness.clock.advance(5)
+
+  // beta-nightly is 15 old, the others 5: only the matching one past the limit goes.
+  const result = await harness.manager({ scopes: [{ pattern: 'beta-{series}', maxAge: 10 }] }).run()
+  t.is(result.scopedDeleted, 1)
+  t.alike(await recordNames(harness), ['beta-weekly', 'prod-1.0.0'])
+})
+
+test('a scope never removes replacement history, even when its template matches the name', async (t) => {
+  const harness = await createHarness(t)
+  const superseded = await harness.publish(MUTABLE, b4a.from('old'), true)
+  await harness.publish(MUTABLE, b4a.from('new'), true)
+  harness.clock.advance(100)
+  const result = await harness
+    .manager({
+      scopes: [{ pattern: 'history-{series}', maxAge: 1 }],
+      isPinned: (record) => record.name === MUTABLE
+    })
+    .run()
+  t.is(result.scopedDeleted, 0)
+  t.is(await exists(path.join(harness.layout.root, historyName(superseded.transferId))), true)
+})
+
+test('retention scopes are validated, copied, and never echoed', async (t) => {
+  const message = 'Invalid retention scope'
+  const invalid: Array<[string, unknown]> = [
+    ['not iterable', 5],
+    ['a string', 'beta-{version}'],
+    ['null', null],
+    ['an element that is not an object', ['beta-{version}']],
+    ['an array element', [['beta-{version}', 2]]],
+    ['a null element', [null]],
+    ['an unknown key', [{ pattern: 'beta-{version}', maxCount: 1, maxVersions: 1 }]],
+    [
+      'an inherited limit',
+      [Object.assign(Object.create({ maxCount: 1 }), { pattern: 'beta-{version}' })]
+    ],
+    ['no pattern', [{ maxCount: 1 }]],
+    ['an empty pattern', [{ pattern: '', maxCount: 1 }]],
+    ['a bare version', [{ pattern: '{version}', maxCount: 1 }]],
+    ['a bare series', [{ pattern: '{series}', maxCount: 1 }]],
+    ['placeholders only', [{ pattern: '{series}{version}', maxCount: 1 }]],
+    ['a parent segment', [{ pattern: 'beta/{version}', maxCount: 1 }]],
+    ['a repeated placeholder', [{ pattern: 'beta-{version}-{version}', maxCount: 1 }]],
+    ['a stray brace', [{ pattern: 'beta-{oops}', maxCount: 1 }]],
+    ['an overlong pattern', [{ pattern: `${'b'.repeat(300)}-{version}`, maxCount: 1 }]],
+    ['no limit', [{ pattern: 'beta-{version}' }]],
+    // Without `{version}` every name is a series of its own, so a count could never remove
+    // anything; it is refused, with or without an age beside it.
+    ['a count on a series-only template', [{ pattern: 'beta-{series}', maxCount: 1 }]],
+    [
+      'a count and an age on a series-only template',
+      [{ pattern: 'beta-{series}', maxCount: 1, maxAge: 5 }]
+    ],
+    [
+      'a count after a valid scope on a series-only template',
+      [
+        { pattern: 'beta-{version}', maxCount: 1 },
+        { pattern: 'nightly-{series}', maxCount: 2, maxAge: 5 }
+      ]
+    ],
+    ['a count on a template with no placeholder', [{ pattern: 'beta', maxCount: 1 }]],
+    ['zero count', [{ pattern: 'beta-{version}', maxCount: 0 }]],
+    ['negative count', [{ pattern: 'beta-{version}', maxCount: -1 }]],
+    ['fractional count', [{ pattern: 'beta-{version}', maxCount: 1.5 }]],
+    ['text count', [{ pattern: 'beta-{version}', maxCount: '5' }]],
+    ['infinite count', [{ pattern: 'beta-{version}', maxCount: Infinity }]],
+    ['unsafe count', [{ pattern: 'beta-{version}', maxCount: 2 ** 60 }]],
+    ['zero age', [{ pattern: 'beta-{version}', maxAge: 0 }]],
+    [
+      'duplicate pattern',
+      [
+        { pattern: 'beta-{version}', maxCount: 1 },
+        { pattern: 'beta-{version}', maxAge: 5 }
+      ]
+    ],
+    [
+      'seventeen scopes',
+      Array.from({ length: 17 }, (_unused, index) => ({
+        pattern: `b${index}-{version}`,
+        maxCount: 1
+      }))
+    ]
+  ]
+  for (const [label, input] of invalid) {
+    let failure: unknown = null
+    try {
+      compileRetentionScopes(input)
+    } catch (error) {
+      failure = error
+    }
+    t.is((failure as { code?: string } | null)?.code, ERRORS.PROTOCOL_INVALID, label)
+    t.is((failure as Error | null)?.message, message, `${label}: the message names nothing`)
+  }
+
+  t.alike(compileRetentionScopes(undefined), [], 'omitted means off')
+  // An age needs no version, and a count is fine wherever `{version}` is present.
+  for (const allowed of [
+    [{ pattern: 'beta-{series}', maxAge: 5 }],
+    [{ pattern: '{series}-beta', maxAge: 5 }],
+    [{ pattern: 'beta-{version}', maxCount: 2 }],
+    [{ pattern: '{series}-beta-{version}', maxCount: 2, maxAge: 5 }]
+  ]) {
+    t.is(compileRetentionScopes(allowed).length, 1, JSON.stringify(allowed))
+  }
+  const sixteen = Array.from({ length: 16 }, (_unused, index) => ({
+    pattern: `b${index}-{version}`,
+    maxCount: 1
+  }))
+  t.is(compileRetentionScopes(sixteen).length, 16)
+  const input = [{ pattern: 'beta-{version}', maxCount: 2, maxAge: 10 }]
+  const compiled = compileRetentionScopes(new Set(input))
+  input[0].maxCount = 99
+  input.push({ pattern: 'extra-{version}', maxCount: 1, maxAge: 1 })
+  t.is(compiled.length, 1)
+  t.is(compiled[0].maxCount, 2, 'the copy shares nothing with the input')
+  t.ok(Object.isFrozen(compiled) && Object.isFrozen(compiled[0]))
+  for (const options of [
+    { scopes: [{ pattern: '{version}', maxCount: 1 }] },
+    { scopes: [{ pattern: 'beta-{version}' }] },
+    { scopes: [{ pattern: 'beta-{series}', maxCount: 1 }] }
+  ]) {
+    const harness = await createHarness(t)
+    await t.exception(() => harness.manager(options as Partial<RetentionOptions>), {
+      code: ERRORS.PROTOCOL_INVALID
+    })
+  }
 })

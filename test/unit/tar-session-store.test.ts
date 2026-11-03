@@ -1042,6 +1042,191 @@ test('admission free-space checks include prior TAR peak reservations', async (t
   await t.exception(() => store.admit(OTHER_OWNER, second), { code: ERRORS.DISK_RESERVE })
 })
 
+const MIN_FREE = 100
+const PLENTY = Number.MAX_SAFE_INTEGER
+
+function peakOf(metadata: { tarSize: number; fileSize: number }): number {
+  return metadata.tarSize + metadata.fileSize
+}
+
+/** A storage adapter whose reported free space the test sets; `bsize` 1 keeps the bytes exact. */
+function freeSpace(base = createStorage()): {
+  storage: ReturnType<typeof createStorage>
+  setAvailable(bytes: number): void
+} {
+  let available = PLENTY
+  return {
+    storage: { ...base, statfs: () => Promise.resolve({ bavail: available, bsize: 1 }) },
+    setAvailable(bytes) {
+      available = bytes
+    }
+  }
+}
+
+test('the free-space check counts what sessions can still write, not what is already on disk', async (t) => {
+  const first = await fixture(t, 'first payload for the free-space check')
+  const { layout } = first
+  // Payloads shrink from one session to the next so each later offer fits the staging cap.
+  const second = await additionalFixture(layout, OTHER_OWNER, 'second.bin', 'second payload 1234')
+  const third = await additionalFixture(layout, OTHER_OWNER, 'third.bin', 'third')
+  const fourth = await additionalFixture(layout, OTHER_OWNER, 'fourth.bin', 'four')
+  const stagingCap = peakOf(first.metadata) + peakOf(second.metadata)
+  const { storage, setAvailable } = freeSpace()
+  const open = async (maxStagingBytes: number): Promise<SessionStore> => {
+    const store = new SessionStore({ layout, maxStagingBytes, minFreeBytes: MIN_FREE, storage })
+    await store.init()
+    t.teardown(() => store.close())
+    return store
+  }
+  const store = await open(stagingCap)
+
+  await store.admit(OWNER, first.metadata)
+  const written = 512
+  await store.append(OWNER, first.metadata, 0, first.archive.subarray(0, written))
+
+  // A receiving session still owes the rest of its TAR and its whole payload: the bytes already
+  // written are in the free space `statfs` reports, so they are not owed a second time.
+  const owedByFirst = first.metadata.tarSize - written + first.metadata.fileSize
+  const needed = MIN_FREE + owedByFirst + peakOf(second.metadata)
+  t.ok(needed < MIN_FREE + peakOf(first.metadata) + peakOf(second.metadata), 'less than before')
+  setAvailable(needed - 1)
+  await t.exception(() => store.admit(OTHER_OWNER, second.metadata), { code: ERRORS.DISK_RESERVE })
+  t.is(store.sessions.has(second.metadata.transferId), false, 'a refusal admits nothing')
+  setAvailable(needed)
+  t.alike(await store.admit(OTHER_OWNER, second.metadata), { status: 'ACCEPT', offset: 0 })
+
+  // The staging cap is not touched: every session still reserves its full TAR and payload, so a
+  // third offer is refused on the cap however much disk is free.
+  t.is(store.reservedBytes, stagingCap, 'reservations stay the full TAR and payload')
+  setAvailable(PLENTY)
+  await t.exception(() => store.admit(OTHER_OWNER, third.metadata), {
+    code: ERRORS.STAGING_LIMIT
+  })
+
+  // A verified session has written everything, so it owes nothing. Delete the second session
+  // and verify the first: the next offer needs only the reserve and its own reservation.
+  await store.delete(b4a.from(second.metadata.transferId, 'hex'))
+  await store.append(OWNER, first.metadata, written, first.archive.subarray(written))
+  t.is((await store.verify(OWNER, first.metadata)).state, 'verified')
+  const afterVerify = MIN_FREE + peakOf(third.metadata)
+  setAvailable(afterVerify - 1)
+  await t.exception(() => store.admit(OTHER_OWNER, third.metadata), { code: ERRORS.DISK_RESERVE })
+  setAvailable(afterVerify)
+  t.alike(await store.admit(OTHER_OWNER, third.metadata), { status: 'ACCEPT', offset: 0 })
+  t.is(store.reservedBytes, peakOf(first.metadata) + peakOf(third.metadata))
+
+  // After a restart the durable progress is what counts: the verified session still owes
+  // nothing and the receiving one owes what its persisted offset leaves.
+  await store.append(OTHER_OWNER, third.metadata, 0, third.archive.subarray(0, written))
+  await store.close()
+  const restarted = await open(stagingCap * 10)
+  t.is(restarted.reservedBytes, peakOf(first.metadata) + peakOf(third.metadata))
+  const owedByThird = third.metadata.tarSize - written + third.metadata.fileSize
+  const afterRestart = MIN_FREE + owedByThird + peakOf(fourth.metadata)
+  setAvailable(afterRestart - 1)
+  await t.exception(() => restarted.admit(OTHER_OWNER, fourth.metadata), {
+    code: ERRORS.DISK_RESERVE
+  })
+  setAvailable(afterRestart)
+  t.alike(await restarted.admit(OTHER_OWNER, fourth.metadata), { status: 'ACCEPT', offset: 0 })
+})
+
+test('the free-space check keeps the whole payload owed while a session is being verified', async (t) => {
+  const first = await fixture(t, 'payload being verified')
+  const second = await additionalFixture(first.layout, OTHER_OWNER, 'second.bin', 'second')
+  const { storage: base, setAvailable } = freeSpace()
+  let verificationStarted: () => void = () => {}
+  let releaseVerification: () => void = () => {}
+  const started = new Promise<void>((resolve) => {
+    verificationStarted = resolve
+  })
+  const gate = new Promise<void>((resolve) => {
+    releaseVerification = resolve
+  })
+  let blocked = false
+  const storage = createStorage({
+    beforeOperation(name, target) {
+      if (!blocked && name === 'read' && target.endsWith(`${first.metadata.transferId}.tar.part`)) {
+        blocked = true
+        verificationStarted()
+        return gate
+      }
+    }
+  })
+  const store = new SessionStore({
+    layout: first.layout,
+    maxStagingBytes: peakOf(first.metadata) + peakOf(second.metadata),
+    minFreeBytes: MIN_FREE,
+    storage: { ...storage, statfs: base.statfs }
+  })
+  await store.init()
+  await store.admit(OWNER, first.metadata)
+  await store.append(OWNER, first.metadata, 0, first.archive)
+
+  const verification = store.verify(OWNER, first.metadata)
+  await started
+  try {
+    // The TAR is complete but extraction has not finished and the free space cannot say how
+    // much of the payload is already written, so the whole payload is still owed.
+    const needed = MIN_FREE + first.metadata.fileSize + peakOf(second.metadata)
+    setAvailable(needed - 1)
+    await t.exception(promptly(store.admit(OTHER_OWNER, second.metadata), 'refused offer'), {
+      code: ERRORS.DISK_RESERVE
+    })
+    setAvailable(needed)
+    t.alike(await promptly(store.admit(OTHER_OWNER, second.metadata), 'accepted offer'), {
+      status: 'ACCEPT',
+      offset: 0
+    })
+  } finally {
+    releaseVerification()
+    await Promise.allSettled([verification])
+  }
+  t.is((await verification).state, 'verified')
+  await store.close()
+})
+
+test('a quarantined session owes no further writes to the free-space check', async (t) => {
+  const first = await fixture(t, 'payload that fails verification')
+  const second = await additionalFixture(first.layout, OTHER_OWNER, 'second.bin', 'second')
+  const extractedPath = path.join(first.layout.staging, `${first.metadata.transferId}.part`)
+  let failCleanup = false
+  const { storage: base, setAvailable } = freeSpace()
+  const injected = createStorage({
+    beforeOperation(name, target) {
+      if (failCleanup && name === 'unlink' && target === extractedPath) {
+        throw new Error('injected extracted staging cleanup failure')
+      }
+    }
+  })
+  const store = new SessionStore({
+    layout: first.layout,
+    maxStagingBytes: peakOf(first.metadata) + peakOf(second.metadata),
+    minFreeBytes: MIN_FREE,
+    storage: { ...injected, statfs: base.statfs }
+  })
+  await store.init()
+  t.teardown(() => store.close())
+  const corrupt = b4a.from(first.archive)
+  corrupt[512] ^= 0xff
+  await store.admit(OWNER, first.metadata)
+  await store.append(OWNER, first.metadata, 0, corrupt)
+  failCleanup = true
+  await t.exception(store.verify(OWNER, first.metadata))
+  t.is(
+    store.sessions.get(first.metadata.transferId)?.state,
+    'deleting',
+    'the residue is quarantined'
+  )
+
+  // The quarantined session still holds its full reservation, but only deletes files.
+  const needed = MIN_FREE + peakOf(second.metadata)
+  setAvailable(needed - 1)
+  await t.exception(store.admit(OTHER_OWNER, second.metadata), { code: ERRORS.DISK_RESERVE })
+  setAvailable(needed)
+  t.alike(await store.admit(OTHER_OWNER, second.metadata), { status: 'ACCEPT', offset: 0 })
+})
+
 test('empty TAR appends and closed session reads are rejected without TTL progress', async (t) => {
   const { layout, metadata } = await fixture(t)
   const clock = createClock()

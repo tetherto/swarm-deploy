@@ -35,6 +35,7 @@ import {
   type RequestOperation,
   type RequestPhase,
   type RetentionEvent,
+  type RetentionScope,
   type ReleaseCoordinates,
   type ServerHooks,
   type ServerEventMap,
@@ -310,7 +311,31 @@ const retentionEvent: RetentionEvent = {
 }
 const countDeleted: number | undefined = retentionEvent.countDeleted
 const versionDeleted: number | undefined = retentionEvent.versionDeleted
-void [countDeleted, versionDeleted]
+const scopedDeleted: number | undefined = retentionEvent.scopedDeleted
+void [countDeleted, versionDeleted, scopedDeleted]
+
+const betaScope: RetentionScope = { pattern: 'beta-{version}', maxCount: 5, maxAge: 604_800_000 }
+const ageOnlyScope: RetentionScope = { pattern: 'nightly-{version}', maxAge: 86_400_000 }
+const scopedServerOptions = {
+  seed: serverSeed,
+  storageDir: '/srv/swarm-deploy',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096,
+  retentionScopes: [betaScope, ageOnlyScope]
+} satisfies ServerOptions
+const scopeSet: ServerOptions['retentionScopes'] = new Set([betaScope])
+const scopedServer = new Server(scopedServerOptions)
+const configuredScopes: readonly RetentionScope[] = scopedServer.retentionScopes
+void [scopeSet, configuredScopes]
+
+// @ts-expect-error A retention scope needs a pattern.
+const patternlessScope: RetentionScope = { maxCount: 1 }
+// @ts-expect-error Scope limits are numbers, not strings.
+const stringLimitScope: RetentionScope = { pattern: 'beta-{version}', maxCount: '5' }
+// @ts-expect-error A scope takes no option beyond pattern, maxCount, and maxAge.
+const unknownScopeKey: RetentionScope = { pattern: 'beta-{version}', maxCount: 1, pin: true }
+void [patternlessScope, stringLimitScope, unknownScopeKey]
 
 const badGranularityOptions = {
   seed: serverSeed,

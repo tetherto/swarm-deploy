@@ -13,8 +13,19 @@ import {
 import { digestMatches, SodiumSha256 } from '../tar-protocol/hash.js'
 import { assertSafeUint } from '../validation.js'
 import { withRootLease } from './root-coordinator.js'
-import { compareReleaseVersions, releaseVersionGroup, type VersionGranularity } from '../release.js'
-import { commitRecordKind, compareCommitOrder, type CommitRecord } from './commit-journal.js'
+import { isReservedHistoryName } from '../files.js'
+import {
+  compareReleaseVersions,
+  ReleaseMatcher,
+  releaseVersionGroup,
+  type VersionGranularity
+} from '../release.js'
+import {
+  commitRecordKind,
+  compareCommitOrder,
+  type CommitRecord,
+  type CommitRelease
+} from './commit-journal.js'
 import { digestTree } from './tree-fs.js'
 import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } from './types.js'
 
@@ -75,6 +86,8 @@ type RetentionEvent =
       countDeleted: number
       versionDeleted: number
       storageDeleted: number
+      /** Present only when retention scopes are configured. */
+      scopedDeleted?: number
     }
   | { type: 'retention'; trigger: string; status: 'failed'; reason: string }
   | { type: 'retention'; trigger: 'scheduled'; status: 'deferred'; reason: 'ACTIVE_RECEIVE' }
@@ -89,9 +102,124 @@ type RetentionEventPayload =
       countDeleted: number
       versionDeleted: number
       storageDeleted: number
+      scopedDeleted?: number
     }
   | { trigger: string; status: 'failed'; reason: string }
   | { trigger: 'scheduled'; status: 'deferred'; reason: 'ACTIVE_RECEIVE' }
+
+/**
+ * A cleanup rule for the committed artifacts whose final name matches `pattern`, independent of
+ * which names uploads may use and of any `artifactPatterns`. `pattern` is an existing release
+ * template (`{series}`, `{version}`) over the artifact's basename only, such as
+ * `beta-{version}`; it needs a literal character, so a bare `{version}` cannot match every
+ * release. Limits are optional but at least one is required. `maxCount` keeps the newest
+ * `maxCount` matching artifacts per series (newest by commit time, like the global
+ * `maxCount`) and needs `{version}` in `pattern`: a template without it gives every name its own
+ * series, so a count could never remove anything and is refused. `maxAge` removes matching
+ * artifacts committed that many milliseconds ago and works with any valid pattern. An artifact
+ * over either limit of any scope is removed, unless it is pinned by anything that pins an
+ * artifact against retention.
+ */
+export interface RetentionScope {
+  pattern: string
+  maxCount?: number
+  /** Milliseconds. */
+  maxAge?: number
+}
+
+const MAX_RETENTION_SCOPES = 16
+const MAX_SCOPE_PATTERN_LENGTH = 256
+const SCOPE_KEYS: ReadonlySet<string> = new Set(['pattern', 'maxCount', 'maxAge'])
+
+export interface CompiledRetentionScope extends RetentionScope {
+  readonly matcher: ReleaseMatcher
+}
+
+function scopeError(): SwarmDeployError {
+  return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Invalid retention scope')
+}
+
+function ownValue(value: object, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(value, key)
+    ? (value as Record<string, unknown>)[key]
+    : undefined
+}
+
+function scopeLimit(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) throw scopeError()
+  return value
+}
+
+/**
+ * Validates and snapshots retention scopes: plain objects with only `pattern`, `maxCount`, and
+ * `maxAge`; a basename template with at least one literal character and no `/`; at least one
+ * positive safe-integer limit, where `maxCount` also requires `{version}` in the template; no
+ * duplicate pattern; at most 16. The result is frozen and shares
+ * nothing with the input. Throws the same fixed `PROTOCOL_INVALID` message for every problem, so
+ * a rejected value is never echoed.
+ */
+export function compileRetentionScopes(input: unknown): readonly CompiledRetentionScope[] {
+  if (input === undefined) return Object.freeze([])
+  if (
+    typeof input !== 'object' ||
+    input === null ||
+    typeof (input as Iterable<unknown>)[Symbol.iterator] !== 'function'
+  ) {
+    throw scopeError()
+  }
+  const scopes: CompiledRetentionScope[] = []
+  const seen = new Set<string>()
+  for (const candidate of input as Iterable<unknown>) {
+    if (scopes.length >= MAX_RETENTION_SCOPES) throw scopeError()
+    if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+      throw scopeError()
+    }
+    for (const key of Reflect.ownKeys(candidate)) {
+      if (typeof key !== 'string' || !SCOPE_KEYS.has(key)) throw scopeError()
+    }
+    const pattern = ownValue(candidate, 'pattern')
+    const maxCount = scopeLimit(ownValue(candidate, 'maxCount'))
+    const maxAge = scopeLimit(ownValue(candidate, 'maxAge'))
+    if (
+      typeof pattern !== 'string' ||
+      pattern.length === 0 ||
+      pattern.length > MAX_SCOPE_PATTERN_LENGTH ||
+      pattern.includes('/') ||
+      pattern.split('{series}').join('').split('{version}').join('').length === 0 ||
+      (maxCount === undefined && maxAge === undefined) ||
+      (maxCount !== undefined && !pattern.includes('{version}')) ||
+      seen.has(pattern)
+    ) {
+      throw scopeError()
+    }
+    let matcher: ReleaseMatcher
+    try {
+      matcher = new ReleaseMatcher([pattern])
+    } catch {
+      throw scopeError()
+    }
+    seen.add(pattern)
+    scopes.push(
+      Object.freeze({
+        pattern,
+        ...(maxCount === undefined ? {} : { maxCount }),
+        ...(maxAge === undefined ? {} : { maxAge }),
+        matcher
+      })
+    )
+  }
+  return Object.freeze(scopes)
+}
+
+/** The scope without its compiled matcher: the plain, immutable form a server exposes. */
+export function plainRetentionScope(scope: CompiledRetentionScope): RetentionScope {
+  return Object.freeze({
+    pattern: scope.pattern,
+    ...(scope.maxCount === undefined ? {} : { maxCount: scope.maxCount }),
+    ...(scope.maxAge === undefined ? {} : { maxAge: scope.maxAge })
+  })
+}
 
 interface RetentionRunOptions {
   incomingBytes?: number
@@ -107,6 +235,8 @@ interface RetentionManagerOptions {
   maxVersions?: number
   versionGranularity?: VersionGranularity
   maxStorageBytes?: number
+  /** Optional cleanup rules for matching names only; see {@link RetentionScope}. Off by default. */
+  scopes?: Iterable<RetentionScope>
   resumeTtl?: number
   cleanupInterval?: number
   clock?: Clock
@@ -173,6 +303,8 @@ interface RetentionResult {
   countDeleted: number
   versionDeleted: number
   storageDeleted: number
+  /** Present only when retention scopes are configured, so a server without them is unchanged. */
+  scopedDeleted?: number
 }
 
 function bySeries(records: CommitRecord[]): Map<string, CommitRecord[]> {
@@ -329,6 +461,7 @@ class RetentionManager {
   maxVersions: number | undefined
   versionGranularity: VersionGranularity | undefined
   maxStorageBytes: number | undefined
+  scopes: readonly CompiledRetentionScope[]
   resumeTtl: number
   cleanupInterval: number
   clock: Clock
@@ -362,6 +495,7 @@ class RetentionManager {
     maxVersions,
     versionGranularity,
     maxStorageBytes,
+    scopes,
     resumeTtl = DEFAULT_RESUME_TTL,
     cleanupInterval = DEFAULT_CLEANUP_INTERVAL,
     clock = Date,
@@ -438,6 +572,7 @@ class RetentionManager {
     this.maxVersions = maxVersions
     this.versionGranularity = versionGranularity
     this.maxStorageBytes = maxStorageBytes
+    this.scopes = compileRetentionScopes(scopes)
     this.resumeTtl = resumeTtl
     this.cleanupInterval = cleanupInterval
     this.clock = clock
@@ -567,7 +702,8 @@ class RetentionManager {
 
   async _deleteRecord(
     record: CommitRecord,
-    reason: 'MAX_AGE' | 'MAX_COUNT' | 'MAX_VERSIONS' | 'MAX_STORAGE'
+    reason:
+      'MAX_AGE' | 'MAX_COUNT' | 'MAX_VERSIONS' | 'MAX_STORAGE' | 'SCOPE_MAX_AGE' | 'SCOPE_MAX_COUNT'
   ): Promise<void> {
     try {
       if (!(await this.commitStore.delete(record))) {
@@ -653,6 +789,14 @@ class RetentionManager {
     }
     const pinned = (record: CommitRecord): boolean =>
       this._isPinned(record) || linkPinned.has(record.transferId)
+    let scopedDeleted = 0
+    if (this.scopes.length > 0) {
+      for (const [record, reason] of this._scopedRemovals(current, pinned)) {
+        await this._deleteRecord(record, reason)
+        current.splice(current.indexOf(record), 1)
+        scopedDeleted++
+      }
+    }
     let ageDeleted = 0
     if (this.maxAge !== undefined) {
       const now = this.clock.now()
@@ -712,8 +856,57 @@ class RetentionManager {
       ageDeleted,
       countDeleted,
       versionDeleted,
-      storageDeleted
+      storageDeleted,
+      ...(this.scopes.length > 0 ? { scopedDeleted } : {})
     }
+  }
+
+  /**
+   * What the configured scopes remove from `records`, oldest first. Every scope is judged against
+   * the same snapshot, so a record any scope selects goes, and one scope's removals cannot change
+   * what another keeps. Only valid, current, non-history records whose basename matches the
+   * scope's template are candidates, whatever `artifactPatterns` admitted: unmanaged files and
+   * every other name are never considered.
+   *
+   * `maxCount` is the global rule over the matches: the newest `maxCount` per series are kept by
+   * the same keep-set, pinned or not, so a pinned newest record holds one of the places and a
+   * pinned older record survives in addition. A pinned record is never removed.
+   */
+  _scopedRemovals(
+    records: CommitRecord[],
+    pinned: (record: CommitRecord) => boolean
+  ): Array<[CommitRecord, 'SCOPE_MAX_AGE' | 'SCOPE_MAX_COUNT']> {
+    const now = this.clock.now()
+    assertSafeUint(now, 'current timestamp')
+    const chosen = new Map<CommitRecord, 'SCOPE_MAX_AGE' | 'SCOPE_MAX_COUNT'>()
+    for (const scope of this.scopes) {
+      const matches: Array<{ record: CommitRecord; release: CommitRelease }> = []
+      for (const record of records) {
+        if (isReservedHistoryName(record.name)) continue
+        const release = scope.matcher.match(record.name)
+        if (release !== null) matches.push({ record, release })
+      }
+      const keep =
+        scope.maxCount === undefined
+          ? null
+          : countKeepSet(
+              matches.map(({ record, release }) => ({ ...record, release })),
+              scope.maxCount
+            )
+      for (const { record } of matches) {
+        if (chosen.has(record) || pinned(record)) continue
+        if (keep !== null && !keep.has(record.transferId)) {
+          chosen.set(record, 'SCOPE_MAX_COUNT')
+        } else if (
+          scope.maxAge !== undefined &&
+          now >= record.committedAt &&
+          now - record.committedAt >= scope.maxAge
+        ) {
+          chosen.set(record, 'SCOPE_MAX_AGE')
+        }
+      }
+    }
+    return [...chosen].sort(([left], [right]) => compareRecords(left, right))
   }
 
   afterCommit(): Promise<boolean> {

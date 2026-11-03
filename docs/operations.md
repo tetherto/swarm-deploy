@@ -94,6 +94,20 @@ Freeing space or raising a limit and retrying is safe: a retry resumes or
 starts over and never publishes a partial artifact. Reporting the code does not
 create capacity, and nothing here changes what the server stores or deletes.
 
+**`DISK_RESERVE` and what it counts (0.7.0).** Admission needs the free space where
+the private state's staging is to cover the reserve (`--min-free-bytes`, default
+1 GiB), what the open sessions can still write, and the new upload. Before 0.7.0
+every open session's whole reservation (TAR plus extracted payload) was counted
+even where its bytes were already on disk, so a partly received upload was
+counted twice. Now a receiving session counts its remaining TAR bytes plus its full
+payload, which stays owed through extraction, and a verified or deleting session
+counts nothing. This only stops the double count. A fresh upload still needs room
+for its TAR and its extracted payload at the same time, and raising or lowering the
+reserve neither frees space nor starts cleanup. To make room for the 1 GiB reserve
+plus that peak, free disk space yourself, or enable
+[scoped retention](artifact-patterns.md#scoped-retention) so the artifacts you can
+age out are removed on the next scheduled pass; a refused upload does not start one.
+
 The server log line is the ground truth for a failure: `reason`, the `phase` the
 server was in, and `systemCode` when the failure was a known errno
 ([How a server reports its own failures](api.md#how-a-server-reports-its-own-failures-063)).
@@ -157,8 +171,14 @@ The server coalesces network fragments into 1 MiB durability batches plus the
 final remainder. A disconnect can require retransmitting only the uncheckpointed
 in-memory tail; it never advertises bytes that were not durably published.
 
-Inactive sessions expire after seven days by default. Active receives and
-verification are protected from expiry.
+Inactive sessions expire after seven days by default (`resumeTtl` /
+`--resume-ttl`): an interrupted receive, or an idle session that already finished
+verification, is removed with its staged bytes once its last activity is older
+than that, and the client then starts the upload over. A receive with a live
+transfer, a verification in progress, and a session being deleted are protected
+from expiry. A shorter TTL takes effect when the server restarts with it, through
+the startup pass, then every scheduled pass and admission, and discards any
+inactive progress older than the new value.
 
 ## Storage, replacement, and retention
 
@@ -204,6 +224,14 @@ Optional retention applies to managed artifacts only:
 - `maxCount`/`--max-count` and `maxVersions`/`--max-versions` rotate released
   artifacts by series; see
   [Artifact patterns and rotation](artifact-patterns.md).
+- `retentionScopes`/`--retention-scope` (0.7.0, off by default) bounds one family
+  of committed names such as `beta-{version}` by newest count and age without
+  requiring artifact patterns. It never removes anything a link, a rollback
+  journal, a replace-name, or a detached hook pins, and never touches production
+  names it does not match or files that were not uploaded. The first pass after a
+  restart removes every unpinned artifact it selects and there is no dry run, so
+  check what a pattern matches first; see
+  [Scoped retention](artifact-patterns.md#scoped-retention).
 - Directory artifacts are create-only. A directory offer for a configured
   `replaceNames` entry, a file-to-directory kind change, or a directory-to-file
   kind change is rejected. Directory replacement and history are deferred.
@@ -228,9 +256,12 @@ Runtime defaults:
 - 15-minute cleanup interval.
 - 7-day resumable-session lifetime.
 
-The advanced runtime API can override these values; the server CLI intentionally
-exposes only its required limits, committed retention and rotation, replacement
-policy, artifact patterns, and hooks module.
+The runtime API can override all of these values. From 0.7.0 the server CLI
+exposes `--min-free-bytes`, `--cleanup-interval` and `--resume-ttl` as well, each
+a positive integer passed on only when given (the CLI cannot turn the reserve off
+and `--cleanup-interval` stops at 2147483647 ms), together with its required
+limits, committed retention and rotation, scoped retention, replacement policy,
+artifact patterns, and hooks module.
 
 ## Resetting storage with `reset-storage`
 

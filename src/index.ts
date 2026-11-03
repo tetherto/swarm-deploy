@@ -53,6 +53,7 @@ export { parseAllowlist } from './allowlist.js'
 export type { ArtifactKind } from './types.js'
 export type { UploadTarget } from './files.js'
 export type { SymlinkRule } from './symlinks.js'
+export type { RetentionScope } from './storage/retention.js'
 export {
   Server,
   type AllowlistKey,

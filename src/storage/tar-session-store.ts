@@ -581,6 +581,25 @@ export class TarSessionStore {
     })
   }
 
+  /**
+   * Bytes a session may still add to the disk. A receiving session still owes the rest of its
+   * TAR and, once the TAR is complete, its whole payload: extraction runs while the state is
+   * still `receiving`, so the full payload stays owed until it flips to `verified`. A verified
+   * session has written everything (commit links or renames it, which writes nothing), and a
+   * deleting one only removes files.
+   */
+  private pendingWrites(session: TarSession): number {
+    if (session.state !== RECEIVING) return 0
+    return session.tarSize - session.partialTarSize + session.size
+  }
+
+  /**
+   * The free-space check compares what `statfs` reports free, which already excludes every byte
+   * written so far, with what sessions can still write plus the incoming reservation. It must not
+   * use `reservedBytes` for that: that is the full TAR and payload of every session, whether or
+   * not it is on disk yet, so bytes already written would be charged twice. `reservedBytes` and
+   * `maxStagingBytes` keep their meaning and are not changed here.
+   */
   private async diskReserve(incoming: number): Promise<void> {
     if (this.minFreeBytes === 0) return
     if (typeof this.storage.statfs !== 'function') {
@@ -588,7 +607,9 @@ export class TarSessionStore {
     }
     const stat = await this.storage.statfs(this.layout.staging)
     const available = BigInt(stat.bavail) * BigInt(stat.bsize)
-    if (available < BigInt(this.minFreeBytes) + BigInt(this.reservedBytes) + BigInt(incoming)) {
+    let pending = 0n
+    for (const session of this.sessions.values()) pending += BigInt(this.pendingWrites(session))
+    if (available < BigInt(this.minFreeBytes) + pending + BigInt(incoming)) {
       throw new SwarmDeployError(ERRORS.DISK_RESERVE, 'Minimum free-disk reserve exceeded')
     }
   }
