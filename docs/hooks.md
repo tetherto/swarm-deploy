@@ -487,12 +487,14 @@ seeds, and TAR bytes:
   finalized or restored as the hook decides; the artifact stays durable), so a
   retry is safe. Set the client idle timeout above the worst-case total, and
   make publishers fail on their own well before it.
-- **The answer is delivered.** After writing a `HOOK_FAILED` answer the server
-  ends its side of the stream and keeps the connection for up to 5 seconds, so
-  the client reads the code instead of a connection reset. This applies to every
-  `HOOK_FAILED` answer, including `beforeCommit` and `afterCommit`. Other
-  failure answers are still followed by an immediate close, as before, so on a
-  real network a client may see a reset rather than their stable code.
+- **The answer is delivered.** After writing a failure answer the server ends
+  its side of the stream and keeps the connection for up to 5 seconds, so the
+  client reads the code instead of a connection reset. This applies to every
+  terminal failure answer that was written, `HOOK_FAILED` (including
+  `beforeCommit` and `afterCommit`) and every other code alike (0.6.3; through
+  0.6.2 only `HOOK_FAILED` was delivered this way and the others could reach a
+  client as a reset). An answer that could not be written, and a server that is
+  closing, still end the connection at once.
 - **A failed link request is rolled back by default.** The link is made
   durable before the hook runs, so the hook sees it. When the hook then fails,
   returns a result that cannot be sent, or is cut off because the server is

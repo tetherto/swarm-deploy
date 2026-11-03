@@ -379,21 +379,34 @@ test('CLI link without --json calls and prints exactly as before', async (t) => 
   t.is(plain.stderr, '')
 })
 
-test('CLI link --json keeps failures as stderr diagnostics with no JSON on stdout', async (t) => {
+test('CLI link --json prints a stable failure object and keeps the stderr diagnostic', async (t) => {
   const secret = 'publisher token sk-secret'
   const failed = await runLink(['--json', 'release-1.2.3', 'current'], () =>
     Promise.reject(new SwarmDeployError(ERRORS.HOOK_FAILED, secret))
   )
   t.is(failed.code, 1)
-  t.is(failed.stdout, '')
-  t.is(failed.stderr, `${ERRORS.HOOK_FAILED}\n`)
+  t.is(failed.stdout, '{"target":"release-1.2.3","name":"current","code":"HOOK_FAILED"}\n')
+  t.is(failed.stderr, `${ERRORS.HOOK_FAILED}\n`, 'the diagnostic is still only the stable code')
+  t.absent((failed.stdout + failed.stderr).includes(secret))
 
   const rejected = await runLink(['--json', 'release-1.2.3', 'current'], () =>
     Promise.reject(new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'Direct stream closed'))
   )
   t.is(rejected.code, 1)
-  t.is(rejected.stdout, '')
-  t.ok(rejected.stderr.length > 0, 'an older server that cannot answer the opt-in is an error')
+  t.is(
+    rejected.stdout,
+    '{"target":"release-1.2.3","name":"current","code":"PROTOCOL_INVALID"}\n',
+    'an older server that cannot answer the opt-in is an error with a code'
+  )
+  t.ok(rejected.stderr.length > 0)
+
+  // A failure with no stable code (a raw local error) is reported as `null`, without its text.
+  const raw = await runLink(['--json', 'release-1.2.3', 'current'], () =>
+    Promise.reject(new Error('ENOENT /srv/private'))
+  )
+  t.is(raw.code, 1)
+  t.is(raw.stdout, '{"target":"release-1.2.3","name":"current","code":null}\n')
+  t.absent(raw.stdout.includes('/srv/private'))
 })
 
 test('CLI --json belongs to link and upload alone and is parsed as a strict flag', async (t) => {
@@ -539,15 +552,111 @@ test('CLI --json prints the server onFailure data of a failed request next to th
   t.ok(upload.stderr.includes('Server failed request'), 'upload keeps printing the error message')
   t.absent((upload.stdout + upload.stderr + link.stdout).includes('sk-secret'), 'nothing raw leaks')
 
-  // Nothing is printed without data, and nothing without --json.
+  // Without data the object is just the code, and without --json nothing is printed.
   const bare = await runUpload(['--json', 'artifact.txt'], () =>
     Promise.reject(failure(ERRORS.HOOK_FAILED))
   )
-  t.is(bare.stdout, '')
+  t.is(bare.stdout, '{"code":"HOOK_FAILED"}\n')
   const quiet = await runLink(['release-1.2.3', 'current'], () =>
     Promise.reject(failure(ERRORS.LINK_CONFLICT, { ticket: 'T-1' }))
   )
   t.is(quiet.stdout, '')
+})
+
+test('CLI upload names the code of a server answer and describes a closure that gave no reason', async (t) => {
+  const secret = 'raw server text sk-secret /srv/private'
+  // What the client throws for the server's own answer: marked `remote`, a fixed message, and
+  // anything raw only on `cause`.
+  const answered = Object.assign(
+    new SwarmDeployError(
+      ERRORS.FILE_EXISTS,
+      'Server rejected upload (FILE_EXISTS): fixed',
+      new Error(secret)
+    ),
+    { remote: true, operation: 'upload', phase: 'admission' }
+  )
+  const rejected = await runUpload(['--json', 'artifact.txt'], () => Promise.reject(answered))
+  t.is(rejected.code, 1)
+  t.is(rejected.stdout, '{"code":"FILE_EXISTS","origin":"server","phase":"admission"}\n')
+  t.is(rejected.stderr, 'Server rejected upload (FILE_EXISTS): fixed\n')
+
+  // What the client throws when the connection closed mid-send: the stream's own text stays
+  // the message for API callers, but the command never repeats it as if it were a reason.
+  const closed = (code: string, phase: string, operation = 'upload'): SwarmDeployError =>
+    Object.assign(new SwarmDeployError(code, 'connection reset by peer', new Error(secret)), {
+      transport: true,
+      operation,
+      phase
+    })
+  const sending = await runUpload(['--json', 'artifact.txt'], () =>
+    Promise.reject(closed(ERRORS.PROTOCOL_INVALID, 'streaming'))
+  )
+  t.is(sending.code, 1)
+  t.is(sending.stdout, '{"code":"PROTOCOL_INVALID","origin":"transport","phase":"streaming"}\n')
+  t.is(
+    sending.stderr,
+    'Upload failed while sending the artifact (PROTOCOL_INVALID): the connection failed or ' +
+      'closed. No server reason was received, so the outcome on the server is unknown.\n'
+  )
+
+  const plain = await runUpload(['artifact.txt'], () =>
+    Promise.reject(closed(ERRORS.UPLOAD_IDLE_TIMEOUT, 'final'))
+  )
+  t.is(plain.stdout, '', 'without --json nothing is printed on stdout')
+  t.ok(
+    plain.stderr.includes(
+      'while waiting for the final answer (UPLOAD_IDLE_TIMEOUT): the wait timed out.'
+    )
+  )
+  t.ok(plain.stderr.includes('No server reason was received'))
+  t.ok(plain.stderr.includes('may already be committed'), 'a lost final answer is not a failure')
+
+  const connect = await runUpload(['artifact.txt'], () =>
+    Promise.reject(closed(ERRORS.CONNECT_TIMEOUT, 'connect'))
+  )
+  t.ok(connect.stderr.includes('while connecting to the server (CONNECT_TIMEOUT)'))
+  t.ok(
+    connect.stderr.includes('unauthorized key'),
+    'a refused key looks like any other connect failure'
+  )
+
+  const link = await runLink(['--json', 'release-1.2.3', 'current'], () =>
+    Promise.reject(closed(ERRORS.PROTOCOL_INVALID, 'final', 'link'))
+  )
+  t.is(
+    link.stdout,
+    '{"target":"release-1.2.3","name":"current","code":"PROTOCOL_INVALID","origin":"transport","phase":"final"}\n'
+  )
+  t.ok(link.stderr.startsWith('Link request failed while waiting for the final answer'))
+
+  // The production shape: a raw stream reset, annotated in place by the client, so it is not a
+  // SwarmDeployError. It carries no stable code, and the command still says what is known.
+  const rawReset = Object.assign(new Error('connection reset by peer'), {
+    transport: true,
+    operation: 'upload',
+    phase: 'admission'
+  })
+  const reset = await runUpload(['--json', 'artifact.txt'], () => Promise.reject(rawReset))
+  t.is(reset.code, 1)
+  t.is(reset.stdout, '{"code":null,"origin":"transport","phase":"admission"}\n')
+  t.is(
+    reset.stderr,
+    'Upload failed while waiting for the server to accept the offer: the connection failed or ' +
+      'closed. No server reason was received, so the outcome on the server is unknown.\n'
+  )
+  t.absent(reset.stderr.includes('reset by peer'), 'the stream text is not repeated as a reason')
+
+  // The command prints only what the client defines: an unknown phase or a raw error prints
+  // the error's own message, as before, and nothing from `cause` ever appears.
+  const odd = await runUpload(['--json', 'artifact.txt'], () =>
+    Promise.reject(closed(ERRORS.PROTOCOL_INVALID, 'sk-secret-phase'))
+  )
+  t.is(odd.stdout, '{"code":"PROTOCOL_INVALID","origin":"transport"}\n')
+  t.is(odd.stderr, 'connection reset by peer\n')
+  for (const result of [rejected, sending, plain, connect, link, odd]) {
+    t.absent((result.stdout + result.stderr).includes('sk-secret'))
+    t.absent((result.stdout + result.stderr).includes('/srv/private'))
+  }
 })
 
 test('CLI link --hook-failure names the policy, independently of --json, and is strict', async (t) => {

@@ -310,9 +310,10 @@ the npm package, so these links point to GitHub.
   identity helpers, `Server`, `Client`, link and upload results, events,
   logging, and errors.
 - [Operations, storage, and rollback](https://github.com/tetherto/swarm-deploy/blob/main/docs/operations.md):
-  the production checklist, transfer and resume behavior, storage, replacement,
-  and retention, resetting a storage root, and rollout, compatibility, and
-  rollback.
+  the production checklist, troubleshooting failed uploads (a server's answer
+  versus a connection that gave no reason), transfer and resume behavior,
+  storage, replacement, and retention, resetting a storage root, and rollout,
+  compatibility, and rollback.
 - [Artifact patterns and rotation](https://github.com/tetherto/swarm-deploy/blob/main/docs/artifact-patterns.md):
   pattern templates, source parent, mandatory matching, and count and version
   rotation.

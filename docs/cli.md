@@ -193,10 +193,55 @@ seed inline.
   [Returning data in the answer](hooks.md#link-publication-hooks)) and is present
   only when a `response` hook returned something. `--json` only asks for the data
   and formats the output: whether the server waits for a hook is its own
-  declaration. When the request fails and the server's `response` `onFailure`
-  returned data, it is printed as `{ "code", "hookResult": { "onFailure" } }`
-  before the usual stderr diagnostic and exit status `1`. It needs a server of
-  version 0.6.0 or later; an older one rejects the opted-in offer.
+  declaration. It needs a server of version 0.6.0 or later; an older one rejects
+  the opted-in offer.
+- A failed upload exits `1` and prints a diagnostic on stderr; see
+  [Failure output](#failure-output). With `--json` it also prints one JSON
+  failure object on stdout.
+
+### Failure output
+
+A failed `upload` or `link` exits `1`. What it prints depends on whether the
+server explained the failure (see [Errors](api.md#where-a-client-failure-came-from-063)):
+
+- **The server answered** (an authoritative rejection). `upload` prints its
+  stable code and a fixed explanation on stderr, never text the server wrote:
+
+  ```text
+  Server rejected upload (DISK_RESERVE): the server does not have enough free disk space
+  ```
+
+  `link` keeps printing only the stable code (`LINK_CONFLICT`, `HOOK_FAILED`, ...).
+
+- **The connection failed or closed with no answer** (a reset, a close, a
+  timeout, an unauthorized key, a crash). Both commands say where and that no
+  reason was received, and never print the stream's own text as if it were one:
+
+  ```text
+  Upload failed while sending the artifact: the connection failed or closed. No server reason was received, so the outcome on the server is unknown.
+  ```
+
+  Where the artifact may already be committed (`waiting for the final answer`),
+  it says so and that repeating an identical upload reports `ALREADY_COMMITTED`
+  if it was. Nothing is implied about a rollback.
+
+With `--json` a failure also prints one object on one line on stdout (the stderr
+diagnostic and exit status are unchanged):
+
+```json
+{ "code": "DISK_RESERVE", "origin": "server", "phase": "admission" }
+{ "code": null, "origin": "transport", "phase": "streaming" }
+```
+
+`link` adds `target` and `name` first. `code` is the stable code, or `null` when
+the failure carries none (a raw connection reset, or a local failure such as an
+unreadable input). `origin` is `server` for the server's own answer and
+`transport` for a connection that gave no reason; it is absent for a local
+failure. `phase` is `connect`, `request`, `admission`, `streaming`, or `final`
+when known. `hookResult` is added, as before, only when the server's `response`
+`onFailure` returned data. Nothing from an error message, `cause`, stack, or the
+server is included. Configuration and usage errors still exit `2` and print no
+JSON.
 
 Accepted names start with an ASCII letter or digit, contain only letters,
 digits, `.`, `_`, and `-`, and occupy at most 100 UTF-8 bytes. `history-` is
@@ -289,9 +334,10 @@ object has just `target`, `name`, and `status`. It is data the hook chose to
 report, such as an accepted submission's ID, not proof that anything was
 published; see [Link publication hooks](hooks.md#link-publication-hooks). A
 failure prints a stable code on stderr and exits `1`, as without the flag, and
-diagnostics stay on stderr; stdout stays empty unless the server's `response`
-`onFailure` returned data, in which case it is
-`{ "target", "name", "code", "hookResult" }` with the primary code.
+diagnostics stay on stderr; stdout gets one failure object,
+`{ "target", "name", "code", "origin"?, "phase"?, "hookResult"? }`, described in
+[Failure output](#failure-output) (`hookResult` only when the server's `response`
+`onFailure` returned data).
 `--json` only asks for the data and formats the output; it never decides whether
 the server waits for a hook. `--idle-timeout` is still the
 whole time budget. Without `--json` the command asks for nothing and prints

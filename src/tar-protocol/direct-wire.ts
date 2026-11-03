@@ -38,8 +38,18 @@ type StreamSocket = DirectDhtSocket & {
   end?(): void
 }
 
+/** How much an early answer may buffer: one whole control record and its length prefix. */
+const EARLY_ANSWER_LIMIT = MAX_CONTROL_RECORD_BYTES + 4
+
 function invalid(message: string, cause: unknown = null): SwarmDeployError {
   return new SwarmDeployError(ERRORS.PROTOCOL_INVALID, message, cause)
+}
+
+/** The peer closed or half-closed the stream before the phase was complete: a connection fact, not a record. */
+function closedEarly(message: string): SwarmDeployError {
+  const error = invalid(message)
+  error.transport = true
+  return error
 }
 
 /** Exact, bounded, phase-aware reader for a half-closed direct stream. */
@@ -48,13 +58,16 @@ export class DirectWireReader {
   private readonly chunks: Buffer[] = []
   private available = 0
   private ended = false
+  private eager = false
   private failure: Error | null = null
   private wake: (() => void) | null = null
   private readonly data = (value: Buffer): void => {
     if (!b4a.isBuffer(value) || value.byteLength === 0) return
     this.chunks.push(b4a.from(value))
     this.available += value.byteLength
-    this.socket.pause?.()
+    // Beyond one control record the peer is not answering, so reading is one chunk at a time again.
+    if (this.available >= EARLY_ANSWER_LIMIT) this.eager = false
+    if (!this.eager) this.socket.pause?.()
     this.notify()
   }
   private readonly end = (): void => {
@@ -62,7 +75,9 @@ export class DirectWireReader {
     this.notify()
   }
   private readonly close = (): void => {
-    if (!this.ended) this.failure = invalid('Direct DHT stream closed without protocol completion')
+    if (!this.ended) {
+      this.failure = closedEarly('Direct DHT stream closed without protocol completion')
+    }
     this.notify()
   }
   private readonly error = (error: Error): void => {
@@ -117,7 +132,7 @@ export class DirectWireReader {
   private async wait(signal: AbortSignalLike | null | undefined, timeout: number): Promise<void> {
     while (this.available === 0) {
       if (this.failure) throw this.failure
-      if (this.ended) throw invalid('Truncated direct protocol phase')
+      if (this.ended) throw closedEarly('Truncated direct protocol phase')
       if (signal?.aborted) throw abortError()
       await this.awaitEvent(signal, timeout)
     }
@@ -184,6 +199,19 @@ export class DirectWireReader {
       if (this.available !== 0) throw invalid('Trailing bytes after exact TAR payload')
     }
     if (this.failure) throw this.failure
+  }
+  /**
+   * Keeps the stream flowing while the caller is busy writing, so an answer the peer sends
+   * early is held here rather than left in a socket that a failed write may destroy. What
+   * is held stays bounded: past one control record the stream is paused again.
+   */
+  keepReading(on = true): void {
+    this.eager = on
+    if (on) this.socket.resume?.()
+  }
+  /** Whether the peer has already sent data, closed its side, or failed the stream. */
+  heard(): boolean {
+    return this.available > 0 || this.ended || this.failure !== null
   }
   closeReader(): void {
     for (const event of ['data', 'end', 'close', 'error'] as const) {

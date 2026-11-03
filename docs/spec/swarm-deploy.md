@@ -501,10 +501,18 @@ hooks queued ahead for the same link, retention); if it expires first the
 client reports `UPLOAD_IDLE_TIMEOUT` instead of `HOOK_FAILED` while the server
 still finishes the hooks.
 
-After a `HOOK_FAILED` answer is written the server ends its write side and
-destroys the connection when the peer closes it or after a 5-second grace
-period, so the peer reads the stable code rather than a stream reset. Other
-failure answers are followed by an immediate destroy.
+After any terminal failure answer is written (an admission `REJECTED`, a `FAILED`
+final, or a `FAILED` link result, whatever its code) the server ends its write
+side and destroys the connection when the peer closes it or after a 5-second
+grace period, so the peer reads the stable code rather than a stream reset. The
+lingering connection holds only its connection slot, and only for that long: the
+transfer guard and upload slot are already released and the stream is drained.
+The connection is destroyed at once when the answer could not be written, for
+an unauthorized or over-capacity peer (no answer is written to them), and when the
+server is closing. A client that is still sending when the server fails an
+upload may read that answer before it finishes sending, and stops sending when it
+does; a server writes nothing to an upload before its payload is complete unless
+it failed.
 
 `onFailure` runs at most once per failed operation after the offer or request was
 decoded, unless every awaited hook already succeeded; for a failed `afterLink` on a

@@ -1,6 +1,7 @@
 import {
   Client,
   Server,
+  SwarmDeployError,
   fixedSeriesKey,
   generateSeed,
   parseAllowlist,
@@ -31,6 +32,8 @@ import {
   type HookResult,
   type HookResultValue,
   type OperationOutcome,
+  type RequestOperation,
+  type RequestPhase,
   type RetentionEvent,
   type ReleaseCoordinates,
   type ServerHooks,
@@ -553,6 +556,23 @@ const stringUploadOption: ClientUploadOptions = { hookResult: 'yes' }
 // @ts-expect-error The upload data has only the three known hooks.
 const unknownUploadKey: UploadHookResult = { beforeCommit: {} }
 void [unknownUploadOption, stringUploadOption, unknownUploadKey]
+
+// Where a client failure surfaced, and whether the server or the connection is its source.
+function describeFailure(error: SwarmDeployError): string {
+  const operation: RequestOperation | undefined = error.operation
+  const phase: RequestPhase | undefined = error.phase
+  const fromServer: boolean | undefined = error.remote
+  const noReason: boolean | undefined = error.transport
+  return `${operation}/${phase}/${fromServer}/${noReason}`
+}
+// The code a server reports for an unexpected failure of its own.
+const unexpectedServerFailure: ErrorCode = 'SERVER_ERROR'
+void unexpectedServerFailure
+// @ts-expect-error A phase is one of the five the client defines.
+const unknownPhase: RequestPhase = 'verifying'
+// @ts-expect-error An operation is an upload or a link.
+const unknownOperation: RequestOperation = 'reset'
+void [describeFailure, unknownPhase, unknownOperation]
 // @ts-expect-error A Date is not a JSON value.
 const dateResult: HookResult = { when: new Date() }
 // @ts-expect-error A function is not a JSON value.

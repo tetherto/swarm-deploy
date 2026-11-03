@@ -1,4 +1,10 @@
-export { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
+export {
+  ERRORS,
+  SwarmDeployError,
+  type ErrorCode,
+  type RequestOperation,
+  type RequestPhase
+} from './errors.js'
 export type {
   Binary,
   BinaryInput,

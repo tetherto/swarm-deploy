@@ -1,6 +1,6 @@
 {
   "name": "swarm-deploy",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Secure resumable artifact uploads over direct HyperDHT",
   "repository": {
     "type": "git",
