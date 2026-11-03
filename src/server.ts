@@ -10,7 +10,7 @@ import {
   type DirectDhtNode,
   type DirectDhtSocket
 } from './direct-dht.js'
-import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
+import { ERRORS, SwarmDeployError, failureCodeOf, systemCodeOf, type ErrorCode } from './errors.js'
 import { isReservedHistoryName, validateReplaceNames } from './files.js'
 import {
   callbackError,
@@ -124,7 +124,7 @@ const MAX_CONNECTIONS = 1024
 const MAX_ACTIVE_UPLOADS = 1024
 const FINGERPRINT_LENGTH = 12
 const TAR_DURABILITY_BATCH_BYTES = 1024 * 1024
-/** How long a connection may linger so its peer can read a `HOOK_FAILED` answer before it is destroyed. */
+/** How long a connection may linger so its peer can read a failure answer before it is destroyed. */
 const ANSWER_CLOSE_GRACE = 5_000
 
 /**
@@ -330,11 +330,13 @@ function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDep
   return new SwarmDeployError(code, message, cause)
 }
 
+/**
+ * The stable code a failure is reported as: an explicit one is kept (including a storage guard's
+ * own `PROTOCOL_INVALID`), an unwrapped raw error with a known errno names it (`ENOSPC` is
+ * `DISK_RESERVE`), and any other raw error is `SERVER_ERROR`. The raw text goes nowhere.
+ */
 function codeOf(error: unknown): ErrorCode {
-  return error instanceof SwarmDeployError &&
-    Object.values(ERRORS).includes(error.code as ErrorCode)
-    ? (error.code as ErrorCode)
-    : ERRORS.PROTOCOL_INVALID
+  return failureCodeOf(error)
 }
 
 /** What a `response` hook is told: it runs while the operation is still succeeding. */
@@ -1134,9 +1136,6 @@ export class Server extends EventEmitter {
   ): Promise<void> {
     let emitted = false
     let resultWriteStarted = false
-    // Set only when this request was refused because legacy state is in the output root. That
-    // refusal changes nothing, so its answer is delivered the way a failed hook's is.
-    let refusedForLegacyState = false
     // Held in an object because closures set it.
     const state: LinkRequestState = {
       artifact: null,
@@ -1166,10 +1165,7 @@ export class Server extends EventEmitter {
     try {
       // A link request has no payload: EOF is the required no-trailing-data boundary.
       await reader.requireEnd(this.signal, this.idleTimeout)
-      if (this.legacyStateReappeared()) {
-        refusedForLegacyState = true
-        throw fail(ERRORS.LINK_FAILED, LEGACY_REAPPEARED_MESSAGE)
-      }
+      if (this.legacyStateReappeared()) throw fail(ERRORS.LINK_FAILED, LEGACY_REAPPEARED_MESSAGE)
       if (request.target === request.name) {
         throw fail(ERRORS.LINK_NOT_ALLOWED, 'Manual link cannot target itself')
       }
@@ -1248,7 +1244,13 @@ export class Server extends EventEmitter {
       } else {
         reason = ERRORS.LINK_FAILED
       }
-      this.logger.warn('Direct link failed', { publicKeyId: fingerprint(owner), reason })
+      const systemCode = systemCodeOf(error)
+      this.logger.warn('Direct link failed', {
+        publicKeyId: fingerprint(owner),
+        reason,
+        phase: state.failed !== null ? 'afterLink' : 'link',
+        ...(systemCode === null ? {} : { systemCode })
+      })
       this.emitSafe('failure', { fingerprint: fingerprint(owner), reason })
       // A restored request has no durable outcome to report; `rolledBack` says so instead.
       emitTerminal(
@@ -1259,7 +1261,7 @@ export class Server extends EventEmitter {
           : undefined,
         state.rolledBack
       )
-      if (answered && (reason === ERRORS.HOOK_FAILED || refusedForLegacyState)) {
+      if (answered) {
         this.closeAfterAnswer(socket)
       } else {
         try {
@@ -1443,34 +1445,44 @@ export class Server extends EventEmitter {
   }
 
   /**
-   * Closes a connection after an answer whose code the caller must be able to read: a
-   * `HOOK_FAILED` answer, and the refusal of a link request while legacy state is in the
-   * output root. Destroying the stream right behind the write can reset it before the peer has
-   * read the record, so the caller would see a reset instead of the stable code. The write
-   * side is ended first and the connection is destroyed once the peer closes it, or after a
-   * grace period if it never does. In both cases the work that failed is already durable or
-   * was never started, so lingering costs only the connection. Every other failure still
-   * destroys the stream at once.
+   * Closes a connection after a terminal failure answer that was written, so the caller can
+   * read the code. Destroying the stream right behind the write can reset it before the peer
+   * has read the record, and the caller would see a reset instead of the server's reason. The
+   * write side is ended first and the connection is destroyed once the peer closes it, or
+   * after `ANSWER_CLOSE_GRACE` if it never does, so a peer that never closes holds its
+   * connection slot for that long and no longer. Nothing else is held: the transfer guard and
+   * the upload slot are already released, and the reader's listeners are gone, so the stream
+   * is only drained until then. The work that failed is durable or was never started, so
+   * lingering costs only the connection.
+   *
+   * A connection is still destroyed at once when there is nothing to deliver or nobody to
+   * deliver to: an answer that could not be written, an unauthorized or over-capacity peer,
+   * and a server that is closing.
    */
   private closeAfterAnswer(socket: DirectDhtSocket): void {
-    let timer: ReturnType<typeof setTimeout> | undefined
+    const end = (socket as DirectDhtSocket & { end?(): void }).end
+    let timer: unknown
     const destroy = (): void => {
-      clearTimeout(timer)
+      if (timer !== undefined) this.scheduler.clearTimeout(timer)
       try {
         socket.destroy()
       } catch {}
     }
-    try {
-      ;(socket as DirectDhtSocket & { end?(): void }).end?.()
-    } catch {
+    if (this.closed || socket.destroyed || typeof end !== 'function') {
       destroy()
       return
     }
-    socket.once('close', () => clearTimeout(timer))
-    timer = setTimeout(destroy, ANSWER_CLOSE_GRACE)
+    timer = this.scheduler.setTimeout(destroy, ANSWER_CLOSE_GRACE)
     // A lingering answer must never keep the process alive on its own.
     if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
       if (typeof timer.unref === 'function') timer.unref()
+    }
+    // Registered before the stream is ended, so a close that the end itself causes is seen.
+    socket.once('close', () => this.scheduler.clearTimeout(timer))
+    try {
+      end.call(socket)
+    } catch {
+      destroy()
     }
   }
 
@@ -1511,7 +1523,12 @@ export class Server extends EventEmitter {
     }
     const current: Active = { owner: b4a.from(owner), transfer: null }
     this.active.set(socket, current)
-    socket.on('error', () => {})
+    // A failure of the peer's own stream (a reset) is the connection's, not the server's: if it
+    // ends an upload it stays `PROTOCOL_INVALID` instead of becoming a server error.
+    const peer: { failure: unknown } = { failure: null }
+    socket.on('error', (error) => {
+      peer.failure = error
+    })
     socket.once('close', () => {
       this.active.delete(socket)
       this.emitSafe('connection-close', {
@@ -1608,6 +1625,9 @@ export class Server extends EventEmitter {
           receiptRequested && receipt !== undefined ? { onFailure: receipt } : undefined
         )
         sentAdmission = true
+        // The rejection was written and nothing else follows: deliver it, then release the
+        // connection, rather than leaving it to a peer that may never close it.
+        this.closeAfterAnswer(socket)
       } finally {
         // Scheduled exactly once, when the answer was attempted, whether or not it could be
         // written: the context is already taken, so the connection's own failure path will not
@@ -1944,10 +1964,15 @@ export class Server extends EventEmitter {
       verificationSucceeded = true
       await finish(verified)
     } catch (error) {
-      const reason = codeOf(error)
+      const reason = error === peer.failure ? ERRORS.PROTOCOL_INVALID : codeOf(error)
+      // Only the code, the phase (a fixed set of names) and, when there is one, a known errno
+      // name: never the error's message, a path, or anything a hook said.
+      const systemCode = systemCodeOf(error)
       this.logger.warn('Direct upload failed', {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
-        reason
+        reason,
+        phase,
+        ...(systemCode === null ? {} : { systemCode })
       })
       this.emitSafe('failure', { fingerprint: owner ? fingerprint(owner) : 'invalid', reason })
       if (event && verificationStarted && !verificationSucceeded) {
@@ -1999,7 +2024,8 @@ export class Server extends EventEmitter {
           answered = true
         }
       } catch {}
-      if (answered && reason === ERRORS.HOOK_FAILED) {
+      // Whatever failed, an answer that was written is delivered before the stream goes away.
+      if (answered) {
         this.closeAfterAnswer(socket)
       } else {
         try {

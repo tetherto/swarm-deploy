@@ -7,7 +7,15 @@ import {
   type DirectDhtNode,
   type DirectDhtSocket
 } from './direct-dht.js'
-import { ERRORS, SwarmDeployError, type ErrorCode } from './errors.js'
+import { errorCode } from './error-code.js'
+import {
+  ERRORS,
+  SwarmDeployError,
+  summarizeCode,
+  type ErrorCode,
+  type RequestOperation,
+  type RequestPhase
+} from './errors.js'
 import { selectUploadTarget } from './files.js'
 import { keyPairFromSeed } from './identity.js'
 import {
@@ -37,6 +45,7 @@ import type { HookResult, UploadHookResult } from './hook-result.js'
 import {
   encodeLinkRequestRecord,
   type AnyMetadataRecord,
+  type FinalRecord,
   type LinkRequestRecord
 } from './tar-protocol/controls.js'
 import { sodiumSha256 } from './tar-protocol/hash.js'
@@ -56,6 +65,12 @@ const DEFAULT_CONNECT_TIMEOUT = 30_000
 const MAX_CONNECT_TIMEOUT = 5 * 60_000
 const DEFAULT_IDLE_TIMEOUT = 60_000
 const FINGERPRINT_LENGTH = 12
+/**
+ * The longest a failed send waits for the answer the server may already have written. A
+ * closed or dead connection ends the wait at once; this only bounds a stream that stays
+ * open and silent.
+ */
+const FAILURE_ANSWER_WAIT = 1_000
 
 export type ClientLogger = Logger
 export interface ClientOptions {
@@ -248,16 +263,69 @@ function receiptOf<T>(received: T | undefined, asked: boolean): T | undefined {
   }
   return received
 }
-/** A failed answer as an error: always the primary code, with the hook's data when asked for. */
+/**
+ * A failed answer as an error: always the primary code, with the hook's data when asked for.
+ * It is the server's own answer, so it is marked `remote`. Its message names the code and a
+ * fixed explanation of it, never text the server sent.
+ */
 function refused(
   code: ErrorCode,
   message: string,
   received: HookResult | UploadHookResult | undefined,
-  asked: boolean
+  asked: boolean,
+  operation: RequestOperation,
+  phase: RequestPhase
 ): SwarmDeployError {
   const receipt = receiptOf(received, asked)
-  const error = fail(code, message)
+  const error = fail(code, `${message} (${code}): ${summarizeCode(code)}`)
+  error.remote = true
+  error.operation = operation
+  error.phase = phase
   if (receipt !== undefined) error.hookResult = receipt
+  return error
+}
+/** Marks an error, in place, as a connection failure: the server gave no reason. */
+function markTransport<E>(error: E): E {
+  if (typeof error === 'object' && error !== null) {
+    try {
+      ;(error as { transport?: boolean }).transport = true
+    } catch {}
+  }
+  return error
+}
+/** Whether a failed read means the peer gave no answer (closed, errored, fell silent), not a bad one. */
+function gaveNoAnswer(error: unknown): boolean {
+  return (
+    !(error instanceof SwarmDeployError) ||
+    error.transport === true ||
+    error.code === ERRORS.UPLOAD_IDLE_TIMEOUT
+  )
+}
+/**
+ * Says where a failure surfaced, on the error itself, so its type, code, message and cause stay
+ * exactly what they were. An abort and an error that already says where it came from are left
+ * alone. A failure of the connection, or a wait that ended without any answer, is marked
+ * `transport`; a raw stream error counts as one only where `rawIsConnection` says it came from
+ * the connection and not from local work.
+ */
+function located<E>(
+  error: E,
+  operation: RequestOperation,
+  phase: RequestPhase,
+  rawIsConnection: boolean
+): E {
+  if (typeof error !== 'object' || error === null) return error
+  const failure = error as { code?: unknown; operation?: RequestOperation; phase?: RequestPhase }
+  if (failure.code === ERRORS.ABORTED || failure.phase !== undefined) return error
+  try {
+    failure.operation = operation
+    failure.phase = phase
+  } catch {
+    return error
+  }
+  const remote = (error as { remote?: boolean }).remote === true
+  const connection = error instanceof SwarmDeployError ? gaveNoAnswer(error) : rawIsConnection
+  if (connection && !remote) markTransport(error)
   return error
 }
 function codeOf(error: unknown): ErrorCode {
@@ -370,16 +438,68 @@ export class Client extends EventEmitter {
     } catch {}
   }
 
+  /**
+   * Connects and authenticates, and says that is where a failure happened. A server drops an
+   * unauthorized key before it answers anything, so that too surfaces here, without a reason.
+   */
+  private async openSocket(operation: RequestOperation): Promise<DirectDhtSocket> {
+    try {
+      return await this.direct.connect(this.serverPublicKey, {
+        signal: this.signal,
+        timeout: this.connectTimeout
+      })
+    } catch (error) {
+      throw located(error, operation, 'connect', true)
+    }
+  }
+
+  /**
+   * What a send that failed, or that stopped because the server had already spoken
+   * (`sendFailure` is `null` then), is reported as. The server's own answer is the reason and
+   * wins. Without one, the failure of the connection stands as it was. The wait is bounded and
+   * ends at once on a closed connection, so a dead peer is never waited on. An answer that is
+   * not a failure, or cannot be read, is reported as that and never taken for success.
+   */
+  private async failureOfSend(
+    reader: DirectWireReader,
+    sendFailure: unknown,
+    wantsResult: boolean
+  ): Promise<unknown> {
+    if (errorCode(sendFailure) === ERRORS.ABORTED) return sendFailure
+    let final: FinalRecord
+    try {
+      final = await reader.control(
+        decodeDirectFinal,
+        this.signal,
+        Math.min(this.idleTimeout, FAILURE_ANSWER_WAIT)
+      )
+    } catch (error) {
+      return gaveNoAnswer(error) ? markTransport(sendFailure ?? error) : error
+    }
+    if (final.status === 'FAILED') {
+      return refused(
+        final.code,
+        'Server failed upload',
+        final.hookResult,
+        wantsResult,
+        'upload',
+        'streaming'
+      )
+    }
+    return fail(
+      ERRORS.PROTOCOL_INVALID,
+      'Server reported completion before the payload was sent',
+      sendFailure
+    )
+  }
+
   private async uploadManifest(
     manifest: AnyManifest,
     reset = false,
     wantsResult = false
   ): Promise<UploadResult> {
     throwIfAborted(this.signal)
-    const socket = await this.direct.connect(this.serverPublicKey, {
-      signal: this.signal,
-      timeout: this.connectTimeout
-    })
+    const socket = await this.openSocket('upload')
     const remote = socket.remotePublicKey
     this.emitSafe('connection', { fingerprint: remote ? fingerprint(remote) : 'invalid' })
     this.emitSafe('connection-open', { fingerprint: remote ? fingerprint(remote) : 'invalid' })
@@ -390,6 +510,7 @@ export class Client extends EventEmitter {
     )
     const reader = new DirectWireReader(socket)
     let verificationStarted = false
+    let phase: RequestPhase = 'request'
     try {
       // The opt-in is sent only when asked for, so an older strict server rejects it.
       // It is not part of the transfer identity: the manifest and its ID are unchanged.
@@ -398,6 +519,7 @@ export class Client extends EventEmitter {
         ...(wantsResult ? { hookResult: true as const } : {})
       }
       await writeMetadata(socket, metadata, { signal: this.signal, timeout: this.idleTimeout })
+      phase = 'admission'
       this.emitSafe('offer', { name: manifest.name, status: 'offered' })
       const admission = await reader.control(decodeDirectAdmission, this.signal, this.idleTimeout)
       if (admission.status === 'ALREADY_COMMITTED') {
@@ -406,14 +528,29 @@ export class Client extends EventEmitter {
         return this.result(manifest, 'ALREADY_COMMITTED', hookResult)
       }
       if (admission.status === 'REJECTED') {
-        throw refused(admission.code, 'Server rejected upload', admission.hookResult, wantsResult)
+        throw refused(
+          admission.code,
+          'Server rejected upload',
+          admission.hookResult,
+          wantsResult,
+          'upload',
+          'admission'
+        )
       }
       if (admission.status === 'VERIFIED') {
+        phase = 'final'
         this.emitSafe('verification', { name: manifest.name, status: 'started' })
         verificationStarted = true
         const final = await reader.control(decodeDirectFinal, this.signal, this.idleTimeout)
         if (final.status !== 'COMMITTED') {
-          throw refused(final.code, 'Server failed verified upload', final.hookResult, wantsResult)
+          throw refused(
+            final.code,
+            'Server failed verified upload',
+            final.hookResult,
+            wantsResult,
+            'upload',
+            'final'
+          )
         }
         const hookResult = receiptOf(final.hookResult, wantsResult)
         this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
@@ -429,20 +566,46 @@ export class Client extends EventEmitter {
         offset
       })
       let progress = offset
-      const regenerated = await regenerateSuffix(
-        manifest,
-        offset,
-        async (chunk) => {
-          await writeTar(socket, chunk, { signal: this.signal, timeout: this.idleTimeout })
-          progress += chunk.byteLength
-          this.emitSafe('progress', {
-            name: manifest.name,
-            bytesSent: progress,
-            totalBytes: manifest.tarSize
-          })
-        },
-        { signal: this.signal, expectedPrefixSha256: expected }
+      phase = 'streaming'
+      // A server has nothing to say until the whole payload is in, so whatever it says sooner is
+      // a failure it hit while receiving. Keeping the stream flowing holds that answer here, where
+      // a failed or abandoned send cannot take it away.
+      const earlyAnswer = fail(
+        ERRORS.PROTOCOL_INVALID,
+        'Server answered before the payload was sent'
       )
+      // Held in an object because the writer sets it: the failure of sending to the connection,
+      // as opposed to a local one (the source changed, the client closing), which is never replaced.
+      const sent: { failure: unknown } = { failure: null }
+      reader.keepReading()
+      let regenerated: TarResumeResult
+      try {
+        regenerated = await regenerateSuffix(
+          manifest,
+          offset,
+          async (chunk) => {
+            // A server that answered, or closed the stream, will not use the rest.
+            if (reader.heard()) throw earlyAnswer
+            try {
+              await writeTar(socket, chunk, { signal: this.signal, timeout: this.idleTimeout })
+            } catch (error) {
+              sent.failure = error
+              throw error
+            }
+            progress += chunk.byteLength
+            this.emitSafe('progress', {
+              name: manifest.name,
+              bytesSent: progress,
+              totalBytes: manifest.tarSize
+            })
+          },
+          { signal: this.signal, expectedPrefixSha256: expected }
+        )
+      } catch (error) {
+        if (error !== earlyAnswer && error !== sent.failure) throw error
+        throw await this.failureOfSend(reader, error === earlyAnswer ? null : error, wantsResult)
+      }
+      reader.keepReading(false)
       if (regenerated.status === 'RESET_REQUIRED') {
         if (reset) throw fail(ERRORS.PROTOCOL_INVALID, 'Reset retry also mismatched')
         this.emitSafe('offer', { name: manifest.name, status: 'reset', offset: 0 })
@@ -461,12 +624,20 @@ export class Client extends EventEmitter {
           totalBytes: manifest.tarSize
         })
       }
+      phase = 'final'
       this.emitSafe('verification', { name: manifest.name, status: 'started' })
       verificationStarted = true
       endWrite(socket)
       const final = await reader.control(decodeDirectFinal, this.signal, this.idleTimeout)
       if (final.status !== 'COMMITTED') {
-        throw refused(final.code, 'Server failed upload', final.hookResult, wantsResult)
+        throw refused(
+          final.code,
+          'Server failed upload',
+          final.hookResult,
+          wantsResult,
+          'upload',
+          'final'
+        )
       }
       const hookResult = receiptOf(final.hookResult, wantsResult)
       this.emitSafe('verification', { name: manifest.name, status: 'succeeded' })
@@ -478,7 +649,9 @@ export class Client extends EventEmitter {
         this.emitSafe('verification', { name: manifest.name, status: 'failed', reason })
         this.emitSafe('commit', { name: manifest.name, status: 'failed', reason })
       }
-      throw error
+      // Raw stream errors are the connection's own everywhere except while sending, where
+      // `failureOfSend` has already marked the ones that were.
+      throw located(error, 'upload', phase, phase !== 'streaming')
     } finally {
       reader.closeReader()
       try {
@@ -526,10 +699,7 @@ export class Client extends EventEmitter {
     // Validate before opening a connection so malformed names never leave the client.
     encodeLinkRequestRecord(request)
     throwIfAborted(this.signal)
-    const socket = await this.direct.connect(this.serverPublicKey, {
-      signal: this.signal,
-      timeout: this.connectTimeout
-    })
+    const socket = await this.openSocket('link')
     const remote = socket.remotePublicKey
     this.emitSafe('connection', { fingerprint: remote ? fingerprint(remote) : 'invalid' })
     this.emitSafe('connection-open', { fingerprint: remote ? fingerprint(remote) : 'invalid' })
@@ -539,13 +709,22 @@ export class Client extends EventEmitter {
       })
     )
     const reader = new DirectWireReader(socket)
+    let phase: RequestPhase = 'request'
     try {
       await writeLinkRequest(socket, request, { signal: this.signal, timeout: this.idleTimeout })
       this.emitSafe('link', { target, name, status: 'requested', final: false })
       endWrite(socket)
+      phase = 'final'
       const response = await reader.control(decodeDirectLinkResult, this.signal, this.idleTimeout)
       if (response.status === 'FAILED') {
-        throw refused(response.code, 'Server failed link request', response.hookResult, wantsResult)
+        throw refused(
+          response.code,
+          'Server failed link request',
+          response.hookResult,
+          wantsResult,
+          'link',
+          'final'
+        )
       }
       receiptOf(response.hookResult, wantsResult)
       const status = response.status
@@ -560,7 +739,7 @@ export class Client extends EventEmitter {
       }
     } catch (error) {
       this.emitSafe('link', { target, name, status: codeOf(error), final: true })
-      throw error
+      throw located(error, 'link', phase, true)
     } finally {
       reader.closeReader()
       try {

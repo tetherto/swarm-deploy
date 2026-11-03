@@ -491,6 +491,8 @@ test('Server applies the inactivity timeout independently to metadata and TAR ph
     const failures: string[] = []
     server.on('failure', (event) => failures.push(event.reason))
     const socket = new FakeSocket(CLIENT_KEY)
+    let ended = 0
+    socket.onEnd = () => void ended++
     node.accept(socket)
     if (input) {
       socket.feed(metadataFrame(input.manifest))
@@ -499,8 +501,14 @@ test('Server applies the inactivity timeout independently to metadata and TAR ph
 
     await waitFor(() => failures.length === 1)
     t.is(failures[0], ERRORS.UPLOAD_IDLE_TIMEOUT, phase)
-    t.is(socket.destroyed, true, phase)
+    // The failure is answered and the stream ended behind the answer, not reset over it. The
+    // connection is released when the peer closes, after the grace period, or with the server.
+    const answer = phase === 'tar' ? 'FAILED' : 'REJECTED'
+    await waitFor(() => statuses(socket).at(-1) === answer)
+    t.is(ended, 1, phase)
+    t.is(socket.destroyed, false, phase)
     await server.close()
+    t.is(socket.destroyed, true, phase)
   }
 })
 
@@ -6235,4 +6243,554 @@ test('a listen that fails after the transport exists calls beforeClose once, hol
   t.is(next.listening, true, 'closing the failed server left the next owner untouched')
   t.absent(JSON.stringify(logs).includes(secret), 'the log names no callback text')
   t.absent(JSON.stringify(logs).includes('sk-secret'), 'nor transport text')
+})
+
+type ManualTimeout = { delay: number; cleared: boolean; fired: boolean; fire(): void }
+
+/** A scheduler whose timeouts are the test's to fire, so a grace period needs no waiting. */
+function manualTimeouts(): { scheduler: ServerScheduler; timeouts: ManualTimeout[] } {
+  const timeouts: ManualTimeout[] = []
+  const scheduler: ServerScheduler = {
+    setTimeout(callback, delay) {
+      const timeout: ManualTimeout = {
+        delay,
+        cleared: false,
+        fired: false,
+        fire() {
+          if (timeout.cleared || timeout.fired) return
+          timeout.fired = true
+          callback()
+        }
+      }
+      timeouts.push(timeout)
+      return timeout
+    },
+    clearTimeout(handle) {
+      ;(handle as ManualTimeout).cleared = true
+    },
+    setInterval: (callback, delay) => setInterval(callback, delay),
+    clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>)
+  }
+  return { scheduler, timeouts }
+}
+
+test('Server delivers every terminal failure answer, ends the stream behind it, and frees the connection within the grace period', async (t) => {
+  const { scheduler, timeouts } = manualTimeouts()
+  const { server, node } = await createServer(t, {
+    scheduler,
+    maxConnections: 1,
+    maxActiveUploads: 1,
+    maxFileBytes: 16 * 1024,
+    idleTimeout: 1_000
+  })
+  const closes: number[] = []
+  server.on('connection-close', (event) => closes.push(event.connections))
+  const sessions = (server as unknown as { sessions: SessionStore }).sessions
+  // What a server that ran out of space while receiving would report: only the code travels.
+  sessions.append = () =>
+    Promise.reject(new SwarmDeployError(ERRORS.DISK_RESERVE, 'disk /srv/private is full'))
+  const large = await manifest(t, 'large.bin', 'x'.repeat(16 * 1024 + 1))
+  const small = await manifest(t, 'small.txt', 'small payload')
+
+  const cases: Array<[string, string, (socket: FakeSocket) => Promise<void>]> = [
+    [
+      'an admission refusal',
+      ERRORS.FILE_TOO_LARGE,
+      async (socket) => {
+        socket.feed(metadataFrame(large.manifest))
+      }
+    ],
+    [
+      'a failure while receiving',
+      ERRORS.DISK_RESERVE,
+      async (socket) => {
+        socket.feed(metadataFrame(small.manifest))
+        await waitFor(() => statuses(socket).includes('ACCEPT'))
+        socket.feed(small.tar)
+        socket.finishInput()
+      }
+    ],
+    [
+      'a link refusal',
+      ERRORS.LINK_NOT_ALLOWED,
+      async (socket) => {
+        const request = encodeLinkRequestRecord({ v: 1, kind: 'link', target: 'a', name: 'b' })
+        socket.feed(encodeControlFrame(request))
+        socket.finishInput()
+      }
+    ]
+  ]
+  for (const [index, [label, reason, send]] of cases.entries()) {
+    const socket = new FakeSocket(CLIENT_KEY)
+    let ended = 0
+    socket.onEnd = () => void ended++
+    node.accept(socket)
+    await send(socket)
+    await waitFor(() => isTerminal(socket) && ended === 1)
+
+    const last = socket.writes.at(-1)!
+    t.is(finalCode(socket), reason, `${label}: the server's own code is the answer`)
+    t.absent(b4a.toString(last).includes('/srv/private'), `${label}: no server text travels`)
+    t.is(socket.destroyed, false, `${label}: the stream is ended behind the answer, not reset`)
+    t.is(timeouts.length, index + 1, `${label}: one grace timer`)
+    t.is(timeouts[index].delay, 5_000)
+    t.is(socket.listenerCount('data'), 0, `${label}: the reader's listeners are gone`)
+    t.is(socket.listenerCount('end'), 0)
+
+    // Until the grace period ends the connection keeps its one slot, and no longer than that.
+    const turnedAway = new FakeSocket(CLIENT_KEY)
+    node.accept(turnedAway)
+    t.is(code(turnedAway.destroyError), ERRORS.FILE_BUSY, `${label}: the slot is held`)
+    timeouts[index].fire()
+    t.is(socket.destroyed, true, `${label}: the grace period ended the connection`)
+    t.is(closes.at(-1), 0, `${label}: the slot is free again`)
+    t.is(socket.listenerCount('close'), 0, `${label}: no listener is left`)
+  }
+
+  // The peer closing first releases the slot at once and cancels the timer.
+  const polite = new FakeSocket(CLIENT_KEY)
+  node.accept(polite)
+  polite.feed(metadataFrame(large.manifest))
+  await waitFor(() => timeouts.length === 4)
+  polite.destroy()
+  t.is(timeouts[3].cleared, true, 'the grace timer went with the peer')
+  t.is(closes.at(-1), 0)
+})
+
+test('Server destroys at once when the answer could not be written or the server is closing', async (t) => {
+  const { scheduler, timeouts } = manualTimeouts()
+  const { server, node } = await createServer(t, {
+    scheduler,
+    maxFileBytes: 16 * 1024,
+    idleTimeout: 1_000
+  })
+  const large = await manifest(t, 'large.bin', 'x'.repeat(16 * 1024 + 1))
+
+  // Nothing was delivered, so there is nothing to wait for: no end, no grace timer.
+  const dead = new FakeSocket(CLIENT_KEY)
+  let ended = 0
+  dead.onEnd = () => void ended++
+  dead.onWrite = () => {
+    throw new Error('write failed')
+  }
+  node.accept(dead)
+  dead.feed(metadataFrame(large.manifest))
+  await waitFor(() => dead.destroyed)
+  t.is(ended, 0)
+  t.is(timeouts.length, 0)
+
+  // A delivered answer lingers, but closing the server destroys it and drops its timer.
+  const lingering = new FakeSocket(CLIENT_KEY)
+  node.accept(lingering)
+  lingering.feed(metadataFrame(large.manifest))
+  await waitFor(() => timeouts.length === 1)
+  t.is(lingering.destroyed, false)
+  await server.close()
+  t.is(lingering.destroyed, true)
+  t.is(timeouts[0].cleared, true)
+  t.is(lingering.listenerCount('close'), 0)
+
+  // A connection that arrives while the server is closing is turned away, as before.
+  const late = new FakeSocket(CLIENT_KEY)
+  node.accept(late)
+  t.is(late.destroyed, true)
+})
+
+const SERVER_KEY = keyPairFromSeed(SERVER_SEED).publicKey
+
+function clientFor(socket: FakeSocket, idleTimeout = 1_000): Client {
+  const client = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: SERVER_KEY,
+    idleTimeout,
+    dht: fakeClientNode(socket)
+  })
+  return client
+}
+
+function finalFrame(record: Parameters<typeof encodeFinalRecord>[0]): Buffer {
+  return encodeControlFrame(encodeFinalRecord(record))
+}
+
+/** A fake server that accepts the offer, then does what `then` says on every write after it. */
+function acceptingServer(
+  then: (socket: FakeSocket, index: number) => boolean | void = () => {}
+): FakeSocket {
+  const socket = new FakeSocket(SERVER_KEY)
+  socket.onWrite = (_bytes, index) => {
+    if (index === 0) {
+      queueMicrotask(() =>
+        socket.feed(
+          encodeControlFrame(encodeAdmissionRecord({ v: 1, status: 'ACCEPT', offset: 0 }))
+        )
+      )
+    }
+    return then(socket, index) !== false
+  }
+  return socket
+}
+
+async function payloadFile(t: Assert, size: number): Promise<string> {
+  const file = path.join(await createTempDir(t), 'payload.bin')
+  await fs.promises.writeFile(file, b4a.alloc(size, 0x61))
+  return file
+}
+
+type Failure = {
+  code?: unknown
+  message: string
+  remote?: unknown
+  transport?: unknown
+  operation?: unknown
+  phase?: unknown
+  hookResult?: unknown
+}
+
+async function rejectionOf(operation: Promise<unknown>): Promise<Failure> {
+  const error = await operation.then(
+    () => {
+      throw new Error('The operation unexpectedly succeeded')
+    },
+    (failure: unknown) => failure
+  )
+  return error as Failure
+}
+
+test('Client reports the answer a server wrote while the payload was still being sent, and stops sending', async (t) => {
+  const file = await payloadFile(t, 512 * 1024)
+  const early = acceptingServer((server, index) => {
+    if (index !== 1) return
+    queueMicrotask(() => {
+      server.feed(finalFrame({ v: 1, status: 'FAILED', code: ERRORS.DISK_RESERVE }))
+      server.finishInput()
+    })
+  })
+  const client = clientFor(early)
+  t.teardown(() => client.close())
+  const reasons: string[] = []
+  client.on('failure', (event) => reasons.push(event.reason))
+
+  const error = await rejectionOf(client.upload(file))
+  t.is(error.code, ERRORS.DISK_RESERVE, 'the server reason, not a local write error')
+  t.is(error.remote, true, 'the answer is the server’s own')
+  t.is(error.operation, 'upload')
+  t.is(error.phase, 'streaming')
+  t.absent(error.transport)
+  t.ok(error.message.includes('DISK_RESERVE'))
+  t.ok(error.message.includes('free disk space'), 'with its fixed explanation')
+  t.is(early.writes.length, 2, 'the offer and the first piece only: the rest was never sent')
+  t.alike(reasons, [ERRORS.DISK_RESERVE])
+  t.is(early.destroyed, true)
+
+  // The connection dying under a write does not hide an answer that arrived before it.
+  const dying = acceptingServer((server, index) => {
+    if (index !== 2) return
+    server.feed(finalFrame({ v: 1, status: 'FAILED', code: ERRORS.STAGING_LIMIT }))
+    server.destroy(new Error('connection reset by peer'))
+    return false
+  })
+  const reset = await rejectionOf(clientFor(dying).upload(file))
+  t.is(reset.code, ERRORS.STAGING_LIMIT)
+  t.is(reset.remote, true)
+  t.is(reset.phase, 'streaming')
+  t.absent(reset.transport)
+})
+
+test('Client reports a connection that closed without an answer with where it happened and no invented reason', async (t) => {
+  const file = await payloadFile(t, 256 * 1024)
+  const reset = (): Error => new Error('connection reset by peer')
+
+  const admissionReset = new FakeSocket(SERVER_KEY)
+  admissionReset.onWrite = (_bytes, index) => {
+    // After the client is waiting, so the stream's own error is what it sees.
+    if (index === 0) setTimeout(() => admissionReset.destroy(reset()), 5)
+    return true
+  }
+  const admissionClosed = new FakeSocket(SERVER_KEY)
+  admissionClosed.onWrite = (_bytes, index) => {
+    if (index === 0) queueMicrotask(() => admissionClosed.destroy())
+    return true
+  }
+  const streaming = acceptingServer((server, index) => {
+    if (index === 1) queueMicrotask(() => server.destroy(reset()))
+  })
+  const finalClosed = acceptingServer()
+  finalClosed.onEnd = () => queueMicrotask(() => finalClosed.destroy())
+  const finalSilent = acceptingServer()
+
+  const scenarios: Array<[string, FakeSocket, string, number]> = [
+    ['reset while waiting for admission', admissionReset, 'admission', 1_000],
+    ['close while waiting for admission', admissionClosed, 'admission', 1_000],
+    ['reset while sending', streaming, 'streaming', 1_000],
+    ['close while waiting for the final answer', finalClosed, 'final', 1_000],
+    ['silence while waiting for the final answer', finalSilent, 'final', 30]
+  ]
+  for (const [label, socket, phase, idleTimeout] of scenarios) {
+    const error = await rejectionOf(clientFor(socket, idleTimeout).upload(file))
+    t.is(error.transport, true, `${label}: marked as a connection failure`)
+    t.is(error.operation, 'upload', label)
+    t.is(error.phase, phase, label)
+    t.absent(error.remote, `${label}: no server answer exists to claim`)
+    t.absent(error.hookResult, label)
+    if (label.startsWith('reset while waiting')) {
+      t.is(error.message, 'connection reset by peer', 'the stream error is kept, not replaced')
+      t.absent(error instanceof SwarmDeployError, 'and keeps its own type')
+    }
+    if (label.startsWith('silence')) {
+      t.is(error.code, ERRORS.UPLOAD_IDLE_TIMEOUT, 'a timeout stays a timeout')
+    }
+  }
+
+  // Connecting and authenticating: a failed handshake and a missing answer both say so.
+  const node = (opened: () => Promise<boolean>): DirectDhtNode => ({
+    destroyed: false,
+    createServer() {
+      throw new Error('Unexpected server creation')
+    },
+    connect() {
+      const socket = Object.assign(new FakeSocket(SERVER_KEY), { opened: opened() })
+      return socket as unknown as DirectDhtSocket
+    },
+    on() {
+      return this
+    },
+    destroy() {
+      return Promise.resolve()
+    }
+  })
+  const failed = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: SERVER_KEY,
+    connectTimeout: 1_000,
+    dht: node(() => Promise.reject(new Error('handshake failed')))
+  })
+  const refused = await rejectionOf(failed.upload(file))
+  t.is(refused.message, 'handshake failed')
+  t.is(refused.transport, true)
+  t.is(refused.phase, 'connect')
+  t.is(refused.operation, 'upload')
+  const stalled = new Client({
+    seed: CLIENT_SEED,
+    serverPublicKey: SERVER_KEY,
+    connectTimeout: 30,
+    dht: node(() => new Promise<boolean>(() => {}))
+  })
+  const timedOut = await rejectionOf(stalled.upload(file))
+  t.is(timedOut.code, ERRORS.CONNECT_TIMEOUT, 'a connect timeout keeps its own code')
+  t.is(timedOut.transport, true)
+  t.is(timedOut.phase, 'connect')
+  await Promise.all([failed.close(), stalled.close()])
+})
+
+test('Client keeps local failures, aborts and unexpected answers while sending, and never reports success', async (t) => {
+  const file = await payloadFile(t, 512 * 1024)
+
+  const closing: { client: Client | null } = { client: null }
+  const aborting = acceptingServer((_server, index) => {
+    if (index === 1) void closing.client?.close()
+  })
+  closing.client = clientFor(aborting)
+  const aborted = await rejectionOf(closing.client.upload(file))
+  t.is(aborted.code, ERRORS.ABORTED, 'an abort stays an abort')
+  t.absent(aborted.transport)
+  t.absent(aborted.phase)
+  t.absent(aborted.remote)
+
+  // The source changing under the upload is the client's own failure, whatever the peer does.
+  const changing = acceptingServer((_server, index) => {
+    if (index === 0) fs.writeFileSync(file, b4a.alloc(512 * 1024 + 1, 0x62))
+  })
+  const changed = await rejectionOf(clientFor(changing).upload(file))
+  t.is(changed.code, ERRORS.FILE_BUSY)
+  t.absent(changed.transport)
+  t.absent(changed.remote)
+  t.is(changed.phase, 'streaming')
+
+  // Completion before the payload is in is a protocol violation, never a success.
+  const other = await payloadFile(t, 512 * 1024)
+  const premature = acceptingServer((server, index) => {
+    if (index !== 1) return
+    queueMicrotask(() => {
+      server.feed(finalFrame({ v: 1, status: 'COMMITTED' }))
+      server.finishInput()
+    })
+  })
+  const early = await rejectionOf(clientFor(premature).upload(other))
+  t.is(early.code, ERRORS.PROTOCOL_INVALID)
+  t.ok(early.message.includes('before the payload was sent'))
+  t.absent(early.transport)
+  t.absent(early.remote)
+
+  // An unreadable answer is reported as that, not replaced by a connection error.
+  const malformed = acceptingServer((server, index) => {
+    if (index !== 1) return
+    queueMicrotask(() =>
+      server.feed(encodeControlFrame(b4a.from('{"v":1,"status":"FAILED","code":"NOT_A_CODE"}')))
+    )
+  })
+  const unreadable = await rejectionOf(clientFor(malformed).upload(other))
+  t.is(unreadable.code, ERRORS.PROTOCOL_INVALID)
+  t.absent(unreadable.transport)
+  t.absent(unreadable.remote)
+  t.is(unreadable.phase, 'streaming')
+})
+
+test('Client never waits long on a peer that is gone while a send fails', async (t) => {
+  const file = await payloadFile(t, 256 * 1024)
+  // The write fails but the connection neither answers nor closes.
+  const silent = acceptingServer((_server, index) => {
+    if (index === 1) throw new Error('EPIPE')
+  })
+  const started = Date.now()
+  const error = await deadline(rejectionOf(clientFor(silent, 100).upload(file)), 'a silent peer')
+  t.is(error.message, 'EPIPE', 'the send failure stands when nothing was answered')
+  t.is(error.transport, true)
+  t.is(error.phase, 'streaming')
+  t.absent(error.remote)
+  t.ok(Date.now() - started < 3_000, 'the wait for an answer is bounded by the idle timeout')
+})
+
+test('Client.link marks the server answer, and a closure that gave no reason, with the request and phase', async (t) => {
+  const answered = new FakeSocket(SERVER_KEY)
+  answered.onEnd = () =>
+    answered.feed(linkAnswer({ v: 1, status: 'FAILED', code: 'LINK_CONFLICT' }))
+  const first = linkClient(SERVER_KEY, answered)
+  const conflict = await rejectionOf(first.client.link('release-1.2.3', 'current'))
+  t.is(conflict.code, ERRORS.LINK_CONFLICT)
+  t.is(conflict.remote, true)
+  t.is(conflict.operation, 'link')
+  t.is(conflict.phase, 'final')
+  t.ok(conflict.message.includes('LINK_CONFLICT'))
+  t.absent(conflict.transport)
+
+  const closed = new FakeSocket(SERVER_KEY)
+  closed.onEnd = () => queueMicrotask(() => closed.destroy())
+  const second = linkClient(SERVER_KEY, closed)
+  const lost = await rejectionOf(second.client.link('release-1.2.3', 'current'))
+  t.is(lost.transport, true)
+  t.is(lost.operation, 'link')
+  t.is(lost.phase, 'final')
+  t.absent(lost.remote)
+  await Promise.all([first.client.close(), second.client.close()])
+})
+
+test('Server reports an unwrapped raw failure by what it was and logs only a known errno', async (t) => {
+  const logs: Array<Record<string, unknown>> = []
+  const { server, node } = await createServer(t, {
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) }
+  })
+  const failures: string[] = []
+  server.on('failure', (event) => failures.push(event.reason))
+  const sessions = (server as unknown as { sessions: SessionStore }).sessions
+  const errno = (name: string): Error =>
+    Object.assign(new Error(`${name}: raw text sk-secret /srv/private/part`), { code: name })
+  const cases: Array<[label: string, injected: Error, expected: string, systemCode?: string]> = [
+    ['a full disk', errno('ENOSPC'), ERRORS.DISK_RESERVE, 'ENOSPC'],
+    ['an exceeded quota', errno('EDQUOT'), ERRORS.DISK_RESERVE, 'EDQUOT'],
+    ['storage that cannot do it', errno('EXDEV'), ERRORS.UNSUPPORTED_STORAGE, 'EXDEV'],
+    ['an unimplemented call', errno('ENOSYS'), ERRORS.UNSUPPORTED_STORAGE, 'ENOSYS'],
+    ['an unsupported operation', errno('ENOTSUP'), ERRORS.UNSUPPORTED_STORAGE, 'ENOTSUP'],
+    ['a permission refusal', errno('EACCES'), ERRORS.COMMIT_FAILED, 'EACCES'],
+    ['a refused operation', errno('EPERM'), ERRORS.COMMIT_FAILED, 'EPERM'],
+    ['a read-only volume', errno('EROFS'), ERRORS.COMMIT_FAILED, 'EROFS'],
+    ['an I/O error', errno('EIO'), ERRORS.COMMIT_FAILED, 'EIO'],
+    [
+      'an errno one level down',
+      new Error('wrapper sk-secret /srv/private', { cause: errno('ENOSPC') }),
+      ERRORS.DISK_RESERVE,
+      'ENOSPC'
+    ],
+    ['an errno that is not on the list', errno('EWEIRD'), ERRORS.SERVER_ERROR],
+    ['an unexpected error', new TypeError('boom sk-secret /srv/private'), ERRORS.SERVER_ERROR],
+    [
+      'an explicit code keeps its code and names the errno under it',
+      new SwarmDeployError(ERRORS.COMMIT_FAILED, 'x sk-secret', errno('ENOSPC')),
+      ERRORS.COMMIT_FAILED,
+      'ENOSPC'
+    ],
+    [
+      'an explicit protocol failure stays a protocol failure',
+      new SwarmDeployError(ERRORS.PROTOCOL_INVALID, 'bad sk-secret'),
+      ERRORS.PROTOCOL_INVALID
+    ]
+  ]
+  for (const [index, [label, injected, expected, systemCode]] of cases.entries()) {
+    sessions.append = () => Promise.reject(injected)
+    const socket = await uploadAll(node, await manifest(t, `case-${index}.txt`, `payload ${index}`))
+    t.is(finalCode(socket), expected, label)
+    const entry = logs.filter((item) => item.message === 'Direct upload failed')[index]
+    t.is(entry.reason, expected, `${label}: the log names the same code`)
+    t.is(entry.phase, 'transfer', `${label}: and where the server was`)
+    t.is(entry.systemCode, systemCode, `${label}: and only a known errno`)
+    t.absent(
+      b4a.toString(socket.writes.at(-1)!).includes('sk-secret'),
+      `${label}: nothing raw sent`
+    )
+  }
+  t.alike(
+    failures,
+    cases.map(([, , expected]) => expected),
+    'the failure events agree'
+  )
+  const serialized = JSON.stringify(logs)
+  t.absent(serialized.includes('sk-secret'), 'no error text is logged')
+  t.absent(serialized.includes('/srv/private'), 'and no path')
+
+  // A malformed request is the client's fault and stays one, however it fails.
+  const garbage = new FakeSocket(CLIENT_KEY)
+  node.accept(garbage)
+  garbage.feed(encodeControlFrame(b4a.from('{"not":"a record"}')))
+  await waitFor(() => isTerminal(garbage))
+  t.is(finalCode(garbage), ERRORS.PROTOCOL_INVALID)
+  const [malformed] = logs.filter((item) => item.message === 'Direct upload failed').slice(-1)
+  t.is(malformed.reason, ERRORS.PROTOCOL_INVALID)
+  t.is(malformed.phase, 'offer')
+  t.absent('systemCode' in malformed)
+})
+
+test('Server keeps a failure of the peer’s own stream a protocol failure, not a server error', async (t) => {
+  const { server, node } = await createServer(t)
+  const failures: string[] = []
+  server.on('failure', (event) => failures.push(event.reason))
+  const input = await manifest(t, 'reset.txt', 'x'.repeat(2000))
+  const socket = new FakeSocket(CLIENT_KEY)
+  node.accept(socket)
+  socket.feed(metadataFrame(input.manifest))
+  await waitFor(() => statuses(socket).includes('ACCEPT'))
+  socket.feed(input.tar.subarray(0, 600))
+  socket.destroy(new Error('connection reset by peer'))
+  await waitFor(() => failures.length === 1)
+  t.alike(failures, [ERRORS.PROTOCOL_INVALID])
+})
+
+test('Client names SERVER_ERROR with its fixed explanation and no server text', async (t) => {
+  const file = await payloadFile(t, 128 * 1024)
+  const failing = acceptingServer((server, index) => {
+    if (index !== 1) return
+    queueMicrotask(() => {
+      server.feed(finalFrame({ v: 1, status: 'FAILED', code: ERRORS.SERVER_ERROR }))
+      server.finishInput()
+    })
+  })
+  const error = await rejectionOf(clientFor(failing).upload(file))
+  t.is(error.code, ERRORS.SERVER_ERROR)
+  t.is(error.remote, true)
+  t.ok(error.message.includes('SERVER_ERROR'))
+  t.ok(error.message.includes('unexpected error'))
+  t.absent(error.transport)
+
+  // PROTOCOL_INVALID can be an invalid request or a storage-state guard on the server, so its
+  // fixed explanation says neither that the request nor the client version was at fault.
+  const guarded = acceptingServer((server, index) => {
+    if (index !== 1) return
+    queueMicrotask(() => {
+      server.feed(finalFrame({ v: 1, status: 'FAILED', code: ERRORS.PROTOCOL_INVALID }))
+      server.finishInput()
+    })
+  })
+  const refused = await rejectionOf(clientFor(guarded).upload(file))
+  t.is(refused.code, ERRORS.PROTOCOL_INVALID)
+  t.is(refused.remote, true)
+  t.ok(refused.message.includes('protocol or storage-state check failure'))
+  t.absent(/invalid|field|version|client/.test(refused.message.replace('PROTOCOL_INVALID', '')))
 })

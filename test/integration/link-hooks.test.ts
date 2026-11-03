@@ -346,10 +346,17 @@ test('swarm-deploy link --json prints the hook result through a real client and 
   t.absent(plain.stdout.includes('sub-'))
   t.is(calls, 4, 'the hook runs for every request')
 
+  // An ordinary refusal reaches the command as the server's own answer, over the real network.
   const missing = await run('--json', 'release-9', 'current')
   t.is(missing.code, 1)
-  t.is(missing.stdout, '', 'a failure prints no JSON')
-  t.ok(missing.stderr.length > 0)
+  t.alike(JSON.parse(missing.stdout), {
+    target: 'release-9',
+    name: 'current',
+    code: 'LINK_NOT_ALLOWED',
+    origin: 'server',
+    phase: 'final'
+  })
+  t.is(missing.stderr, 'LINK_NOT_ALLOWED\n')
 })
 
 test('swarm-deploy link rolls a failed hook back by default and keeps the link with --hook-failure keep', async (t) => {

@@ -475,7 +475,8 @@ link request restores its previous link first unless it asked to keep it (see
 Stable codes include authentication and server-key rejection, invalid
 configuration and protocol records, file and staging limits, disk reserve,
 filename and replacement conflicts, checksum failures, connection or upload
-timeouts, aborts, commit failures, cleanup failures, and managed-link failures
+timeouts, aborts, commit failures, cleanup failures, unexpected server errors
+(`SERVER_ERROR`, 0.6.3), and managed-link failures
 (`LINK_NOT_ALLOWED`, `LINK_TARGET_NOT_FOUND`, `LINK_CONFLICT`, `LINK_FAILED`,
 `UNSUPPORTED_STORAGE`). Manual requests use `LINK_NOT_ALLOWED` for policy,
 self-link, and automatic-name rejection; `LINK_TARGET_NOT_FOUND` for an absent
@@ -485,3 +486,85 @@ reconciliation failure after a durable commit behaves like other post-commit
 deployment failures: the artifact stays committed, the client receives a
 stable failure, and an already-committed retry reruns reconciliation before
 succeeding. Import `ERRORS` rather than matching exception messages.
+
+### How a server reports its own failures (0.6.3)
+
+Through 0.6.2 a server reported every upload error that was not a
+`SwarmDeployError` as `PROTOCOL_INVALID`, so a raw server fault could look like
+an invalid request. From 0.6.3, for **uploads**:
+
+- An explicit `SwarmDeployError` always keeps its stable code. That includes
+  `PROTOCOL_INVALID`, which can mean an invalid request or answer (a malformed
+  record, a transfer ID that does not match, a peer's own stream failing) **or**
+  a check of the server's own storage state: the storage layer can wrap a raw
+  failure in its own `PROTOCOL_INVALID` (for example when it cannot open or check
+  a staging file or directory, or when rolling back a failed append), and the
+  server refuses new work while legacy private state is in the output root. So
+  `PROTOCOL_INVALID` alone does not say that the request, a field, or the client
+  version was at fault; the server log's `phase` and `systemCode` say more.
+- A raw error that reaches the server **unwrapped** and has a known errno is
+  reported as the code that names it: `ENOSPC` and `EDQUOT` as `DISK_RESERVE`;
+  `EXDEV`, `ENOSYS` and `ENOTSUP` as `UNSUPPORTED_STORAGE`; `EACCES`, `EPERM`,
+  `EROFS` and `EIO` as `COMMIT_FAILED` (a write or commit that could not be
+  done). The errno is read from the error or from one level of its `cause`. An
+  errno inside a storage guard's `PROTOCOL_INVALID` is not remapped.
+- Any other unwrapped raw error is the new stable code `SERVER_ERROR`
+  (`ERRORS.SERVER_ERROR`): the server hit an error it did not expect. Its
+  explanation is fixed; no message or cause is sent.
+- Link requests are unchanged: a failure of a link request that has no stable
+  link code is reported as `LINK_FAILED`, so the errno mapping and `SERVER_ERROR`
+  do not apply to link answers.
+- The answer carries only the code, as before: no record field and no version
+  changed. The server log line `Direct upload failed` (and `Direct link failed`)
+  carries `publicKeyId`, `reason`, the `phase` the server was in (`offer`,
+  `transfer`, `verification`, `beforeCommit`, `commit`, `afterCommit`,
+  `afterLink`; `link` or `afterLink` for a link request) and, when the failure
+  has one, `systemCode`: the errno name, from a short fixed list. It never
+  carries the error's message, a path, a stack, or hook text.
+
+A client older than 0.6.3 does not know `SERVER_ERROR`: it rejects the answer as
+an invalid record (`PROTOCOL_INVALID`, raised by the client while decoding) and
+cannot show the code, so look at the server log, which says `SERVER_ERROR` and
+the phase. This fails closed: no request that succeeds is affected, and the
+other codes above already existed. A client of 0.6.3 or newer shows the code.
+
+### Where a client failure came from (0.6.3)
+
+A `Client.upload` or `Client.link` failure says whether the server explained it:
+
+- `error.remote === true`: the server answered and `error.code` is its own
+  stable code (for example `FILE_EXISTS`, `FILE_TOO_LARGE`, `DISK_RESERVE`,
+  `LINK_NOT_ALLOWED`). The message names the code and a fixed explanation of it
+  (`Server rejected upload (DISK_RESERVE): the server does not have enough free
+disk space or quota`); text the server wrote, paths, and hook causes never
+  appear in it.
+  `error.hookResult` is unchanged. This includes a failure the server hit while
+  the client was still sending: the client reads the answer, stops sending, and
+  reports that code, not a local write error.
+- `error.transport === true`: the connection failed, closed, or timed out and
+  **no server reason was received**. The code then says nothing about the
+  server's cause, and nothing says whether the server rolled back or finished:
+  an abrupt close after the whole payload was sent may follow a commit. The
+  error object is the one that was thrown (a raw stream error such as a reset
+  stays a raw error with its own message and code; a `SwarmDeployError` keeps its
+  code and `cause`), with these fields added on it.
+- `error.operation` (`'upload' | 'link'`) and `error.phase`
+  (`'connect' | 'request' | 'admission' | 'streaming' | 'final'`) say where it
+  surfaced, when known: `connect` covers the DHT lookup, the server-key check and
+  the handshake (a client key the server does not allow is dropped before any
+  answer, so it looks the same as an unreachable server); `admission` is waiting
+  for the decision on an upload offer; `streaming` is sending the artifact;
+  `final` is waiting for the terminal answer.
+- An error with neither `remote` nor `transport` (an invalid input, a local
+  checksum or changed-source failure, an answer that could not be read, an abort)
+  is the client's own: it keeps its type and code. It may still carry `operation`
+  and `phase` saying where the client was when it failed, which does not mean the
+  server or the connection was involved, so decide on `remote` and `transport`,
+  not on the presence of `phase`. An abort is never relabelled and carries no
+  `operation` or `phase`.
+
+`RequestOperation` and `RequestPhase` are exported types. The server can only
+answer a client it has authenticated, and only while it can write: a client
+key the server does not allow, an over-capacity server (`maxConnections`), a
+crash, or a network failure end the connection with no answer, and are
+`transport` failures.

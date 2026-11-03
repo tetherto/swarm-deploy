@@ -21,6 +21,8 @@ import type { StorageAdapter, StorageFileHandle, StorageLayout, StorageStat } fr
 const DEFAULT_RESUME_TTL = 7 * 24 * 60 * 60 * 1000
 const DEFAULT_CLEANUP_INTERVAL = 15 * 60 * 1000
 const MAX_CLEANUP_INTERVAL = 0x7fffffff
+/** How many unmanaged names one scan names individually; the rest are counted. */
+const MAX_UNKNOWN_LOGGED = 32
 
 interface Session {
   state: string
@@ -338,6 +340,10 @@ class RetentionManager {
   linkPinsFallback: ((records: CommitRecord[]) => Promise<ReadonlySet<string>>) | undefined
   managedLinkNames: (() => ReadonlySet<string>) | undefined
   logger: Logger | null
+  /** The unmanaged names the last scan logged, at most `MAX_UNKNOWN_LOGGED`, so a repeat is quiet. */
+  unknownLogged: Set<string>
+  /** How many unmanaged names past that limit the last scan counted. */
+  unknownOverflow: number
   timer: unknown | null
   cleanupFailure: unknown | null
   scheduler: Scheduler
@@ -443,6 +449,8 @@ class RetentionManager {
     this.linkPinsFallback = linkPinsFallback
     this.managedLinkNames = managedLinkNames
     this.logger = logger
+    this.unknownLogged = new Set()
+    this.unknownOverflow = 0
     this.timer = null
     this.cleanupFailure = null
     this.scheduler = scheduler
@@ -473,6 +481,28 @@ class RetentionManager {
     return this.sessionStore.expire(this.resumeTtl, (session) => !this.isSessionActive(session))
   }
 
+  /**
+   * Logs the entries of the output root that no record owns. They are legitimate (an
+   * operator's own file, an artifact whose metadata was deleted) and are never adopted or
+   * removed. A scan runs after every commit and on a schedule, so a name is logged when it
+   * first shows up, and again only if it went away and came back, not on every pass. What is
+   * remembered is the last scan's first `MAX_UNKNOWN_LOGGED` names, so it cannot grow with the
+   * root; the rest are counted, and that count is logged again only when it changes.
+   */
+  _reportUnknown(unknown: readonly string[]): void {
+    const listed = unknown.slice(0, MAX_UNKNOWN_LOGGED)
+    for (const name of listed) {
+      if (this.unknownLogged.has(name)) continue
+      report(this.logger, 'warn', 'Ignoring unknown committed path', { name })
+    }
+    const more = unknown.length - listed.length
+    if (more > 0 && more !== this.unknownOverflow) {
+      report(this.logger, 'warn', 'Ignoring more unknown committed paths', { count: more })
+    }
+    this.unknownLogged = new Set(listed)
+    this.unknownOverflow = more
+  }
+
   async scrubCommitted({ hash = true }: { hash?: boolean } = {}): Promise<{
     records: CommitRecord[]
     deleted: number
@@ -495,9 +525,7 @@ class RetentionManager {
     )
     const linkNames = this.managedLinkNames ? this.managedLinkNames() : new Set<string>()
     const unknown = rootNames.filter((name) => !knownNames.has(name) && !linkNames.has(name)).sort()
-    for (const name of unknown) {
-      report(this.logger, 'warn', 'Ignoring unknown committed path', { name })
-    }
+    this._reportUnknown(unknown)
 
     const valid = []
     let deleted = scanned.deleted

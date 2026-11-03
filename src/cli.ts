@@ -5,7 +5,7 @@ import os from '#os'
 import path from '#path'
 import process from '#process'
 import type { FileHandle } from 'node:fs/promises'
-import { SwarmDeployError, ERRORS } from './errors.js'
+import { SwarmDeployError, ERRORS, isStableCode, type RequestPhase } from './errors.js'
 import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './identity.js'
 import { validateReplaceNames } from './files.js'
 import { compileSymlinkRules } from './symlinks.js'
@@ -804,14 +804,105 @@ function printUploadJson(result: ClientUploadResult, io: CliIo): number {
   return status === 'COMMITTED' || status === 'ALREADY_COMMITTED' ? 0 : 1
 }
 
+const PHASE_ACTIVITY: Record<RequestPhase, string> = {
+  connect: 'connecting to the server',
+  request: 'sending the request',
+  admission: 'waiting for the server to accept the offer',
+  streaming: 'sending the artifact',
+  final: 'waiting for the final answer'
+}
+
+const CONNECT_HINT =
+  'An unauthorized key, an unreachable server and a network failure look the same here.'
+const UPLOAD_FINAL_HINT =
+  'The upload may already be committed; repeating the identical upload reports ALREADY_COMMITTED if it was.'
+const LINK_FINAL_HINT =
+  'The link may already have changed; repeating the request reports UNCHANGED if it did.'
+
 /**
- * With `--json`, a failed request whose answer carried the server's `onFailure` data prints one
- * JSON object with the primary error code and that data; the exit status and the error message
- * are the same as without it. Nothing is printed when the server returned none.
+ * What the client may attach to any error it throws. A raw stream error (a reset) is annotated in
+ * place and is not a `SwarmDeployError`, so the fields are read from whatever object was thrown.
+ */
+type LocatedError = {
+  code?: unknown
+  transport?: unknown
+  remote?: unknown
+  operation?: unknown
+  phase?: unknown
+}
+
+function locatedError(err: unknown): LocatedError {
+  return typeof err === 'object' && err !== null ? (err as LocatedError) : {}
+}
+
+/** The phase a client error reports, only when it is one the client defines. */
+function phaseOf(err: unknown): RequestPhase | null {
+  const phase = locatedError(err).phase
+  if (typeof phase !== 'string' || !Object.prototype.hasOwnProperty.call(PHASE_ACTIVITY, phase)) {
+    return null
+  }
+  return phase as RequestPhase
+}
+
+/**
+ * What is printed for a connection that failed or closed without the server giving a reason:
+ * where the request was, that no reason was received, and that the server's outcome is therefore
+ * unknown. Nothing here comes from the connection's own error text, the server, or the machine.
+ * Any other error, including every answer the server wrote, is not described here.
+ */
+function transportMessage(err: unknown): string | null {
+  const failure = locatedError(err)
+  if (failure.transport !== true || failure.remote === true) return null
+  const phase = phaseOf(err)
+  if (phase === null) return null
+  const link = failure.operation === 'link'
+  const timedOut =
+    failure.code === ERRORS.CONNECT_TIMEOUT || failure.code === ERRORS.UPLOAD_IDLE_TIMEOUT
+  const code = isStableCode(failure.code) ? ` (${failure.code})` : ''
+  const hints = {
+    connect: CONNECT_HINT,
+    final: link ? LINK_FINAL_HINT : UPLOAD_FINAL_HINT
+  }
+  const hint = phase === 'connect' || phase === 'final' ? ` ${hints[phase]}` : ''
+  return (
+    `${link ? 'Link request' : 'Upload'} failed while ${PHASE_ACTIVITY[phase]}${code}: ` +
+    `${timedOut ? 'the wait timed out' : 'the connection failed or closed'}. ` +
+    `No server reason was received, so the outcome on the server is unknown.${hint}`
+  )
+}
+
+/** What an upload failure prints on stderr: the transport description, else the error's own message. */
+function uploadErrorMessage(err: unknown): string {
+  return transportMessage(err) ?? errorMessage(err)
+}
+
+/**
+ * The fields of a failed request's `--json` object, after the request's own: the stable `code`
+ * (`null` when the failure carries none, as a raw connection reset or a local failure does), where
+ * it came from (`server` for the server's own answer, `transport` for a connection that gave no
+ * reason), the phase when known, and the data the server's `onFailure` returned, when it returned
+ * some. Nothing from an error's message or cause is included.
+ */
+function failureFields(err: unknown): Record<string, unknown> {
+  const failure = locatedError(err)
+  const phase = phaseOf(err)
+  const origin =
+    failure.remote === true ? 'server' : failure.transport === true ? 'transport' : null
+  const hookResult = err instanceof SwarmDeployError ? err.hookResult : undefined
+  return {
+    code: isStableCode(failure.code) ? failure.code : null,
+    ...(origin === null ? {} : { origin }),
+    ...(phase === null ? {} : { phase }),
+    ...(hookResult === undefined ? {} : { hookResult })
+  }
+}
+
+/**
+ * With `--json`, a failed request prints one JSON object on stdout (see `failureFields`); the
+ * exit status and the error message on stderr are the same as without it.
  */
 function printFailureJson(fields: Record<string, string>, err: unknown, io: CliIo): void {
-  if (!(err instanceof SwarmDeployError) || err.hookResult === undefined) return
-  writeLine(io.stdout, JSON.stringify({ ...fields, code: err.code, hookResult: err.hookResult }))
+  writeLine(io.stdout, JSON.stringify({ ...fields, ...failureFields(err) }))
 }
 
 function printLinkResult(result: ClientLinkResult, io: CliIo): number {
@@ -840,7 +931,7 @@ function linkErrorMessage(err: unknown): string {
   ) {
     return err.code
   }
-  return errorMessage(err)
+  return transportMessage(err) ?? errorMessage(err)
 }
 
 async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
@@ -914,7 +1005,7 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
       code = json ? printUploadJson(result, io) : printUploadResult(result, io)
     } catch (err) {
       if (json) printFailureJson({}, err, io)
-      runError = new CliError(errorMessage(err), 1)
+      runError = new CliError(uploadErrorMessage(err), 1)
     }
   } finally {
     detach()

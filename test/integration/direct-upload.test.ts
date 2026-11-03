@@ -1,11 +1,12 @@
 /// <reference path="../types/brittle.d.ts" />
 /// <reference path="../types/third-party.d.ts" />
 
-import test from 'brittle'
+import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import { Client, ERRORS, keyPairFromSeed } from '../../dist/index.js'
+import { Client, ERRORS, keyPairFromSeed, type ServerOptions } from '../../dist/index.js'
+import { main } from '../../dist/cli.js'
 import {
   buildTarManifest,
   deterministicTarSize,
@@ -17,7 +18,7 @@ import type { StorageAdapter } from '../../dist/storage/types.js'
 import { createTempDir } from '../helpers/files.js'
 import { Server } from '../helpers/server.js'
 import { createStorage } from '../helpers/storage.js'
-import { createLocalTestnet } from '../helpers/testnet.js'
+import { createLocalTestnet, waitFor } from '../helpers/testnet.js'
 
 function restrictiveStorage(modeCapable = true): StorageAdapter {
   const storage = createStorage()
@@ -578,4 +579,280 @@ test('a storage adapter without publication mode support fails closed only when 
   await t.exception(client.upload(input))
   t.alike(commitFailures, [ERRORS.UNSUPPORTED_STORAGE])
   await t.exception(() => fs.promises.lstat(path.join(storage, 'artifact.txt')), { code: 'ENOENT' })
+})
+
+type Testnet = Awaited<ReturnType<typeof createLocalTestnet>>
+
+function output(): { stream: { write(value: string): void }; text(): string } {
+  let text = ''
+  return {
+    stream: {
+      write(value: string) {
+        text += value
+      }
+    },
+    text: () => text
+  }
+}
+
+type Failure = {
+  code?: unknown
+  message: string
+  remote?: unknown
+  transport?: unknown
+  operation?: unknown
+  phase?: unknown
+}
+
+async function rejectionOf(operation: Promise<unknown>): Promise<Failure> {
+  const error = await operation.then(
+    () => {
+      throw new Error('The operation unexpectedly succeeded')
+    },
+    (failure: unknown) => failure
+  )
+  return error as Failure
+}
+
+/** A real server and client on the loopback testnet; `connections` follows the server's own count. */
+async function failureRig(
+  t: Assert,
+  testnet: Testnet,
+  id: number,
+  options: Partial<ServerOptions> = {}
+) {
+  const clientSeed = b4a.alloc(32, id)
+  const storage = await createTempDir(t)
+  const server = new Server({
+    seed: b4a.alloc(32, id + 100),
+    storageDir: storage,
+    allowedKeys: [keyPairFromSeed(clientSeed).publicKey],
+    maxFileBytes: 1024,
+    maxStagingBytes: 16 * 1024 * 1024,
+    minFreeBytes: 0,
+    dht: testnet.createNode(),
+    ...options
+  })
+  const client = new Client({
+    seed: clientSeed,
+    serverPublicKey: server.publicKey,
+    connectTimeout: 5_000,
+    idleTimeout: 10_000,
+    dht: testnet.createNode()
+  })
+  const rig = { testnet, server, client, storage, clientSeed, connections: 0 }
+  server.on('connection-open', (event) => {
+    rig.connections = event.connections
+  })
+  server.on('connection-close', (event) => {
+    rig.connections = event.connections
+  })
+  t.teardown(async () => {
+    await client.close()
+    await server.close()
+  })
+  await server.listen()
+  return rig
+}
+
+/** `swarm-deploy upload` through the real CLI against a rig, with its output captured. */
+async function runUpload(
+  rig: Awaited<ReturnType<typeof failureRig>>,
+  file: string,
+  flags: string[]
+) {
+  const stdout = output()
+  const stderr = output()
+  const exit = await main(
+    ['upload', ...flags, '--server-key', b4a.toString(rig.server.publicKey, 'hex'), file],
+    { SWARM_DEPLOY_CLIENT_SEED: b4a.toString(rig.clientSeed, 'hex') },
+    {
+      dht: rig.testnet.createNode(),
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      connectTimeout: 5_000,
+      idleTimeout: 10_000
+    }
+  )
+  return { exit, stdout: stdout.text(), stderr: stderr.text() }
+}
+
+test('ordinary refusals and a disk-reserve refusal reach a real client and the CLI as the server’s own code', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const directory = await createTempDir(t)
+  const small = path.join(directory, 'artifact.txt')
+  const large = path.join(directory, 'large.bin')
+  await fs.promises.writeFile(small, 'first content')
+  await fs.promises.writeFile(large, b4a.alloc(2048, 0x61))
+
+  // A size limit: refused before any payload is sent.
+  const limited = await failureRig(t, testnet, 21)
+  const tooLarge = await rejectionOf(limited.client.upload(large))
+  t.is(tooLarge.code, ERRORS.FILE_TOO_LARGE)
+  t.is(tooLarge.remote, true)
+  t.is(tooLarge.operation, 'upload')
+  t.is(tooLarge.phase, 'admission')
+  t.absent(tooLarge.transport)
+  t.ok(
+    tooLarge.message.includes('FILE_TOO_LARGE'),
+    'the message names the code, not just "rejected"'
+  )
+  await waitFor(() => limited.connections === 0)
+
+  // An explicit link request the server refuses.
+  const link = await rejectionOf(limited.client.link('missing', 'current'))
+  t.is(link.code, ERRORS.LINK_NOT_ALLOWED)
+  t.is(link.remote, true)
+  t.is(link.operation, 'link')
+  t.is(link.phase, 'final')
+  await waitFor(() => limited.connections === 0)
+
+  // The same refusal through the CLI, plain and as JSON, with nothing secret in either.
+  const plain = await runUpload(limited, large, [])
+  t.is(plain.exit, 1)
+  t.is(plain.stdout, '')
+  t.is(
+    plain.stderr,
+    'Server rejected upload (FILE_TOO_LARGE): the artifact exceeds the size the server accepts\n'
+  )
+  const json = await runUpload(limited, large, ['--json'])
+  t.is(json.exit, 1)
+  t.alike(JSON.parse(json.stdout), { code: 'FILE_TOO_LARGE', origin: 'server', phase: 'admission' })
+  t.is(json.stdout.trimEnd().includes('\n'), false, 'one object on one line')
+  t.is(json.stderr, plain.stderr, 'the diagnostic is the same with --json')
+  const seed = b4a.toString(limited.clientSeed, 'hex')
+  t.absent((plain.stdout + plain.stderr + json.stdout + json.stderr).includes(seed))
+  await waitFor(() => limited.connections === 0)
+
+  // A name that already holds other content.
+  const conflicting = await failureRig(t, testnet, 22)
+  t.is((await conflicting.client.upload(small)).status, 'COMMITTED')
+  await fs.promises.writeFile(small, 'other content!')
+  const exists = await rejectionOf(conflicting.client.upload(small))
+  t.is(exists.code, ERRORS.FILE_EXISTS)
+  t.is(exists.remote, true)
+  t.is(exists.phase, 'admission')
+  await waitFor(() => conflicting.connections === 0)
+
+  // The reserve check that production hit: the code arrives, not a connection reset.
+  const reserved = await failureRig(t, testnet, 23, { minFreeBytes: Number.MAX_SAFE_INTEGER })
+  const noSpace = await rejectionOf(reserved.client.upload(small))
+  t.is(noSpace.code, ERRORS.DISK_RESERVE)
+  t.is(noSpace.remote, true)
+  t.is(noSpace.phase, 'admission')
+  t.absent(noSpace.transport)
+  t.absent(noSpace.message.includes('reset'))
+  const reserveJson = await runUpload(reserved, small, ['--json'])
+  t.is(reserveJson.exit, 1)
+  t.alike(JSON.parse(reserveJson.stdout), {
+    code: 'DISK_RESERVE',
+    origin: 'server',
+    phase: 'admission'
+  })
+  t.ok(reserveJson.stderr.includes('DISK_RESERVE'))
+  await waitFor(() => reserved.connections === 0)
+  t.alike(await fs.promises.readdir(reserved.storage), [], 'nothing was published')
+})
+
+test('a failure while the payload is still streaming reaches the client as the server’s own code', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const file = path.join(await createTempDir(t), 'payload.bin')
+  await fs.promises.writeFile(file, b4a.alloc(6 * 1024 * 1024, 0x61))
+  const logs: Array<Record<string, unknown>> = []
+  const rig = await failureRig(t, testnet, 24, {
+    maxFileBytes: 8 * 1024 * 1024,
+    maxStagingBytes: 32 * 1024 * 1024,
+    logger: { warn: (message, details) => void logs.push({ message, ...details }) }
+  })
+  // A disk that fills while receiving: the first durable append (after one MiB) fails with a
+  // raw write error, while the client is still sending under backpressure. The reserve check
+  // itself runs at admission, so this is the same condition arriving later, and it is reported
+  // as the same code.
+  const sessions = (rig.server as unknown as { sessions: SessionStore }).sessions
+  sessions.append = () =>
+    Promise.reject(
+      Object.assign(new Error('ENOSPC: no space left on device, write /srv/private/part'), {
+        code: 'ENOSPC'
+      })
+    )
+  const failures: string[] = []
+  rig.server.on('failure', (event) => failures.push(event.reason))
+
+  const error = await rejectionOf(rig.client.upload(file))
+  t.is(error.code, ERRORS.DISK_RESERVE, 'the server reason, not a reset')
+  t.is(error.remote, true)
+  t.is(error.operation, 'upload')
+  t.ok(['streaming', 'final'].includes(String(error.phase)), `phase ${String(error.phase)}`)
+  t.absent(error.transport)
+  t.ok(error.message.includes('free disk space'))
+  t.absent(error.message.includes('/srv/private'), 'server text never reaches the message')
+  t.absent(error.message.includes('ENOSPC'))
+  t.alike(failures, [ERRORS.DISK_RESERVE], 'the server counted one failure')
+  const [logged] = logs.filter((entry) => entry.message === 'Direct upload failed')
+  t.is(logged.reason, ERRORS.DISK_RESERVE)
+  t.is(logged.phase, 'transfer', 'the log says where the server was')
+  t.is(logged.systemCode, 'ENOSPC', 'and which known errno it was')
+  t.absent(JSON.stringify(logs).includes('/srv/private'), 'with no error text or path')
+
+  // The connection and every slot are released, and nothing was published.
+  await waitFor(() => rig.connections === 0)
+  const state = rig.server as unknown as {
+    activeUploads: Set<unknown>
+    activeTransfers: Set<string>
+  }
+  t.is(state.activeUploads.size, 0)
+  t.is(state.activeTransfers.size, 0)
+  t.alike(await fs.promises.readdir(rig.storage), [])
+})
+
+test('a server that drops the connection without answering is reported with its phase and no invented reason', async (t) => {
+  const testnet = await createLocalTestnet(t)
+  const file = path.join(await createTempDir(t), 'artifact.txt')
+  await fs.promises.writeFile(file, 'payload that is never answered')
+  const serverNode = testnet.createNode()
+  const dht = {
+    get destroyed() {
+      return serverNode.destroyed
+    },
+    createServer(
+      options: Parameters<typeof serverNode.createServer>[0],
+      handler: Parameters<typeof serverNode.createServer>[1]
+    ) {
+      return serverNode.createServer(options, (socket) => {
+        // A server that cannot answer: whatever it would write drops the connection instead.
+        const stream = socket as unknown as { write(bytes: Buffer): boolean; destroy(): void }
+        stream.write = () => {
+          stream.destroy()
+          return false
+        }
+        handler(socket)
+      })
+    },
+    connect: serverNode.connect.bind(serverNode),
+    on: serverNode.on.bind(serverNode),
+    destroy: serverNode.destroy.bind(serverNode)
+  }
+  const rig = await failureRig(t, testnet, 25, { dht })
+
+  const error = await rejectionOf(rig.client.upload(file))
+  t.is(error.transport, true, 'marked as a connection failure')
+  t.is(error.operation, 'upload')
+  t.ok(['request', 'admission'].includes(String(error.phase)), `phase ${String(error.phase)}`)
+  t.absent(error.remote, 'no server answer exists to claim')
+  t.absent(String(error.code).startsWith('FILE_'), 'no server code is invented')
+
+  const plain = await runUpload(rig, file, [])
+  t.is(plain.exit, 1)
+  t.is(plain.stdout, '')
+  t.ok(plain.stderr.startsWith('Upload failed while '), plain.stderr)
+  t.ok(
+    plain.stderr.includes('No server reason was received, so the outcome on the server is unknown.')
+  )
+  t.absent(plain.stderr.includes('reset by peer'), 'the stream text is not repeated as a reason')
+  const json = await runUpload(rig, file, ['--json'])
+  t.is(json.exit, 1)
+  const fields = JSON.parse(json.stdout) as Record<string, unknown>
+  t.is(fields.origin, 'transport')
+  t.ok(['request', 'admission'].includes(String(fields.phase)))
+  t.absent('hookResult' in fields)
 })

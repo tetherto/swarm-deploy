@@ -968,6 +968,101 @@ test('scrub ignores a configured managed link name instead of reporting it unkno
   t.is(scrub.records.length, 1)
 })
 
+type LogEntry = [level: string, message: string, details: Record<string, unknown>]
+
+function capturedLogs(): {
+  logs: LogEntry[]
+  logger: NonNullable<RetentionOptions['logger']>
+  messages(message: string): Array<Record<string, unknown>>
+} {
+  const logs: LogEntry[] = []
+  const at =
+    (level: string) =>
+    (message: string, details: Record<string, unknown>): void => {
+      logs.push([level, message, details])
+    }
+  return {
+    logs,
+    logger: { info: at('info'), warn: at('warn'), error: at('error') },
+    messages: (message) => logs.filter((entry) => entry[1] === message).map((entry) => entry[2])
+  }
+}
+
+test('repeat scans do not flood unmanaged-path warnings, while real failures stay visible', async (t) => {
+  const harness = await createHarness(t)
+  const { logs, logger, messages } = capturedLogs()
+  const manager = harness.manager({ logger })
+  const root = harness.layout.root
+  const unknown = (): unknown[] =>
+    messages('Ignoring unknown committed path').map((details) => details.name)
+  await harness.publish('kept.bin', b4a.from('kept'))
+  await fs.promises.writeFile(path.join(root, 'operator.txt'), 'operator')
+
+  for (let pass = 0; pass < 4; pass++) await manager.scrubCommitted({ hash: false })
+  t.alike(unknown(), ['operator.txt'], 'four scans name the unmanaged file once')
+
+  await fs.promises.writeFile(path.join(root, 'later.txt'), 'later')
+  await manager.scrubCommitted({ hash: false })
+  await manager.scrubCommitted({ hash: false })
+  t.alike(unknown(), ['operator.txt', 'later.txt'], 'a new entry is named when it first appears')
+
+  await fs.promises.rm(path.join(root, 'operator.txt'))
+  await manager.scrubCommitted({ hash: false })
+  await fs.promises.writeFile(path.join(root, 'operator.txt'), 'again')
+  await manager.scrubCommitted({ hash: false })
+  t.alike(
+    unknown(),
+    ['operator.txt', 'later.txt', 'operator.txt'],
+    'an entry that went away and came back is named again'
+  )
+  t.is(await fs.promises.readFile(path.join(root, 'later.txt'), 'utf8'), 'later')
+  t.is(await fs.promises.readFile(path.join(root, 'operator.txt'), 'utf8'), 'again')
+  t.is((await harness.commits.list()).length, 1, 'unmanaged files are never adopted')
+
+  // A managed record that no longer matches its file is still reported when it is found,
+  // and the quiet unmanaged entries do not hide or repeat beside it.
+  const tampered = await harness.publish('tampered.bin', b4a.from('same'))
+  await fs.promises.writeFile(path.join(root, tampered.name), 'DIFF')
+  logs.length = 0
+  const result = await manager.scrubCommitted()
+  t.is(result.deleted, 1)
+  t.alike(
+    messages('Removed invalid managed commit').map((details) => details.name),
+    ['tampered.bin']
+  )
+  t.alike(unknown(), [], 'the same unmanaged entries are not named again')
+
+  // A scan that fails is not swallowed by the quiet.
+  harness.commits.scrubRecords = () => Promise.reject(new Error('metadata unreadable'))
+  await t.exception(manager.scrubCommitted({ hash: false }), { code: ERRORS.CLEANUP_FAILED })
+})
+
+test('a scan past the per-scan log limit names the first entries and counts the rest once', async (t) => {
+  const harness = await createHarness(t)
+  const { logger, messages } = capturedLogs()
+  const manager = harness.manager({ logger })
+  const root = harness.layout.root
+  const entry = (index: number): string => `u${String(index).padStart(2, '0')}.txt`
+  for (let index = 0; index < 34; index++) {
+    await fs.promises.writeFile(path.join(root, entry(index)), 'x')
+  }
+
+  await manager.scrubCommitted({ hash: false })
+  t.is(messages('Ignoring unknown committed path').length, 32)
+  t.alike(messages('Ignoring more unknown committed paths'), [{ count: 2 }])
+  t.ok(manager.unknownLogged.size <= 32, 'what is remembered does not grow with the root')
+
+  await manager.scrubCommitted({ hash: false })
+  await manager.scrubCommitted({ hash: false })
+  t.is(messages('Ignoring unknown committed path').length, 32, 'repeats stay quiet')
+  t.is(messages('Ignoring more unknown committed paths').length, 1)
+
+  await fs.promises.writeFile(path.join(root, entry(34)), 'x')
+  await manager.scrubCommitted({ hash: false })
+  t.is(messages('Ignoring unknown committed path').length, 32, 'the named entries are not repeated')
+  t.alike(messages('Ignoring more unknown committed paths'), [{ count: 2 }, { count: 3 }])
+})
+
 test('a dormant managed link is removed before retention deletes its old target', async (t) => {
   const harness = await createHarness(t)
   await harness.publishTree('0.18.0', { 'a.bin': 'a' })

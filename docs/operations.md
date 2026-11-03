@@ -7,6 +7,7 @@ reset a storage root, and how to upgrade or roll back. Back to the
 ## Contents
 
 - [Production operations](#production-operations)
+- [Troubleshooting failed uploads](#troubleshooting-failed-uploads)
 - [Transfer and resume behavior](#transfer-and-resume-behavior)
 - [Storage, replacement, and retention](#storage-replacement-and-retention)
 - [Resetting storage with `reset-storage`](#resetting-storage-with-reset-storage)
@@ -64,6 +65,71 @@ rollback procedure are in [RELEASING.md](../RELEASING.md).
 See [SECURITY.md](../SECURITY.md) for vulnerability reporting and operator
 precautions.
 
+## Troubleshooting failed uploads
+
+A failed `swarm-deploy upload` or `link` (exit `1`) is one of two kinds, and
+the output says which (see [Failure output](cli.md#failure-output) and
+[Errors](api.md#where-a-client-failure-came-from-063)).
+
+**The server answered.** The message, or for `link` the printed line, carries a
+stable code, and `--json` reports `"origin": "server"`. The code is the server's
+own, and its log has a matching `Direct upload failed` or `Direct link failed`
+warning with the same `reason` (the answer never carries the server's raw error,
+paths, or hook output; the log is where to look for those).
+
+| Code                                   | Usually means                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DISK_RESERVE`                         | Less free space than the reserve plus the upload needs (default reserve 1 GiB), measured where the private state's staging is; or, from 0.6.3, an upload write that failed with a raw `ENOSPC`/`EDQUOT` the server did not wrap.                                                                                                                                                                                                                                                              |
+| `STAGING_LIMIT`                        | Staged data would exceed `--max-staging-bytes`.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `FILE_TOO_LARGE`                       | The artifact exceeds `--max-file-bytes`.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `FILE_EXISTS`                          | The name already holds different content and is not a `--replace-name`.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `ACTIVE_UPLOAD_LIMIT`, `FILE_BUSY`     | The server is at its upload limit, or the same transfer is already running; retry later.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `HOOK_FAILED`                          | A deployment hook failed; the log has the reason, and the artifact may already be committed.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `COMMIT_FAILED`, `UNSUPPORTED_STORAGE` | The server could not write or commit. For an upload, a raw errno the server did not wrap maps here: permissions (`EACCES`, `EPERM`), a read-only volume (`EROFS`), an I/O error (`EIO`), or storage that cannot do the operation (`EXDEV`, `ENOSYS`, `ENOTSUP`, as `UNSUPPORTED_STORAGE`). The log names the errno as `systemCode`. The same errno inside a storage guard shows as `PROTOCOL_INVALID` instead.                                                                                |
+| `SERVER_ERROR`                         | An upload hit a raw error the server did not expect and did not wrap (0.6.3 or newer). The log has `reason: SERVER_ERROR` and the `phase`. Link requests do not use it.                                                                                                                                                                                                                                                                                                                       |
+| `PROTOCOL_INVALID`                     | A protocol check or a storage-state check failed on the server: a malformed record, a mismatched transfer ID, a field this server does not know, legacy state in the root, or a storage guard that wrapped a raw failure (for example it could not open or check a staging file or directory). It does not by itself say the request or the client version was at fault; the log's `phase` and `systemCode` say more. Through 0.6.2 it was also what any unwrapped raw upload error reported. |
+| `LINK_*`                               | See the server log; a link request's unclassified failure is `LINK_FAILED`.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+
+Freeing space or raising a limit and retrying is safe: a retry resumes or
+starts over and never publishes a partial artifact. Reporting the code does not
+create capacity, and nothing here changes what the server stores or deletes.
+
+The server log line is the ground truth for a failure: `reason`, the `phase` the
+server was in, and `systemCode` when the failure was a known errno
+([How a server reports its own failures](api.md#how-a-server-reports-its-own-failures-063)).
+A client older than 0.6.3 cannot read `SERVER_ERROR`: it reports an invalid
+answer (`PROTOCOL_INVALID`, raised by the client), so with an older client read
+the server log, not the code. This does not affect any request that succeeds.
+
+**The connection gave no reason.** The output says `No server reason was
+received` and names where it was (`connecting`, `sending the request`, `waiting
+for the server to accept the offer`, `sending the artifact`, `waiting for the
+final answer`); `--json` reports `"origin": "transport"`. The code, if any,
+says nothing about the server. Possible causes, which the client cannot tell
+apart:
+
+- While connecting: the server is down or unreachable, the pinned `--server-key`
+  is wrong, or the client key is not in the server's `--allow-key` list. The
+  server drops a key it does not allow before it answers anything, so no reason
+  can ever be delivered for that.
+- While waiting for admission or sending: the server crashed, restarted, hit its
+  connection limit, or the network failed. A server older than 0.6.3 also reset
+  the connection right behind a failure answer for every code except
+  `HOOK_FAILED`, so look in its log for a `Direct upload failed` line with the
+  real reason. The client version does not matter for that: a newer client cannot
+  read an answer the server never delivered, and a server of 0.6.3 or newer
+  delivers every answer it manages to write.
+- While waiting for the final answer: the upload may already be committed.
+  Repeating the identical upload returns `ALREADY_COMMITTED` if it was.
+- A timeout (`UPLOAD_IDLE_TIMEOUT`, `CONNECT_TIMEOUT`) is a wait that ended with no
+  answer, not a server decision; raise `--idle-timeout` only if the server's hooks
+  are slow (see [Deployment hooks](hooks.md)).
+
+Upgrade servers before clients (see
+[Rollout and compatibility](#rollout-and-compatibility)): the server decides
+whether an answer reaches the client, and the client decides whether the code is
+shown.
+
 ## Transfer and resume behavior
 
 Each file follows this lifecycle:
@@ -108,7 +174,14 @@ Names are create-only by default:
 - New content for an unused name is committed atomically.
 - Identical managed content returns `ALREADY_COMMITTED`.
 - Different content for an occupied create-only name returns `FILE_EXISTS`.
-- Unmanaged files and paths are never overwritten or deleted.
+- Unmanaged files and paths are never overwritten or deleted. Files an operator
+  placed there, or artifacts whose metadata was removed, are legitimate: the
+  retention scan notes each one with an `Ignoring unknown committed path`
+  warning when it first appears (and again only if it went away and came
+  back), not on every scan. At most 32 names are listed per scan; any beyond that
+  are counted once in `Ignoring more unknown committed paths`. Only the log is
+  quieter: invalid managed state and failed scans or operations are still
+  reported each time they happen, and nothing unmanaged is adopted or removed.
 
 Names configured with `--replace-name` or `ServerOptions.replaceNames` are
 mutable:
