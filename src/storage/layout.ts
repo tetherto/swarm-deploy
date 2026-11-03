@@ -6,6 +6,7 @@ import path from '#path'
 import process from '#process'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { safeOpenFlags } from '../open-flags.js'
 import { mountFor, readMountInfo, type MountEntry } from './mounts.js'
 import type {
   StorageAdapter,
@@ -951,28 +952,20 @@ export function isProcessAlive(pid: number): boolean {
 
 const defaultIsProcessAlive = isProcessAlive
 
-function noFollowFlag() {
-  if (fs.constants?.O_NOFOLLOW !== undefined) return fs.constants.O_NOFOLLOW
-  const platform = os.platform()
-  if (platform === 'darwin') return 0x100
-  if (platform === 'linux') return 0x20000
-  throw storageError('Safe file open is unsupported on this platform')
-}
-
+/**
+ * The flags of a safe open: no symlink at the final path, and for `create` an exclusive create of
+ * a new file. Taken from the runtime's constants where it has them, and otherwise from the
+ * platform and architecture table in `open-flags.ts`; an unknown ABI refuses instead of guessing.
+ */
 export function safeFileOpenFlags(access: SafeFileAccess): number {
-  const constants = fs.constants || {}
-  const noFollow = noFollowFlag()
-  if (access === 'create') {
-    return (
-      (constants.O_WRONLY ?? 1) |
-      (constants.O_CREAT ?? 0o100) |
-      (constants.O_EXCL ?? 0o200) |
-      noFollow
-    )
+  if (access !== 'create' && access !== 'write' && access !== 'read') {
+    throw storageError('Invalid safe file open access')
   }
-  if (access === 'write') return (constants.O_RDWR ?? 2) | noFollow
-  if (access === 'read') return (constants.O_RDONLY ?? 0) | noFollow
-  throw storageError('Invalid safe file open access')
+  const flags = safeOpenFlags(access, fs.constants, os.platform(), os.arch())
+  if (flags === undefined) {
+    throw storageError('Safe file open is unsupported on this platform')
+  }
+  return flags
 }
 
 export async function openSafeRegularFile(

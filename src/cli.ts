@@ -8,6 +8,7 @@ import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS, isStableCode, type RequestPhase } from './errors.js'
 import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './identity.js'
 import { validateReplaceNames } from './files.js'
+import { safeOpenFlags } from './open-flags.js'
 import { compileReplacePolicy } from './replace-policy.js'
 import { compileSymlinkRules } from './symlinks.js'
 import { loadHooksModule } from './hooks-module.js'
@@ -126,41 +127,23 @@ function normalizeArgv(argv: Iterable<string> | null | undefined): string[] {
   return args
 }
 
-function platformName() {
-  return os.platform()
-}
-
-function noFollowFlag() {
-  if (fs.constants?.O_NOFOLLOW !== undefined) return fs.constants.O_NOFOLLOW
-  const platform = platformName()
-  if (platform === 'darwin') return 0x100
-  if (platform === 'linux') return 0x20000
-  throw configError('Safe file open is unsupported on this platform')
-}
-
-function exclusiveCreateFlag() {
-  if (fs.constants?.O_EXCL !== undefined) return fs.constants.O_EXCL
-  const platform = platformName()
-  if (platform === 'darwin') return 0x800
-  if (platform === 'linux') return 0x80
-  throw configError('Safe exclusive create is unsupported on this platform')
-}
-
-function createFileFlag() {
-  if (fs.constants?.O_CREAT !== undefined) return fs.constants.O_CREAT
-  const platform = platformName()
-  if (platform === 'darwin') return 0x200
-  if (platform === 'linux') return 0x40
-  throw configError('Safe exclusive create is unsupported on this platform')
-}
-
+// The same flag lookup as the private-state guards (`storage/layout.ts`), so the two cannot drift:
+// the runtime's own constants where it has them, otherwise the platform and architecture table,
+// and an unknown ABI refuses instead of guessing.
 function createSeedFlags() {
-  const constants = fs.constants || {}
-  return (constants.O_WRONLY ?? 1) | createFileFlag() | exclusiveCreateFlag() | noFollowFlag()
+  const flags = safeOpenFlags('create', fs.constants, os.platform(), os.arch())
+  if (flags === undefined) {
+    throw configError('Safe exclusive create is unsupported on this platform')
+  }
+  return flags
 }
 
 function readFlags() {
-  return (fs.constants?.O_RDONLY ?? 0) | noFollowFlag()
+  const flags = safeOpenFlags('read', fs.constants, os.platform(), os.arch())
+  if (flags === undefined) {
+    throw configError('Safe file open is unsupported on this platform')
+  }
+  return flags
 }
 
 function parsePositiveSafeInteger(value: unknown, name: string): number {

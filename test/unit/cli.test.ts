@@ -2494,6 +2494,119 @@ test('--retention-scope rejects every malformed or unsafe value without echoing 
   )
 })
 
+test('a seed file that is a link is refused and the seed behind it is never read', async (t) => {
+  const root = await createTempDir(t)
+  const seedHex = b4a.toString(CLIENT_SEED, 'hex')
+  const artifact = path.join(root, 'artifact.txt')
+  const real = path.join(root, 'real.seed')
+  const link = path.join(root, 'link.seed')
+  const dangling = path.join(root, 'dangling.seed')
+  await fs.promises.writeFile(artifact, 'payload')
+  await fs.promises.writeFile(real, `${seedHex}\n`, { mode: 0o600 })
+  await fs.promises.symlink(real, link)
+  await fs.promises.symlink(path.join(root, 'missing.seed'), dangling)
+
+  for (const seedPath of [link, dangling]) {
+    const name = path.basename(seedPath)
+    const stdout = output()
+    const stderr = output()
+    t.is(
+      await main(
+        ['public-key', '--seed-file', seedPath],
+        {},
+        { stdout: stdout.stream, stderr: stderr.stream }
+      ),
+      2,
+      name
+    )
+    t.is(stdout.text(), '', `${name}: no key is printed`)
+    t.ok(stderr.text().includes('seed file must be a regular file'), name)
+    t.absent(stderr.text().includes(seedHex), `${name}: the seed is not echoed`)
+
+    let constructed = false
+    class Client {
+      constructor(_options: ClientOptions) {
+        constructed = true
+      }
+      upload() {
+        return Promise.reject(new Error('the upload must not be reached'))
+      }
+      close() {
+        return Promise.resolve()
+      }
+    }
+    const uploadErr = output()
+    t.is(
+      await main(
+        [
+          'upload',
+          '--seed-file',
+          seedPath,
+          '--server-key',
+          b4a.toString(SERVER_KEY, 'hex'),
+          artifact
+        ],
+        {},
+        {
+          Client: Client as unknown as new (
+            options: ClientOptions
+          ) => import('../../dist/client.js').Client,
+          stdout: output().stream,
+          stderr: uploadErr.stream
+        }
+      ),
+      2,
+      `${name}: upload`
+    )
+    t.ok(uploadErr.text().includes('seed file must be a regular file'), `${name}: upload message`)
+    t.absent(constructed, `${name}: no client was made from it`)
+  }
+  t.is(await fs.promises.readFile(real, 'utf8'), `${seedHex}\n`, 'the real seed is untouched')
+})
+
+test('keygen writes one new private seed file and never overwrites or follows a path that exists', async (t) => {
+  const root = await createTempDir(t)
+  const fresh = path.join(root, 'fresh.seed')
+  const stdout = output()
+  const stderr = output()
+  t.is(
+    await main(['keygen', '--out', fresh], {}, { stdout: stdout.stream, stderr: stderr.stream }),
+    0,
+    stderr.text()
+  )
+  const seed = await fs.promises.readFile(fresh, 'utf8')
+  t.ok(/^[0-9a-f]{64}\n$/.test(seed), 'a canonical seed')
+  const stat = await fs.promises.lstat(fresh)
+  t.ok(stat.isFile(), 'a regular file')
+  t.is(stat.mode & 0o077, 0, 'private to its owner')
+  t.alike(await fs.promises.readdir(root), ['fresh.seed'], 'no temporary file is left')
+  const derived = output()
+  t.is(await main(['public-key', '--seed-file', fresh], {}, { stdout: derived.stream }), 0)
+  t.is(derived.text(), stdout.text(), 'the printed key is the one the file holds')
+
+  const precious = path.join(root, 'precious.seed')
+  const link = path.join(root, 'link.seed')
+  const dangling = path.join(root, 'dangling.seed')
+  const missing = path.join(root, 'missing.seed')
+  await fs.promises.writeFile(precious, 'precious')
+  await fs.promises.symlink(precious, link)
+  await fs.promises.symlink(missing, dangling)
+  for (const out of [fresh, precious, link, dangling]) {
+    const name = path.basename(out)
+    const refused = output()
+    t.is(await main(['keygen', '--out', out], {}, { stderr: refused.stream }), 2, name)
+    t.ok(refused.text().includes('Refusing to overwrite existing seed file'), name)
+  }
+  t.is(await fs.promises.readFile(fresh, 'utf8'), seed, 'the first seed is kept')
+  t.is(await fs.promises.readFile(precious, 'utf8'), 'precious', 'a file behind a link is kept')
+  t.is(await fs.promises.readlink(link), precious, 'the link is as it was')
+  await t.exception(
+    () => fs.promises.lstat(missing),
+    { code: 'ENOENT' },
+    'nothing was created through a dangling link'
+  )
+})
+
 test('the usage text documents the repeatable optional-name symlink option', async (t) => {
   const stdout = output()
   t.is(await main(['--help'], {}, { stdout: stdout.stream }), 0)
