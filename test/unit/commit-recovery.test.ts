@@ -367,6 +367,321 @@ test('direct-TAR replacement recovery is idempotent after convergence', async (t
   await sessions.close()
 })
 
+type DedupBoundary =
+  | 'history-linked'
+  | 'publication-linked'
+  | 'final-renamed'
+  | 'current-sidecar-renamed'
+  | 'history-sidecar-durable'
+  | 'duplicate-removed'
+
+interface DedupCrash {
+  harness: Harness
+  layout: StorageLayout
+  /** The transfer ID of the content that is returning, which is also the first one published. */
+  id: string
+  first: CommitRecord
+  second: CommitRecord
+  /** The history record of the returning content, as it was before the attempt. */
+  parked: CommitRecord
+  historyA: string
+  historyB: string
+  sidecarA: string
+  sidecarB: string
+  final: string
+}
+
+/**
+ * A, then B replacing it, then A returning: the history copy of A is the duplicate the new current
+ * record supersedes. The attempt is stopped right after the named boundary, as a dying process
+ * would; with `die: false` the boundary throws once and the process lives, so the attempt rolls
+ * itself back; with `abort` the boundary aborts the attempt instead of failing it.
+ */
+async function crashDedup(
+  t: Assert,
+  boundary: DedupBoundary,
+  { die = true, abort }: { die?: boolean; abort?: { aborted: boolean } } = {}
+): Promise<DedupCrash> {
+  let armed = false
+  let crashed = false
+  let thrown = false
+  const target: { layout: StorageLayout | null; ids: { a: string; b: string } } = {
+    layout: null,
+    ids: { a: '', b: '' }
+  }
+  const storage = createStorage({
+    beforeOperation(name) {
+      if (die && crashed && MUTATIONS.has(name))
+        throw new Error('process stopped at crash boundary')
+    },
+    afterOperation(name, source, destination) {
+      const layout = target.layout
+      if (!armed || (die ? crashed : thrown) || layout === null) return
+      const to = typeof destination === 'string' ? destination : ''
+      const hit =
+        (boundary === 'history-linked' &&
+          name === 'link' &&
+          to === path.join(layout.root, historyName(target.ids.b))) ||
+        (boundary === 'publication-linked' &&
+          name === 'link' &&
+          to.startsWith(layout.publications)) ||
+        (boundary === 'final-renamed' &&
+          name === 'rename' &&
+          to === path.join(layout.root, MUTABLE)) ||
+        (boundary === 'current-sidecar-renamed' &&
+          name === 'rename' &&
+          to === path.join(layout.commits, `${target.ids.a}.json`)) ||
+        (boundary === 'history-sidecar-durable' &&
+          name === 'rename' &&
+          to === path.join(layout.commits, `${target.ids.b}.json`)) ||
+        (boundary === 'duplicate-removed' &&
+          name === 'unlink' &&
+          source === path.join(layout.root, historyName(target.ids.a)))
+      if (!hit) return
+      if (abort) {
+        // The attempt notices at its next step and rolls itself back.
+        abort.aborted = true
+        thrown = true
+        return
+      }
+      if (die) crashed = true
+      else thrown = true
+      throw new Error(`crash at ${boundary}`)
+    }
+  })
+  const harness = await createHarness(t, storage)
+  const layout = harness.layout
+  target.layout = layout
+  const first = await harness.publish(OLD_BYTES, MUTABLE, OLD_RELEASE, OLD_RELEASE.version)
+  const second = await harness.publish(NEW_BYTES, MUTABLE, RELEASE, RELEASE.version)
+  const returning = await harness.stage(OLD_BYTES, MUTABLE, OLD_RELEASE.version)
+  t.is(returning.id, first.transferId, 'the same content is the same transfer')
+  target.ids = { a: first.transferId, b: second.transferId }
+  const sidecarA = path.join(layout.commits, `${first.transferId}.json`)
+  const parked = await readRecord(sidecarA)
+  t.is(parked.name, historyName(first.transferId), 'the returning content has a history record')
+  armed = true
+  await harness.commits
+    .commit(returning, {
+      replaceNames: [MUTABLE],
+      release: OLD_RELEASE,
+      ...(abort ? { signal: abort } : {})
+    })
+    .then(
+      () => undefined,
+      () => undefined
+    )
+  armed = false
+  t.ok(die && !abort ? crashed : thrown, `${boundary} reached`)
+  return {
+    harness,
+    layout,
+    id: first.transferId,
+    first,
+    second,
+    parked,
+    historyA: path.join(layout.root, historyName(first.transferId)),
+    historyB: path.join(layout.root, historyName(second.transferId)),
+    sidecarA,
+    sidecarB: path.join(layout.commits, `${second.transferId}.json`),
+    final: path.join(layout.root, MUTABLE)
+  }
+}
+
+async function recoverDedup(crash: DedupCrash) {
+  await crash.harness.sessions.close()
+  const sessions = await restart(crash.layout)
+  const commits = new CommitStore({ layout: crash.layout })
+  const results = await recoverStorage({
+    layout: crash.layout,
+    sessionStore: sessions,
+    commitStore: commits,
+    logger: { warn() {} }
+  })
+  return { sessions, commits, results }
+}
+
+async function assertReturned(t: Assert, crash: DedupCrash, commits: CommitStore, label: string) {
+  t.alike(await fs.promises.readFile(crash.final), OLD_BYTES, `${label}: A is current again`)
+  t.alike(await fs.promises.readFile(crash.historyB), NEW_BYTES, `${label}: B is history`)
+  t.is(await exists(crash.historyA), false, `${label}: the duplicate is gone`)
+  const current = await readRecord(crash.sidecarA)
+  t.is(current.name, MUTABLE, `${label}: A's record is the current one`)
+  t.is(current.version, 2, label)
+  t.alike(current.release, OLD_RELEASE, label)
+  t.alike(
+    await readRecord(crash.sidecarB),
+    { ...crash.second, name: historyName(crash.second.transferId) },
+    `${label}: B's record is its history record`
+  )
+  t.alike(
+    (await commits.list()).map((record) => record.name).sort(),
+    [MUTABLE, historyName(crash.second.transferId)].sort(),
+    `${label}: exact records`
+  )
+  t.alike(await fs.promises.readdir(crash.layout.publications), [], `${label}: publications`)
+  t.is(
+    await exists(path.join(crash.layout.journals, `${crash.id}.json`)),
+    false,
+    `${label}: journal`
+  )
+}
+
+test('A, B, A, B on a mutable file keeps exactly one copy of each and the right history', async (t) => {
+  const harness = await createHarness(t)
+  const a = await harness.publish(OLD_BYTES, MUTABLE, OLD_RELEASE, OLD_RELEASE.version)
+  const b = await harness.publish(NEW_BYTES, MUTABLE, RELEASE, RELEASE.version)
+  const root = harness.layout.root
+  const historyOf = (record: CommitRecord): string =>
+    path.join(root, historyName(record.transferId))
+  t.alike(await fs.promises.readFile(historyOf(a)), OLD_BYTES)
+
+  const returned = await harness.publish(OLD_BYTES, MUTABLE, OLD_RELEASE, OLD_RELEASE.version)
+  t.is(returned.transferId, a.transferId)
+  t.alike(await fs.promises.readFile(path.join(root, MUTABLE)), OLD_BYTES)
+  t.alike(await fs.promises.readFile(historyOf(b)), NEW_BYTES)
+  t.is(await exists(historyOf(a)), false, 'the returning content is the only copy of itself')
+  t.alike(
+    (await harness.commits.list()).map((record) => record.name).sort(),
+    [MUTABLE, historyName(b.transferId)].sort()
+  )
+
+  const again = await harness.publish(NEW_BYTES, MUTABLE, RELEASE, RELEASE.version)
+  t.is(again.transferId, b.transferId)
+  t.alike(await fs.promises.readFile(path.join(root, MUTABLE)), NEW_BYTES)
+  t.alike(await fs.promises.readFile(historyOf(a)), OLD_BYTES)
+  t.is(await exists(historyOf(b)), false)
+  t.alike(
+    (await harness.commits.list()).map((record) => record.name).sort(),
+    [MUTABLE, historyName(a.transferId)].sort()
+  )
+  t.alike(await fs.promises.readdir(harness.layout.publications), [])
+  t.alike(await fs.promises.readdir(harness.layout.journals), [])
+})
+
+test('an interrupted A, B, A keeps the returning content history file and record exactly until it is superseded', async (t) => {
+  for (const boundary of ['history-linked', 'publication-linked', 'final-renamed'] as const) {
+    const crash = await crashDedup(t, boundary)
+    const { sessions, commits, results } = await recoverDedup(crash)
+    t.is(results[0].status, 'RESUMABLE', boundary)
+    t.alike(await fs.promises.readFile(crash.final), NEW_BYTES, `${boundary}: B is still current`)
+    t.alike(
+      await fs.promises.readFile(crash.historyA),
+      OLD_BYTES,
+      `${boundary}: the history bytes of the returning content are intact`
+    )
+    t.alike(
+      await readRecord(crash.sidecarA),
+      crash.parked,
+      `${boundary}: and so is their original record`
+    )
+    t.alike(await readRecord(crash.sidecarB), crash.second, `${boundary}: B's record is current`)
+    t.is(await exists(crash.historyB), false, `${boundary}: B has no history yet`)
+    t.alike(
+      (await commits.list()).map((record) => record.name).sort(),
+      [MUTABLE, historyName(crash.id)].sort(),
+      boundary
+    )
+    // Still retryable, and the retry supersedes the duplicate only once it is current.
+    const retried = await commitRelease(
+      commits,
+      await sessions.readVerified(transferId(crash.id)),
+      { replaceNames: [MUTABLE], release: OLD_RELEASE }
+    )
+    t.is(retried.transferId, crash.id, `${boundary}: retry`)
+    await assertReturned(t, crash, commits, `${boundary} retry`)
+    await sessions.close()
+  }
+})
+
+test('an interrupted A, B, A completes once the new current record is durable', async (t) => {
+  for (const boundary of [
+    'current-sidecar-renamed',
+    'history-sidecar-durable',
+    'duplicate-removed'
+  ] as const) {
+    const crash = await crashDedup(t, boundary)
+    const { sessions, commits, results } = await recoverDedup(crash)
+    t.is(results[0].status, 'COMMITTED', boundary)
+    await assertReturned(t, crash, commits, boundary)
+    await sessions.close()
+    // Recovery repeated has nothing left to do.
+    const again = await restart(crash.layout)
+    const rerun = await recoverStorage({
+      layout: crash.layout,
+      sessionStore: again,
+      commitStore: new CommitStore({ layout: crash.layout }),
+      logger: { warn() {} }
+    })
+    t.is(rerun.length, 0, `${boundary}: idempotent`)
+    await again.close()
+  }
+})
+
+test('an aborted A, B, A restores the replaced file and leaves the returning history file and record exact', async (t) => {
+  const crash = await crashDedup(t, 'final-renamed', { abort: { aborted: false } })
+  // The attempt was aborted right after the new file took the name, and rolled itself back.
+  t.alike(await fs.promises.readFile(crash.final), NEW_BYTES, 'B is current again')
+  t.alike(await fs.promises.readFile(crash.historyA), OLD_BYTES, 'the history bytes are intact')
+  t.alike(await readRecord(crash.sidecarA), crash.parked, 'and so is their record')
+  t.is(await exists(crash.historyB), false)
+  t.alike(await fs.promises.readdir(crash.layout.journals), [])
+  t.alike(await fs.promises.readdir(crash.layout.publications), [])
+  t.is(await exists(path.join(crash.layout.sessions, `${crash.id}.json`)), true, 'still resumable')
+})
+
+test('a current record that reached disk through an ambiguous write is undone and the history record put back', async (t) => {
+  const crash = await crashDedup(t, 'current-sidecar-renamed', { die: false })
+  // The rename of the new current record happened and then reported failure; the process lives,
+  // so the attempt rolled back: B is current again and A's history record is back as it was.
+  t.alike(await fs.promises.readFile(crash.final), NEW_BYTES)
+  t.alike(await fs.promises.readFile(crash.historyA), OLD_BYTES)
+  t.alike(await readRecord(crash.sidecarA), crash.parked, 'the sidecar is the history record again')
+  t.alike(await readRecord(crash.sidecarB), crash.second)
+  t.is(await exists(crash.historyB), false)
+  t.alike(await fs.promises.readdir(crash.layout.journals), [])
+})
+
+test('a journal an earlier release left after it had already removed the duplicate still recovers', async (t) => {
+  const crash = await crashDedup(t, 'history-linked')
+  // What 0.7 did before it crashed there: the history file and its record were already gone and the
+  // journal said so. Nothing is left to restore, and recovery must still return the old file.
+  await fs.promises.unlink(crash.historyA)
+  await fs.promises.unlink(crash.sidecarA)
+  const journalPath = path.join(crash.layout.journals, `${crash.id}.json`)
+  const journal = JSON.parse(await fs.promises.readFile(journalPath, 'utf8')) as Record<
+    string,
+    unknown
+  >
+  await fs.promises.writeFile(journalPath, JSON.stringify({ ...journal, phase: 'deduped' }))
+  const { sessions, commits, results } = await recoverDedup(crash)
+  t.is(results[0].status, 'RESUMABLE')
+  t.alike(await fs.promises.readFile(crash.final), NEW_BYTES)
+  t.is(await exists(crash.historyB), false)
+  const retried = await commitRelease(commits, await sessions.readVerified(transferId(crash.id)), {
+    replaceNames: [MUTABLE],
+    release: OLD_RELEASE
+  })
+  t.is(retried.transferId, crash.id)
+  t.alike(await fs.promises.readFile(crash.final), OLD_BYTES)
+  t.alike(await fs.promises.readFile(crash.historyB), NEW_BYTES)
+  await sessions.close()
+})
+
+test('a duplicate that is not a copy of the returning content is left alone after the replacement', async (t) => {
+  const crash = await crashDedup(t, 'history-sidecar-durable')
+  await fs.promises.writeFile(crash.historyA, 'someone else wrote this')
+  const { sessions, results } = await recoverDedup(crash)
+  t.is(results[0].status, 'COMMITTED')
+  t.is(
+    await fs.promises.readFile(crash.historyA, 'utf8'),
+    'someone else wrote this',
+    'only a proven duplicate is removed'
+  )
+  t.alike(await fs.promises.readFile(crash.final), OLD_BYTES)
+  await sessions.close()
+})
+
 test('recovery logs an unknown journal path by pathId and never by its name', async (t) => {
   const harness = await createHarness(t)
   const name = 'operator-notes.json'
@@ -1052,7 +1367,7 @@ test('directory publication maps descriptor chmod failures to COMMIT_FAILED', as
   t.is(await exists(path.join(harness.layout.root, session.name)), false)
 })
 
-test('a directory artifact is create-only and never changes kind', async (t) => {
+test('a directory is not replaced without permission, and an artifact never changes kind', async (t) => {
   const harness = await createHarness(t)
   const first = await harness.stageTree('0.18.1', { 'a.bin': 'a' })
   await harness.commits.commit(first)
@@ -1061,14 +1376,18 @@ test('a directory artifact is create-only and never changes kind', async (t) => 
   const second = await harness.stageTree('0.18.1', { 'a.bin': 'b' })
   await t.exception(() => harness.commits.commit(second), { code: ERRORS.FILE_EXISTS })
   await harness.sessions.retireCommitted(second.transferId)
-  const replaceAttempt = await harness.stageTree('0.18.1', { 'a.bin': 'c' })
-  await t.exception(() => harness.commits.commit(replaceAttempt, { replaceNames: ['0.18.1'] }), {
-    code: ERRORS.FILE_EXISTS
-  })
-  await harness.sessions.retireCommitted(replaceAttempt.transferId)
+  t.is(
+    await fs.promises.readFile(path.join(harness.layout.root, '0.18.1', 'a.bin'), 'utf8'),
+    'a',
+    'the refused offer changed nothing'
+  )
 
   const asFile = await harness.stage(b4a.from('file'), '0.18.1')
-  await t.exception(() => harness.commits.commit(asFile), { code: ERRORS.FILE_EXISTS })
+  await t.exception(
+    () => harness.commits.commit(asFile, { replaceNames: ['0.18.1'] }),
+    { code: ERRORS.FILE_EXISTS },
+    'a file may not replace a directory, even where the name may be replaced'
+  )
   await harness.sessions.retireCommitted(asFile.transferId)
 
   const fileFirst = await harness.stage(b4a.from('file'), 'plain.bin')
@@ -1076,6 +1395,16 @@ test('a directory artifact is create-only and never changes kind', async (t) => 
   await harness.sessions.retireCommitted(fileFirst.transferId)
   const dirSecond = await harness.stageTree('plain.bin', { 'a.bin': 'a' })
   await t.exception(() => harness.commits.commit(dirSecond), { code: ERRORS.FILE_EXISTS })
+  await t.exception(
+    () => harness.commits.commit(dirSecond, { replaceNames: ['plain.bin'] }),
+    { code: ERRORS.FILE_EXISTS },
+    'a directory may not replace a file, even where the name may be replaced'
+  )
+  t.is(
+    await fs.promises.readFile(path.join(harness.layout.root, 'plain.bin'), 'utf8'),
+    'file',
+    'the file is untouched'
+  )
 })
 
 test('an unchanged directory offer is already committed and a mutated one is not', async (t) => {

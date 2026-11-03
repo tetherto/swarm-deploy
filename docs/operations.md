@@ -137,7 +137,15 @@ apart:
   Repeating the identical upload returns `ALREADY_COMMITTED` if it was.
 - A timeout (`UPLOAD_IDLE_TIMEOUT`, `CONNECT_TIMEOUT`) is a wait that ended with no
   answer, not a server decision; raise `--idle-timeout` only if the server's hooks
-  are slow (see [Deployment hooks](hooks.md)).
+  are slow (see [Deployment hooks](hooks.md)). From 0.8.0 the client waits ten
+  minutes by default and `--idle-timeout` / `ClientOptions.idleTimeout` accept any
+  positive integer up to 2147483647 ms (the longest delay a timer accepts; a larger
+  or invalid value is refused, never shortened). The wait is one wait for one
+  answer, not a deadline for the transfer: every chunk that moves restarts it, and
+  the final answer is a single wait that covers verification, commit and every
+  awaited hook, including a directory replacement. The connect timeout is separate
+  and unchanged (30 seconds, at most 5 minutes). The server's own `idleTimeout`
+  (60 seconds) bounds how long the server waits for the client and is unchanged.
 
 Upgrade servers before clients (see
 [Rollout and compatibility](#rollout-and-compatibility)): the server decides
@@ -204,17 +212,93 @@ Names are create-only by default:
   reported each time they happen, and nothing unmanaged is adopted or removed.
 
 Names configured with `--replace-name` or `ServerOptions.replaceNames` are
-mutable:
+mutable, and from 0.8.0 so are the names `--allow-replace` /
+`ServerOptions.allowReplace` select (see
+[Replacing managed artifacts](#replacing-managed-artifacts)):
 
 - Different verified content atomically becomes current.
 - The prior managed inode and record are preserved as
   `history-<full-old-transfer-id>`.
-- The current mutable name is pinned against age and quota retention.
+- The current mutable name of `--replace-name` is pinned against age and quota
+  retention (the legacy, standing pin). `--allow-replace` pins nothing.
 - Historical versions remain eligible for retention.
 
 Commit journals and inode checks recover interrupted create and replacement
 operations. Recovery rolls back mutations before the durable new current
 sidecar and rolls forward operations after that linearization point.
+
+### Replacing managed artifacts
+
+Off by default. `--allow-replace` (repeatable, `ServerOptions.allowReplace`) lets
+an upload replace the Swarm-managed artifact that already holds its name, file or
+whole directory:
+
+```sh
+swarm-deploy server ... --allow-replace                     # every managed name
+swarm-deploy server ... --allow-replace beta-{version}      # a template
+swarm-deploy server ... --allow-replace latest.json --allow-replace 0.18.1
+swarm-deploy server ... --allow-replace '{version}'         # SemVer-named artifacts only
+```
+
+- **Only managed artifacts, whatever the setting.** A path nobody uploaded, a
+  managed artifact whose content no longer matches its record (a directory with a
+  child added, changed or removed, an empty directory included), a symlink, and a
+  file where a directory is (or the reverse) are all left exactly as they are and
+  the upload gets `FILE_EXISTS`. Names are matched exactly; a case variant on a
+  case-insensitive volume is not the managed name and is refused too.
+- **Selectors** are an exact artifact name, or a release template in the grammar of
+  `--artifact-pattern` matched against the final basename (`beta-{version}`,
+  `{series}-nightly`, a bare `{version}` for the names that are SemVer versions).
+  A `/` is refused: a source parent is asserted by the client and is not stored
+  with the artifact, so a permission could not be judged again from what is on
+  disk. A bare `--allow-replace` allows every managed name and wins over listed
+  selectors, which are still validated.
+- **Retention is unchanged.** Allowing replacement pins nothing against age,
+  count, version or quota retention, and does not stop scoped retention. Only the
+  legacy `--replace-name` keeps its standing pin. The artifact being replaced is
+  held, and a replaced artifact kept as history is an ordinary record again once the
+  replacement is done.
+- **A directory is replaced by an atomic exchange**, so the public path is never
+  absent and never half published: the new tree is parked at a private path, one
+  exchange puts it at the name, and the old tree becomes
+  `history-<old-transfer-id>`. It needs a storage adapter whose `atomicSwap`
+  provides the exchange. The default adapter does on Linux and macOS (it loads the
+  native `fs-native-extensions` addon the first time a directory is actually
+  replaced, never for a client or for file-only use). Windows has no atomic
+  exchange: a directory replacement is refused with `UNSUPPORTED_STORAGE` before
+  anything published changes, and so is a filesystem that cannot exchange. The
+  server tests the exchange once per storage layout, on scratch directories in the
+  private state. Replacing files needs none of this.
+- **A busy artifact is retried, not replaced.** While an awaited upload hook or an
+  explicit link request is using an artifact's public path, and while a queued or
+  running detached hook or an open link rollback journal names it, a replacement of
+  that name is refused with the retryable `FILE_BUSY`, so a hook never reads a path
+  whose content changes under it. A hook that already failed, or a link that
+  settled, holds nothing. This applies to files and directories, and to `--replace-name`
+  too.
+- **History and A, B, A.** The replaced artifact is kept as
+  `history-<its transfer id>`. When the returning content already has a history copy,
+  that copy is parked privately and restored exactly if the replacement does not
+  complete, and removed only once the new current record is durable, so the content
+  ends as the single current copy. A file's returning history copy is handled the
+  same way (0.8.0; before, it and its record were deleted before the new current
+  record was durable, so an interrupted A, B, A lost them): its file and its record
+  stay exactly as they are until the new current record replaces the history record
+  in one atomic step, and the duplicate file is removed only afterwards, once proven
+  to be a copy of the returning content. No journal or record format changed, and a
+  journal an earlier release left still recovers.
+- **Links.** A managed symlink names the artifact by its path, so it keeps working
+  and serves the new bytes. An automatic link runs its `afterLink` hook again for
+  the replacement (`LINKED`); a manual link's ledger is untouched until it is
+  published again, and an explicit `link` request for the same target runs
+  `afterLink` (`UNCHANGED`) for the bytes that are there now.
+- **Downgrade barrier.** The first directory replacement durably rewrites the
+  state directory's record (`.swarm-deploy-state.json`) in a strict form that
+  0.7.x and older refuse as malformed at startup, before they read any journal,
+  record or session. Once a directory has been replaced the state needs this
+  release; to go back, restore the state directory from a backup taken before. The
+  barrier is written only when a directory replacement actually begins, and never
+  removed automatically. `reset-storage` keeps it.
 
 Optional retention applies to managed artifacts only:
 
@@ -232,9 +316,9 @@ Optional retention applies to managed artifacts only:
   restart removes every unpinned artifact it selects and there is no dry run, so
   check what a pattern matches first; see
   [Scoped retention](artifact-patterns.md#scoped-retention).
-- Directory artifacts are create-only. A directory offer for a configured
-  `replaceNames` entry, a file-to-directory kind change, or a directory-to-file
-  kind change is rejected. Directory replacement and history are deferred.
+- A directory is created by default and replaced only where replacement is allowed
+  (`--replace-name` or `--allow-replace`, from 0.8.0, above). A file-to-directory
+  or directory-to-file kind change is always rejected.
 - Committed artifacts, including directories, are immutable on disk. Do not write
   into a committed directory after publish: hooks must not run `npm ci`, create
   `.cache`, dotfiles, or extra symlinks inside the tree. If the tree changes,
@@ -251,7 +335,8 @@ Runtime defaults:
 
 - 64 authenticated connections.
 - 8 active uploads.
-- 60-second upload inactivity timeout.
+- 60-second upload inactivity timeout (the server's `idleTimeout`; the client's is
+  10 minutes from 0.8.0, see below).
 - 1 GiB minimum free-disk reserve.
 - 15-minute cleanup interval.
 - 7-day resumable-session lifetime.
@@ -447,6 +532,30 @@ count or version rotated.
 
 Roll out the server, then the pattern configuration, then clients that stage
 into conforming folders.
+
+### Directory replacement and the state barrier (0.8.0)
+
+Nothing changes until `--allow-replace` (or `--replace-name` for a directory) is
+used to replace a directory, and an older client works unchanged: no wire field or
+version changed. The first directory replacement durably rewrites the state
+directory's record, `.swarm-deploy-state.json`, from
+`{ "version": 1, "root": "<root>" }` to
+`{ "version": 2, "root": { "path": "<root>", "requires": ["directory-replacement-v1"] } }`
+before it writes any version 4 journal or history record. Releases through 0.7
+read `root` as a string and stop at startup with `Malformed state directory
+record`, before they read a journal, a record or a session, so they cannot
+quarantine the new journal as corrupt or delete the new history records as invalid.
+This release reads both shapes, `reset-storage` keeps the record, and nothing
+removes it.
+
+To roll back to 0.7.x after a directory was replaced, stop the server, restore the
+state directory (and the output root with it) from a backup taken before the first
+directory replacement, and start 0.7.x. Do not edit the record by hand: the version
+4 history directories and records would then be handled by a release that cannot
+read them. Rolling back before any directory was replaced needs nothing: the record
+is untouched, and 0.7.x reads it. To stop replacing directories without rolling
+back, remove `--allow-replace` / `--replace-name`; history directories already
+created stay and age out through ordinary retention.
 
 ### Private state moved out of the storage root (0.6.1)
 

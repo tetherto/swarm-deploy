@@ -19,7 +19,12 @@ import { validateAndExtractTreeTar } from '../tar-protocol/tree-extract.js'
 import { assertMetadataTransferId } from '../tar-protocol/manifest.js'
 import { assertTreeMetadataTransferId } from '../tar-protocol/tree-manifest.js'
 import { atomicWriteRenamed, MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
-import { isDirectoryJournal, readCommitJournal } from './commit-journal.js'
+import {
+  isDirectoryJournal,
+  isDirectoryReplacementJournal,
+  readCommitJournal,
+  type AnyCommitJournal
+} from './commit-journal.js'
 import { assertSafeFile, openSafeRegularFile, withSafeDirectoryIdentity } from './layout.js'
 import { createTreeStagingTarget } from './tree-staging.js'
 import { digestTree, inspectTreePath, removeTree } from './tree-fs.js'
@@ -109,6 +114,15 @@ export interface TarSessionStoreOptions {
   resumeTtl?: number
   isSessionActive?: (session: TarSession) => boolean
   storage?: StorageAdapter
+}
+
+/**
+ * Whether an open commit journal accounts for a verified directory session whose staging tree is
+ * not at its staging name: a create or a replacement commit moves that tree, so its absence is
+ * explained by the journal, and recovery (not this store) decides what becomes of it.
+ */
+function ownsDirectoryTree(journal: AnyCommitJournal | null): boolean {
+  return isDirectoryJournal(journal) || isDirectoryReplacementJournal(journal)
 }
 
 function problem(message: string, cause: unknown = null): SwarmDeployError {
@@ -510,7 +524,7 @@ export class TarSessionStore {
       return
     }
     const journal = await readCommitJournal(session.id, this.layout, this.storage)
-    if (!journal || !isDirectoryJournal(journal)) throw problem('Session is not verified')
+    if (!ownsDirectoryTree(journal)) throw problem('Session is not verified')
   }
 
   private async purgeCorruptSession(id: string): Promise<void> {
@@ -683,7 +697,7 @@ export class TarSessionStore {
           )
           if (treeState !== 'DIRECTORY') {
             const journal = await readCommitJournal(id, this.layout, this.storage)
-            if (!journal || !isDirectoryJournal(journal)) {
+            if (!ownsDirectoryTree(journal)) {
               await this.purgeCorruptSession(id)
               if (treeState !== 'MISSING') {
                 await removeTree(this.treeStagingPath(id), this.layout.staging, this.storage, {

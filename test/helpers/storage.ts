@@ -1,4 +1,5 @@
 import fs from '#fs'
+import { nativeAtomicSwap } from '../../dist/storage/atomic-swap.js'
 import type {
   StorageAdapter,
   StorageFileHandle,
@@ -17,6 +18,7 @@ export type StorageOperationName =
   | 'readFile'
   | 'writeFile'
   | 'rename'
+  | 'swap'
   | 'link'
   | 'symlink'
   | 'readlink'
@@ -50,6 +52,13 @@ export interface CreateStorageOptions {
   failSyncFor?: StoragePathPredicate
   beforeOperation?: StorageOperationHook
   afterOperation?: StorageOperationHook
+  /**
+   * The adapter's atomic directory exchange. By default the real one (the native addon on
+   * Linux and macOS), reported to the hooks as `swap` with its two paths. `false` leaves the
+   * capability out, as an adapter that cannot exchange directories would; a function replaces
+   * the exchange, for a test that needs it to fail or to observe what stands between its calls.
+   */
+  atomicSwap?: false | ((first: string, second: string) => Promise<void>)
 }
 
 export interface TestStorageFileHandle extends StorageFileHandle {
@@ -69,11 +78,12 @@ export function createStorage({
   failWriteFor = () => false,
   failSyncFor = () => false,
   beforeOperation = () => {},
-  afterOperation = () => {}
+  afterOperation = () => {},
+  atomicSwap
 }: CreateStorageOptions = {}): TestStorage {
   const promises = fs.promises
 
-  return {
+  const storage: TestStorage = {
     async mkdir(target: string, options?: StorageMkdirOptions): Promise<void> {
       await beforeOperation('mkdir', target, options)
       await promises.mkdir(target, options)
@@ -216,4 +226,12 @@ export function createStorage({
       }
     }
   }
+  if (atomicSwap !== false) {
+    storage.atomicSwap = async (first: string, second: string): Promise<void> => {
+      await beforeOperation('swap', first, second)
+      await (atomicSwap === undefined ? nativeAtomicSwap(first, second) : atomicSwap(first, second))
+      await afterOperation('swap', first, second)
+    }
+  }
+  return storage
 }

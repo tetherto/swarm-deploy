@@ -30,8 +30,10 @@ protocol for stored artifacts.
   the client verifies the stored prefix.
 - **Verified:** files and directories are sent as deterministic TAR and checked
   with SHA-256 before an explicit terminal `COMMITTED` result.
-- **Safe storage:** names are create-only by default, named files can opt in to
-  replacement with history, and unmanaged files are never overwritten or deleted.
+- **Safe storage:** names are create-only by default, managed files and whole
+  directories can opt in to replacement with history (`--allow-replace`,
+  `--replace-name`; a directory is exchanged atomically, 0.8.0), and unmanaged
+  files and paths are never overwritten or deleted.
 - **Retention and rotation:** age and storage-quota limits, plus count and
   SemVer rotation driven by artifact patterns.
 - **Managed symlinks:** automatic newest-match aliases and explicit client
@@ -285,8 +287,13 @@ Upload a file:
 
 ```sh
 swarm-deploy upload --seed-file client.seed --server-key "$SERVER_KEY" \
-  --idle-timeout 60000 ./artifact.bin
+  --idle-timeout 600000 ./artifact.bin
 ```
+
+`--idle-timeout` is how long one wait for the server may stay silent, in
+milliseconds: 600000 (ten minutes) by default from 0.8.0, and up to 2147483647. It is
+not a deadline for the whole transfer, and the single wait for the final answer
+covers verification, commit and awaited hooks.
 
 Successful output is:
 

@@ -475,8 +475,9 @@ seeds, and TAR bytes:
   The caller sees that code only while it is still waiting; see the time budget
   below.
 - **Time budget.** The server sets no hook deadline. A client waits for its
-  answer for at most its idle timeout (60 seconds by default, 5 minutes at most:
-  `--idle-timeout`, `ClientOptions.idleTimeout`), and that one wait covers
+  answer for at most its idle timeout (10 minutes by default from 0.8.0, 60
+  seconds before; up to 2147483647 milliseconds: `--idle-timeout`,
+  `ClientOptions.idleTimeout`), and that one wait covers
   everything the server does before it answers. For an upload that is
   verification and commit, `afterCommit`, every `afterLink` call for the upload
   one after another (one per automatic link the artifact moved), hooks queued
@@ -487,6 +488,17 @@ seeds, and TAR bytes:
   finalized or restored as the hook decides; the artifact stays durable), so a
   retry is safe. Set the client idle timeout above the worst-case total, and
   make publishers fail on their own well before it.
+- **The artifact's path stays put while a hook uses it (0.8.0).** Where
+  replacement is allowed (`--replace-name`, `--allow-replace`), a replacement of an
+  artifact's name is refused with the retryable `FILE_BUSY` while an awaited
+  `afterCommit` or `afterLink` hook (an upload's or an explicit link request's, under
+  either `hookFailure` policy), a queued or running detached call, or an open link
+  rollback journal is using that artifact, so a hook walking the public path never
+  sees it change under it. A hook that already failed, or a request that settled,
+  holds nothing, and the retry goes through. After a replacement, an automatic
+  link's `afterLink` runs again for the new artifact (`LINKED`), and an explicit
+  `link` request for the same target runs `afterLink` (`UNCHANGED`) for the bytes
+  that are there now.
 - **The answer is delivered.** After writing a failure answer the server ends
   its side of the stream and keeps the connection for up to 5 seconds, so the
   client reads the code instead of a connection reset. This applies to every

@@ -8,6 +8,7 @@ import type { FileHandle } from 'node:fs/promises'
 import { SwarmDeployError, ERRORS, isStableCode, type RequestPhase } from './errors.js'
 import { parseSeed, generateSeed, publicKeyFromSeed, parsePublicKey } from './identity.js'
 import { validateReplaceNames } from './files.js'
+import { compileReplacePolicy } from './replace-policy.js'
 import { compileSymlinkRules } from './symlinks.js'
 import { loadHooksModule } from './hooks-module.js'
 import {
@@ -74,7 +75,7 @@ const USAGE = [
   'Usage:',
   '  swarm-deploy keygen --out <seed-file>',
   '  swarm-deploy public-key (--seed-file <seed-file> | --seed <64-lower-hex>)',
-  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> [--state-dir <dir>] --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--retention-scope <json>]... [--resume-ttl <milliseconds>] [--cleanup-interval <milliseconds>] [--min-free-bytes <bytes>] [--replace-name <safe-basename>]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...] [--initialize-state]',
+  '  swarm-deploy server (--seed-file <seed-file> | --seed <64-lower-hex>) --storage <dir> [--state-dir <dir>] --allow-key <64-lower-hex> --max-file-bytes <bytes> --max-staging-bytes <bytes> [--allow-key <64-lower-hex>]... [--max-storage-bytes <bytes>] [--max-age-days <days>] [--retention-scope <json>]... [--resume-ttl <milliseconds>] [--cleanup-interval <milliseconds>] [--min-free-bytes <bytes>] [--replace-name <safe-basename>]... [--allow-replace [<selector>]]... [--artifact-pattern <template>]... [--max-count <count>] [--max-versions <count> --version-granularity <major|minor>] [--symlink <selector> [<link-name>]]... [--hooks <module> [--hook-mode <afterCommit|afterLink|onFailure>=<response|detached>]...] [--initialize-state]',
   '  swarm-deploy upload (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--no-source-parent] [--json] <file-or-directory>',
   '  swarm-deploy link (--seed-file <seed-file> | --seed <64-lower-hex>) --server-key <64-lower-hex> [--idle-timeout <milliseconds>] [--hook-failure <rollback|keep>] [--json] <target> <link-name>',
   '  swarm-deploy reset-storage --storage <dir> [--apply [--wait <milliseconds>]] [--state-dir <dir>]',
@@ -186,6 +187,32 @@ function parseCleanupInterval(value: unknown): number {
   const interval = parsePositiveSafeInteger(value, 'cleanup-interval')
   if (interval > MAX_CLEANUP_INTERVAL) throw usageError('Invalid cleanup-interval')
   return interval
+}
+
+/**
+ * Every `--allow-replace`: with no value it allows every managed artifact, and with a value it
+ * names one exact artifact name or one release template (`beta-{version}`, matched against the
+ * final basename). Each value is validated even beside a bare flag, so a typo is never hidden by
+ * the wider permission. Every problem is the same fixed message and never echoes the value.
+ */
+function parseAllowReplace(values: ReadonlyArray<string | undefined>): boolean | string[] {
+  if (values.length === 0) return false
+  const selectors = values.filter((value): value is string => value !== undefined)
+  try {
+    compileReplacePolicy(selectors)
+  } catch {
+    throw usageError('Invalid --allow-replace')
+  }
+  return values.includes(undefined) ? true : selectors
+}
+
+/** The longest delay a timer accepts; the client rejects anything larger rather than clamp it. */
+const MAX_IDLE_TIMEOUT = 0x7fffffff
+
+function parseIdleTimeout(value: unknown): number {
+  const timeout = parsePositiveSafeInteger(value, 'idle-timeout')
+  if (timeout > MAX_IDLE_TIMEOUT) throw usageError('Invalid idle-timeout')
+  return timeout
 }
 
 const MAX_RETENTION_SCOPE_BYTES = 2 * 1024
@@ -402,12 +429,15 @@ function parseOptions(
   keyValues: ReadonlySet<string> = new Set(),
   flags: ReadonlySet<string> = new Set(),
   pairs: ReadonlySet<string> = new Set(),
-  allowCanonicalHexPositionals = false
+  allowCanonicalHexPositionals = false,
+  optionals: ReadonlySet<string> = new Set()
 ): {
   options: Record<string, string | undefined>
   repeatedOptions: Record<string, string[] | undefined>
   pairOptions: Record<string, Array<[string, string | undefined]> | undefined>
   flagOptions: Record<string, true | undefined>
+  /** Repeatable options whose value is optional: `undefined` where none followed. */
+  optionalOptions: Record<string, Array<string | undefined> | undefined>
   positionals: string[]
 } {
   const options: Record<string, string | undefined> = Object.create(null) as Record<
@@ -424,6 +454,9 @@ function parseOptions(
     string,
     true | undefined
   >
+  const optionalOptions: Record<string, Array<string | undefined> | undefined> = Object.create(
+    null
+  ) as Record<string, Array<string | undefined> | undefined>
   const positionals: string[] = []
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
@@ -439,6 +472,7 @@ function parseOptions(
       if (
         !repeatable.has(arg) &&
         !pairs.has(arg) &&
+        !optionals.has(arg) &&
         (Object.prototype.hasOwnProperty.call(options, arg) ||
           Object.prototype.hasOwnProperty.call(repeatedOptions, arg) ||
           Object.prototype.hasOwnProperty.call(flagOptions, arg))
@@ -448,6 +482,21 @@ function parseOptions(
       // A flag takes no value, so the next argument keeps its own meaning.
       if (flags.has(arg)) {
         flagOptions[arg] = true
+        continue
+      }
+      if (optionals.has(arg)) {
+        // The value is optional, and no artifact name or template begins with `-`, so a following
+        // argument that does is the next option and this one stands alone.
+        const next = args[i + 1]
+        const values = optionalOptions[arg] || []
+        optionalOptions[arg] = values
+        if (next === undefined || next.startsWith('-')) {
+          values.push(undefined)
+          continue
+        }
+        if (isCanonicalHexToken(next) && !keyValues.has(arg)) rejectUnexpectedSeed()
+        values.push(next)
+        i++
         continue
       }
       if (pairs.has(arg)) {
@@ -487,7 +536,7 @@ function parseOptions(
     }
     positionals.push(arg)
   }
-  return { options, repeatedOptions, pairOptions, flagOptions, positionals }
+  return { options, repeatedOptions, pairOptions, flagOptions, optionalOptions, positionals }
 }
 
 function requireOption(options: Record<string, string | undefined>, name: string): string {
@@ -678,44 +727,48 @@ function parseHookModes(values: readonly string[]): HookModes {
 }
 
 async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
-  const { options, repeatedOptions, pairOptions, flagOptions, positionals } = parseOptions(
-    args,
-    new Set([
-      '--seed-file',
-      '--seed',
-      '--storage',
-      '--state-dir',
-      '--initialize-state',
-      '--allow-key',
-      '--max-file-bytes',
-      '--max-staging-bytes',
-      '--max-storage-bytes',
-      '--max-age-days',
-      '--retention-scope',
-      '--resume-ttl',
-      '--cleanup-interval',
-      '--min-free-bytes',
-      '--replace-name',
-      '--artifact-pattern',
-      '--max-count',
-      '--max-versions',
-      '--version-granularity',
-      '--symlink',
-      '--hooks',
-      '--hook-mode'
-    ]),
-    new Set([
-      '--replace-name',
-      '--allow-key',
-      '--artifact-pattern',
-      '--symlink',
-      '--hook-mode',
-      '--retention-scope'
-    ]),
-    new Set(['--allow-key', '--seed']),
-    new Set(['--initialize-state']),
-    new Set(['--symlink'])
-  )
+  const { options, repeatedOptions, pairOptions, flagOptions, optionalOptions, positionals } =
+    parseOptions(
+      args,
+      new Set([
+        '--seed-file',
+        '--seed',
+        '--storage',
+        '--state-dir',
+        '--initialize-state',
+        '--allow-key',
+        '--max-file-bytes',
+        '--max-staging-bytes',
+        '--max-storage-bytes',
+        '--max-age-days',
+        '--retention-scope',
+        '--resume-ttl',
+        '--cleanup-interval',
+        '--min-free-bytes',
+        '--replace-name',
+        '--allow-replace',
+        '--artifact-pattern',
+        '--max-count',
+        '--max-versions',
+        '--version-granularity',
+        '--symlink',
+        '--hooks',
+        '--hook-mode'
+      ]),
+      new Set([
+        '--replace-name',
+        '--allow-key',
+        '--artifact-pattern',
+        '--symlink',
+        '--hook-mode',
+        '--retention-scope'
+      ]),
+      new Set(['--allow-key', '--seed']),
+      new Set(['--initialize-state']),
+      new Set(['--symlink']),
+      false,
+      new Set(['--allow-replace'])
+    )
   requirePositionals(positionals, 0, 'server does not accept positional arguments')
   const storageDir = requireOption(options, '--storage')
   const stateDir = options['--state-dir']
@@ -753,6 +806,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
   } catch {
     throw usageError('Invalid --replace-name')
   }
+  const allowReplace = parseAllowReplace(optionalOptions['--allow-replace'] || [])
   const artifactPatterns = repeatedOptions['--artifact-pattern']
   const maxCount =
     options['--max-count'] === undefined
@@ -834,6 +888,7 @@ async function runServer(args: string[], env: Env, io: CliIo): Promise<number> {
       ...(cleanupInterval === undefined ? {} : { cleanupInterval }),
       ...(minFreeBytes === undefined ? {} : { minFreeBytes }),
       replaceNames,
+      ...(allowReplace === false ? {} : { allowReplace }),
       artifactPatterns,
       maxCount,
       maxVersions,
@@ -1061,7 +1116,7 @@ async function runUpload(args: string[], env: Env, io: CliIo): Promise<number> {
   const idleTimeout =
     options['--idle-timeout'] === undefined
       ? io.idleTimeout
-      : parsePositiveSafeInteger(options['--idle-timeout'], 'idle-timeout')
+      : parseIdleTimeout(options['--idle-timeout'])
 
   const ClientImpl = io.Client || Client
   let client: Client
@@ -1169,7 +1224,7 @@ async function runLink(args: string[], env: Env, io: CliIo): Promise<number> {
   const idleTimeout =
     options['--idle-timeout'] === undefined
       ? io.idleTimeout
-      : parsePositiveSafeInteger(options['--idle-timeout'], 'idle-timeout')
+      : parseIdleTimeout(options['--idle-timeout'])
 
   const ClientImpl = io.Client || Client
   let client: Client

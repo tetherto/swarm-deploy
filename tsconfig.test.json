@@ -35,10 +35,13 @@
     "test/unit/tar-session-store.test.ts",
     "test/unit/commit-journal.test.ts",
     "test/unit/commit-recovery.test.ts",
+    "test/unit/replace-policy.test.ts",
+    "test/unit/directory-replacement.test.ts",
     "test/integration/direct-upload.test.ts",
     "test/integration/source-parent-optout.test.ts",
     "test/integration/behavior-observability.test.ts",
     "test/integration/link-hooks.test.ts",
-    "test/integration/private-state.test.ts"
+    "test/integration/private-state.test.ts",
+    "test/integration/replacement.test.ts"
   ]
 }

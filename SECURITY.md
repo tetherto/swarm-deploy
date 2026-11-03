@@ -51,6 +51,15 @@ and disclosure may use a private GitHub Security Advisory.
   Stop the server cleanly before backup or restore, preserve the output root
   together with its state directory, and let the same or newer package version
   complete recovery before serving traffic.
+- Replacing managed artifacts is opt-in (`--allow-replace`, `--replace-name`) and
+  only ever replaces what the server itself published and can still prove
+  unchanged: unmanaged paths, symlinks, modified directories and artifacts of the
+  other kind are left untouched, whatever is allowed. The first time a directory is
+  replaced, the state directory's record is durably rewritten in a form that 0.7.x
+  and older refuse at startup, because those releases would quarantine or delete
+  the new journal and records. Do not hand such a state directory to an older
+  release: use this release, or restore a backup taken before the first directory
+  replacement.
 - Run every instance and `reset-storage` for one output root as the same user, with
   the same `HOME` and the same `--state-dir`. The storage lock lives in the private
   state directory, because nothing private may sit in the output root, so it only

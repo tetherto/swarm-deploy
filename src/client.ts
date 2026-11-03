@@ -63,7 +63,14 @@ import type {
 const EventEmitter = events.EventEmitter
 const DEFAULT_CONNECT_TIMEOUT = 30_000
 const MAX_CONNECT_TIMEOUT = 5 * 60_000
-const DEFAULT_IDLE_TIMEOUT = 60_000
+/**
+ * How long one wait for the server may stay silent. It is not a deadline for a whole transfer:
+ * every chunk that moves restarts it, and it bounds each wait on its own, including the single
+ * wait for the final answer while the server verifies, commits and runs awaited hooks.
+ */
+const DEFAULT_IDLE_TIMEOUT = 600_000
+/** The longest delay a timer accepts; a larger value would fire at once instead of waiting. */
+const MAX_IDLE_TIMEOUT = 0x7fffffff
 const FINGERPRINT_LENGTH = 12
 /**
  * The longest a failed send waits for the answer the server may already have written. A
@@ -76,7 +83,15 @@ export type ClientLogger = Logger
 export interface ClientOptions {
   seed: SeedInput
   serverPublicKey: PublicKeyInput
+  /** Milliseconds to wait for a connection. Default 30 000, at most 300 000. */
   connectTimeout?: number
+  /**
+   * Milliseconds one wait for the server may stay silent: each protocol read, each chunk write,
+   * and the single wait for the final answer while the server verifies, commits and runs awaited
+   * hooks. It is not a deadline for the whole transfer, and moving bytes restarts it. Default
+   * 600 000, a positive integer of at most 2 147 483 647 (the longest delay a timer accepts);
+   * any other value is rejected with `PROTOCOL_INVALID` rather than adjusted.
+   */
   idleTimeout?: number
   /**
    * Send the immediate source directory name with the offer. Defaults to
@@ -208,13 +223,9 @@ function key(value: unknown, label: string, code: ErrorCode): Buffer {
   if (!b4a.isBuffer(value) || value.byteLength !== 32) throw fail(code, `Invalid ${label}`)
   return b4a.from(value)
 }
-function duration(value: unknown, label: string, fallback: number): number {
+function duration(value: unknown, label: string, fallback: number, maximum: number): number {
   const actual = value ?? fallback
-  if (
-    !Number.isSafeInteger(actual) ||
-    (actual as number) <= 0 ||
-    (actual as number) > MAX_CONNECT_TIMEOUT
-  ) {
+  if (!Number.isSafeInteger(actual) || (actual as number) <= 0 || (actual as number) > maximum) {
     throw fail(ERRORS.PROTOCOL_INVALID, `Invalid ${label}`)
   }
   return actual as number
@@ -413,9 +424,15 @@ export class Client extends EventEmitter {
     this.connectTimeout = duration(
       options.connectTimeout,
       'connect timeout',
-      DEFAULT_CONNECT_TIMEOUT
+      DEFAULT_CONNECT_TIMEOUT,
+      MAX_CONNECT_TIMEOUT
     )
-    this.idleTimeout = duration(options.idleTimeout, 'idle timeout', DEFAULT_IDLE_TIMEOUT)
+    this.idleTimeout = duration(
+      options.idleTimeout,
+      'idle timeout',
+      DEFAULT_IDLE_TIMEOUT,
+      MAX_IDLE_TIMEOUT
+    )
     if (
       options.includeSourceParent !== undefined &&
       typeof options.includeSourceParent !== 'boolean'
@@ -810,6 +827,7 @@ export {
   DEFAULT_CONNECT_TIMEOUT,
   MAX_CONNECT_TIMEOUT,
   DEFAULT_IDLE_TIMEOUT,
+  MAX_IDLE_TIMEOUT,
   FINGERPRINT_LENGTH,
   fingerprint
 }

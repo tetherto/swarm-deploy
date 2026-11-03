@@ -53,6 +53,13 @@ interface CommitStore {
     record: CommitRecord,
     options?: { preservePath?: boolean }
   ): Promise<false | { purged: true; preservedPath: boolean }>
+  /**
+   * The transfer IDs every unfinished replacement journal owns: the replaced artifact, the one
+   * replacing it, and any older history copy parked for it. Retention neither deletes nor scrubs
+   * them while the journal exists, so a pass that runs after a failed rollback cannot take what
+   * recovery still has to restore.
+   */
+  pendingReplacementPins?(): Promise<ReadonlySet<string>>
 }
 
 interface Logger {
@@ -224,6 +231,12 @@ export function plainRetentionScope(scope: CompiledRetentionScope): RetentionSco
 interface RetentionRunOptions {
   incomingBytes?: number
   trigger?: string
+  /**
+   * Artifact names this pass must not delete, for the duration of one pass only: the commit that is
+   * about to replace a name holds it here, so the replaced artifact survives that commit's own
+   * pre-commit pass. It is a temporary pin under the root lease, never a permission.
+   */
+  pinNames?: readonly string[]
 }
 
 interface RetentionManagerOptions {
@@ -664,6 +677,7 @@ class RetentionManager {
 
     const valid = []
     let deleted = scanned.deleted
+    let owned: ReadonlySet<string> | null = null
     for (const record of records) {
       const status = await inspectManagedFinal(record, {
         layout: this.layout,
@@ -671,6 +685,14 @@ class RetentionManager {
         hash
       })
       if (status === 'VALID') {
+        valid.push(record)
+        continue
+      }
+      // A record an unfinished replacement still owns may be mid-move (its tree parked at a
+      // private path), so its absence from the visible name proves nothing: recovery decides,
+      // and this pass keeps the record exactly as it is.
+      owned ??= await this._pendingReplacementPins()
+      if (owned.has(record.transferId)) {
         valid.push(record)
         continue
       }
@@ -724,6 +746,12 @@ class RetentionManager {
     return this.isPinned(record) === true
   }
 
+  /** The IDs every unfinished replacement journal owns; empty for a store that has none to report. */
+  async _pendingReplacementPins(): Promise<ReadonlySet<string>> {
+    if (typeof this.commitStore.pendingReplacementPins !== 'function') return new Set<string>()
+    return this.commitStore.pendingReplacementPins()
+  }
+
   _totalSize(records: CommitRecord[]): number {
     let total = 0
     for (const record of records) {
@@ -755,7 +783,8 @@ class RetentionManager {
 
   async _run({
     incomingBytes = 0,
-    trigger = 'manual'
+    trigger = 'manual',
+    pinNames = []
   }: RetentionRunOptions = {}): Promise<RetentionResult> {
     assertSafeUint(incomingBytes, 'incomingBytes')
     // Legacy state in the output root means an older release or another writer is using this
@@ -787,8 +816,15 @@ class RetentionManager {
         })
       }
     }
+    // Held only while this pass runs: what an unfinished replacement journal owns, and the
+    // names the calling commit is about to replace. Neither is a standing pin.
+    const ownedByReplacement = await this._pendingReplacementPins()
+    const heldNames = new Set(pinNames)
     const pinned = (record: CommitRecord): boolean =>
-      this._isPinned(record) || linkPinned.has(record.transferId)
+      this._isPinned(record) ||
+      linkPinned.has(record.transferId) ||
+      ownedByReplacement.has(record.transferId) ||
+      heldNames.has(record.name)
     let scopedDeleted = 0
     if (this.scopes.length > 0) {
       for (const [record, reason] of this._scopedRemovals(current, pinned)) {

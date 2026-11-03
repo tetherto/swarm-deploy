@@ -684,8 +684,9 @@ Commit records for directories use version 3. Directory journals use version 3
 with phases `journaled → renamed → sidecar → cleanup`. A directory publishes by
 renaming its verified staging tree under the name and root leases. Recovery
 handles crashes before rename, after rename, after the sidecar, and during
-symlink reconciliation. Directory artifacts are create-only; configured
-`replaceNames`, file-to-directory, and directory-to-file offers are rejected.
+symlink reconciliation. A directory is created by default and replaced only where
+replacement is allowed (below); file-to-directory and directory-to-file offers are
+always rejected.
 Committed artifacts, including directories, are immutable on disk: hooks and
 operators must not write into a published directory (`npm ci`, `.cache`,
 dotfiles, or extra symlinks). If a committed tree changes, startup hash scrub
@@ -714,6 +715,72 @@ durable new current sidecar, rollback restores the old current and preserves a
 valid verified new session. After that sidecar is durable, recovery finishes
 the new current/history state and cleanup without rolling back committed
 content.
+
+### Directory replacement (0.8.0)
+
+Replacement is permitted by `replaceNames` (exact names; the current artifact stays
+pinned against retention) or by `allowReplace` (`true`, or selectors: an exact name
+or a release template matched against the final basename; no `/`; no pin). Whatever
+is permitted, only a managed artifact of the same kind whose content is proven
+against its record is replaced; an unmanaged path, a modified tree (any child
+added, changed or removed, an empty directory included), a symlink, or the other
+kind is left untouched and the offer is `FILE_EXISTS`. A replacement is refused with
+the retryable `FILE_BUSY`, before any change, while an awaited upload hook or
+explicit link request holds the artifact's path, a queued or running detached call
+pins it, or a link rollback journal names it (asked at admission and again under
+the root lease). It needs `StorageAdapter.atomicSwap`, an atomic exchange of two
+paths on one filesystem (Linux `renameat2(RENAME_EXCHANGE)`, macOS `renamex_np(RENAME_SWAP)`
+through `fs-native-extensions`); a storage without it, or a filesystem that refuses
+it (probed once per layout on scratch directories), gives `UNSUPPORTED_STORAGE`
+before anything changes. There is no emulation by renames.
+
+Records and journals. The current directory record stays version 3 (no
+`replaces`). A replaced directory's record becomes a version 4 directory record
+named `history-<its transfer ID>`, the only directory record allowed to carry a
+history name. The journal is version 4, `intent: replace-directory`, naming the
+visible name, the history name, the publication path `publications/<attempt>.tree`,
+a parked duplicate `publications/<attempt>.dedup` when any, the inode identity of
+the new tree, of the old tree and of the parked copy, the old, new and parked
+records, and the phase (`journaled`, `dedup-moved`, `moved`, `swapped`,
+`current-sidecar`, `history-moved`, `history-sidecar`, `cleanup`).
+
+Transaction. After the plan (the visible tree proven against its record and an
+identity snapshot taken) and the commit's own retention pass (which holds the
+replaced name), and before any change: the busy and capability answers are taken
+and the state directory is durably marked (below). Then: the journal is made
+durable; a history copy of the returning content (A, B, A) is moved, proven by its
+inode, to its private dedup path; the new tree is moved from staging to its
+publication path; the exchange puts it at the visible name and the old tree at the
+publication path; the old tree is checked against its snapshot (a changed tree
+repeats the exchange and fails with `FILE_BUSY`); the new current record is made
+durable by one atomic file replacement, which is the linearization point (for
+returning content this replaces the history record under the same transfer ID in
+one step); the old tree moves to its history name; its record becomes the version 4
+history record; the parked duplicate is removed; the session and TAR part are
+retired; the journal is discarded. Every move is preceded by a proof of the inode
+being moved and of the destination being free, on the verified identity of both
+parent directories.
+
+Recovery trusts what is observed, not the phase. A durable new current record means
+the replacement is completed. Otherwise it is undone exactly: the exchange is
+repeated if it happened, the new tree returns to staging (so the session resumes),
+and a parked history copy returns to its name with its record exactly as it was.
+Any path that holds an unexpected inode, kind or link is not touched and recovery
+fails closed with the journal kept. A revoked owner or an `aborting` journal aborts
+an unfinished replacement and cannot undo a finished one. Retention neither deletes
+nor scrubs a record an unfinished journal owns.
+
+State barrier. Releases through 0.7 would quarantine a version 4 journal as corrupt
+and delete a version 4 record as invalid, and they read only the string `root` of
+the state directory's record. So before the first journal or record of version 4,
+the state directory's record is durably rewritten (a synced private file renamed
+over the old one, then the directory synced) from
+`{ "version": 1, "root": "<root>" }` to
+`{ "version": 2, "root": { "path": "<root>", "requires": ["directory-replacement-v1"] } }`.
+A reader that expects a string rejects that as malformed at startup, before it reads
+a journal, sidecar or session. This release reads both shapes and refuses a record
+that requires a feature it does not know. Nothing writes the strict form unless a
+directory replacement begins, and nothing removes it.
 
 Startup recovers journals before listening, validates journal-owned identities
 before mutation, re-hashes managed committed files, removes invalid managed

@@ -2180,6 +2180,173 @@ test('--symlink rejects a missing selector and invalid rules with exit code 2', 
   }
 })
 
+test('--allow-replace is off unless given, bare for every managed name, or a list of selectors', async (t) => {
+  const root = await createTempDir(t)
+  const none = await runServerCli(root, [])
+  t.is(none.code, 0)
+  t.absent('allowReplace' in (none.options as ServerOptions), 'not passed by default')
+
+  const bare = await runServerCli(root, ['--allow-replace'])
+  t.is(bare.code, 0, bare.stderr)
+  t.is((bare.options as ServerOptions).allowReplace, true)
+
+  const selected = await runServerCli(root, [
+    '--allow-replace',
+    'beta-{version}',
+    '--allow-replace',
+    'latest.json',
+    '--allow-replace',
+    '{version}'
+  ])
+  t.is(selected.code, 0, selected.stderr)
+  t.alike(
+    [...((selected.options as ServerOptions).allowReplace as Iterable<string>)],
+    ['beta-{version}', 'latest.json', '{version}']
+  )
+
+  // A bare flag followed by another option stands alone and leaves that option intact.
+  const beside = await runServerCli(root, ['--allow-replace', '--replace-name', 'latest.json'])
+  t.is(beside.code, 0, beside.stderr)
+  t.is((beside.options as ServerOptions).allowReplace, true)
+  t.alike(
+    [...((beside.options as ServerOptions).replaceNames as Iterable<string>)],
+    ['latest.json']
+  )
+
+  // Every selector is validated even beside a bare flag, which then allows every name.
+  const both = await runServerCli(root, ['--allow-replace', 'beta-{version}', '--allow-replace'])
+  t.is(both.code, 0, both.stderr)
+  t.is((both.options as ServerOptions).allowReplace, true)
+  const hidden = await runServerCli(root, ['--allow-replace', 'history-x', '--allow-replace'])
+  t.is(hidden.code, 2, 'a bare flag does not hide a bad selector')
+  t.is(hidden.constructed, 0)
+
+  const legacy = await runServerCli(root, ['--replace-name', 'a.tar.gz', '--replace-name', 'b'])
+  t.is(legacy.code, 0)
+  t.alike(
+    [...((legacy.options as ServerOptions).replaceNames as Iterable<string>)],
+    ['a.tar.gz', 'b']
+  )
+  t.absent('allowReplace' in (legacy.options as ServerOptions))
+})
+
+test('--allow-replace rejects bad selectors and a secret-shaped value without echoing it', async (t) => {
+  const root = await createTempDir(t)
+  const secret = 'ab'.repeat(32)
+  const invalid: string[][] = [
+    ['--allow-replace', secret],
+    ['--allow-replace', 'a/{version}'],
+    ['--allow-replace', 'history-anything'],
+    ['--allow-replace', 'beta-{oops}'],
+    ['--allow-replace', 'beta-{version}-{version}'],
+    ['--allow-replace', 'same', '--allow-replace', 'same'],
+    ['--allow-replace', 'beta-{version}', '--allow-replace', 'beta-{version}'],
+    ['--allow-replace', '--allow-replace=beta-{version}']
+  ]
+  for (const extra of invalid) {
+    const run = await runServerCli(root, extra)
+    t.is(run.code, 2, extra.join(' '))
+    t.is(run.constructed, 0, extra.join(' '))
+    t.absent(run.stderr.includes(secret), 'the value is never echoed')
+  }
+})
+
+test('the server usage documents --allow-replace with an optional selector', (t) => {
+  t.ok(USAGE.includes('[--allow-replace [<selector>]]...'))
+})
+
+test('--idle-timeout takes a positive integer up to the longest timer delay, for upload and link', async (t) => {
+  const root = await createTempDir(t)
+  const seedPath = path.join(root, 'client.seed')
+  const artifact = path.join(root, 'artifact.txt')
+  await fs.promises.writeFile(seedPath, `${b4a.toString(CLIENT_SEED, 'hex')}\n`, { mode: 0o600 })
+  await fs.promises.writeFile(artifact, 'artifact')
+  const seen: ClientOptions[] = []
+  class Client {
+    constructor(options: ClientOptions) {
+      seen.push(options)
+    }
+    upload() {
+      return Promise.resolve({
+        status: 'COMMITTED' as const,
+        kind: 'file' as const,
+        name: 'artifact.txt',
+        size: 8,
+        digest: b4a.alloc(32),
+        transferId: b4a.alloc(32)
+      })
+    }
+    link(target: string, name: string) {
+      return Promise.resolve({ target, name, status: 'LINKED' as const })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const io = () => ({
+    Client: Client as unknown as new (
+      options: ClientOptions
+    ) => import('../../dist/client.js').Client,
+    stdout: output().stream,
+    stderr: output().stream
+  })
+  const serverKey = b4a.toString(SERVER_KEY, 'hex')
+  const upload = (value: string) =>
+    main(
+      [
+        'upload',
+        '--seed-file',
+        seedPath,
+        '--server-key',
+        serverKey,
+        '--idle-timeout',
+        value,
+        artifact
+      ],
+      {},
+      io()
+    )
+  const link = (value: string) =>
+    main(
+      [
+        'link',
+        '--seed-file',
+        seedPath,
+        '--server-key',
+        serverKey,
+        '--idle-timeout',
+        value,
+        'a',
+        'b'
+      ],
+      {},
+      io()
+    )
+
+  for (const value of ['1', '600000', '2147483647']) {
+    const before = seen.length
+    t.is(await upload(value), 0, `upload ${value}`)
+    t.is(await link(value), 0, `link ${value}`)
+    t.alike(
+      seen.slice(before).map((options) => options.idleTimeout),
+      [Number(value), Number(value)]
+    )
+  }
+  for (const value of ['0', '-1', '2147483648', '9007199254740991', '1.5', '1e3', 'ten', '']) {
+    const before = seen.length
+    t.is(await upload(value), 2, `upload ${value}`)
+    t.is(await link(value), 2, `link ${value}`)
+    t.is(seen.length, before, `${value} was rejected before a client existed`)
+  }
+  // Without the option the client's own default applies; the CLI invents none.
+  const before = seen.length
+  t.is(
+    await main(['upload', '--seed-file', seedPath, '--server-key', serverKey, artifact], {}, io()),
+    0
+  )
+  t.is(seen[before].idleTimeout, undefined)
+})
+
 const DAY = 24 * 60 * 60 * 1000
 
 test('retention scopes and the session and disk options are passed through only when given', async (t) => {

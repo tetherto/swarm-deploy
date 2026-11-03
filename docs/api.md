@@ -139,7 +139,27 @@ Optional operational limits and policies:
   that are already on disk are no longer counted twice. It does not reduce the
   peak of a fresh upload, which still needs its TAR and its extracted payload
   at once; `maxStagingBytes` and the reservations themselves are unchanged.
-- `maxAge`, `maxStorageBytes`, `replaceNames`
+- `maxAge`, `maxStorageBytes`
+- `replaceNames?: Iterable<string>`: exact names an upload may replace, files and
+  (from 0.8.0) managed directories. The current artifact of each name is pinned
+  against every retention stage (the legacy, standing pin). Readable as
+  `server.replaceNames`.
+- `allowReplace?: boolean | Iterable<string>` (0.8.0, off by default; readable as
+  `server.allowReplace`: `false`, `true`, or a frozen copy of the selectors): the
+  opt-in permission to replace Swarm-managed artifacts. `true` allows every managed
+  name; a list holds selectors, each an exact name or a release template in the
+  grammar of `artifactPatterns` (`beta-{version}`, a bare `{version}` for
+  SemVer-named artifacts only) matched against the final basename; a `/`, a
+  `history-` name, a duplicate, more than 64 selectors or anything that is not a
+  string throws `PROTOCOL_INVALID` ("Invalid allowReplace"). Only a managed artifact
+  of the same kind whose content still matches its record is ever replaced: an
+  unmanaged path, a modified directory, a symlink or the other kind of artifact is
+  left untouched (`FILE_EXISTS`). It pins nothing against retention. A directory is
+  replaced by an atomic exchange and needs a storage adapter whose `atomicSwap`
+  provides one (below); without it the replacement is refused with
+  `UNSUPPORTED_STORAGE` before anything published changes. While a hook or link
+  request is using the artifact's path the upload is refused with the retryable
+  `FILE_BUSY`. See [Replacing managed artifacts](operations.md#replacing-managed-artifacts).
 - `artifactPatterns?: Iterable<string>`, `maxCount?: number`,
   `maxVersions?: number`, and `versionGranularity?: 'major' | 'minor'`; see
   [Artifact patterns and rotation](artifact-patterns.md).
@@ -163,6 +183,22 @@ Optional operational limits and policies:
   other post-operation hook is `'detached'`: it runs after the answer, and nothing
   waits for it. See
   [Response and detached hooks](hooks.md#response-and-detached-hooks).
+
+`ServerOptions.storage` replaces the runtime filesystem with a `StorageAdapter`.
+From 0.8.0 an adapter may offer one optional capability, `atomicSwap(first, second)`:
+exchange two existing paths on one filesystem in a single atomic step, so that
+afterwards each name designates the other's former inode with every entry intact
+and no observer ever sees either name missing or half populated. An adapter must do
+exactly that or throw having changed nothing; a copy, or several renames, is not an
+exchange and must not be offered under this name. A server only calls it to replace
+a managed directory (and once per layout, on scratch directories, to learn whether
+the filesystem supports it); an adapter without it, or one that reports
+`ENOTSUP`/`EINVAL`, makes a directory replacement fail with `UNSUPPORTED_STORAGE`
+before anything published changes, and file replacement is unaffected. The default
+adapter provides it on Linux and macOS from `fs-native-extensions`, loaded only when
+a directory is first replaced: importing the package, a `Client`, or a server that
+never replaces a directory does not load the native addon. Windows has no atomic
+exchange, so the default adapter offers none there.
 
 The root package exports the `ServerHooks`, `HookModes`, `HookResponse`,
 `OperationOutcome`, `FailedOutcome`, `BeforeCommitContext`,
@@ -226,7 +262,7 @@ const client = new Client({
   seed: process.env.SWARM_DEPLOY_CLIENT_SEED!,
   serverPublicKey: parsePublicKey(process.env.SWARM_DEPLOY_SERVER_KEY!),
   connectTimeout: 30_000,
-  idleTimeout: 60_000
+  idleTimeout: 600_000
 })
 
 const result = await client.upload('./dist/release.tar.gz')
@@ -240,7 +276,16 @@ string. `serverPublicKey` is a Buffer produced by `parsePublicKey`. Optional
 values are `connectTimeout`, `idleTimeout`, `includeSourceParent`, `dht`,
 `dhtFactory`, and `logger`.
 
-`connectTimeout` defaults to 30 seconds. `idleTimeout` defaults to 60 seconds.
+`connectTimeout` defaults to 30 seconds and is at most 5 minutes. `idleTimeout`
+defaults to 10 minutes (600000 from 0.8.0, 60000 before) and takes a positive
+integer up to 2147483647 milliseconds, the longest delay a timer accepts; any other
+value is rejected with `PROTOCOL_INVALID` rather than clamped (a longer delay would
+fire at once). It bounds one wait for the server, not the whole transfer: each
+protocol read, each backpressured chunk write, and the single wait for the final
+answer while the server verifies, commits and runs awaited hooks, and every chunk
+that moves restarts it. A client that gives up first (`UPLOAD_IDLE_TIMEOUT`) leaves
+the server to finish; repeating the identical upload returns `ALREADY_COMMITTED` if
+it did. The server's own `idleTimeout` is separate and unchanged.
 `includeSourceParent` defaults to `true`; set it to `false` to suppress the
 [source parent](artifact-patterns.md#source-parent) for every upload the client
 makes. Calling `close()` aborts pending work, closes active sockets, and is
