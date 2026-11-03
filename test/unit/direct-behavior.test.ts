@@ -6674,7 +6674,7 @@ test('Client.link marks the server answer, and a closure that gave no reason, wi
   await Promise.all([first.client.close(), second.client.close()])
 })
 
-test('Server reports a raw failure by what it was, never as a bad request, and logs only a known errno', async (t) => {
+test('Server reports an unwrapped raw failure by what it was and logs only a known errno', async (t) => {
   const logs: Array<Record<string, unknown>> = []
   const { server, node } = await createServer(t, {
     logger: { warn: (message, details) => void logs.push({ message, ...details }) }
@@ -6778,4 +6778,19 @@ test('Client names SERVER_ERROR with its fixed explanation and no server text', 
   t.ok(error.message.includes('SERVER_ERROR'))
   t.ok(error.message.includes('unexpected error'))
   t.absent(error.transport)
+
+  // PROTOCOL_INVALID can be an invalid request or a storage-state guard on the server, so its
+  // fixed explanation says neither that the request nor the client version was at fault.
+  const guarded = acceptingServer((server, index) => {
+    if (index !== 1) return
+    queueMicrotask(() => {
+      server.feed(finalFrame({ v: 1, status: 'FAILED', code: ERRORS.PROTOCOL_INVALID }))
+      server.finishInput()
+    })
+  })
+  const refused = await rejectionOf(clientFor(guarded).upload(file))
+  t.is(refused.code, ERRORS.PROTOCOL_INVALID)
+  t.is(refused.remote, true)
+  t.ok(refused.message.includes('protocol or storage-state check failure'))
+  t.absent(/invalid|field|version|client/.test(refused.message.replace('PROTOCOL_INVALID', '')))
 })

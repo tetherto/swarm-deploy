@@ -208,7 +208,7 @@ server explained the failure (see [Errors](api.md#where-a-client-failure-came-fr
   stable code and a fixed explanation on stderr, never text the server wrote:
 
   ```text
-  Server rejected upload (DISK_RESERVE): the server does not have enough free disk space
+  Server rejected upload (DISK_RESERVE): the server does not have enough free disk space or quota
   ```
 
   `link` keeps printing only the stable code (`LINK_CONFLICT`, `HOOK_FAILED`, ...).

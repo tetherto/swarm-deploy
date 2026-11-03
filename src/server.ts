@@ -331,9 +331,9 @@ function fail(code: ErrorCode, message: string, cause: unknown = null): SwarmDep
 }
 
 /**
- * The stable code a failure is reported as: an explicit one is kept, a raw error with a known
- * errno names it (`ENOSPC` is `DISK_RESERVE`), and an unexpected one is `SERVER_ERROR`, so a
- * server fault is never reported as a bad request. The raw text goes nowhere.
+ * The stable code a failure is reported as: an explicit one is kept (including a storage guard's
+ * own `PROTOCOL_INVALID`), an unwrapped raw error with a known errno names it (`ENOSPC` is
+ * `DISK_RESERVE`), and any other raw error is `SERVER_ERROR`. The raw text goes nowhere.
  */
 function codeOf(error: unknown): ErrorCode {
   return failureCodeOf(error)

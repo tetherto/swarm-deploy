@@ -49,7 +49,7 @@ const CODE_SUMMARIES: Record<ErrorCode, string> = {
   AUTH_REJECTED: 'the server did not accept this client key',
   SERVER_KEY_MISMATCH: 'the connected server is not the pinned server key',
   PROTOCOL_INVALID:
-    'the server refused the request as invalid (for example a field it does not know)',
+    'the server reported a protocol or storage-state check failure; see the server log',
   INVALID_FILENAME: 'the artifact name is not allowed by the server',
   INVALID_SEED: 'the seed is not valid',
   INVALID_PUBLIC_KEY: 'a public key is not valid',
@@ -128,10 +128,11 @@ export function systemCodeOf(error: unknown): string | null {
 
 /**
  * The stable code a server reports for a failure. An explicit `SwarmDeployError` keeps its stable
- * code, so a malformed request stays `PROTOCOL_INVALID`. A raw error with a known errno maps to
- * the code that names it (a full or over-quota disk, storage that cannot do the operation, a
- * write or commit that was refused), and anything else the server did not expect is
- * `SERVER_ERROR`, never a fault of the client's request.
+ * code, so a malformed request, and a storage layer that wraps a failure in its own
+ * `PROTOCOL_INVALID` guard, both stay `PROTOCOL_INVALID`. A raw error that reaches this function
+ * unwrapped and has a known errno maps to the code that names it (a full or over-quota disk,
+ * storage that cannot do the operation, a write or commit that was refused), and any other raw
+ * error the server did not expect is `SERVER_ERROR`.
  */
 export function failureCodeOf(error: unknown): ErrorCode {
   if (error instanceof SwarmDeployError) {

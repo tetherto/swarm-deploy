@@ -779,7 +779,7 @@ test('a failure while the payload is still streaming reaches the client as the s
   rig.server.on('failure', (event) => failures.push(event.reason))
 
   const error = await rejectionOf(rig.client.upload(file))
-  t.is(error.code, ERRORS.DISK_RESERVE, 'the server reason, not a reset and not a bad request')
+  t.is(error.code, ERRORS.DISK_RESERVE, 'the server reason, not a reset')
   t.is(error.remote, true)
   t.is(error.operation, 'upload')
   t.ok(['streaming', 'final'].includes(String(error.phase)), `phase ${String(error.phase)}`)
