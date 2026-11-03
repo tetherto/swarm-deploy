@@ -9,6 +9,7 @@ import { ERRORS } from '../../dist/errors.js'
 import { historyName } from '../../dist/files.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore } from '../../dist/storage/commit-store.js'
+import { RetentionManager } from '../../dist/storage/retention.js'
 import {
   DIRECTORY_JOURNAL_VERSION,
   readCommitJournal,
@@ -411,8 +412,9 @@ async function crashDedup(
   }
   const storage = createStorage({
     beforeOperation(name) {
-      if (die && crashed && MUTATIONS.has(name))
+      if (die && crashed && MUTATIONS.has(name)) {
         throw new Error('process stopped at crash boundary')
+      }
     },
     afterOperation(name, source, destination) {
       const layout = target.layout
@@ -680,6 +682,92 @@ test('a duplicate that is not a copy of the returning content is left alone afte
   )
   t.alike(await fs.promises.readFile(crash.final), OLD_BYTES)
   await sessions.close()
+})
+
+test('an A, B, A file commit whose own retention pass evicts the returning history copy still replaces', async (t) => {
+  // The history copy of A is an ordinary, unpinned record when A comes back: the commit's pass may
+  // legitimately remove it (the quota needs room for the incoming bytes, or it has aged out). The
+  // plan for returning content must therefore be made after that pass, never before it.
+  const size = OLD_BYTES.byteLength + NEW_BYTES.byteLength
+  const modes = [
+    { label: 'quota', reason: 'MAX_STORAGE', options: { maxStorageBytes: size } },
+    { label: 'age', reason: 'MAX_AGE', options: { maxAge: 500 } }
+  ] as const
+  for (const { label, reason, options } of modes) {
+    const clock = { time: 1_000, now: () => clock.time }
+    const storage = createStorage()
+    const harness = await createHarness(t, storage)
+    const { layout } = harness
+    const commits = new CommitStore({ layout, storage, clock, logger: { warn() {} } })
+    const removed: Array<Record<string, unknown> | undefined> = []
+    const retention = new RetentionManager({
+      layout,
+      sessionStore: harness.sessions as never,
+      commitStore: commits as never,
+      storage,
+      clock,
+      isSessionActive: () => false,
+      logger: {
+        info(message, details) {
+          if (message === 'Removed managed commit') removed.push(details)
+        }
+      },
+      ...options
+    })
+    const publish = async (content: Buffer, release: ReleaseCoordinates): Promise<CommitRecord> => {
+      const session = await harness.stage(content, MUTABLE, release.version)
+      const record = await commits.commit(session, {
+        retentionManager: retention as never,
+        deferPostCommitRetention: true,
+        replaceNames: [MUTABLE],
+        release
+      })
+      await harness.sessions.retireCommitted(session.transferId)
+      return record
+    }
+    const historyOf = (record: CommitRecord): string =>
+      path.join(layout.root, historyName(record.transferId))
+
+    const a = await publish(OLD_BYTES, OLD_RELEASE)
+    clock.time = 1_100
+    const b = await publish(NEW_BYTES, RELEASE)
+    t.alike(await fs.promises.readFile(historyOf(a)), OLD_BYTES, `${label}: A is B's history`)
+    t.alike(removed, [], `${label}: nothing was evicted while A and B were committed`)
+
+    clock.time = 1_700
+    const returned = await publish(OLD_BYTES, OLD_RELEASE)
+    t.alike(
+      removed,
+      [{ name: historyName(a.transferId), reason }],
+      `${label}: the pass evicted exactly the history copy of the returning content`
+    )
+    t.is(returned.transferId, a.transferId, `${label}: the same content is the same transfer`)
+    t.is(returned.version, 2, `${label}: a replacement record`)
+    t.alike(
+      await fs.promises.readFile(path.join(layout.root, MUTABLE)),
+      OLD_BYTES,
+      `${label}: A is current again`
+    )
+    t.alike(await fs.promises.readFile(historyOf(b)), NEW_BYTES, `${label}: B is history`)
+    t.is(await exists(historyOf(a)), false, `${label}: the evicted copy stays gone`)
+    t.alike(
+      await readRecord(path.join(layout.commits, `${a.transferId}.json`)),
+      returned,
+      `${label}: A's record is the current one`
+    )
+    t.alike(
+      await readRecord(path.join(layout.commits, `${b.transferId}.json`)),
+      { ...b, name: historyName(b.transferId) },
+      `${label}: B's record is its history record`
+    )
+    t.alike(
+      (await commits.list()).map((record) => record.name).sort(),
+      [MUTABLE, historyName(b.transferId)].sort(),
+      `${label}: exact records`
+    )
+    t.alike(await fs.promises.readdir(layout.publications), [], `${label}: publications`)
+    t.alike(await fs.promises.readdir(layout.journals), [], `${label}: journals`)
+  }
 })
 
 test('recovery logs an unknown journal path by pathId and never by its name', async (t) => {

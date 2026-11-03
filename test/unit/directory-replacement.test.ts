@@ -264,8 +264,9 @@ async function crashReplacement(
   const storage = createStorage({
     ...extra,
     beforeOperation(name) {
-      if (target.crashed && MUTATIONS.has(name))
+      if (target.crashed && MUTATIONS.has(name)) {
         throw new Error('process stopped at crash boundary')
+      }
     },
     afterOperation(name, source, destination) {
       const layout = target.layout
@@ -1263,18 +1264,39 @@ test('different names are replaced independently and the same name one after ano
   t.alike(await snapshot(path.join(harness.layout.root, 'one')), shape(TREE_B))
   t.alike(await snapshot(path.join(harness.layout.root, 'two')), shape(TREE_B))
 
-  const sessions = [
-    await harness.stageTree('one', { 'x.bin': 'x1' }),
-    await harness.stageTree('one', { 'x.bin': 'x2' })
-  ]
-  const results = await Promise.allSettled(
-    sessions.map((session) => harness.commits.commit(session, { replace: ALLOW }))
+  // One name admits one session at a time: a second offer for it is FILE_BUSY until the first is
+  // retired, and that guard is the server's, not something to route around. So the same name is
+  // replaced one after another (stage, commit, retire, then the next), never two staged at once.
+  const x1 = { 'x.bin': 'x1' }
+  const x2 = { 'x.bin': 'x2' }
+  const pending = await harness.stageTree('one', x1)
+  await t.exception(
+    () => harness.stageTree('one', x2),
+    { code: ERRORS.FILE_BUSY },
+    'a second session for a name that has an active one is refused at admission'
   )
   t.alike(
-    results.map((result) => result.status),
-    ['fulfilled', 'fulfilled'],
-    'both ran, one after the other'
+    await snapshot(path.join(harness.layout.root, 'one')),
+    shape(TREE_B),
+    'the refused offer changed nothing'
   )
+  const afterX1 = await harness.commits.commit(pending, { replace: ALLOW })
+  await harness.sessions.retireCommitted(pending.transferId)
+  t.alike(await snapshot(path.join(harness.layout.root, 'one')), shape(x1))
+
+  const afterX2 = await harness.replace('one', x2)
+  t.alike(await snapshot(path.join(harness.layout.root, 'one')), shape(x2))
+  t.alike(
+    await snapshot(path.join(harness.layout.root, historyName(first.transferId))),
+    shape(TREE_B),
+    'the first replaced tree is a history copy'
+  )
+  t.alike(
+    await snapshot(path.join(harness.layout.root, historyName(afterX1.transferId))),
+    shape(x1),
+    'and so is the second'
+  )
+  t.not(afterX1.transferId, afterX2.transferId)
   t.alike(await fs.promises.readdir(harness.layout.journals), [])
   t.alike(await fs.promises.readdir(harness.layout.publications), [])
   const names = (await harness.commits.list()).map((record) => record.name)
@@ -1353,6 +1375,8 @@ test('a file under a permission is refused while busy and replaced once it is no
   const harness = await createHarness(t)
   const first = await stageFile(t, harness.sessions, 'notes.txt', 'one')
   await harness.commits.commit(first)
+  // A name admits one session at a time: the committed one is retired before the next is staged.
+  await harness.sessions.retireCommitted(first.transferId)
   const second = await stageFile(t, harness.sessions, 'notes.txt', 'two')
   const offer = {
     name: 'notes.txt',
@@ -1372,6 +1396,7 @@ test('a file under a permission is refused while busy and replaced once it is no
 
   busy = false
   const record = await harness.commits.commit(second, { replace: permission })
+  await harness.sessions.retireCommitted(second.transferId)
   t.is(record.name, 'notes.txt')
   t.is(await fs.promises.readFile(path.join(harness.layout.root, 'notes.txt'), 'utf8'), 'two')
   t.alike(

@@ -571,7 +571,10 @@ hooks, and retention for files are unchanged. Directory metadata, session
 version 4, commit record version 3, directory journals, directory trash, and
 managed symlinks are not downgrade-compatible. Drain uploads before upgrading
 and do not roll back after committing a directory artifact without restoring
-from backup.
+from backup. From 0.8.0, an interrupted file replacement that returns earlier
+content (A, B, A) keeps that content's history record in place until the new
+current record is durable, which a 0.7 recovery refuses as a sidecar that does not
+match the journal: let 0.8 recover, and stop it cleanly, before rolling back.
 
 ## Storage layout and private state
 

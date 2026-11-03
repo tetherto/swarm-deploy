@@ -2394,7 +2394,6 @@ class CommitStore {
     ) {
       throw existsError('History destination already exists')
     }
-    const dedup = await this._dedupHistory(newRecord)
 
     if (retentionManager) {
       // The replaced name is held for this pass, so the artifact about to be replaced survives
@@ -2410,6 +2409,11 @@ class CommitStore {
     if (!pinned.stat || !identitiesEqual(fileIdentity(pinned.stat), finalIdentity)) {
       throw commitError('Managed artifact changed before replacement')
     }
+    // Planned only now, under the same lease, like a directory replacement: the pass above may
+    // legitimately have evicted the history copy of the returning content (quota, age, count), and
+    // a plan made before it would then name a copy and a record that are gone. What this finds is
+    // what the journal records and what linearization re-proves.
+    const dedup = await this._dedupHistory(newRecord)
 
     const attempt = attemptId()
     let journal: ReplacementJournal = {

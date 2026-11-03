@@ -285,8 +285,12 @@ swarm-deploy server ... --allow-replace '{version}'         # SemVer-named artif
   record was durable, so an interrupted A, B, A lost them): its file and its record
   stay exactly as they are until the new current record replaces the history record
   in one atomic step, and the duplicate file is removed only afterwards, once proven
-  to be a copy of the returning content. No journal or record format changed, and a
-  journal an earlier release left still recovers.
+  to be a copy of the returning content. The returning copy is looked for after the
+  commit's own retention pass, so a pass that legitimately evicted it (quota, age,
+  count) leaves an ordinary replacement. No journal or record format changed, and a
+  journal an earlier release left still recovers. Only 0.8 finishes or undoes an
+  interrupted A, B, A: see the rollback note under
+  [Directory replacement and the state barrier](#directory-replacement-and-the-state-barrier-080).
 - **Links.** A managed symlink names the artifact by its path, so it keeps working
   and serves the new bytes. An automatic link runs its `afterLink` hook again for
   the replacement (`LINKED`); a manual link's ledger is untouched until it is
@@ -298,7 +302,10 @@ swarm-deploy server ... --allow-replace '{version}'         # SemVer-named artif
   record or session. Once a directory has been replaced the state needs this
   release; to go back, restore the state directory from a backup taken before. The
   barrier is written only when a directory replacement actually begins, and never
-  removed automatically. `reset-storage` keeps it.
+  removed automatically. `reset-storage` keeps it. Before that, going back to 0.7.x
+  still needs one clean 0.8 start and stop, so that no unfinished replacement journal
+  is left for 0.7.x to refuse (see the rollback note under
+  [Directory replacement and the state barrier](#directory-replacement-and-the-state-barrier-080)).
 
 Optional retention applies to managed artifacts only:
 
@@ -549,13 +556,24 @@ This release reads both shapes, `reset-storage` keeps the record, and nothing
 removes it.
 
 To roll back to 0.7.x after a directory was replaced, stop the server, restore the
-state directory (and the output root with it) from a backup taken before the first
-directory replacement, and start 0.7.x. Do not edit the record by hand: the version
-4 history directories and records would then be handled by a release that cannot
-read them. Rolling back before any directory was replaced needs nothing: the record
-is untouched, and 0.7.x reads it. To stop replacing directories without rolling
-back, remove `--allow-replace` / `--replace-name`; history directories already
-created stay and age out through ordinary retention.
+state directory and the output root together, from one backup taken before the first
+directory replacement (so records and published files stay consistent), and start
+0.7.x. Do not edit the record by hand: the version 4 history directories and records
+would then be handled by a release that cannot read them.
+
+If no directory was ever replaced, the record is untouched and 0.7.x reads it, so
+no restore is needed. But stop the 0.8 server cleanly first: let it finish
+starting (it recovers every unfinished journal before it listens), stop it, check
+that `<state>/journals` holds no journal, and only then start 0.7.x. A 0.8 file
+replacement that returns earlier content (A, B, A) and is interrupted before its new
+current record is durable leaves a version 2 journal that 0.7.x parses but cannot
+finish: it refuses to start with `Commit sidecar does not match journal`, before it
+changes anything, until 0.8 has recovered that journal. 0.7.x never recovers it. If
+0.8 itself refuses to start, resolve that first; do not start 0.7.x on the state.
+
+To stop replacing directories without rolling back, remove `--allow-replace` /
+`--replace-name`; history directories already created stay and age out through
+ordinary retention.
 
 ### Private state moved out of the storage root (0.6.1)
 
