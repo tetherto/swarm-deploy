@@ -9,7 +9,11 @@ import { ERRORS, systemCodeOf } from '../../dist/errors.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore, type ReplacePermission } from '../../dist/storage/commit-store.js'
 import type { CommitRecord } from '../../dist/storage/commit-journal.js'
-import { fileCatalogPath, readFileCatalog } from '../../dist/storage/file-catalog.js'
+import {
+  MAX_CATALOG_BYTES,
+  fileCatalogPath,
+  readFileCatalog
+} from '../../dist/storage/file-catalog.js'
 import {
   STATE_FEATURE_FILE_CATALOG,
   STATE_ROOT_NAME,
@@ -1165,6 +1169,21 @@ test('catalog read I/O failures preserve ownership and do not quarantine valid m
   state.failure = null
   await h.merge(NAME, { 'a.bin': 'new' }, { replace: ALLOW })
   t.is(await fs.promises.readFile(path.join(h.layout.root, NAME, 'a.bin'), 'utf8'), 'new')
+})
+
+test('an oversized catalog is quarantined as malformed without removing its published files', async (t) => {
+  const h = await createHarness(t)
+  await h.merge(NAME, { 'a.bin': 'owned' })
+  const catalog = fileCatalogPath(h.layout.catalogs, NAME)
+  await fs.promises.writeFile(catalog, b4a.alloc(MAX_CATALOG_BYTES + 1, 0x20))
+  const result = await h.commits.scrubRecords({ hash: true })
+  t.is(result.deleted, 1)
+  t.alike(result.records, [])
+  t.is(await exists(catalog), false)
+  const names = await fs.promises.readdir(h.layout.catalogs)
+  t.is(names.length, 1)
+  t.ok(names[0].includes('.corrupt-'))
+  t.is(await fs.promises.readFile(path.join(h.layout.root, NAME, 'a.bin'), 'utf8'), 'owned')
 })
 
 test('merge quota reserves only owned-set growth, including after scrub releases a missing leaf', async (t) => {

@@ -162,7 +162,7 @@ export function readJson(
         handle = await openSafeRegularFile(filePath, 'read', storage)
         const stat = await handle.stat()
         if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > maxBytes) {
-          throw storageError(`Metadata file exceeds ${maxBytes} byte limit`)
+          throw new MetadataFormatError(`Metadata file exceeds ${maxBytes} byte limit`)
         }
         const bytes = await readAll(handle, stat.size)
         let parsed: unknown

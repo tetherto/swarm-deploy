@@ -682,9 +682,17 @@ test('a merge journal holds every action of the largest upload, far past the 16 
     ...serialized,
     padding: 'x'.repeat(MAX_FILE_JOURNAL_BYTES)
   })
-  await t.exception(() => readCommitJournal(ID, initLayout(oversized), createStorage()), {
-    message: /byte limit/
-  })
+  const failure = await readCommitJournal(ID, initLayout(oversized), createStorage()).then(
+    () => null,
+    (error: unknown) => error
+  )
+  t.ok(failure instanceof CorruptJournalError, 'oversized metadata is classified as corrupt')
+  t.ok(
+    failure instanceof CorruptJournalError &&
+      failure.cause instanceof Error &&
+      /byte limit/.test(failure.cause.message),
+    'the byte limit is checked before parsing and remains available as the cause'
+  )
 })
 
 test('every older journal keeps its 16 KiB bound', async (t) => {

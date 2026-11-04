@@ -57,8 +57,9 @@ const CODE_SUMMARIES: Record<ErrorCode, string> = {
   STAGING_LIMIT: 'the server has no staging space left for this upload',
   ACTIVE_UPLOAD_LIMIT: 'the server is receiving its maximum number of uploads; retry later',
   DISK_RESERVE: 'the server does not have enough free disk space or quota',
-  FILE_EXISTS: 'the destination name already exists on the server',
-  FILE_BUSY: 'the same transfer is already in progress on the server; retry later',
+  FILE_EXISTS: 'the upload conflicts with existing server content; replacement may be restricted',
+  FILE_BUSY:
+    'the destination or transfer is busy with another operation or pending recovery; retry later',
   CHECKSUM_MISMATCH: 'the data the server received did not match the offered checksum',
   CONNECT_TIMEOUT: 'the server could not be reached in time',
   UPLOAD_IDLE_TIMEOUT: 'the transfer timed out waiting for the other side',

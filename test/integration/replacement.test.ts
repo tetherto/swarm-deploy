@@ -505,6 +505,34 @@ test('a no-op untracked upload holds its container while response or detached ho
   }
 })
 
+test('an empty directory upload holds its name against file creation while its hook runs', async (t) => {
+  for (const mode of ['response', 'detached'] as const) {
+    const entered = deferred()
+    const gate = deferred()
+    t.teardown(() => gate.resolve())
+    const { client, connect, storage } = await setup(t, {
+      hooks: {
+        afterCommit: async () => {
+          entered.resolve()
+          await gate.promise
+        }
+      },
+      hookModes: { afterCommit: mode }
+    })
+    const first = client.upload(await directory(t, 'shared', { 'empty/': '' }))
+    await entered.promise
+    t.is(await exists(path.join(storage, 'shared')), false, 'empty folders create no resource')
+    const other = connect()
+    const input = await file(t, 'shared', 'file payload')
+    await t.exception(other.upload(input), { code: ERRORS.FILE_BUSY })
+    t.is(await exists(path.join(storage, 'shared')), false, mode)
+    gate.resolve()
+    t.is((await first).status, 'COMMITTED')
+    t.is((await retryWhileBusy(() => other.upload(input))).status, 'COMMITTED')
+    t.is(await fs.promises.readFile(path.join(storage, 'shared'), 'utf8'), 'file payload')
+  }
+})
+
 test('a queued or running detached hook keeps its artifact in place until it ends', async (t) => {
   const gate = deferred()
   const entered = deferred()

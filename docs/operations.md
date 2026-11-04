@@ -82,8 +82,8 @@ paths, or hook output; the log is where to look for those).
 | `DISK_RESERVE`                         | Less free space than the reserve plus the upload needs (default reserve 1 GiB), measured where the private state's staging is; or, from 0.6.3, an upload write that failed with a raw `ENOSPC`/`EDQUOT` the server did not wrap.                                                                                                                                                                                                                                                              |
 | `STAGING_LIMIT`                        | Staged data would exceed `--max-staging-bytes`.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `FILE_TOO_LARGE`                       | The artifact exceeds `--max-file-bytes`.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `FILE_EXISTS`                          | The name already holds different content and is not a `--replace-name`.                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `ACTIVE_UPLOAD_LIMIT`, `FILE_BUSY`     | The server is at its upload limit, or the same transfer is already running; retry later.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `FILE_EXISTS`                          | An occupied standalone name, a differing untracked/edited leaf, a kind/case conflict, or replacement not permitted by `--allow-replace`/`--replace-name`.                                                                                                                                                                                                                                                                                                                                     |
+| `ACTIVE_UPLOAD_LIMIT`, `FILE_BUSY`     | The server is at its upload limit, a transfer or artifact is in use by another operation/hook, or earlier commit cleanup needs retry/recovery.                                                                                                                                                                                                                                                                                                                                                |
 | `HOOK_FAILED`                          | A deployment hook failed; the log has the reason, and the artifact may already be committed.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `COMMIT_FAILED`, `UNSUPPORTED_STORAGE` | The server could not write or commit. For an upload, a raw errno the server did not wrap maps here: permissions (`EACCES`, `EPERM`), a read-only volume (`EROFS`), an I/O error (`EIO`), or storage that cannot do the operation (`EXDEV`, `ENOSYS`, `ENOTSUP`, as `UNSUPPORTED_STORAGE`). The log names the errno as `systemCode`. The same errno inside a storage guard shows as `PROTOCOL_INVALID` instead.                                                                                |
 | `SERVER_ERROR`                         | An upload hit a raw error the server did not expect and did not wrap (0.6.3 or newer). The log has `reason: SERVER_ERROR` and the `phase`. Link requests do not use it.                                                                                                                                                                                                                                                                                                                       |
@@ -343,7 +343,7 @@ archives: 0
 remaining payloads: 1 (app-2.4.1.tar.gz)
 remaining symlinks: 1 (latest)
 fresh start: no
-note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually
+note: remaining payloads are unmanaged; existing files cannot be replaced, but directory uploads may add missing files and leave identical files unchanged
 note: remaining symlinks have no ownership record after the reset; an automatic --symlink rule for that name fails closed with LINK_CONFLICT until you remove them manually, while an explicit link request replaces them
 result: preview only, nothing changed; re-run with --apply to archive this metadata
 ```
@@ -357,9 +357,9 @@ belongs to another storage root makes the command exit `2` without changing
 anything.
 
 With `--apply` the command takes the storage lock, moves the state directory's
-`staging`, `sessions`, `commits`, `journals`, `publications`, `links`, and
+`staging`, `sessions`, `commits`, `catalogs`, `journals`, `publications`, `links`, and
 `trash` plus retired or abandoned lock directories into
-`<state>/archive/reset-<timestamp>-<random>/`, recreates the seven
+`<state>/archive/reset-<timestamp>-<random>/`, recreates the eight
 directories empty, writes a `reset.json` marker with `status: "completed"`,
 releases the lock, and prints the same report followed by `archive: <path>`.
 Every move is a rename inside the state directory, so nothing is copied, nothing
@@ -371,8 +371,10 @@ everything visible in the root are left untouched.
 What the reset does not do, and the report says so:
 
 - It never removes visible payloads, `history-*` files, directories, or
-  symlinks from the root. A remaining payload keeps its name occupied, so a
-  fresh upload of that name returns `FILE_EXISTS`. A remaining symlink loses
+  symlinks from the root. Remaining payloads become unmanaged: standalone files
+  cannot be replaced, but directory uploads may add missing leaves and leave
+  identical untracked files unchanged. Differing untracked files remain protected.
+  A remaining symlink loses
   its ownership record, so an automatic `--symlink` rule for that name fails
   closed with `LINK_CONFLICT`, while an explicit `link` request replaces it
   (see [Managed symlinks](managed-links.md)). `fresh start: yes` is
@@ -418,7 +420,7 @@ is the archive itself, and the marker keeps only a summary of it:
 - `version`: `2`. Version 1 markers stay readable.
 - `status`, `root`, `completedAt`, and the first attempt's `startedAt` and
   `pid`.
-- `moved`: the metadata directories the archive holds, at most seven names.
+- `moved`: the metadata directories the archive holds, at most eight names.
 - `locks`: `count` and `sha256` for the retired and abandoned lock directories
   in the archive's `locks/` directory. The names stay there; the digest is
   over each sorted name followed by a newline, so

@@ -1518,6 +1518,9 @@ class CommitStore {
         deferPostCommitRetention
       )
     }
+    if (await rules.busy(record)) {
+      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Artifact is in use by a hook or a link request')
+    }
     const stagingPath = this._stagingPath(record.transferId)
     const finalPath = this._finalPath(record.name)
 

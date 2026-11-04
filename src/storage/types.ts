@@ -77,7 +77,8 @@ export interface StorageAdapter {
   symlink?(target: string, path: string): Promise<void>
   readlink?(path: string): Promise<string>
   /**
-   * Required only to replace a managed directory. Exchanges two existing paths on one filesystem
+   * Used only to recover legacy whole-directory replacement journals. New file merges do not
+   * require it. Exchanges two existing paths on one filesystem
    * in a single atomic step: afterwards each name designates the other's former inode, with every
    * entry intact, and no observer ever sees either name missing or half-populated. An adapter must
    * either do exactly that or throw having changed nothing: a copy, or several renames, is not an

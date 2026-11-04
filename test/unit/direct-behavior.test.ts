@@ -3406,6 +3406,8 @@ test('a pending afterLink holds no storage lease, and requests for one link run 
 
 test('afterLink results reach only a request that asked, and only once the hook has resolved', async (t) => {
   const held = gate()
+  const entered = gate()
+  t.teardown(() => held.open())
   const logs: Array<Record<string, unknown>> = []
   const { server, node } = await createServer(t, {
     symlinks: [{ selector: '/^release-\\d+$/' }],
@@ -3415,6 +3417,7 @@ test('afterLink results reach only a request that asked, and only once the hook 
     },
     hooks: {
       afterLink: async ({ link, artifact }) => {
+        entered.open()
         await held.wait
         return {
           submissionId: `sub-${link.name}`,
@@ -3432,7 +3435,7 @@ test('afterLink results reach only a request that asked, and only once the hook 
   const { transferId } = metadataFromManifest(input.manifest)
 
   const asked = linkRequest(node, 'release-1', 'current', true)
-  await settled()
+  await entered.wait
   t.is(asked.writes.length, 0, 'nothing, not even LINKED, is sent while the hook is pending')
   t.is(await fs.promises.readlink(path.join(server.storageDir, 'current')), 'release-1')
   held.open()
