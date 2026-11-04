@@ -739,7 +739,10 @@ export async function listFileCatalogs(
       catalog = parseFileCatalog(
         await readJson(path.join(directory, filename), storage, MAX_CATALOG_BYTES)
       )
-    } catch {
+    } catch (error) {
+      if (!(error instanceof MetadataFormatError) && !(error instanceof CorruptCatalogError)) {
+        throw error
+      }
       unusable.push(filename)
       continue
     }

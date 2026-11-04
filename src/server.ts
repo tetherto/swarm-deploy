@@ -207,9 +207,9 @@ export interface ServerOptions {
   scheduler?: ServerScheduler
   logger?: Logger | null
   /**
-   * Exact artifact names an upload may replace. Replacing one keeps the replaced artifact as
-   * history, and the current artifact of each name is pinned against every retention stage (the
-   * legacy, standing pin; `allowReplace` adds none). Files and managed directories both qualify.
+   * Exact artifact names under which an upload may replace intact managed files, including leaves
+   * of a directory input. Standalone files retain history; directory merges preserve omitted
+   * siblings and keep rollback data privately. The current artifact keeps its legacy retention pin.
    */
   replaceNames?: Iterable<string>
   /**
@@ -218,13 +218,12 @@ export interface ServerOptions {
    * in the grammar of `artifactPatterns` (`beta-{version}`, a bare `{version}` for the names that
    * are SemVer versions), matched against the artifact's final basename only. A source-parent
    * segment is refused, because the parent is asserted by the client and not stored with the
-   * artifact. Whatever is allowed, only a managed artifact of the same kind whose content still
-   * matches its record is ever replaced: an unmanaged path, a modified directory, a symlink or a
-   * file where a directory is (or the reverse) is left untouched. Replaced artifacts stay as
-   * history. The permission pins nothing against retention. A directory is replaced by an atomic
-   * exchange and needs a storage adapter whose `atomicSwap` provides one (the default adapter does
-   * on Linux and macOS); where it is unavailable the replacement is refused with
-   * `UNSUPPORTED_STORAGE` before anything published changes. Validated and copied at construction.
+   * artifact. Directory inputs merge missing leaves without permission and preserve omitted
+   * siblings. Differing intact owned files require permission; differing untracked/edited files,
+   * links and kind conflicts reject the whole input. Full private staging and journaled rollback
+   * do not promise instantaneous multi-file visibility. No directory exchange or public history
+   * tree is used for new merges; standalone file history is unchanged. Adds no retention pin.
+   * Validated and copied at construction.
    */
   allowReplace?: boolean | Iterable<string>
   /** Optional deployment lifecycle callbacks; snapshotted at construction. */
@@ -470,6 +469,7 @@ export class Server extends EventEmitter {
    * path whose content changes under it. In memory only, released in a `finally`.
    */
   private readonly activeArtifacts = new Map<string, number>()
+  private readonly activeArtifactNames = new Map<string, number>()
   private readonly replacePermission: ReplacePermission
   readonly hooks: Readonly<ServerHooks>
   readonly hookModes: Readonly<HookModes>
@@ -921,8 +921,9 @@ export class Server extends EventEmitter {
    * Marks an artifact's public path as in use by an awaited hook or an explicit link request. The
    * returned function ends the use, once; callers call it from a `finally`.
    */
-  private holdArtifact(transferId: string): () => void {
+  private holdArtifact(transferId: string, name: string): () => void {
     this.activeArtifacts.set(transferId, (this.activeArtifacts.get(transferId) ?? 0) + 1)
+    this.activeArtifactNames.set(name, (this.activeArtifactNames.get(name) ?? 0) + 1)
     let released = false
     return () => {
       if (released) return
@@ -930,6 +931,9 @@ export class Server extends EventEmitter {
       const count = (this.activeArtifacts.get(transferId) ?? 1) - 1
       if (count <= 0) this.activeArtifacts.delete(transferId)
       else this.activeArtifacts.set(transferId, count)
+      const named = (this.activeArtifactNames.get(name) ?? 1) - 1
+      if (named <= 0) this.activeArtifactNames.delete(name)
+      else this.activeArtifactNames.set(name, named)
     }
   }
 
@@ -941,6 +945,10 @@ export class Server extends EventEmitter {
    * clears by itself and a replacement is only ever asked to retry.
    */
   private async replacementBusy(record: CommitRecord): Promise<boolean> {
+    if (this.activeArtifactNames.has(record.name)) return true
+    for (const name of this.detached.names()) {
+      if (name === record.name) return true
+    }
     if (this.activeArtifacts.has(record.transferId)) return true
     for (const pinned of this.detached.pins()) {
       if (pinned === record.transferId) return true
@@ -1086,6 +1094,7 @@ export class Server extends EventEmitter {
       outcome: scope,
       turn: item.turn,
       pin: item.artifact.transferId,
+      artifactName: item.artifact.name,
       fields: {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
         name: item.link.name,
@@ -1116,6 +1125,7 @@ export class Server extends EventEmitter {
       outcome: scope,
       turn: this.commitHookTurns.reserve(context.artifact.name),
       pin,
+      artifactName: context.artifact.name,
       fields: {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
         name: context.artifact.name,
@@ -1184,6 +1194,7 @@ export class Server extends EventEmitter {
       outcome: context.outcome,
       turn: null,
       pin,
+      ...(pin !== null && context.artifact !== null ? { artifactName: context.artifact.name } : {}),
       fields: {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
         transfer,
@@ -1439,7 +1450,7 @@ export class Server extends EventEmitter {
         )
         if (!target) throw fail(ERRORS.LINK_TARGET_NOT_FOUND, 'Manual link target was not found')
         state.artifact = this.recordArtifact(target)
-        hold.release = this.holdArtifact(target.transferId)
+        hold.release = this.holdArtifact(target.transferId, target.name)
         const artifacts = new Set(records.map((record) => record.name))
         if (artifacts.has(request.name)) {
           throw fail(ERRORS.LINK_CONFLICT, 'Manual link name conflicts with an artifact')
@@ -1881,7 +1892,7 @@ export class Server extends EventEmitter {
       const runPostCommit = async (
         alreadyDurable: boolean
       ): Promise<UploadHookResult | undefined> => {
-        const release = this.holdArtifact(durableId ?? hookArtifact.transferId)
+        const release = this.holdArtifact(durableId ?? hookArtifact.transferId, hookArtifact.name)
         try {
           return await runPostCommitHooks(alreadyDurable)
         } finally {

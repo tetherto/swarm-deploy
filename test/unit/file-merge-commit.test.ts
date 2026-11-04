@@ -5,11 +5,11 @@ import test, { type Assert } from 'brittle'
 import b4a from 'b4a'
 import fs from '#fs'
 import path from '#path'
-import { ERRORS } from '../../dist/errors.js'
+import { ERRORS, systemCodeOf } from '../../dist/errors.js'
 import { TarSessionStore, type TarSession } from '../../dist/storage/tar-session-store.js'
 import { CommitStore, type ReplacePermission } from '../../dist/storage/commit-store.js'
 import type { CommitRecord } from '../../dist/storage/commit-journal.js'
-import { readFileCatalog } from '../../dist/storage/file-catalog.js'
+import { fileCatalogPath, readFileCatalog } from '../../dist/storage/file-catalog.js'
 import {
   STATE_FEATURE_FILE_CATALOG,
   STATE_ROOT_NAME,
@@ -1138,34 +1138,118 @@ test('a merge counts its bytes honestly: the quota pass may evict an unpinned ar
   )
 })
 
-test('a merge of a thousand files journals every action, past the old 16 KiB, and publishes them all', async (t) => {
-  const state: { layout: StorageLayout | null; largest: number } = { layout: null, largest: 0 }
+test('catalog read I/O failures preserve ownership and do not quarantine valid metadata', async (t) => {
+  const state: { file: string | null; failure: string | null } = { file: null, failure: null }
   const storage = createStorage({
-    async afterOperation(name, _source, destination) {
-      const layout = state.layout
-      if (layout === null || (name !== 'link' && name !== 'rename')) return
-      const to = typeof destination === 'string' ? destination : ''
-      if (to.startsWith(layout.journals)) {
-        state.largest = Math.max(state.largest, (await fs.promises.stat(to)).size)
+    beforeOperation(operation, target) {
+      if (operation === 'open' && target === state.file && state.failure !== null) {
+        throw Object.assign(new Error('temporary catalog read failure'), { code: state.failure })
       }
     }
   })
   const h = await createHarness(t, { storage })
-  state.layout = h.layout
-  const spec: TreeSpec = {}
-  for (let index = 0; index < 1000; index++) {
-    spec[`group-${index % 10}/file-${String(index).padStart(4, '0')}.bin`] = `${index}`
+  await h.merge(NAME, { 'a.bin': 'owned' })
+  state.file = fileCatalogPath(h.layout.catalogs, NAME)
+  const before = await fs.promises.readFile(state.file, 'utf8')
+  for (const code of ['EIO', 'EACCES']) {
+    state.failure = code
+    const failure = await h.commits.scrubRecords({ hash: true }).then(
+      () => null,
+      (error: unknown) => error
+    )
+    t.ok(failure, 'the failed read is propagated')
+    t.is(systemCodeOf(failure), code, 'the original system reason survives its storage guard')
+    t.is(await fs.promises.readFile(state.file, 'utf8'), before, `${code}: catalog preserved`)
+    t.alike(await fs.promises.readdir(h.layout.catalogs), [path.basename(state.file)])
   }
-  const record = await h.merge(NAME, spec)
-  t.is(record.entryCount, 1000)
-  t.ok(state.largest > 16 * 1024 * 10, `the journal was ${state.largest} bytes`)
-  t.is((await ownedPaths(h)).length, 1000)
-  t.is(
-    await fs.promises.readFile(path.join(h.layout.root, NAME, 'group-7', 'file-0997.bin'), 'utf8'),
-    '997'
-  )
-  await assertNoResidue(t, h.layout, 'finished')
+  state.failure = null
+  await h.merge(NAME, { 'a.bin': 'new' }, { replace: ALLOW })
+  t.is(await fs.promises.readFile(path.join(h.layout.root, NAME, 'a.bin'), 'utf8'), 'new')
 })
+
+test('merge quota reserves only owned-set growth, including after scrub releases a missing leaf', async (t) => {
+  const h = await createHarness(t)
+  const bystander = await stageFile(t, h.sessions, 'keep.bin', 'k'.repeat(9))
+  await h.commits.commit(bystander)
+  await h.sessions.retireCommitted(bystander.transferId)
+  await h.merge(NAME, { 'a.bin': 'a'.repeat(90) })
+  const retention = new RetentionManager({
+    layout: h.layout,
+    sessionStore: h.sessions,
+    commitStore: h.commits,
+    storage: h.storage,
+    isSessionActive: () => false,
+    maxStorageBytes: 100
+  })
+  const merged = await h.merge(
+    NAME,
+    { 'a.bin': 'a'.repeat(90), 'b.bin': 'b' },
+    { retentionManager: retention }
+  )
+  t.is(merged.size, 91)
+  t.is(
+    await exists(path.join(h.layout.root, 'keep.bin')),
+    true,
+    'unchanged bytes do not evict another artifact'
+  )
+  const smaller = await h.merge(
+    NAME,
+    { 'a.bin': 'small' },
+    { retentionManager: retention, replace: ALLOW }
+  )
+  t.is(smaller.size, 6)
+  t.is(
+    await exists(path.join(h.layout.root, 'keep.bin')),
+    true,
+    'a shrinking replacement retains no public history'
+  )
+
+  // A disappeared leaf is released by scrub; restoring it must still reserve its new bytes.
+  await fs.promises.unlink(path.join(h.layout.root, NAME, 'a.bin'))
+  await h.merge(NAME, { 'a.bin': 'a'.repeat(99) }, { retentionManager: retention })
+  t.is((await h.commits.list()).find((record) => record.name === NAME)!.size, 100)
+  t.is(
+    await exists(path.join(h.layout.root, 'keep.bin')),
+    false,
+    'restored bytes reserve real capacity'
+  )
+})
+
+test(
+  'a merge of a thousand files journals every action, past the old 16 KiB, and publishes them all',
+  { timeout: 120_000 },
+  async (t) => {
+    const state: { layout: StorageLayout | null; largest: number } = { layout: null, largest: 0 }
+    const storage = createStorage({
+      async afterOperation(name, _source, destination) {
+        const layout = state.layout
+        if (layout === null || (name !== 'link' && name !== 'rename')) return
+        const to = typeof destination === 'string' ? destination : ''
+        if (to.startsWith(layout.journals)) {
+          state.largest = Math.max(state.largest, (await fs.promises.stat(to)).size)
+        }
+      }
+    })
+    const h = await createHarness(t, { storage })
+    state.layout = h.layout
+    const spec: TreeSpec = {}
+    for (let index = 0; index < 1000; index++) {
+      spec[`group-${index % 10}/file-${String(index).padStart(4, '0')}.bin`] = `${index}`
+    }
+    const record = await h.merge(NAME, spec)
+    t.is(record.entryCount, 1000)
+    t.ok(state.largest > 16 * 1024 * 10, `the journal was ${state.largest} bytes`)
+    t.is((await ownedPaths(h)).length, 1000)
+    t.is(
+      await fs.promises.readFile(
+        path.join(h.layout.root, NAME, 'group-7', 'file-0997.bin'),
+        'utf8'
+      ),
+      '997'
+    )
+    await assertNoResidue(t, h.layout, 'finished')
+  }
+)
 
 test('removing a directory artifact deletes only unchanged owned files and prunes only empty folders', async (t) => {
   const h = await createHarness(t)

@@ -474,6 +474,37 @@ test('an awaited hook keeps its artifact in place until it is done, then the rep
   t.alike(await snapshot(path.join(storage, 'site')), shape(site(2)))
 })
 
+test('a no-op untracked upload holds its container while response or detached hooks use it', async (t) => {
+  for (const mode of ['response', 'detached'] as const) {
+    const entered = deferred()
+    const gate = deferred()
+    t.teardown(() => gate.resolve())
+    const { client, connect, storage } = await setup(t, {
+      hooks: {
+        afterCommit: async () => {
+          entered.resolve()
+          await gate.promise
+        }
+      },
+      hookModes: { afterCommit: mode }
+    })
+    await writeTree(path.join(storage, 'shared'), { 'foreign.flatpak': 'flatpak' })
+    const first = client.upload(await directory(t, 'shared', { 'foreign.flatpak': 'flatpak' }))
+    await entered.promise
+    const other = connect()
+    const snap = await directory(t, 'shared', { 'QV.AC.snap': 'snap' })
+    await t.exception(other.upload(snap), { code: ERRORS.FILE_BUSY })
+    t.is(await exists(path.join(storage, 'shared', 'QV.AC.snap')), false, mode)
+    gate.resolve()
+    t.is((await first).status, 'COMMITTED')
+    t.is((await retryWhileBusy(() => other.upload(snap))).status, 'COMMITTED')
+    t.is(
+      await fs.promises.readFile(path.join(storage, 'shared', 'foreign.flatpak'), 'utf8'),
+      'flatpak'
+    )
+  }
+})
+
 test('a queued or running detached hook keeps its artifact in place until it ends', async (t) => {
   const gate = deferred()
   const entered = deferred()

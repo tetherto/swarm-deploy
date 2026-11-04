@@ -2108,22 +2108,27 @@ class CommitStore {
 
     const standing = async (): Promise<CommitRecord | null> =>
       (await this._scanRecords()).find((entry) => entry.name === name) ?? null
+    const current = await standing()
+    if (await rules.busy(current ?? record)) {
+      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Artifact is in use by a hook or a link request')
+    }
     if (!planned.outcome.changed) {
       await this._retireUpload(record.transferId)
       return (await standing()) ?? record
     }
 
-    const current = await standing()
-    if (current !== null && (await rules.busy(current))) {
-      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Artifact is in use by a hook or a link request')
-    }
-    if (retentionManager) {
-      // The upload's own size is a ceiling on what it can add: its files are links, not copies.
+    const reserveGrowth = async (): Promise<void> => {
+      if (!retentionManager) return
+      // The current group is already counted and remains pinned. Skipped bytes and the old
+      // bytes of replaced leaves must not be reserved again: merges keep no public history.
       await retentionManager._runUnlocked({
-        incomingBytes: record.size,
+        incomingBytes: Math.max(0, planned.outcome.result.bytes - planned.outcome.previous.bytes),
         trigger: 'commit',
         pinNames: [name]
       })
+    }
+    if (retentionManager) {
+      await reserveGrowth()
     }
     assertNotAborted(signal)
     const afterPass = await readFileCatalog(this.layout.catalogs, name, this.storage)
@@ -2134,6 +2139,9 @@ class CommitStore {
         await this._retireUpload(record.transferId)
         return (await standing()) ?? record
       }
+      // Scrub may have released missing/edited leaves. Recheck capacity against that new
+      // ownership baseline before recreating them; an earlier credit must not survive scrub.
+      await reserveGrowth()
     }
     if (!(await treeMatchesSnapshot(treePath, this.storage, identities))) {
       throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Staging tree changed before publication')
