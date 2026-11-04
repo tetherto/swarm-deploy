@@ -13,6 +13,16 @@ declare module 'b4a' {
   export default b4a
 }
 
+declare module 'fs-native-extensions' {
+  /**
+   * Atomically exchanges two existing paths on one filesystem (Linux and macOS; the Windows
+   * fallback is not atomic and is never used). Reports completion by return value or by promise.
+   */
+  export function swap(first: string, second: string): unknown
+  const fsx: { swap(first: string, second: string): unknown }
+  export default fsx
+}
+
 declare module 'sodium-native' {
   const sodium: {
     randombytes_buf(buffer: Uint8Array): void

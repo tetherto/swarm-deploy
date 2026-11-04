@@ -1056,3 +1056,28 @@ test('every method and getter keeps the adapter as its receiver, so class adapte
     'a frozen adapter works too'
   )
 })
+
+test('an atomic exchange refused across mounts is reported once, and an absent one stays absent', async (t) => {
+  let notified = 0
+  class Exchanging extends StatefulAdapter {
+    atomicSwap(first: string, second: string): Promise<void> {
+      this.seen.push(`swap ${first} ${second}`)
+      return Promise.reject(errno('EXDEV'))
+    }
+  }
+  const adapter = new Exchanging()
+  const diagnosed = diagnoseCrossMount(adapter as unknown as StorageAdapter, () => {
+    notified++
+  })
+  t.is(typeof diagnosed.atomicSwap, 'function')
+  const refused = await diagnosed.atomicSwap!('a', 'b').then(
+    () => null,
+    (error: unknown) => error as { code?: string }
+  )
+  t.is(refused?.code, 'EXDEV', 'rethrown unchanged')
+  t.is(notified, 1, 'and reported once')
+  t.alike(adapter.seen, ['swap a b'], 'it ran on the adapter itself')
+
+  const plain = diagnoseCrossMount(new StatefulAdapter() as unknown as StorageAdapter, () => {})
+  t.is(typeof plain.atomicSwap, 'undefined', 'a capability the adapter lacks stays absent')
+})

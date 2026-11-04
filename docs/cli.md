@@ -50,6 +50,7 @@ swarm-deploy server \
   [--max-storage-bytes <bytes>] \
   [--max-age-days <days>] \
   [--replace-name <safe-basename>]... \
+  [--allow-replace [<selector>]]... \
   [--artifact-pattern <template>]... \
   [--max-count <count>] \
   [--max-versions <count> --version-granularity <major|minor>] \
@@ -107,8 +108,30 @@ Optional options:
 - `--max-storage-bytes`: maximum total managed committed storage. Oldest
   eligible artifacts are removed first.
 - `--max-age-days`: remove eligible committed artifacts at or beyond this age.
-- `--replace-name`: permit replacement of this exact basename. Repeat for
-  multiple mutable names.
+- `--replace-name`: permit replacement of this exact basename, a file or (from
+  0.8.0) a managed directory. Repeat for multiple mutable names. The current
+  artifact of each name is pinned against retention (the legacy, standing pin).
+- `--allow-replace [<selector>]` (0.8.0, off by default, repeatable): permit an
+  upload to replace the Swarm-managed artifact that holds its name. With no value
+  it allows every managed name; with a value it allows one exact artifact name or
+  one release template in the grammar of `--artifact-pattern`, matched against the
+  final basename (`beta-{version}`, a bare `{version}` for SemVer-named artifacts
+  only, `{series}-nightly`). The value is optional because no name begins with `-`:
+  an argument that does is the next option. A `/` is refused, every value is
+  validated even beside a bare flag, and a bad one is a usage error (exit `2`) that
+  never echoes it. Whatever is allowed, only a managed artifact of the same kind
+  whose content still matches its record is replaced (an unmanaged path, a
+  modified directory, a symlink, or the other kind of artifact is left untouched
+  and the upload gets `FILE_EXISTS`); the replaced artifact stays as
+  `history-<old-transfer-id>`; and nothing is pinned against retention. A
+  directory is replaced by an atomic exchange, on Linux and macOS; where that is
+  unavailable the upload is refused with `UNSUPPORTED_STORAGE` before anything
+  changes. While a hook or link request is using the artifact's path the upload
+  gets the retryable `FILE_BUSY`. The first directory replacement makes the state
+  directory refuse 0.7.x and older (restore a backup to go back). See
+  [Replacing managed artifacts](operations.md#replacing-managed-artifacts). A
+  selector that is 64 lowercase hexadecimal characters is refused like any secret
+  passed as a positional argument.
 - `--artifact-pattern <template>`: identify releases and make matching
   mandatory. Repeat for multiple templates; declaration order is match order.
   See [Artifact patterns and rotation](artifact-patterns.md).
@@ -208,8 +231,13 @@ Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>` to provide the
 seed inline.
 
 - `--server-key` is the full pinned server public key.
-- `--idle-timeout` defaults to 60 seconds and bounds inactive protocol reads and
-  backpressured writes.
+- `--idle-timeout <milliseconds>` defaults to 10 minutes (600000) from 0.8.0 and
+  takes a positive integer up to 2147483647 (the longest delay a timer accepts);
+  any other value is a usage error (exit `2`), never shortened. It bounds one
+  wait: each inactive protocol read, each backpressured write, and the single wait
+  for the final answer while the server verifies, commits and runs its awaited
+  hooks. It is not a deadline for the whole transfer: every chunk that moves
+  restarts it. The connect timeout is separate (30 seconds) and not a CLI option.
 - The input may be any regular binary file; Swarm Deploy creates the canonical
   one-entry USTAR stream automatically. Pre-tarring is not required.
 - A direct file retains its basename.
@@ -305,8 +333,8 @@ swarm-deploy link \
 
 Replace `--seed-file <seed-file>` with `--seed <64-lower-hex>`, or use
 `SWARM_DEPLOY_CLIENT_SEED`, exactly as for `upload`. `--server-key` pins the
-server identity, and `--idle-timeout` has the same 60-second default and
-inactivity semantics as upload. `--hook-failure` takes `rollback` (the default)
+server identity, and `--idle-timeout` has the same 10-minute default, range and
+semantics as upload. `--hook-failure` takes `rollback` (the default)
 or `keep` and `--json` takes no value; both belong to `link` alone.
 
 The command asks the authenticated server to point `<link-name>` at the

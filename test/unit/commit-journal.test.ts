@@ -10,13 +10,18 @@ import {
   compareCommitOrder,
   CorruptJournalError,
   DIRECTORY_COMMIT_VERSION,
+  DIRECTORY_HISTORY_COMMIT_VERSION,
   DIRECTORY_JOURNAL_VERSION,
   DIRECTORY_PHASES,
+  DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
+  DIRECTORY_REPLACEMENT_PHASES,
   isDirectoryJournal,
+  isDirectoryReplacementJournal,
   readCommitJournal,
   serializeJournal,
   type CommitRecord,
-  type DirectoryCommitJournal
+  type DirectoryCommitJournal,
+  type DirectoryReplacementJournal
 } from '../../dist/storage/commit-journal.js'
 import { MAX_TREE_ENTRIES } from '../../dist/tar-protocol/tree.js'
 import { createTempDir } from '../helpers/files.js'
@@ -113,8 +118,12 @@ test('a malformed directory record is rejected field by field', (t) => {
         replaces: { name: '0.18.0', transferId: OTHER_ID, historyName: `history-${OTHER_ID}` }
       })
     ],
-    ['unknown version', directoryRecord({ version: 4 })],
-    ['reserved name', directoryRecord({ name: `history-${OTHER_ID}` })]
+    ['unknown version', directoryRecord({ version: 5 })],
+    ['reserved name', directoryRecord({ name: `history-${OTHER_ID}` })],
+    [
+      'a version 4 record that is not a history copy',
+      directoryRecord({ version: DIRECTORY_HISTORY_COMMIT_VERSION })
+    ]
   ]
   for (const [label, candidate] of cases) {
     t.exception(() => assertCommitRecord(candidate), { code: ERRORS.PROTOCOL_INVALID }, label)
@@ -304,4 +313,198 @@ test('file and replacement journals read back unchanged', async (t) => {
   const read = await readCommitJournal(ID, initLayout(root), createStorage())
   t.absent(isDirectoryJournal(read))
   t.is(read?.version, 1)
+})
+
+const OLD_ID = 'f'.repeat(64)
+
+function historyRecordShape(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return directoryRecord({
+    version: DIRECTORY_HISTORY_COMMIT_VERSION,
+    transferId: OLD_ID,
+    name: `history-${OLD_ID}`,
+    ...overrides
+  })
+}
+
+function replacementJournal(
+  overrides: Partial<Record<keyof DirectoryReplacementJournal, unknown>> = {}
+): Record<string, unknown> {
+  return {
+    version: DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
+    intent: 'replace-directory',
+    state: 'committing',
+    phase: 'journaled',
+    transferId: ID,
+    attemptId: ATTEMPT,
+    name: '0.18.1',
+    historyName: `history-${OLD_ID}`,
+    publicationName: `${ATTEMPT}.tree`,
+    dedupName: null,
+    stagingTreeIdentity: IDENTITY,
+    oldTreeIdentity: { dev: '66', ino: '5678' },
+    dedupTreeIdentity: null,
+    dedupRecord: null,
+    oldRecord: directoryRecord({ transferId: OLD_ID, committedAt: 500 }),
+    record: directoryRecord(),
+    ...overrides
+  }
+}
+
+test('a version 4 directory history record is the only directory record with a history name', (t) => {
+  const record = assertCommitRecord(historyRecordShape())
+  t.is(record.version, 4)
+  t.is(record.kind, 'directory')
+  t.is(record.name, `history-${OLD_ID}`)
+  t.is(commitRecordKind(record), 'directory')
+
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['a current name', historyRecordShape({ name: '0.18.1' })],
+    ['another transfer’s history name', historyRecordShape({ name: `history-${ID}` })],
+    ['no entry count', historyRecordShape({ entryCount: undefined })],
+    ['not a directory', historyRecordShape({ kind: 'file' })],
+    [
+      'replacement metadata',
+      historyRecordShape({
+        replaces: { name: '0.18.0', transferId: ID, historyName: `history-${ID}` }
+      })
+    ]
+  ]
+  for (const [label, candidate] of cases) {
+    t.exception(() => assertCommitRecord(candidate), { code: ERRORS.PROTOCOL_INVALID }, label)
+  }
+})
+
+test('a directory replacement journal round-trips through serialize and read', async (t) => {
+  for (const phase of DIRECTORY_REPLACEMENT_PHASES) {
+    const journal = replacementJournal({ phase })
+    const serialized = serializeJournal(journal as unknown as DirectoryReplacementJournal)
+    t.alike(Object.keys(serialized).sort(), [
+      'attemptId',
+      'dedupName',
+      'dedupRecord',
+      'dedupTreeIdentity',
+      'historyName',
+      'intent',
+      'name',
+      'oldRecord',
+      'oldTreeIdentity',
+      'phase',
+      'publicationName',
+      'record',
+      'stagingTreeIdentity',
+      'state',
+      'transferId',
+      'version'
+    ])
+    const root = await writeJournal(t, ID, serialized)
+    const read = await readCommitJournal(ID, initLayout(root), createStorage())
+    t.ok(isDirectoryReplacementJournal(read), phase)
+    t.absent(isDirectoryJournal(read), 'a replacement is not a create')
+    t.alike<unknown>(read, journal, phase)
+  }
+  t.absent(isDirectoryReplacementJournal(null))
+})
+
+test('a journal that parks a returning history copy carries all of it or none of it', async (t) => {
+  const parked = replacementJournal({
+    dedupName: `${ATTEMPT}.dedup`,
+    dedupTreeIdentity: { dev: '66', ino: '9999' },
+    dedupRecord: historyRecordShape({ transferId: ID, name: `history-${ID}` })
+  })
+  const root = await writeJournal(
+    t,
+    ID,
+    serializeJournal(parked as unknown as DirectoryReplacementJournal)
+  )
+  const read = await readCommitJournal(ID, initLayout(root), createStorage())
+  t.alike<unknown>(read, parked)
+
+  const partial: Array<[string, Record<string, unknown>]> = [
+    ['a name only', replacementJournal({ dedupName: `${ATTEMPT}.dedup` })],
+    ['an identity only', replacementJournal({ dedupTreeIdentity: IDENTITY })],
+    [
+      'a record only',
+      replacementJournal({
+        dedupRecord: historyRecordShape({ transferId: ID, name: `history-${ID}` })
+      })
+    ]
+  ]
+  for (const [label, journal] of partial) {
+    const dir = await writeJournal(t, ID, journal)
+    await t.exception(
+      () => readCommitJournal(ID, initLayout(dir), createStorage()),
+      CorruptJournalError,
+      label
+    )
+  }
+})
+
+test('a corrupt directory replacement journal is rejected instead of silently repaired', async (t) => {
+  const dedup = {
+    dedupName: `${ATTEMPT}.dedup`,
+    dedupTreeIdentity: IDENTITY
+  }
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['wrong intent', replacementJournal({ intent: 'create-directory' })],
+    ['unknown state', replacementJournal({ state: 'done' })],
+    ['unknown phase', replacementJournal({ phase: 'exchanged' })],
+    ['non-hex attempt', replacementJournal({ attemptId: 'not-hex' })],
+    ['publication name mismatch', replacementJournal({ publicationName: `${OTHER_ID}.tree` })],
+    ['publication is a part file', replacementJournal({ publicationName: `${ATTEMPT}.part` })],
+    ['history name mismatch', replacementJournal({ historyName: `history-${OTHER_ID}` })],
+    ['reserved name', replacementJournal({ name: `history-${OLD_ID}` })],
+    ['identity missing', replacementJournal({ oldTreeIdentity: { dev: '66' } })],
+    ['current record is a file record', replacementJournal({ record: fileRecord() })],
+    [
+      'old record is a history record',
+      replacementJournal({ oldRecord: historyRecordShape({ name: `history-${OLD_ID}` }) })
+    ],
+    [
+      'record name disagrees with the journal name',
+      replacementJournal({ record: directoryRecord({ name: '0.18.2' }) })
+    ],
+    [
+      'record transfer disagrees with the journal ID',
+      replacementJournal({ record: directoryRecord({ transferId: OTHER_ID }) })
+    ],
+    [
+      'the journal replaces its own transfer',
+      replacementJournal({ oldRecord: directoryRecord({ transferId: ID }) })
+    ],
+    [
+      'dedup record is not a history copy of this transfer',
+      replacementJournal({
+        ...dedup,
+        dedupRecord: historyRecordShape({ transferId: OTHER_ID, name: `history-${OTHER_ID}` })
+      })
+    ],
+    [
+      'dedup record is a current record',
+      replacementJournal({ ...dedup, dedupRecord: directoryRecord() })
+    ],
+    [
+      'dedup name is not this attempt’s',
+      replacementJournal({
+        dedupName: `${OTHER_ID}.dedup`,
+        dedupTreeIdentity: IDENTITY,
+        dedupRecord: historyRecordShape({ transferId: ID, name: `history-${ID}` })
+      })
+    ]
+  ]
+  for (const [label, journal] of cases) {
+    const root = await writeJournal(t, ID, journal)
+    await t.exception(
+      () => readCommitJournal(ID, initLayout(root), createStorage()),
+      CorruptJournalError,
+      label
+    )
+  }
+})
+
+test('an unknown journal version is corrupt, never guessed at', async (t) => {
+  const root = await writeJournal(t, ID, { ...replacementJournal(), version: 5 })
+  await t.exception(
+    () => readCommitJournal(ID, initLayout(root), createStorage()),
+    CorruptJournalError
+  )
 })

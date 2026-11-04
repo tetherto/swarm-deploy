@@ -72,6 +72,17 @@ history never matches, and a rule is dormant until a target exists. Automatic
 link names are unique and reserved even while their rule is dormant, so a
 manual request cannot claim one.
 
+**Replaced artifacts (0.8.0).** A link names its target by path, so when the
+target's name is replaced (`--replace-name`, `--allow-replace`) the link keeps
+working and serves the new bytes. An automatic link is rewritten for the new
+artifact and runs `afterLink` again (`LINKED`). A manual link's ownership record
+keeps the old transfer ID until the same target is linked again; that request
+returns `UNCHANGED`, rewrites the record, and runs `afterLink` for the bytes that are
+there now, with the usual `rollback` or `keep` handling. While a link request, or
+its open rollback journal, is using the target, a replacement of that name is
+refused with the retryable `FILE_BUSY`, so the hook never reads a path that changes
+under it. History copies of replaced artifacts are never link targets.
+
 Manual targets must be current managed top-level files or directories, must
 match a one-argument rule, and cannot be history names. Manual link names are
 safe top-level basenames and cannot equal the target, an automatic link name,

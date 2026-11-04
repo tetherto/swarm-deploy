@@ -20,6 +20,12 @@ import {
   type ServerHooks,
   type ServerScheduler
 } from '../../dist/index.js'
+import {
+  DEFAULT_CONNECT_TIMEOUT,
+  DEFAULT_IDLE_TIMEOUT,
+  MAX_CONNECT_TIMEOUT,
+  MAX_IDLE_TIMEOUT
+} from '../../dist/client.js'
 import { MAX_HOOK_RESULT_BYTES } from '../../dist/hook-result.js'
 import { fixedSeriesKey } from '../../dist/release.js'
 import { sodiumSha256 } from '../../dist/tar-protocol/hash.js'
@@ -1281,6 +1287,122 @@ test('Server retention scopes work without artifact patterns, are validated, and
       () => new Server({ ...base, retentionScopes } as ConstructorParameters<typeof Server>[0]),
       { code: ERRORS.PROTOCOL_INVALID, message: 'Invalid retention scopes' },
       JSON.stringify(retentionScopes)
+    )
+  }
+})
+
+test('Server allowReplace is off by default, validated, and copied', async (t) => {
+  const base = {
+    seed: SERVER_SEED,
+    allowedKeys: [CLIENT_KEY],
+    maxFileBytes: 1024,
+    maxStagingBytes: 4096,
+    minFreeBytes: 0,
+    storageDir: '/unused'
+  }
+  t.is(new Server(base).allowReplace, false, 'off by default')
+  t.is(new Server({ ...base, allowReplace: false }).allowReplace, false)
+  t.is(new Server({ ...base, allowReplace: [] }).allowReplace, false, 'an empty list is off')
+  t.is(new Server({ ...base, allowReplace: true }).allowReplace, true)
+
+  const selectors = ['beta-{version}', 'latest.json', '{version}']
+  const server = new Server({ ...base, allowReplace: selectors })
+  selectors[0] = 'changed-{version}'
+  selectors.push('extra')
+  t.alike(
+    [...(server.allowReplace as readonly string[])],
+    ['beta-{version}', 'latest.json', '{version}'],
+    'an immutable copy'
+  )
+  t.ok(Object.isFrozen(server.allowReplace))
+
+  // Legacy exact names stay what they were; allowing names adds no pin and merges nothing.
+  const both = new Server({ ...base, replaceNames: ['a.bin'], allowReplace: ['{version}'] })
+  t.alike([...both.replaceNames], ['a.bin'])
+  t.alike([...(both.allowReplace as readonly string[])], ['{version}'])
+
+  for (const allowReplace of [
+    'beta-{version}',
+    5,
+    null,
+    {},
+    [5],
+    [''],
+    ['a/{version}'],
+    ['history-x'],
+    ['beta-{oops}'],
+    ['a', 'a']
+  ]) {
+    await t.exception(
+      // Deliberately not a valid ServerOptions: the runtime must refuse what the types forbid.
+      () =>
+        new Server({ ...base, allowReplace } as unknown as ConstructorParameters<typeof Server>[0]),
+      { code: ERRORS.PROTOCOL_INVALID, message: 'Invalid allowReplace' },
+      JSON.stringify(allowReplace)
+    )
+  }
+})
+
+test('Client waits ten minutes by default and accepts any idle timeout up to the longest timer delay', async (t) => {
+  const node: DirectDhtNode = {
+    destroyed: false,
+    createServer() {
+      throw new Error('Unexpected server creation')
+    },
+    connect() {
+      throw new Error('Unexpected connection')
+    },
+    on() {
+      return this
+    },
+    destroy() {
+      return Promise.resolve()
+    }
+  }
+  const make = (options: { idleTimeout?: number; connectTimeout?: number } = {}): Client =>
+    new Client({
+      seed: CLIENT_SEED,
+      serverPublicKey: keyPairFromSeed(SERVER_SEED).publicKey,
+      dht: node,
+      ...options
+    })
+  t.is(DEFAULT_IDLE_TIMEOUT, 600_000)
+  t.is(make().idleTimeout, 600_000, 'ten minutes unless told otherwise')
+  t.is(make().connectTimeout, 30_000, 'the connect default is unchanged')
+  t.is(make().connectTimeout, DEFAULT_CONNECT_TIMEOUT)
+
+  for (const idleTimeout of [1, 5 * 60_000 + 1, 600_000, 3_600_000, MAX_IDLE_TIMEOUT]) {
+    t.is(make({ idleTimeout }).idleTimeout, idleTimeout, `${idleTimeout}`)
+  }
+  t.is(MAX_IDLE_TIMEOUT, 2_147_483_647)
+  const tooLong = [
+    0,
+    -1,
+    1.5,
+    MAX_IDLE_TIMEOUT + 1,
+    Number.MAX_SAFE_INTEGER,
+    Number.NaN,
+    Number.POSITIVE_INFINITY
+  ]
+  for (const idleTimeout of tooLong) {
+    await t.exception(
+      () => make({ idleTimeout }),
+      { code: ERRORS.PROTOCOL_INVALID, message: 'Invalid idle timeout' },
+      `rejected, not clamped: ${idleTimeout}`
+    )
+  }
+  await t.exception(() => make({ idleTimeout: '600000' as unknown as number }), {
+    code: ERRORS.PROTOCOL_INVALID
+  })
+
+  // The connect timeout keeps its own, unchanged ceiling.
+  t.is(make({ connectTimeout: MAX_CONNECT_TIMEOUT }).connectTimeout, MAX_CONNECT_TIMEOUT)
+  t.is(MAX_CONNECT_TIMEOUT, 300_000)
+  for (const connectTimeout of [0, -1, MAX_CONNECT_TIMEOUT + 1, MAX_IDLE_TIMEOUT]) {
+    await t.exception(
+      () => make({ connectTimeout }),
+      { code: ERRORS.PROTOCOL_INVALID, message: 'Invalid connect timeout' },
+      `connect ${connectTimeout}`
     )
   }
 })

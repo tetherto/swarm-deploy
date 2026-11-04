@@ -1,6 +1,5 @@
 import b4a from 'b4a'
 import events from '#events'
-import fs from '#fs'
 import path from '#path'
 import sodium from 'sodium-native'
 import { abortError, createAbortController, throwIfAborted, type AbortSignalLike } from './abort.js'
@@ -12,6 +11,11 @@ import {
 } from './direct-dht.js'
 import { ERRORS, SwarmDeployError, failureCodeOf, systemCodeOf, type ErrorCode } from './errors.js'
 import { isReservedHistoryName, validateReplaceNames } from './files.js'
+import {
+  compileReplacePolicy,
+  describeReplacePolicy,
+  type ReplacePolicy
+} from './replace-policy.js'
 import {
   callbackError,
   hookError,
@@ -53,7 +57,8 @@ import {
 } from './post-hooks.js'
 import { keyPairFromSeed } from './identity.js'
 import { ReleaseMatcher, type ReleaseCoordinates, type VersionGranularity } from './release.js'
-import { CommitStore } from './storage/commit-store.js'
+import { createDefaultStorage } from './storage/atomic-swap.js'
+import { CommitStore, type ReplacePermission } from './storage/commit-store.js'
 import {
   LinkStore,
   type LinkReconcileResult,
@@ -201,7 +206,27 @@ export interface ServerOptions {
   storage?: StorageAdapter
   scheduler?: ServerScheduler
   logger?: Logger | null
+  /**
+   * Exact artifact names an upload may replace. Replacing one keeps the replaced artifact as
+   * history, and the current artifact of each name is pinned against every retention stage (the
+   * legacy, standing pin; `allowReplace` adds none). Files and managed directories both qualify.
+   */
   replaceNames?: Iterable<string>
+  /**
+   * Opt-in permission to replace Swarm-managed artifacts, off by default. `true` allows every
+   * managed name; an iterable lists selectors, each an exact artifact name or a release template
+   * in the grammar of `artifactPatterns` (`beta-{version}`, a bare `{version}` for the names that
+   * are SemVer versions), matched against the artifact's final basename only. A source-parent
+   * segment is refused, because the parent is asserted by the client and not stored with the
+   * artifact. Whatever is allowed, only a managed artifact of the same kind whose content still
+   * matches its record is ever replaced: an unmanaged path, a modified directory, a symlink or a
+   * file where a directory is (or the reverse) is left untouched. Replaced artifacts stay as
+   * history. The permission pins nothing against retention. A directory is replaced by an atomic
+   * exchange and needs a storage adapter whose `atomicSwap` provides one (the default adapter does
+   * on Linux and macOS); where it is unavailable the replacement is refused with
+   * `UNSUPPORTED_STORAGE` before anything published changes. Validated and copied at construction.
+   */
+  allowReplace?: boolean | Iterable<string>
   /** Optional deployment lifecycle callbacks; snapshotted at construction. */
   hooks?: ServerHooks | null
   /**
@@ -435,6 +460,17 @@ export class Server extends EventEmitter {
   readonly storage: StorageAdapter
   readonly scheduler: ServerScheduler
   readonly replaceNames: ReadonlySet<string>
+  /** The replacement permission: `false` (off), `true` (every managed name), or the frozen selectors. */
+  readonly allowReplace: boolean | readonly string[]
+  private readonly replacePolicy: ReplacePolicy
+  /**
+   * Transfer IDs of the artifacts whose public path is in use right now by an awaited hook or by an
+   * explicit link request, counted so overlapping uses release independently. A replacement is
+   * refused (retryably) while the artifact it would replace is in here, so a hook never reads a
+   * path whose content changes under it. In memory only, released in a `finally`.
+   */
+  private readonly activeArtifacts = new Map<string, number>()
+  private readonly replacePermission: ReplacePermission
   readonly hooks: Readonly<ServerHooks>
   readonly hookModes: Readonly<HookModes>
   readonly symlinks: readonly CompiledSymlinkRule[]
@@ -611,9 +647,19 @@ export class Server extends EventEmitter {
     this.allowedKeySnapshot = allow.map((candidate) => b4a.from(candidate))
     this.dht = options.dht
     this.dhtFactory = options.dhtFactory
-    this.storage = options.storage || fs.promises
+    this.storage = options.storage || createDefaultStorage()
     this.scheduler = options.scheduler || { setTimeout, clearTimeout, setInterval, clearInterval }
     this.replaceNames = validateReplaceNames(options.replaceNames)
+    try {
+      this.replacePolicy = compileReplacePolicy(options.allowReplace)
+    } catch (error) {
+      throw fail(ERRORS.PROTOCOL_INVALID, 'Invalid allowReplace', error)
+    }
+    this.allowReplace = describeReplacePolicy(this.replacePolicy)
+    this.replacePermission = {
+      allows: (name) => this.replacePolicy.allows(name),
+      busy: (record) => this.replacementBusy(record)
+    }
     this.hooks = snapshotHooks(options.hooks)
     this.hookModes = snapshotHookModes(options.hookModes, this.hooks)
     this.symlinks = compileSymlinkRules(options.symlinks)
@@ -869,6 +915,39 @@ export class Server extends EventEmitter {
         if (record) pins.add(record.transferId)
       }
     }
+  }
+
+  /**
+   * Marks an artifact's public path as in use by an awaited hook or an explicit link request. The
+   * returned function ends the use, once; callers call it from a `finally`.
+   */
+  private holdArtifact(transferId: string): () => void {
+    this.activeArtifacts.set(transferId, (this.activeArtifacts.get(transferId) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const count = (this.activeArtifacts.get(transferId) ?? 1) - 1
+      if (count <= 0) this.activeArtifacts.delete(transferId)
+      else this.activeArtifacts.set(transferId, count)
+    }
+  }
+
+  /**
+   * Whether the artifact's public path is being read or relied on right now, so replacing it would
+   * change what that work sees: an awaited upload hook or explicit link request holds it, a queued
+   * or running detached call pins it, and an open link rollback journal names it. Nothing else
+   * counts (a hook that already failed, a link that settled, a retention pin), so the answer
+   * clears by itself and a replacement is only ever asked to retry.
+   */
+  private async replacementBusy(record: CommitRecord): Promise<boolean> {
+    if (this.activeArtifacts.has(record.transferId)) return true
+    for (const pinned of this.detached.pins()) {
+      if (pinned === record.transferId) return true
+    }
+    const pins = new Set<string>()
+    await this.pinPendingRollbacks([record], pins)
+    return pins.has(record.transferId)
   }
 
   /** Start-up: restore every link whose request an earlier process never finished. */
@@ -1340,6 +1419,9 @@ export class Server extends EventEmitter {
     // A request that waited for the lease may find the server closing; it changes nothing then.
     throwIfAborted(this.signal)
     const open: { transaction: ManualLinkTransaction | null } = { transaction: null }
+    // The target's path is in use from the decision until the request has settled, whichever way
+    // the hook fails or is configured, so a replacement of that name waits instead of changing it.
+    const hold: { release: (() => void) | null } = { release: null }
     const respond = this.responds('afterLink')
     try {
       const decided = await withRootLease(this.layout!.root, async () => {
@@ -1349,6 +1431,7 @@ export class Server extends EventEmitter {
         )
         if (!target) throw fail(ERRORS.LINK_TARGET_NOT_FOUND, 'Manual link target was not found')
         state.artifact = this.recordArtifact(target)
+        hold.release = this.holdArtifact(target.transferId)
         const artifacts = new Set(records.map((record) => record.name))
         if (artifacts.has(request.name)) {
           throw fail(ERRORS.LINK_CONFLICT, 'Manual link name conflicts with an artifact')
@@ -1437,6 +1520,8 @@ export class Server extends EventEmitter {
         await this.refreshAfterSettle(request.name)
       }
       throw error
+    } finally {
+      hold.release?.()
     }
   }
 
@@ -1712,7 +1797,7 @@ export class Server extends EventEmitter {
        * awaited in order, `afterCommit` then each automatic link's `afterLink`, and their
        * data is read, checked and bounded as one receipt whatever the offer asked for.
        */
-      const runPostCommit = async (
+      const runPostCommitHooks = async (
         alreadyDurable: boolean
       ): Promise<UploadHookResult | undefined> => {
         const commitContext = Object.freeze({
@@ -1778,6 +1863,21 @@ export class Server extends EventEmitter {
           releaseLinkHooks(owned)
         }
       }
+      /**
+       * The awaited hooks read the artifact's public path, so the path is marked in use for as long
+       * as they run, success or failure, and a replacement of that name waits (retryably) until
+       * they are done. A detached call pins its artifact from registration instead.
+       */
+      const runPostCommit = async (
+        alreadyDurable: boolean
+      ): Promise<UploadHookResult | undefined> => {
+        const release = this.holdArtifact(durableId ?? hookArtifact.transferId)
+        try {
+          return await runPostCommitHooks(alreadyDurable)
+        } finally {
+          release()
+        }
+      }
       const finish = async (verified: TarSession): Promise<void> => {
         phase = 'beforeCommit'
         hookPath = stagingHookPath
@@ -1797,6 +1897,7 @@ export class Server extends EventEmitter {
           retentionManager: this.retention,
           signal: this.signal,
           replaceNames: this.replaceNames,
+          replace: this.replacePermission,
           release,
           deferPostCommitRetention: this.defersPostCommitRetention()
         })
@@ -1844,7 +1945,7 @@ export class Server extends EventEmitter {
           transferId: b4a.from(metadata.transferId, 'hex'),
           release
         },
-        { replaceNames: this.replaceNames }
+        { replaceNames: this.replaceNames, replace: this.replacePermission }
       )
       if (inspected.status === 'ALREADY_COMMITTED') {
         alreadyCommitted = true
@@ -1876,6 +1977,18 @@ export class Server extends EventEmitter {
       }
       if (inspected.status === 'FILE_EXISTS') {
         await rejectEarly(ERRORS.FILE_EXISTS, 'Destination already exists')
+        return
+      }
+      if (inspected.status === 'BUSY') {
+        // Retryable: a hook or link request is using the artifact's path right now.
+        await rejectEarly(ERRORS.FILE_BUSY, 'Artifact is in use by a hook or a link request')
+        return
+      }
+      if (inspected.status === 'UNSUPPORTED') {
+        await rejectEarly(
+          ERRORS.UNSUPPORTED_STORAGE,
+          'The storage cannot replace a directory atomically'
+        )
         return
       }
       if (this.activeUploads.size >= this.maxActiveUploads) {
@@ -2238,6 +2351,12 @@ export class Server extends EventEmitter {
           pattern: scope.pattern,
           ...(scope.maxCount === undefined ? {} : { maxCount: scope.maxCount }),
           ...(scope.maxAge === undefined ? {} : { maxAge: scope.maxAge })
+        })
+      }
+      if (this.replacePolicy.global || this.replacePolicy.selectors.length > 0) {
+        this.logger.info('Managed artifact replacement enabled', {
+          scope: this.replacePolicy.global ? 'all' : 'selected',
+          selectors: this.replacePolicy.selectors.length
         })
       }
       await this.retention.start()

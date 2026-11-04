@@ -14,9 +14,17 @@ import type { StorageAdapter, StorageLayout, StorageStat } from './types.js'
 const COMMIT_VERSION = 1
 const REPLACEMENT_COMMIT_VERSION = 2
 const DIRECTORY_COMMIT_VERSION = 3
+/**
+ * A directory record that is only a history copy (`history-<transfer ID>`): what a replaced
+ * directory's record becomes. Releases through 0.7 read none of version 4 and would delete such a
+ * record as invalid, which is why the state directory requires `directory-replacement-v1` before
+ * any version 4 record or journal is written (see `requireStateFeature`).
+ */
+const DIRECTORY_HISTORY_COMMIT_VERSION = 4
 const JOURNAL_VERSION = 1
 const REPLACEMENT_JOURNAL_VERSION = 2
 const DIRECTORY_JOURNAL_VERSION = 3
+const DIRECTORY_REPLACEMENT_JOURNAL_VERSION = 4
 const MAX_COMMIT_METADATA_BYTES = 16 * 1024
 
 function sameTransferId(left: string, right: string): boolean {
@@ -165,7 +173,8 @@ function assertCommitRecordShape(record: unknown): asserts record is CommitRecor
   if (
     candidate.version !== COMMIT_VERSION &&
     candidate.version !== REPLACEMENT_COMMIT_VERSION &&
-    candidate.version !== DIRECTORY_COMMIT_VERSION
+    candidate.version !== DIRECTORY_COMMIT_VERSION &&
+    candidate.version !== DIRECTORY_HISTORY_COMMIT_VERSION
   ) {
     throw storageError('Invalid commit record version')
   }
@@ -176,13 +185,21 @@ function assertCommitRecordShape(record: unknown): asserts record is CommitRecor
   if (!isHex(candidate.uploaderFingerprint)) throw storageError('Invalid uploader fingerprint')
   if (!isHex(candidate.transferId)) throw storageError('Invalid commit transfer ID')
   if (candidate.release !== undefined) assertCommitRelease(candidate.release)
-  if (candidate.version === DIRECTORY_COMMIT_VERSION) {
+  if (
+    candidate.version === DIRECTORY_COMMIT_VERSION ||
+    candidate.version === DIRECTORY_HISTORY_COMMIT_VERSION
+  ) {
     if (candidate.kind !== 'directory') throw storageError('Invalid commit artifact kind')
     assertSafeUint(candidate.entryCount, 'commit entry count')
     if ((candidate.entryCount as number) > MAX_TREE_ENTRIES) {
       throw storageError('Invalid commit entry count')
     }
-    if (isReservedHistoryName(candidate.name)) throw storageError('Reserved directory name')
+    if (candidate.version === DIRECTORY_COMMIT_VERSION) {
+      if (isReservedHistoryName(candidate.name)) throw storageError('Reserved directory name')
+    } else if (candidate.name !== historyName(candidate.transferId as string)) {
+      // A history copy lives at exactly the name its own transfer ID gives it.
+      throw storageError('Invalid directory history name')
+    }
     if (candidate.replaces !== undefined) {
       throw storageError('Unexpected commit replacement metadata')
     }
@@ -261,7 +278,66 @@ export interface DirectoryCommitJournal {
   record: CommitRecord
 }
 
-export type AnyCommitJournal = CommitJournal | ReplacementJournal | DirectoryCommitJournal
+/**
+ * Ordered boundaries of a directory replacement; each one is durable before the next step starts.
+ * The names are the order of events, not a recovery script: recovery trusts what it observes on
+ * disk (which inode is at which path), and uses the phase only as the trail of intent.
+ */
+export const DIRECTORY_REPLACEMENT_PHASES = [
+  'journaled',
+  'dedup-moved',
+  'moved',
+  'swapped',
+  'current-sidecar',
+  'history-moved',
+  'history-sidecar',
+  'cleanup'
+] as const
+export type DirectoryReplacementPhase = (typeof DIRECTORY_REPLACEMENT_PHASES)[number]
+
+/**
+ * The transaction that replaces a managed directory by atomic exchange. Four private or public
+ * paths take part, and every one is named here with the inode identity it must hold:
+ *
+ * - the visible name, which holds the old tree (`oldTreeIdentity`) until the exchange and the new
+ *   tree (`stagingTreeIdentity`) after it;
+ * - the publication path `publications/<publicationName>`, where the new tree waits for the
+ *   exchange and the old tree waits afterwards;
+ * - the history name (`historyName`), where the old tree ends up;
+ * - when the returning content already has a history copy (A, B, A), the dedup path
+ *   `publications/<dedupName>`, where that copy waits, together with its record
+ *   (`dedupRecord`), until the new current record is durable. Nothing of it is deleted before
+ *   then, so every step before the new current record is durable can be undone exactly.
+ *
+ * The new current record being durable is the linearization point.
+ */
+export interface DirectoryReplacementJournal {
+  version: 4
+  intent: 'replace-directory'
+  state: 'committing' | 'aborting'
+  phase: DirectoryReplacementPhase
+  transferId: string
+  attemptId: string
+  name: string
+  historyName: string
+  publicationName: string
+  dedupName: string | null
+  stagingTreeIdentity: FileIdentity
+  oldTreeIdentity: FileIdentity
+  dedupTreeIdentity: FileIdentity | null
+  dedupRecord: CommitRecord | null
+  oldRecord: CommitRecord
+  record: CommitRecord
+}
+
+export type AnyCommitJournal =
+  CommitJournal | ReplacementJournal | DirectoryCommitJournal | DirectoryReplacementJournal
+
+export function isDirectoryReplacementJournal(
+  journal: AnyCommitJournal | null
+): journal is DirectoryReplacementJournal {
+  return journal !== null && journal.version === DIRECTORY_REPLACEMENT_JOURNAL_VERSION
+}
 
 export function isDirectoryJournal(
   journal: AnyCommitJournal | null
@@ -401,8 +477,113 @@ function parseDirectoryJournal(
   }
 }
 
+function isDirectoryReplacementPhase(value: unknown): value is DirectoryReplacementPhase {
+  return (
+    typeof value === 'string' && (DIRECTORY_REPLACEMENT_PHASES as readonly string[]).includes(value)
+  )
+}
+
+function parseDirectoryReplacementJournal(
+  id: string,
+  journal: Record<string, unknown>
+): DirectoryReplacementJournal {
+  if (
+    journal.intent !== 'replace-directory' ||
+    (journal.state !== 'committing' && journal.state !== 'aborting') ||
+    !isDirectoryReplacementPhase(journal.phase) ||
+    !sameTransferId(journal.transferId as string, id) ||
+    !isHex(journal.attemptId) ||
+    typeof journal.name !== 'string' ||
+    journal.publicationName !== `${journal.attemptId}.tree`
+  ) {
+    throw new CorruptJournalError('Invalid directory replacement journal')
+  }
+  let name: string
+  try {
+    name = validateBasename(journal.name)
+    if (isReservedHistoryName(name)) throw storageError('Reserved replacement name')
+  } catch (error: unknown) {
+    throw new CorruptJournalError('Invalid directory replacement journal name', error)
+  }
+  const record = parseRecord(journal.record)
+  const oldRecord = parseRecord(journal.oldRecord)
+  if (!sameTransferId(record.transferId, id)) {
+    throw new CorruptJournalError('Commit journal ID mismatch')
+  }
+  if (
+    record.version !== DIRECTORY_COMMIT_VERSION ||
+    oldRecord.version !== DIRECTORY_COMMIT_VERSION ||
+    record.name !== name ||
+    oldRecord.name !== name
+  ) {
+    throw new CorruptJournalError('Directory replacement journal record mismatch')
+  }
+  if (journal.historyName !== historyName(oldRecord.transferId)) {
+    throw new CorruptJournalError('Invalid replacement history name')
+  }
+  if (sameTransferId(oldRecord.transferId, record.transferId)) {
+    throw new CorruptJournalError('Replacement journal replaces its own transfer')
+  }
+  // The three fields describing a parked history copy are all present or all absent.
+  const dedupRecord = journal.dedupRecord === null ? null : parseRecord(journal.dedupRecord)
+  const dedupTreeIdentity =
+    journal.dedupTreeIdentity === null ? null : parseIdentity(journal.dedupTreeIdentity)
+  const dedupName = journal.dedupName
+  const parked = [dedupRecord !== null, dedupTreeIdentity !== null, dedupName !== null]
+  if (parked.some((value) => value !== parked[0])) {
+    throw new CorruptJournalError('Invalid replacement dedup state')
+  }
+  if (dedupRecord !== null) {
+    if (
+      dedupName !== `${journal.attemptId}.dedup` ||
+      dedupRecord.version !== DIRECTORY_HISTORY_COMMIT_VERSION ||
+      !sameTransferId(dedupRecord.transferId, record.transferId)
+    ) {
+      throw new CorruptJournalError('Invalid replacement dedup record')
+    }
+  }
+  return {
+    version: DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
+    intent: 'replace-directory',
+    state: journal.state,
+    phase: journal.phase,
+    transferId: id,
+    attemptId: journal.attemptId,
+    name,
+    historyName: journal.historyName,
+    publicationName: journal.publicationName,
+    dedupName: dedupName === null ? null : (dedupName as string),
+    stagingTreeIdentity: parseIdentity(journal.stagingTreeIdentity),
+    oldTreeIdentity: parseIdentity(journal.oldTreeIdentity),
+    dedupTreeIdentity,
+    dedupRecord,
+    oldRecord,
+    record
+  }
+}
+
 /** The exact durable shape of a journal, for creation and phase transitions. */
 export function serializeJournal(journal: AnyCommitJournal): Record<string, unknown> {
+  if (journal.version === DIRECTORY_REPLACEMENT_JOURNAL_VERSION) {
+    return {
+      version: DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
+      intent: journal.intent,
+      state: journal.state,
+      phase: journal.phase,
+      transferId: journal.transferId,
+      attemptId: journal.attemptId,
+      name: journal.name,
+      historyName: journal.historyName,
+      publicationName: journal.publicationName,
+      dedupName: journal.dedupName,
+      stagingTreeIdentity: journal.stagingTreeIdentity,
+      oldTreeIdentity: journal.oldTreeIdentity,
+      dedupTreeIdentity: journal.dedupTreeIdentity,
+      dedupRecord: journal.dedupRecord,
+      oldRecord: journal.oldRecord,
+      record: journal.record
+    }
+  }
   if (journal.version === DIRECTORY_JOURNAL_VERSION) {
     return {
       version: DIRECTORY_JOURNAL_VERSION,
@@ -464,6 +645,9 @@ export async function readCommitJournal(
     }
     journal = await readJson(journalPath, storage, MAX_COMMIT_METADATA_BYTES)
     if (journal.version === DIRECTORY_JOURNAL_VERSION) return parseDirectoryJournal(id, journal)
+    if (journal.version === DIRECTORY_REPLACEMENT_JOURNAL_VERSION) {
+      return parseDirectoryReplacementJournal(id, journal)
+    }
     if (journal.version === REPLACEMENT_JOURNAL_VERSION) {
       return parseReplacementJournal(id, journal)
     }
@@ -500,8 +684,10 @@ export {
   COMMIT_VERSION,
   REPLACEMENT_COMMIT_VERSION,
   DIRECTORY_COMMIT_VERSION,
+  DIRECTORY_HISTORY_COMMIT_VERSION,
   JOURNAL_VERSION,
   REPLACEMENT_JOURNAL_VERSION,
   DIRECTORY_JOURNAL_VERSION,
+  DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
   MAX_COMMIT_METADATA_BYTES
 }

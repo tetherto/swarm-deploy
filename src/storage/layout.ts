@@ -6,6 +6,7 @@ import path from '#path'
 import process from '#process'
 import sodium from 'sodium-native'
 import { ERRORS, SwarmDeployError } from '../errors.js'
+import { safeOpenFlags } from '../open-flags.js'
 import { mountFor, readMountInfo, type MountEntry } from './mounts.js'
 import type {
   StorageAdapter,
@@ -339,21 +340,33 @@ export function diagnoseCrossMount(
   onCrossMount: () => void
 ): StorageAdapter {
   const diagnose =
-    (name: 'rename' | 'link') =>
+    (name: 'rename' | 'link' | 'atomicSwap') =>
     async (from: string, to: string): Promise<void> => {
       try {
-        await storage[name](from, to)
+        const operation = storage[name]
+        if (typeof operation !== 'function') {
+          throw storageError('Storage adapter lacks the operation')
+        }
+        await operation.call(storage, from, to)
       } catch (error: unknown) {
         if (errorCode(error) === 'EXDEV') onCrossMount()
         throw error
       }
     }
-  const diagnosed = { rename: diagnose('rename'), link: diagnose('link') }
+  const diagnosed = {
+    rename: diagnose('rename'),
+    link: diagnose('link'),
+    atomicSwap: diagnose('atomicSwap')
+  }
   // The proxy's own target is empty, so no property invariant of the adapter (a frozen object,
-  // say) can conflict with the bound methods returned for it.
+  // say) can conflict with the bound methods returned for it. `atomicSwap` is diagnosed only
+  // when the adapter has it: a capability the adapter lacks stays absent.
   return new Proxy({} as StorageAdapter, {
     get(_target, property) {
       if (property === 'rename' || property === 'link') return diagnosed[property]
+      if (property === 'atomicSwap' && typeof storage.atomicSwap === 'function') {
+        return diagnosed.atomicSwap
+      }
       const value: unknown = Reflect.get(storage, property, storage)
       return typeof value === 'function' ? value.bind(storage) : value
     },
@@ -461,8 +474,38 @@ function boundElsewhereError(
   )
 }
 
-/** The output root a state directory records, or null when it has no record yet. */
-function readBinding(marker: string): string | null {
+/**
+ * A feature a state directory can come to require of every release that opens it, because the
+ * release that wrote it left data an older release would mishandle. It is recorded in the state
+ * directory's root record, in a shape older releases refuse (see {@link requireStateFeature}).
+ */
+export const STATE_FEATURE_DIRECTORY_REPLACEMENT = 'directory-replacement-v1'
+export type StateFeature = typeof STATE_FEATURE_DIRECTORY_REPLACEMENT
+const KNOWN_STATE_FEATURES: ReadonlySet<string> = new Set<string>([
+  STATE_FEATURE_DIRECTORY_REPLACEMENT
+])
+const STATE_FEATURE_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/
+
+interface StateRecord {
+  root: string
+  requires: readonly string[]
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Reads the root record of a state directory, or null when it has none yet.
+ *
+ * Two shapes exist. Releases through 0.7 write `{ "version": 1, "root": "<canonical root>" }`
+ * and read only that string, so any other `root` is a malformed record to them and they refuse to
+ * start before they touch a journal, a sidecar or a session. The strict shape
+ * `{ "version": 2, "root": { "path": "<canonical root>", "requires": ["<feature>"] } }` is written
+ * only once a feature that an older release must not run against has been used. This release
+ * reads both, and refuses a record that requires a feature it does not know.
+ */
+function parseStateRecord(marker: string): StateRecord | null {
   const stat = lstatOrNull(marker)
   if (stat === null) return null
   if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_ROOT_BYTES) {
@@ -474,9 +517,105 @@ function readBinding(marker: string): string | null {
   } catch (error: unknown) {
     throw storageError(`Malformed state directory record: ${marker}`, error)
   }
-  const owner = typeof bound === 'object' && bound !== null && 'root' in bound ? bound.root : null
-  if (typeof owner !== 'string') throw storageError(`Malformed state directory record: ${marker}`)
-  return owner
+  if (!isPlainObject(bound) || !('root' in bound)) {
+    throw storageError(`Malformed state directory record: ${marker}`)
+  }
+  const { root } = bound
+  if (typeof root === 'string') return { root, requires: [] }
+  if (
+    bound.version !== 2 ||
+    !isPlainObject(root) ||
+    typeof root.path !== 'string' ||
+    !Array.isArray(root.requires) ||
+    Object.keys(root).some((key) => key !== 'path' && key !== 'requires') ||
+    root.requires.some(
+      (feature: unknown) => typeof feature !== 'string' || !STATE_FEATURE_NAME.test(feature)
+    )
+  ) {
+    throw storageError(`Malformed state directory record: ${marker}`)
+  }
+  const requires = (root.requires as string[]).slice().sort()
+  const unknown = requires.find((feature) => !KNOWN_STATE_FEATURES.has(feature))
+  if (unknown !== undefined) {
+    throw storageError(
+      `State directory ${path.dirname(marker)} requires the feature ${unknown}, which this release does not support. Use a release that does, or restore the state from a backup taken before it was used`
+    )
+  }
+  return { root: root.path, requires }
+}
+
+/** The output root a state directory records, or null when it has no record yet. */
+function readBinding(marker: string): string | null {
+  return parseStateRecord(marker)?.root ?? null
+}
+
+/**
+ * Durably records that every release opening this state directory must support `feature`, before
+ * the first change that needs it. The root record becomes the strict shape older releases refuse
+ * as malformed, at startup and before any journal, sidecar or session is read, so none of them can
+ * quarantine a journal or delete a record it does not understand. Nothing writes it unless the
+ * feature is actually used, and nothing ever removes it: once a directory has been replaced, the
+ * state needs this release or a restore from a backup taken before.
+ *
+ * The record is rewritten as a private file, synced, and renamed over the old one, so a crash
+ * leaves either the old record or the new one, and the directory is synced before this returns.
+ * It binds the same canonical root as before; a record naming another root is refused.
+ */
+export function requireStateFeature(layout: StorageLayout, feature: StateFeature): void {
+  if (!KNOWN_STATE_FEATURES.has(feature)) throw storageError('Unknown state feature')
+  const state = layout.internal
+  const marker = path.join(state, STATE_ROOT_NAME)
+  let canonicalRoot: string
+  try {
+    canonicalRoot = fs.realpathSync(layout.root)
+  } catch (error: unknown) {
+    throw storageError('Unable to resolve the output root', error)
+  }
+  const current = parseStateRecord(marker)
+  if (current === null) throw storageError(`Missing state directory record: ${marker}`)
+  if (current.root !== canonicalRoot) throw boundElsewhereError(state, current.root, canonicalRoot)
+  if (current.requires.includes(feature)) return
+
+  const requires = [...current.requires, feature].sort()
+  const temporary = `${marker}.${randomToken().slice(0, 16)}.tmp`
+  const bytes = b4a.from(JSON.stringify({ version: 2, root: { path: canonicalRoot, requires } }))
+  try {
+    try {
+      const fd = fs.openSync(temporary, 'wx', 0o600)
+      try {
+        let written = 0
+        while (written < bytes.byteLength) {
+          written += fs.writeSync(fd, bytes, written, bytes.byteLength - written)
+        }
+        fs.fsyncSync(fd)
+      } finally {
+        fs.closeSync(fd)
+      }
+      fs.renameSync(temporary, marker)
+    } finally {
+      // Gone already when the rename published it; only this call's own temporary is touched.
+      try {
+        fs.unlinkSync(temporary)
+      } catch {}
+    }
+    syncDirectoryEntries(state)
+  } catch (error: unknown) {
+    if (error instanceof SwarmDeployError) throw error
+    throw storageError(
+      `Unable to record the required feature in the private state directory ${state}`,
+      error
+    )
+  }
+  const written = parseStateRecord(marker)
+  if (written === null || written.root !== canonicalRoot || !written.requires.includes(feature)) {
+    throw storageError(`State directory record was not written as expected: ${marker}`)
+  }
+}
+
+/** Whether the state directory already requires `feature`. Read-only. */
+export function stateRequiresFeature(layout: StorageLayout, feature: StateFeature): boolean {
+  const current = parseStateRecord(path.join(layout.internal, STATE_ROOT_NAME))
+  return current !== null && current.requires.includes(feature)
 }
 
 function nestedLegacyError(state: string): SwarmDeployError {
@@ -813,28 +952,20 @@ export function isProcessAlive(pid: number): boolean {
 
 const defaultIsProcessAlive = isProcessAlive
 
-function noFollowFlag() {
-  if (fs.constants?.O_NOFOLLOW !== undefined) return fs.constants.O_NOFOLLOW
-  const platform = os.platform()
-  if (platform === 'darwin') return 0x100
-  if (platform === 'linux') return 0x20000
-  throw storageError('Safe file open is unsupported on this platform')
-}
-
+/**
+ * The flags of a safe open: no symlink at the final path, and for `create` an exclusive create of
+ * a new file. Taken from the runtime's constants where it has them, and otherwise from the
+ * platform and architecture table in `open-flags.ts`; an unknown ABI refuses instead of guessing.
+ */
 export function safeFileOpenFlags(access: SafeFileAccess): number {
-  const constants = fs.constants || {}
-  const noFollow = noFollowFlag()
-  if (access === 'create') {
-    return (
-      (constants.O_WRONLY ?? 1) |
-      (constants.O_CREAT ?? 0o100) |
-      (constants.O_EXCL ?? 0o200) |
-      noFollow
-    )
+  if (access !== 'create' && access !== 'write' && access !== 'read') {
+    throw storageError('Invalid safe file open access')
   }
-  if (access === 'write') return (constants.O_RDWR ?? 2) | noFollow
-  if (access === 'read') return (constants.O_RDONLY ?? 0) | noFollow
-  throw storageError('Invalid safe file open access')
+  const flags = safeOpenFlags(access, fs.constants, os.platform(), os.arch())
+  if (flags === undefined) {
+    throw storageError('Safe file open is unsupported on this platform')
+  }
+  return flags
 }
 
 export async function openSafeRegularFile(

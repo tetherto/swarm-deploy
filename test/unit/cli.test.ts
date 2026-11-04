@@ -2180,6 +2180,173 @@ test('--symlink rejects a missing selector and invalid rules with exit code 2', 
   }
 })
 
+test('--allow-replace is off unless given, bare for every managed name, or a list of selectors', async (t) => {
+  const root = await createTempDir(t)
+  const none = await runServerCli(root, [])
+  t.is(none.code, 0)
+  t.absent('allowReplace' in (none.options as ServerOptions), 'not passed by default')
+
+  const bare = await runServerCli(root, ['--allow-replace'])
+  t.is(bare.code, 0, bare.stderr)
+  t.is((bare.options as ServerOptions).allowReplace, true)
+
+  const selected = await runServerCli(root, [
+    '--allow-replace',
+    'beta-{version}',
+    '--allow-replace',
+    'latest.json',
+    '--allow-replace',
+    '{version}'
+  ])
+  t.is(selected.code, 0, selected.stderr)
+  t.alike(
+    [...((selected.options as ServerOptions).allowReplace as Iterable<string>)],
+    ['beta-{version}', 'latest.json', '{version}']
+  )
+
+  // A bare flag followed by another option stands alone and leaves that option intact.
+  const beside = await runServerCli(root, ['--allow-replace', '--replace-name', 'latest.json'])
+  t.is(beside.code, 0, beside.stderr)
+  t.is((beside.options as ServerOptions).allowReplace, true)
+  t.alike(
+    [...((beside.options as ServerOptions).replaceNames as Iterable<string>)],
+    ['latest.json']
+  )
+
+  // Every selector is validated even beside a bare flag, which then allows every name.
+  const both = await runServerCli(root, ['--allow-replace', 'beta-{version}', '--allow-replace'])
+  t.is(both.code, 0, both.stderr)
+  t.is((both.options as ServerOptions).allowReplace, true)
+  const hidden = await runServerCli(root, ['--allow-replace', 'history-x', '--allow-replace'])
+  t.is(hidden.code, 2, 'a bare flag does not hide a bad selector')
+  t.is(hidden.constructed, 0)
+
+  const legacy = await runServerCli(root, ['--replace-name', 'a.tar.gz', '--replace-name', 'b'])
+  t.is(legacy.code, 0)
+  t.alike(
+    [...((legacy.options as ServerOptions).replaceNames as Iterable<string>)],
+    ['a.tar.gz', 'b']
+  )
+  t.absent('allowReplace' in (legacy.options as ServerOptions))
+})
+
+test('--allow-replace rejects bad selectors and a secret-shaped value without echoing it', async (t) => {
+  const root = await createTempDir(t)
+  const secret = 'ab'.repeat(32)
+  const invalid: string[][] = [
+    ['--allow-replace', secret],
+    ['--allow-replace', 'a/{version}'],
+    ['--allow-replace', 'history-anything'],
+    ['--allow-replace', 'beta-{oops}'],
+    ['--allow-replace', 'beta-{version}-{version}'],
+    ['--allow-replace', 'same', '--allow-replace', 'same'],
+    ['--allow-replace', 'beta-{version}', '--allow-replace', 'beta-{version}'],
+    ['--allow-replace', '--allow-replace=beta-{version}']
+  ]
+  for (const extra of invalid) {
+    const run = await runServerCli(root, extra)
+    t.is(run.code, 2, extra.join(' '))
+    t.is(run.constructed, 0, extra.join(' '))
+    t.absent(run.stderr.includes(secret), 'the value is never echoed')
+  }
+})
+
+test('the server usage documents --allow-replace with an optional selector', (t) => {
+  t.ok(USAGE.includes('[--allow-replace [<selector>]]...'))
+})
+
+test('--idle-timeout takes a positive integer up to the longest timer delay, for upload and link', async (t) => {
+  const root = await createTempDir(t)
+  const seedPath = path.join(root, 'client.seed')
+  const artifact = path.join(root, 'artifact.txt')
+  await fs.promises.writeFile(seedPath, `${b4a.toString(CLIENT_SEED, 'hex')}\n`, { mode: 0o600 })
+  await fs.promises.writeFile(artifact, 'artifact')
+  const seen: ClientOptions[] = []
+  class Client {
+    constructor(options: ClientOptions) {
+      seen.push(options)
+    }
+    upload() {
+      return Promise.resolve({
+        status: 'COMMITTED' as const,
+        kind: 'file' as const,
+        name: 'artifact.txt',
+        size: 8,
+        digest: b4a.alloc(32),
+        transferId: b4a.alloc(32)
+      })
+    }
+    link(target: string, name: string) {
+      return Promise.resolve({ target, name, status: 'LINKED' as const })
+    }
+    close() {
+      return Promise.resolve()
+    }
+  }
+  const io = () => ({
+    Client: Client as unknown as new (
+      options: ClientOptions
+    ) => import('../../dist/client.js').Client,
+    stdout: output().stream,
+    stderr: output().stream
+  })
+  const serverKey = b4a.toString(SERVER_KEY, 'hex')
+  const upload = (value: string) =>
+    main(
+      [
+        'upload',
+        '--seed-file',
+        seedPath,
+        '--server-key',
+        serverKey,
+        '--idle-timeout',
+        value,
+        artifact
+      ],
+      {},
+      io()
+    )
+  const link = (value: string) =>
+    main(
+      [
+        'link',
+        '--seed-file',
+        seedPath,
+        '--server-key',
+        serverKey,
+        '--idle-timeout',
+        value,
+        'a',
+        'b'
+      ],
+      {},
+      io()
+    )
+
+  for (const value of ['1', '600000', '2147483647']) {
+    const before = seen.length
+    t.is(await upload(value), 0, `upload ${value}`)
+    t.is(await link(value), 0, `link ${value}`)
+    t.alike(
+      seen.slice(before).map((options) => options.idleTimeout),
+      [Number(value), Number(value)]
+    )
+  }
+  for (const value of ['0', '-1', '2147483648', '9007199254740991', '1.5', '1e3', 'ten', '']) {
+    const before = seen.length
+    t.is(await upload(value), 2, `upload ${value}`)
+    t.is(await link(value), 2, `link ${value}`)
+    t.is(seen.length, before, `${value} was rejected before a client existed`)
+  }
+  // Without the option the client's own default applies; the CLI invents none.
+  const before = seen.length
+  t.is(
+    await main(['upload', '--seed-file', seedPath, '--server-key', serverKey, artifact], {}, io()),
+    0
+  )
+  t.is(seen[before].idleTimeout, undefined)
+})
+
 const DAY = 24 * 60 * 60 * 1000
 
 test('retention scopes and the session and disk options are passed through only when given', async (t) => {
@@ -2324,6 +2491,119 @@ test('--retention-scope rejects every malformed or unsafe value without echoing 
   t.alike(
     [...((ageOnly.options as ServerOptions).retentionScopes as Iterable<unknown>)],
     [{ pattern: 'beta-{series}', maxAge: 7 * DAY }]
+  )
+})
+
+test('a seed file that is a link is refused and the seed behind it is never read', async (t) => {
+  const root = await createTempDir(t)
+  const seedHex = b4a.toString(CLIENT_SEED, 'hex')
+  const artifact = path.join(root, 'artifact.txt')
+  const real = path.join(root, 'real.seed')
+  const link = path.join(root, 'link.seed')
+  const dangling = path.join(root, 'dangling.seed')
+  await fs.promises.writeFile(artifact, 'payload')
+  await fs.promises.writeFile(real, `${seedHex}\n`, { mode: 0o600 })
+  await fs.promises.symlink(real, link)
+  await fs.promises.symlink(path.join(root, 'missing.seed'), dangling)
+
+  for (const seedPath of [link, dangling]) {
+    const name = path.basename(seedPath)
+    const stdout = output()
+    const stderr = output()
+    t.is(
+      await main(
+        ['public-key', '--seed-file', seedPath],
+        {},
+        { stdout: stdout.stream, stderr: stderr.stream }
+      ),
+      2,
+      name
+    )
+    t.is(stdout.text(), '', `${name}: no key is printed`)
+    t.ok(stderr.text().includes('seed file must be a regular file'), name)
+    t.absent(stderr.text().includes(seedHex), `${name}: the seed is not echoed`)
+
+    let constructed = false
+    class Client {
+      constructor(_options: ClientOptions) {
+        constructed = true
+      }
+      upload() {
+        return Promise.reject(new Error('the upload must not be reached'))
+      }
+      close() {
+        return Promise.resolve()
+      }
+    }
+    const uploadErr = output()
+    t.is(
+      await main(
+        [
+          'upload',
+          '--seed-file',
+          seedPath,
+          '--server-key',
+          b4a.toString(SERVER_KEY, 'hex'),
+          artifact
+        ],
+        {},
+        {
+          Client: Client as unknown as new (
+            options: ClientOptions
+          ) => import('../../dist/client.js').Client,
+          stdout: output().stream,
+          stderr: uploadErr.stream
+        }
+      ),
+      2,
+      `${name}: upload`
+    )
+    t.ok(uploadErr.text().includes('seed file must be a regular file'), `${name}: upload message`)
+    t.absent(constructed, `${name}: no client was made from it`)
+  }
+  t.is(await fs.promises.readFile(real, 'utf8'), `${seedHex}\n`, 'the real seed is untouched')
+})
+
+test('keygen writes one new private seed file and never overwrites or follows a path that exists', async (t) => {
+  const root = await createTempDir(t)
+  const fresh = path.join(root, 'fresh.seed')
+  const stdout = output()
+  const stderr = output()
+  t.is(
+    await main(['keygen', '--out', fresh], {}, { stdout: stdout.stream, stderr: stderr.stream }),
+    0,
+    stderr.text()
+  )
+  const seed = await fs.promises.readFile(fresh, 'utf8')
+  t.ok(/^[0-9a-f]{64}\n$/.test(seed), 'a canonical seed')
+  const stat = await fs.promises.lstat(fresh)
+  t.ok(stat.isFile(), 'a regular file')
+  t.is(stat.mode & 0o077, 0, 'private to its owner')
+  t.alike(await fs.promises.readdir(root), ['fresh.seed'], 'no temporary file is left')
+  const derived = output()
+  t.is(await main(['public-key', '--seed-file', fresh], {}, { stdout: derived.stream }), 0)
+  t.is(derived.text(), stdout.text(), 'the printed key is the one the file holds')
+
+  const precious = path.join(root, 'precious.seed')
+  const link = path.join(root, 'link.seed')
+  const dangling = path.join(root, 'dangling.seed')
+  const missing = path.join(root, 'missing.seed')
+  await fs.promises.writeFile(precious, 'precious')
+  await fs.promises.symlink(precious, link)
+  await fs.promises.symlink(missing, dangling)
+  for (const out of [fresh, precious, link, dangling]) {
+    const name = path.basename(out)
+    const refused = output()
+    t.is(await main(['keygen', '--out', out], {}, { stderr: refused.stream }), 2, name)
+    t.ok(refused.text().includes('Refusing to overwrite existing seed file'), name)
+  }
+  t.is(await fs.promises.readFile(fresh, 'utf8'), seed, 'the first seed is kept')
+  t.is(await fs.promises.readFile(precious, 'utf8'), 'precious', 'a file behind a link is kept')
+  t.is(await fs.promises.readlink(link), precious, 'the link is as it was')
+  await t.exception(
+    () => fs.promises.lstat(missing),
+    { code: 'ENOENT' },
+    'nothing was created through a dangling link'
   )
 })
 

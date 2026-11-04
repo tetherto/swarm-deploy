@@ -337,6 +337,46 @@ const stringLimitScope: RetentionScope = { pattern: 'beta-{version}', maxCount: 
 const unknownScopeKey: RetentionScope = { pattern: 'beta-{version}', maxCount: 1, pin: true }
 void [patternlessScope, stringLimitScope, unknownScopeKey]
 
+const replaceEverything = {
+  seed: serverSeed,
+  storageDir: '/srv/swarm-deploy',
+  allowedKeys: parseAllowlist('00'.repeat(32)),
+  maxFileBytes: 1024,
+  maxStagingBytes: 4096,
+  allowReplace: true
+} satisfies ServerOptions
+const replaceSelected = {
+  ...replaceEverything,
+  replaceNames: ['latest.json'],
+  allowReplace: ['beta-{version}', 'app', '{version}']
+} satisfies ServerOptions
+const replaceFromSet: ServerOptions['allowReplace'] = new Set(['{version}'])
+const replacePolicy: boolean | readonly string[] = new Server(replaceSelected).allowReplace
+void [replaceEverything, replaceFromSet, replacePolicy]
+// @ts-expect-error A selector is a string.
+const badSelector: ServerOptions['allowReplace'] = [5]
+// @ts-expect-error The permission is true or a list of selectors, not a number.
+const badPermission: ServerOptions['allowReplace'] = 5
+void [badSelector, badPermission]
+
+// A storage adapter offers an atomic directory exchange, or leaves the capability out.
+const exchanging: Pick<StorageAdapter, 'atomicSwap'> = {
+  atomicSwap: (first: string, second: string): Promise<void> => {
+    void [first, second]
+    return Promise.resolve()
+  }
+}
+const notExchanging: Pick<StorageAdapter, 'atomicSwap'> = {}
+void [exchanging, notExchanging]
+
+const patientClient = {
+  seed: clientSeed,
+  serverPublicKey: parsePublicKey('00'.repeat(32)),
+  connectTimeout: 30_000,
+  idleTimeout: 600_000
+} satisfies ClientOptions
+void patientClient
+
 const badGranularityOptions = {
   seed: serverSeed,
   storageDir: '/srv/swarm-deploy',

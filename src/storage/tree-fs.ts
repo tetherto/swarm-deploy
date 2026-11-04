@@ -651,6 +651,31 @@ function matchesIdentitySnapshot(result: WalkResult, expected: TreeIdentitySnaps
   )
 }
 
+/** The identity stamp of the root and every member of a tree, as one walk sees them. */
+export async function captureTreeSnapshot(
+  treePath: string,
+  storage: StorageAdapter
+): Promise<TreeIdentitySnapshot> {
+  return snapshotTreeIdentities(await walkIdentities(treePath, storage))
+}
+
+/**
+ * Whether the tree at `treePath` is exactly the one `expected` describes: the same root inode and
+ * the same members, each with the same inode, size and (when both report it) modification time.
+ * A tree that is missing, unreadable or no longer valid is simply not a match.
+ */
+export async function treeMatchesSnapshot(
+  treePath: string,
+  storage: StorageAdapter,
+  expected: TreeIdentitySnapshot
+): Promise<boolean> {
+  try {
+    return matchesIdentitySnapshot(await walkIdentities(treePath, storage), expected)
+  } catch {
+    return false
+  }
+}
+
 export async function walkTree(treePath: string, storage: StorageAdapter): Promise<TreeEntry[]> {
   const { entries } = await walkIdentities(treePath, storage)
   return entries.map(({ kind, path: entryPath, size }) => ({ kind, path: entryPath, size }))
