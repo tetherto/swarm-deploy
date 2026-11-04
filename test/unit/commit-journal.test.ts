@@ -15,13 +15,19 @@ import {
   DIRECTORY_PHASES,
   DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
   DIRECTORY_REPLACEMENT_PHASES,
+  FILE_MERGE_JOURNAL_VERSION,
+  FILE_MERGE_PHASES,
+  MAX_FILE_JOURNAL_BYTES,
   isDirectoryJournal,
   isDirectoryReplacementJournal,
+  isFileMergeJournal,
   readCommitJournal,
   serializeJournal,
   type CommitRecord,
   type DirectoryCommitJournal,
-  type DirectoryReplacementJournal
+  type DirectoryReplacementJournal,
+  type FileMergeAction,
+  type FileMergeJournal
 } from '../../dist/storage/commit-journal.js'
 import { MAX_TREE_ENTRIES } from '../../dist/tar-protocol/tree.js'
 import { createTempDir } from '../helpers/files.js'
@@ -502,9 +508,190 @@ test('a corrupt directory replacement journal is rejected instead of silently re
 })
 
 test('an unknown journal version is corrupt, never guessed at', async (t) => {
-  const root = await writeJournal(t, ID, { ...replacementJournal(), version: 5 })
+  const root = await writeJournal(t, ID, { ...replacementJournal(), version: 6 })
   await t.exception(
     () => readCommitJournal(ID, initLayout(root), createStorage()),
     CorruptJournalError
+  )
+})
+
+const SNAPSHOT = '5'.repeat(64)
+const PREVIOUS_SNAPSHOT = '6'.repeat(64)
+
+function mergeActions(count: number, directory = 'assets'): FileMergeAction[] {
+  const actions: FileMergeAction[] = []
+  for (let index = 0; index < count; index++) {
+    const replace = index % 3 === 0
+    actions.push({
+      op: replace ? 'replace' : 'add',
+      path: `${directory}/file-${String(index).padStart(5, '0')}.bin`,
+      size: index,
+      sha256: DIGEST,
+      staged: { dev: '66', ino: String(10_000 + index) },
+      ...(replace ? { previous: { dev: '66', ino: String(50_000 + index) } } : {})
+    })
+  }
+  return actions
+}
+
+function mergeJournal(
+  overrides: Partial<Record<keyof FileMergeJournal, unknown>> = {}
+): Record<string, unknown> {
+  return {
+    version: FILE_MERGE_JOURNAL_VERSION,
+    intent: 'merge-files',
+    state: 'committing',
+    phase: 'journaled',
+    transferId: ID,
+    attemptId: ATTEMPT,
+    name: '0.18.1',
+    baseGeneration: 2,
+    generation: 3,
+    snapshotId: SNAPSHOT,
+    previousSnapshotId: PREVIOUS_SNAPSHOT,
+    uploader: UPLOADER,
+    committedAt: 1_000,
+    stagingTreeIdentity: IDENTITY,
+    actions: mergeActions(3),
+    directories: [
+      { path: '0.18.1', identity: null },
+      { path: '0.18.1/assets', identity: { dev: '66', ino: '777' } }
+    ],
+    legacyRecords: [OTHER_ID],
+    ...overrides
+  }
+}
+
+test('a file merge journal round-trips through serialize and read in every phase', async (t) => {
+  for (const phase of FILE_MERGE_PHASES) {
+    const journal = mergeJournal({
+      phase,
+      release: { series: 'api', version: '1.2.3' },
+      previousSnapshotId: null
+    })
+    const serialized = serializeJournal(journal as unknown as FileMergeJournal)
+    t.alike(Object.keys(serialized).sort(), [
+      'actions',
+      'attemptId',
+      'baseGeneration',
+      'committedAt',
+      'directories',
+      'generation',
+      'intent',
+      'legacyRecords',
+      'name',
+      'phase',
+      'previousSnapshotId',
+      'release',
+      'snapshotId',
+      'stagingTreeIdentity',
+      'state',
+      'transferId',
+      'uploader',
+      'version'
+    ])
+    const root = await writeJournal(t, ID, serialized)
+    const read = await readCommitJournal(ID, initLayout(root), createStorage())
+    t.ok(isFileMergeJournal(read), phase)
+    t.alike<unknown>(read, journal, phase)
+  }
+  t.absent(isFileMergeJournal(null))
+})
+
+test('a corrupt file merge journal is rejected instead of silently repaired', async (t) => {
+  // `mergeActions` alternates: its first entry replaces a file, its second adds one.
+  const [action, added] = mergeActions(2)
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['wrong intent', mergeJournal({ intent: 'create-directory' })],
+    ['unknown state', mergeJournal({ state: 'done' })],
+    ['unknown phase', mergeJournal({ phase: 'swapped' })],
+    ['journal ID mismatch', mergeJournal({ transferId: OTHER_ID })],
+    ['non-hex attempt', mergeJournal({ attemptId: 'not-hex' })],
+    ['non-hex snapshot', mergeJournal({ snapshotId: 'nope' })],
+    ['non-hex previous snapshot', mergeJournal({ previousSnapshotId: 'nope' })],
+    ['reserved name', mergeJournal({ name: `history-${OTHER_ID}` })],
+    ['generation does not follow its base', mergeJournal({ baseGeneration: 3, generation: 3 })],
+    ['negative generation', mergeJournal({ baseGeneration: -1 })],
+    ['unknown key', { ...mergeJournal(), extra: true }],
+    ['identity missing', mergeJournal({ stagingTreeIdentity: { dev: '66' } })],
+    ['an action with an unknown key', mergeJournal({ actions: [{ ...action, extra: 1 }] })],
+    ['an unknown action', mergeJournal({ actions: [{ ...action, op: 'delete' }] })],
+    [
+      'a replacement without its preimage',
+      mergeJournal({ actions: [{ ...added, op: 'replace' }] })
+    ],
+    [
+      'an addition that has a preimage',
+      mergeJournal({ actions: [{ ...added, previous: { dev: '66', ino: '1' } }] })
+    ],
+    ['a traversing path', mergeJournal({ actions: [{ ...action, path: '../escape.bin' }] })],
+    ['an absolute path', mergeJournal({ actions: [{ ...action, path: '/etc/passwd' }] })],
+    ['a non-hex digest', mergeJournal({ actions: [{ ...action, sha256: 'zz' }] })],
+    ['a duplicated path', mergeJournal({ actions: [action, { ...action }] })],
+    ['a directory that traverses', mergeJournal({ directories: [{ path: '..', identity: null }] })],
+    [
+      'a directory that is reserved',
+      mergeJournal({ directories: [{ path: 'history-x', identity: null }] })
+    ],
+    [
+      'a directory listed twice',
+      mergeJournal({
+        directories: [
+          { path: 'a', identity: null },
+          { path: 'a', identity: null }
+        ]
+      })
+    ],
+    ['a legacy record that is not an ID', mergeJournal({ legacyRecords: ['nope'] })],
+    ['too many legacy records', mergeJournal({ legacyRecords: Array(9).fill(OTHER_ID) })],
+    [
+      'more actions than a tree holds',
+      mergeJournal({ actions: mergeActions(MAX_TREE_ENTRIES + 1) })
+    ]
+  ]
+  for (const [label, journal] of cases) {
+    const root = await writeJournal(t, ID, journal)
+    await t.exception(
+      () => readCommitJournal(ID, initLayout(root), createStorage()),
+      CorruptJournalError,
+      label
+    )
+  }
+})
+
+test('a merge journal holds every action of the largest upload, far past the 16 KiB of the older journals', async (t) => {
+  // The tree limit (10 000 entries) is the most actions a merge can have, with paths near the
+  // 100-byte limit of a tree entry.
+  const directory = `${'d'.repeat(30)}/${'e'.repeat(30)}`
+  const journal = mergeJournal({
+    actions: mergeActions(MAX_TREE_ENTRIES, directory),
+    directories: [{ path: '0.18.1', identity: null }]
+  })
+  const serialized = serializeJournal(journal as unknown as FileMergeJournal)
+  const size = JSON.stringify(serialized).length
+  t.ok(size > 16 * 1024 * 100, 'it is two orders of magnitude over the older limit')
+  t.ok(size < MAX_FILE_JOURNAL_BYTES, 'and within its own bound')
+  const root = await writeJournal(t, ID, serialized)
+  const read = await readCommitJournal(ID, initLayout(root), createStorage())
+  t.ok(isFileMergeJournal(read))
+  t.is(read && 'actions' in read ? read.actions.length : -1, MAX_TREE_ENTRIES)
+  t.alike<unknown>(read, journal)
+
+  // The bound is not removed, only moved: a journal past it is refused unread, whatever it holds.
+  const oversized = await writeJournal(t, ID, {
+    ...serialized,
+    padding: 'x'.repeat(MAX_FILE_JOURNAL_BYTES)
+  })
+  await t.exception(() => readCommitJournal(ID, initLayout(oversized), createStorage()), {
+    message: /byte limit/
+  })
+})
+
+test('every older journal keeps its 16 KiB bound', async (t) => {
+  const padded = await writeJournal(t, ID, { ...directoryJournal(), padding: 'x'.repeat(20_000) })
+  await t.exception(
+    () => readCommitJournal(ID, initLayout(padded), createStorage()),
+    { message: /size limit/ },
+    'a directory journal over 16 KiB is refused for its size'
   )
 })

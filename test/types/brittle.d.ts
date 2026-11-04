@@ -41,7 +41,14 @@ declare module 'brittle' {
     end(): void
   }
 
+  /** The per-test options this suite uses; `timeout` is in milliseconds (default 30 000). */
+  interface TestOptions {
+    timeout?: number
+  }
+
   interface TestFn {
+    // The plain form stays last: tests derive their callback type from the last signature.
+    (name: string, options: TestOptions, fn: (t: Assert) => void | Promise<void>): void
     (name: string, fn: (t: Assert) => void | Promise<void>): void
     only(name: string, fn: (t: Assert) => void | Promise<void>): void
     skip(name: string, fn: (t: Assert) => void | Promise<void>): void
@@ -49,5 +56,5 @@ declare module 'brittle' {
 
   const test: TestFn
   export default test
-  export { type Assert, type ExpectedError, type TeardownOptions, type Thrower }
+  export { type Assert, type ExpectedError, type TeardownOptions, type TestOptions, type Thrower }
 }

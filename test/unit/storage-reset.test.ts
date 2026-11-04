@@ -112,6 +112,9 @@ async function seedStorage(t: Assert): Promise<{ root: string; layout: StorageLa
   )
   await fs.promises.mkdir(path.join(layout.trash, `${ID_C}.tree`))
   await write(path.join(layout.trash, `${ID_C}.tree`, 'leftover.bin'), 'trash')
+  // The ownership catalog of a directory artifact: private metadata like the rest, whose loss
+  // leaves the files it listed on disk and owned by nobody.
+  await write(path.join(layout.catalogs, `${ID_A}.json`), '{"version":1}')
   await fs.promises.mkdir(`${layout.lock}.retired-${TOKEN}`)
   await write(`${layout.lock}.retired-${TOKEN}/owner.json`, lockOwner(1, 1))
   await write(path.join(layout.internal, 'README-notes.txt'), 'unrelated operator file')
@@ -222,6 +225,7 @@ test('reset-storage preview reports metadata left behind by a manual payload del
     'publications: 1 entries',
     'links: 1 records',
     'trash: 1 entries',
+    'catalogs: 1 entries',
     'obsolete locks: 1',
     'archives: 0',
     'unknown internal entries: 1 (README-notes.txt); left in place',
@@ -274,11 +278,14 @@ test('reset-storage --apply archives every metadata class, recreates empty direc
     'journals',
     'publications',
     'links',
-    'trash'
+    'trash',
+    'catalogs'
   ] as const) {
     t.alike(await fs.promises.readdir(layout[name]), [], `${name} is empty`)
   }
   t.alike(await snapshot(archive), [
+    'catalogs/',
+    `catalogs/${ID_A}.json 13`,
     'commits/',
     `commits/${ID_A}.json ${commitRecord(ID_A, 'kept.txt', 12).length}`,
     `commits/${ID_B}.json ${commitRecord(ID_B, 'deleted.txt', 7).length}`,
@@ -311,7 +318,8 @@ test('reset-storage --apply archives every metadata class, recreates empty direc
     'journals',
     'publications',
     'links',
-    'trash'
+    'trash',
+    'catalogs'
   ])
   t.alike(marker.locks, lockSummary([`lock.retired-${TOKEN}`]))
   t.is(
@@ -633,7 +641,8 @@ test('an interrupted reset leaves a recoverable in-progress archive and a re-run
     'journals',
     'publications',
     'links',
-    'trash'
+    'trash',
+    'catalogs'
   ])
   t.alike(finished.locks, lockSummary([`lock.retired-${TOKEN}`]))
   const attempts = (finished.attempts ?? []) as Array<{ pid: number; failed?: string }>
@@ -677,7 +686,8 @@ const METADATA = [
   'journals',
   'publications',
   'links',
-  'trash'
+  'trash',
+  'catalogs'
 ] as const
 
 test('a retry after a hard stop resumes the pending archive, and that one archive restores the whole reset', async (t) => {

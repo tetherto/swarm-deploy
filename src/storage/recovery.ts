@@ -47,13 +47,15 @@ interface CommitStore {
     options: { isAuthorized: ((ownerKey: Uint8Array) => boolean) | null }
   ): Promise<RecoveryResult>
   list(): Promise<CommitRecord[]>
-  scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }>
+  scrubRecords(options?: { hash?: boolean }): Promise<{ records: CommitRecord[]; deleted: number }>
   delete(record: CommitRecord): Promise<boolean>
   purge(
     record: CommitRecord,
     options?: { preservePath?: boolean }
   ): Promise<false | { purged: true; preservedPath: boolean }>
   sweepTrash(): Promise<number>
+  /** Private scratch directories of merges no open journal owns. */
+  sweepMergeScratch?(): Promise<number>
 }
 
 type RecoveryEvent =
@@ -145,7 +147,8 @@ async function assertRecoveryLayout(layout: StorageLayout, storage: StorageAdapt
     layout.commits,
     layout.journals,
     layout.links,
-    layout.trash
+    layout.trash,
+    layout.catalogs
   ]) {
     await assertSafeDirectory(directory, storage)
   }
@@ -325,6 +328,8 @@ async function recoverStorage({
       await sessionStore.delete(b4a.from(id, 'hex'))
     }
   }
+  // Every merge journal has been recovered above, so what is left in the merge scratch is residue.
+  if (typeof commitStore.sweepMergeScratch === 'function') await commitStore.sweepMergeScratch()
   const sweptTrash = await commitStore.sweepTrash()
   if (sweptTrash > 0) {
     report(logger, 'warn', 'Swept managed directory trash residue', { trees: sweptTrash })

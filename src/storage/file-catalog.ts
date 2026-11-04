@@ -701,13 +701,100 @@ function catalogBusy(): SwarmDeployError {
 export async function commitFileCatalog(
   directory: string,
   next: FileCatalog,
-  storage: StorageAdapter = fs.promises
+  storage: StorageAdapter = fs.promises,
+  /**
+   * The generation the catalog on disk must have (0 when there is none). It is `next`'s own
+   * predecessor, except when `next` continues a catalog imported from a legacy record, which has
+   * not been written yet.
+   */
+  expectedGeneration: number = next.generation - 1
 ): Promise<void> {
   const bytes = serializeFileCatalog(next)
   if (next.generation < 1) throw corrupt('A persisted catalog has a generation')
   const current = await readFileCatalog(directory, next.name, storage)
-  if ((current === null ? 0 : current.generation) !== next.generation - 1) throw catalogBusy()
+  if ((current === null ? 0 : current.generation) !== expectedGeneration) throw catalogBusy()
   await writeAtomic(fileCatalogPath(directory, next.name), bytes, storage)
+}
+
+const CATALOG_FILE = /^([0-9a-f]{64})\.json$/
+
+/**
+ * Every catalog in `directory`. A file that is not a catalog under its own name is reported, not
+ * read as one, so a corrupt or foreign file can neither be trusted nor hide a catalog.
+ */
+export async function listFileCatalogs(
+  directory: string,
+  storage: StorageAdapter = fs.promises
+): Promise<{ catalogs: FileCatalog[]; corrupt: string[] }> {
+  const names = await withSafeDirectoryIdentity(directory, storage, () =>
+    storage.readdir(directory)
+  )
+  const catalogs: FileCatalog[] = []
+  const unusable: string[] = []
+  for (const filename of names.sort()) {
+    const match = CATALOG_FILE.exec(filename)
+    if (match === null) continue
+    let catalog: FileCatalog
+    try {
+      catalog = parseFileCatalog(
+        await readJson(path.join(directory, filename), storage, MAX_CATALOG_BYTES)
+      )
+    } catch {
+      unusable.push(filename)
+      continue
+    }
+    if (catalogGroupId(catalog.name) !== match[1]) {
+      unusable.push(filename)
+      continue
+    }
+    catalogs.push(catalog)
+  }
+  return { catalogs, corrupt: unusable }
+}
+
+/** What a catalog looks like to retention, links and hooks: one artifact with an owned size. */
+export interface CatalogView {
+  readonly name: string
+  readonly size: number
+  readonly sha256: string
+  readonly entryCount: number
+  readonly committedAt: number
+  readonly uploaderFingerprint: string
+  /** The published snapshot ID, never an upload's transfer ID. */
+  readonly transferId: string
+  readonly release?: CommitRelease
+}
+
+/**
+ * The aggregate of a catalog's owned files, or `null` when it owns none. The newest writer stands
+ * for the artifact's time and uploader. It describes only owned leaves: never a directory, never a
+ * file Swarm does not own.
+ */
+export function catalogView(catalog: FileCatalog): CatalogView | null {
+  if (catalog.files.length === 0) return null
+  let newest = catalog.files[0].writer
+  let size = 0
+  for (const file of catalog.files) {
+    size += file.size
+    const writer = file.writer
+    if (
+      writer.committedAt > newest.committedAt ||
+      (writer.committedAt === newest.committedAt && writer.transferId > newest.transferId)
+    ) {
+      newest = writer
+    }
+  }
+  const digest = ownedDigest(catalog.files)
+  return {
+    name: catalog.name,
+    size,
+    sha256: digest,
+    entryCount: catalog.files.length,
+    committedAt: newest.committedAt,
+    uploaderFingerprint: newest.uploader,
+    transferId: snapshotId(catalog.name, catalog.release, digest),
+    ...(catalog.release === undefined ? {} : { release: catalog.release })
+  }
 }
 
 async function syncDirectory(directory: string, storage: StorageAdapter): Promise<void> {

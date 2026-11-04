@@ -1,6 +1,8 @@
 import b4a from 'b4a'
 import {
   emptyFileCatalog,
+  ownedDigest,
+  snapshotId,
   type FileCatalog,
   type FileWriter
 } from '../../dist/storage/file-catalog.js'
@@ -36,6 +38,28 @@ export function facts(
   content: string
 ): { path: string; size: number; sha256: string } {
   return { path, size: b4a.from(content).byteLength, sha256: sha(content) }
+}
+
+/**
+ * What a directory artifact that owns exactly `files` (relative path to content) is published as,
+ * worked out by hand from the contents: the digest of the owned files, the snapshot identity that
+ * stands in for the transfer ID, and the totals. It is not any one upload's identity.
+ */
+export function publishedAs(
+  name: string,
+  files: Record<string, string>,
+  release?: { series: string; version?: string }
+): { sha256: string; transferId: string; size: number; entryCount: number } {
+  const owned = Object.entries(files)
+    .sort(([left], [right]) => compareTreePaths(left, right))
+    .map(([path, content]) => facts(path, content))
+  const sha256 = ownedDigest(owned)
+  return {
+    sha256,
+    transferId: snapshotId(name, release, sha256),
+    size: owned.reduce((total, file) => total + file.size, 0),
+    entryCount: owned.length
+  }
 }
 
 /**

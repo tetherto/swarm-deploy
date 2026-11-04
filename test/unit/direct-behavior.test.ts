@@ -62,6 +62,7 @@ import {
 } from '../../dist/tar-protocol/manifest.js'
 import { historyName } from '../../dist/files.js'
 import { acquireStorageLock } from '../../dist/storage/layout.js'
+import { publishedAs } from '../helpers/file-merge.js'
 import type { CommitStore } from '../../dist/storage/commit-store.js'
 import type { SessionStore } from '../../dist/storage/session-store.js'
 import { createTempDir, stateDirFor } from '../helpers/files.js'
@@ -2455,14 +2456,17 @@ test('Server keeps durable manual names managed after rules are removed on resta
 
 test('Server fallback retention pins a manual target while deleting an unpinned artifact', async (t) => {
   let failAutomaticReconciliation = false
+  // Startup recovery scans the publications directory for merge residue and then sweeps the trash.
+  // The injected failure targets the link reconciliation that follows, so it is armed once recovery
+  // has reached its trash sweep.
+  let recoveryFinished = false
   const storage = createStorage({
     beforeOperation(operation, target) {
-      if (
-        failAutomaticReconciliation &&
-        operation === 'readdir' &&
-        target.endsWith(path.join('.swarm-deploy', 'publications'))
-      ) {
-        throw new Error('injected automatic reconciliation failure')
+      if (failAutomaticReconciliation && operation === 'readdir') {
+        if (target.endsWith(path.join('.swarm-deploy', 'trash'))) recoveryFinished = true
+        else if (recoveryFinished && target.endsWith(path.join('.swarm-deploy', 'publications'))) {
+          throw new Error('injected automatic reconciliation failure')
+        }
       }
     }
   })
@@ -2855,15 +2859,22 @@ test('afterLink describes a committed directory target with its entry count and 
 
   t.alike((await linkAll(node, '0.18.1', 'current')).result, { v: 1, status: 'LINKED' })
   const metadata = treeMetadataFromManifest(built.manifest)
+  // A directory target is the artifact's owned files: their total size, their count (the empty
+  // folder is nobody's), and the identity of that published content, which is not the upload's.
+  const release = { series: fixedSeriesKey('{version}'), version: '0.18.1' }
+  const published = publishedAs('0.18.1', { 'a/b.bin': 'bb', 'z.bin': 'z' }, release)
   t.alike(contexts[0].artifact, {
     name: '0.18.1',
     kind: 'directory',
     size: metadata.payloadBytes,
-    sha256: metadata.treeSha256,
-    transferId: metadata.transferId,
-    entryCount: 4,
-    release: { series: fixedSeriesKey('{version}'), version: '0.18.1' }
+    sha256: published.sha256,
+    transferId: published.transferId,
+    entryCount: 2,
+    release
   })
+  t.is(published.size, metadata.payloadBytes)
+  t.not(contexts[0].artifact.sha256, metadata.treeSha256)
+  t.not(contexts[0].artifact.transferId, metadata.transferId)
 })
 
 test('a failing afterLink answers HOOK_FAILED without its message, keeps the link, and stays observable', async (t) => {

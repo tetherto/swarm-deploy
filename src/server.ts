@@ -974,18 +974,26 @@ export class Server extends EventEmitter {
    * retry re-runs a hook that failed. The caller owns the returned places in
    * the hook lines and must release them.
    */
-  private async reconcileAfterCommit(artifact: HookArtifact): Promise<PendingLinkHook[]> {
+  private async reconcileAfterCommit(
+    artifact: HookArtifact,
+    committed: CommitRecord | null
+  ): Promise<PendingLinkHook[]> {
     if (!this.links || !this.commits) return []
+    // A directory upload is merged into a container, so what a link designates is the committed
+    // artifact (the aggregate of the files Swarm owns there), identified by its published snapshot
+    // and not by the upload's transfer ID; a link hook is told about that artifact.
+    const target = committed !== null && committed.group === true ? committed : null
+    const designated = target === null ? artifact : this.recordArtifact(target)
     try {
       return await withRootLease(this.layout!.root, async () => {
         const { desired, result } = await this.convergeLinksUnlocked(await this.commits!.list())
         if (this.hooks.afterLink === undefined) return []
         const unchanged = new Set(result?.unchanged)
         const pending = desired
-          .filter((link) => link.transferId === artifact.transferId)
+          .filter((link) => link.transferId === designated.transferId)
           .map((link) => ({
             link: this.hookLink(link, 'automatic'),
-            artifact,
+            artifact: designated,
             status: unchanged.has(link.name) ? ('UNCHANGED' as const) : ('LINKED' as const),
             trigger: 'upload' as const
           }))
@@ -1673,6 +1681,8 @@ export class Server extends EventEmitter {
     // one: what a detached call pins. It comes from the record, not from the offer, because an
     // already-committed mutable name can be another upload's. `null` before anything is durable.
     let durableId: string | null = null
+    // The record the commit returned, for what links designate once a directory was merged.
+    let committedRecord: CommitRecord | null = null
     let guardedTransfer: string | null = null
     // Settled once, after the answer was attempted; detached hooks of this operation wait for it.
     const scope = new OperationScope()
@@ -1814,7 +1824,7 @@ export class Server extends EventEmitter {
             durableId ?? commitContext.artifact.transferId
           )
         }
-        const linkHooks = await this.reconcileAfterCommit(hookArtifact)
+        const linkHooks = await this.reconcileAfterCommit(hookArtifact, committedRecord)
         // The places in the link hook lines this call still owns: all of them for a response
         // hook, none once each has been handed to its detached job.
         let owned = linkHooks
@@ -1893,22 +1903,37 @@ export class Server extends EventEmitter {
         )
         phase = 'commit'
         commitStarted = true
-        await this.commits!.commit(verified, {
-          retentionManager: this.retention,
-          signal: this.signal,
-          replaceNames: this.replaceNames,
-          replace: this.replacePermission,
-          release,
-          deferPostCommitRetention: this.defersPostCommitRetention()
-        })
+        let committed: CommitRecord
+        try {
+          committed = await this.commits!.commit(verified, {
+            retentionManager: this.retention,
+            signal: this.signal,
+            replaceNames: this.replaceNames,
+            replace: this.replacePermission,
+            release,
+            deferPostCommitRetention: this.defersPostCommitRetention()
+          })
+        } catch (error) {
+          // A directory that is refused outright was checked as a whole and changed nothing, and it
+          // cannot be accepted until something outside this upload changes. Its verified session
+          // would only keep the name busy, so it goes, and the upload is made again when it is
+          // wanted (an offer that never got this far never left a session either).
+          if (isTreeMetadata(metadata) && codeOf(error) === ERRORS.FILE_EXISTS) {
+            await this.discardRefusedSession(verified.transferId, owner)
+          }
+          throw error
+        }
         this.emitSafe('commit', {
           ...event,
           fingerprint: fingerprint(owner),
           status: 'succeeded'
         })
         commitSucceeded = true
-        // The record this commit just wrote carries the authenticated transfer ID.
-        durableId = metadata.transferId
+        committedRecord = committed
+        // The record a file commit just wrote carries the authenticated transfer ID. A directory
+        // upload is merged into a container: what is durable is the artifact it now belongs to, the
+        // aggregate of the files Swarm owns there, under the published snapshot's own ID.
+        durableId = committed.group === true ? committed.transferId : metadata.transferId
         hookPath = path.join(this.layout!.root, metadata.name)
         await this.retireQuietly(verified.transferId, owner)
         const receipt = await runPostCommit(false)
@@ -1952,6 +1977,7 @@ export class Server extends EventEmitter {
         // The durable record decides, not the offer: for a mutable name that already holds
         // identical content it can be another upload's record, with another transfer ID.
         durableId = inspected.record.transferId
+        committedRecord = inspected.record
         hookPath = path.join(this.layout!.root, metadata.name)
         const receipt = await runPostCommit(true)
         hooksFinished = true
@@ -2250,6 +2276,21 @@ export class Server extends EventEmitter {
       await this.sessions!.retireCommitted(transferId)
     } catch (error) {
       this.logger.warn('Committed session cleanup failed', {
+        publicKeyId: owner ? fingerprint(owner) : 'invalid',
+        reason: codeOf(error)
+      })
+    }
+  }
+
+  /** Drops the verified session of an upload that was refused, so it no longer holds its name. */
+  private async discardRefusedSession(
+    transferId: Uint8Array,
+    owner: Uint8Array | null
+  ): Promise<void> {
+    try {
+      await this.sessions!.delete(transferId)
+    } catch (error) {
+      this.logger.warn('Refused session cleanup failed', {
         publicKeyId: owner ? fingerprint(owner) : 'invalid',
         reason: codeOf(error)
       })

@@ -15,6 +15,7 @@ import {
 } from '../../dist/index.js'
 import { historyName } from '../../dist/files.js'
 import { createTempDir, stateDirFor } from '../helpers/files.js'
+import { publishedAs } from '../helpers/file-merge.js'
 import { Server } from '../helpers/server.js'
 import { createLocalTestnet } from '../helpers/testnet.js'
 import { writeTree, type TreeSpec } from '../helpers/trees.js'
@@ -24,6 +25,7 @@ const CLIENT_SEED = b4a.alloc(32, 0xe2)
 
 type UploadResult = Awaited<ReturnType<Client['upload']>>
 
+/** A tree whose file names differ from one version to the next, so merging versions only adds files. */
 function spec(version: number, files = 3): TreeSpec {
   const tree: TreeSpec = { 'nested/': '' }
   for (let index = 0; index < files; index++) {
@@ -31,6 +33,21 @@ function spec(version: number, files = 3): TreeSpec {
   }
   tree[`nested/inner-${version}.txt`] = `inner ${version}`
   return tree
+}
+
+/** A tree whose paths stay the same from one version to the next, so a newer one changes files. */
+function site(version: number, extra: TreeSpec = {}): TreeSpec {
+  return {
+    'index.html': `index ${version}`,
+    'assets/': '',
+    'assets/app.js': `app ${version}`,
+    ...extra
+  }
+}
+
+/** The files of a tree spec: its directory entries own nothing. */
+function filesOf(tree: TreeSpec): Record<string, string> {
+  return Object.fromEntries(Object.entries(tree).filter(([relative]) => !relative.endsWith('/')))
 }
 
 function shape(tree: TreeSpec): Record<string, string> {
@@ -138,6 +155,11 @@ function idOf(result: UploadResult): string {
   return b4a.toString(result.transferId, 'hex')
 }
 
+/** The history copies in the output root: a directory upload never leaves one. */
+async function histories(storage: string): Promise<string[]> {
+  return (await fs.promises.readdir(storage)).filter((entry) => entry.startsWith('history-'))
+}
+
 async function retryWhileBusy(upload: () => Promise<UploadResult>): Promise<UploadResult> {
   const deadline = Date.now() + 10_000
   for (;;) {
@@ -152,54 +174,128 @@ async function retryWhileBusy(upload: () => Promise<UploadResult>): Promise<Uplo
   }
 }
 
-test('replacement is off by default: a changed file or directory under a taken name is refused', async (t) => {
+test('a directory merges into the folder without permission, but a changed file is refused as a whole', async (t) => {
   const { client, storage } = await setup(t)
+  const folder = path.join(storage, 'site')
   t.is((await client.upload(await directory(t, 'site', spec(1)))).status, 'COMMITTED')
   t.is((await client.upload(await file(t, 'notes.txt', 'one'))).status, 'COMMITTED')
 
-  await t.exception(client.upload(await directory(t, 'site', spec(2))), {
-    code: ERRORS.FILE_EXISTS
-  })
+  // New files need no permission: the folder is a container, and what is there stays.
+  t.is((await client.upload(await directory(t, 'site', spec(2)))).status, 'COMMITTED')
+  t.alike(await snapshot(folder), { ...shape(spec(1)), ...shape(spec(2)) })
+  t.alike(await histories(storage), [], 'a directory upload leaves no history copy')
+
+  // A file that would change needs the permission, and one refused file refuses every file.
+  await t.exception(
+    client.upload(await directory(t, 'site', { 'v1-0.bin': 'changed', 'brand-new.bin': 'new' })),
+    { code: ERRORS.FILE_EXISTS }
+  )
+  t.is(await exists(path.join(folder, 'brand-new.bin')), false, 'not even its new file is created')
+  t.is(await fs.promises.readFile(path.join(folder, 'v1-0.bin'), 'utf8'), 'v1-0')
+  t.alike(await snapshot(folder), { ...shape(spec(1)), ...shape(spec(2)) })
+
+  // A standalone file still needs the permission to change.
   await t.exception(client.upload(await file(t, 'notes.txt', 'two')), { code: ERRORS.FILE_EXISTS })
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(1)))
   t.is(await fs.promises.readFile(path.join(storage, 'notes.txt'), 'utf8'), 'one')
 })
 
-test('allowReplace replaces managed files and whole directories and keeps the old ones as history', async (t) => {
+test('allowReplace replaces the files a directory changes in place, keeps the rest, and leaves no history', async (t) => {
   const { client, storage } = await setup(t, { allowReplace: true })
-  const first = await client.upload(await directory(t, 'site', spec(1)))
-  const second = await client.upload(await directory(t, 'site', spec(2)))
+  const folder = path.join(storage, 'site')
+  const first = await client.upload(await directory(t, 'site', site(1, { 'old-only.txt': 'old' })))
+  const second = await client.upload(
+    await directory(t, 'site', site(2, { 'extra.txt': 'extra', 'empty/': '' }))
+  )
   t.is(first.status, 'COMMITTED')
   t.is(second.status, 'COMMITTED')
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(2)), 'the new tree is published')
   t.alike(
-    await snapshot(path.join(storage, historyName(idOf(first)))),
-    shape(spec(1)),
-    'the old tree, empty directory included, is the history copy'
+    await snapshot(folder),
+    shape({ ...site(2), 'old-only.txt': 'old', 'extra.txt': 'extra' }),
+    'changed files are replaced, files the upload omits stay, and an empty folder is never created'
   )
+  t.alike(await histories(storage), [], 'a directory upload leaves no history copy')
 
   const oldFile = await client.upload(await file(t, 'notes.txt', 'one'))
   const newFile = await client.upload(await file(t, 'notes.txt', 'two'))
   t.is(newFile.status, 'COMMITTED')
   t.is(await fs.promises.readFile(path.join(storage, 'notes.txt'), 'utf8'), 'two')
-  t.is(await fs.promises.readFile(path.join(storage, historyName(idOf(oldFile))), 'utf8'), 'one')
+  t.is(
+    await fs.promises.readFile(path.join(storage, historyName(idOf(oldFile))), 'utf8'),
+    'one',
+    'a standalone file keeps its history copy'
+  )
 
-  // The same content again is already committed, and nothing moves.
-  const again = await client.upload(await directory(t, 'site', spec(2)))
-  t.is(again.status, 'ALREADY_COMMITTED')
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(2)))
+  // The same upload again is a no-op: every file in it is already there.
+  const again = await client.upload(
+    await directory(t, 'site', site(2, { 'extra.txt': 'extra', 'empty/': '' }))
+  )
+  t.is(again.status, 'COMMITTED')
+  t.alike(
+    await snapshot(folder),
+    shape({ ...site(2), 'old-only.txt': 'old', 'extra.txt': 'extra' })
+  )
+  t.alike(
+    await histories(storage),
+    [historyName(idOf(oldFile))],
+    'the only history copy is the standalone file'
+  )
 })
 
-test('an unmanaged path is preserved even where every name may be replaced', async (t) => {
+test('an upload that is the whole artifact is already committed when it is offered again', async (t) => {
   const { client, storage } = await setup(t, { allowReplace: true })
-  await writeTree(path.join(storage, 'operator'), { 'keep.txt': 'mine' })
+  const first = await client.upload(await directory(t, 'solo', site(1)))
+  t.is(first.status, 'COMMITTED')
+  const again = await client.upload(await directory(t, 'solo', site(1)))
+  t.is(again.status, 'ALREADY_COMMITTED')
+  t.alike(await snapshot(path.join(storage, 'solo')), shape(site(1)))
+
+  // Once a file of it was edited, the offer is no longer provably committed: it is merged again,
+  // and a file that is not what Swarm wrote is not Swarm's to replace, permission or not.
+  await fs.promises.writeFile(path.join(storage, 'solo', 'index.html'), 'edited')
+  await t.exception(client.upload(await directory(t, 'solo', site(1))), {
+    code: ERRORS.FILE_EXISTS
+  })
+  t.is(await fs.promises.readFile(path.join(storage, 'solo', 'index.html'), 'utf8'), 'edited')
+})
+
+test('files that Swarm does not own are never changed, adopted or deleted, even where every name may be replaced', async (t) => {
+  const { client, storage } = await setup(t, { allowReplace: true })
+  await writeTree(path.join(storage, 'operator'), { 'keep.txt': 'mine', 'same.txt': 'same' })
   await fs.promises.writeFile(path.join(storage, 'operator.txt'), 'mine too')
   await fs.promises.mkdir(path.join(storage, 'elsewhere'))
   await fs.promises.symlink('elsewhere', path.join(storage, 'linked'))
 
-  await t.exception(client.upload(await directory(t, 'operator', spec(1))), {
-    code: ERRORS.FILE_EXISTS
+  // New files merge into an operator's folder; an identical file of theirs is skipped, not adopted.
+  const merged = await client.upload(
+    await directory(t, 'operator', { 'same.txt': 'same', 'new.txt': 'new' })
+  )
+  t.is(merged.status, 'COMMITTED')
+  t.alike(await snapshot(path.join(storage, 'operator')), {
+    'keep.txt': 'mine',
+    'same.txt': 'same',
+    'new.txt': 'new'
   })
+  const catalogs = path.join(stateDirFor(path.resolve(storage)), 'catalogs')
+  const owned: string[] = []
+  for (const entry of await fs.promises.readdir(catalogs)) {
+    owned.push(await fs.promises.readFile(path.join(catalogs, entry), 'utf8'))
+  }
+  t.ok(
+    owned.some((text) => text.includes('"new.txt"')),
+    'the file Swarm wrote is owned'
+  )
+  t.absent(
+    owned.some((text) => text.includes('same.txt') || text.includes('keep.txt')),
+    'a file Swarm did not write is never adopted'
+  )
+
+  // A file of theirs that the upload would change stays theirs: the whole upload is refused.
+  await t.exception(
+    client.upload(await directory(t, 'operator', { 'keep.txt': 'ours', 'other-new.txt': 'x' })),
+    { code: ERRORS.FILE_EXISTS }
+  )
+  t.is(await exists(path.join(storage, 'operator', 'other-new.txt')), false)
+
   await t.exception(client.upload(await file(t, 'operator.txt', 'new')), {
     code: ERRORS.FILE_EXISTS
   })
@@ -216,22 +312,37 @@ test('an unmanaged path is preserved even where every name may be replaced', asy
     code: ERRORS.FILE_EXISTS
   })
 
-  t.alike(await snapshot(path.join(storage, 'operator')), { 'keep.txt': 'mine' })
+  t.is(await fs.promises.readFile(path.join(storage, 'operator', 'keep.txt'), 'utf8'), 'mine')
   t.is(await fs.promises.readFile(path.join(storage, 'operator.txt'), 'utf8'), 'mine too')
   t.is(await fs.promises.readlink(path.join(storage, 'linked')), 'elsewhere')
+  t.alike(await snapshot(path.join(storage, 'elsewhere')), {})
   t.alike(await snapshot(path.join(storage, 'site')), shape(spec(1)))
   t.is(await fs.promises.readFile(path.join(storage, 'doc'), 'utf8'), 'text')
 })
 
-test('a managed directory that was changed on disk is preserved', async (t) => {
+test('a file added or edited by hand is never overwritten, and a hand-edited owned file refuses the upload whole', async (t) => {
   const { client, storage } = await setup(t, { allowReplace: true })
-  await client.upload(await directory(t, 'site', spec(1)))
-  await fs.promises.writeFile(path.join(storage, 'site', 'added-by-hand.txt'), 'hand')
-  await t.exception(client.upload(await directory(t, 'site', spec(2))), {
+  const folder = path.join(storage, 'site')
+  await client.upload(await directory(t, 'site', site(1)))
+  await fs.promises.writeFile(path.join(folder, 'added-by-hand.txt'), 'hand')
+
+  // A file added by hand is just another file: the folder is still merged into.
+  t.is(
+    (await client.upload(await directory(t, 'site', { 'extra.txt': 'extra' }))).status,
+    'COMMITTED'
+  )
+  t.is(await fs.promises.readFile(path.join(folder, 'added-by-hand.txt'), 'utf8'), 'hand')
+
+  // An owned file edited by hand is no longer what Swarm wrote, so replacing it is refused, even
+  // though names may be replaced, and nothing else in that upload is published.
+  await fs.promises.writeFile(path.join(folder, 'index.html'), 'edited by hand')
+  await t.exception(client.upload(await directory(t, 'site', site(2, { 'late.txt': 'late' }))), {
     code: ERRORS.FILE_EXISTS
   })
-  t.is(await fs.promises.readFile(path.join(storage, 'site', 'added-by-hand.txt'), 'utf8'), 'hand')
-  t.is(await exists(path.join(storage, 'site', 'v2-0.bin')), false)
+  t.is(await fs.promises.readFile(path.join(folder, 'index.html'), 'utf8'), 'edited by hand')
+  t.is(await fs.promises.readFile(path.join(folder, 'assets', 'app.js'), 'utf8'), 'app 1')
+  t.is(await exists(path.join(folder, 'late.txt')), false)
+  t.is(await fs.promises.readFile(path.join(folder, 'added-by-hand.txt'), 'utf8'), 'hand')
 })
 
 test('a selector names what may be replaced: exact names, templates, and bare {version}', async (t) => {
@@ -239,10 +350,10 @@ test('a selector names what may be replaced: exact names, templates, and bare {v
     allowReplace: ['beta-{version}', 'latest.json', '{version}']
   })
   const replaced = async (name: string, from: number, to: number): Promise<void> => {
-    await client.upload(await directory(t, name, spec(from)))
-    const result = await client.upload(await directory(t, name, spec(to)))
+    await client.upload(await directory(t, name, site(from)))
+    const result = await client.upload(await directory(t, name, site(to)))
     t.is(result.status, 'COMMITTED', name)
-    t.alike(await snapshot(path.join(storage, name)), shape(spec(to)), name)
+    t.alike(await snapshot(path.join(storage, name)), shape(site(to)), name)
   }
   await replaced('beta-1.0.0', 1, 2)
   await replaced('0.18.1', 1, 2)
@@ -252,63 +363,78 @@ test('a selector names what may be replaced: exact names, templates, and bare {v
   t.is(await fs.promises.readFile(path.join(storage, 'latest.json'), 'utf8'), '{"v":2}')
 
   for (const name of ['prod-1.0.0', 'app']) {
-    await client.upload(await directory(t, name, spec(1)))
-    await t.exception(client.upload(await directory(t, name, spec(2))), {
+    await client.upload(await directory(t, name, site(1)))
+    await t.exception(client.upload(await directory(t, name, site(2))), {
       code: ERRORS.FILE_EXISTS
     })
-    t.alike(await snapshot(path.join(storage, name)), shape(spec(1)), `${name} is not selected`)
+    t.alike(await snapshot(path.join(storage, name)), shape(site(1)), `${name} is not selected`)
+    // New files still merge into a name nobody may replace files of.
+    t.is(
+      (await client.upload(await directory(t, name, { 'more.txt': 'more' }))).status,
+      'COMMITTED'
+    )
   }
 })
 
-test('a legacy replaceNames entry replaces a managed directory as well as a file', async (t) => {
+test('a legacy replaceNames entry replaces the files of a managed directory as well as a file', async (t) => {
   const { client, storage } = await setup(t, { replaceNames: ['site'] })
-  await client.upload(await directory(t, 'site', spec(1)))
-  t.is((await client.upload(await directory(t, 'site', spec(2)))).status, 'COMMITTED')
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(2)))
-  await client.upload(await directory(t, 'other', spec(1)))
-  await t.exception(client.upload(await directory(t, 'other', spec(2))), {
+  await client.upload(await directory(t, 'site', site(1)))
+  t.is((await client.upload(await directory(t, 'site', site(2)))).status, 'COMMITTED')
+  t.alike(await snapshot(path.join(storage, 'site')), shape(site(2)))
+  await client.upload(await directory(t, 'other', site(1)))
+  await t.exception(client.upload(await directory(t, 'other', site(2))), {
     code: ERRORS.FILE_EXISTS
   })
 })
 
-test('a reader of the public path never sees the directory missing or half published', async (t) => {
+test('a reader never finds a file missing or half written while the files of a folder are replaced', async (t) => {
   const { client, storage } = await setup(t, { allowReplace: true })
   const versions = [1, 2, 3, 4, 5]
-  // One directory listing resolves the public name once, so it is a single tree's complete
-  // listing or it is a failure; a walk of several paths could straddle two replacements.
-  const top = (version: number): string =>
-    Object.keys(spec(version, 8))
-      .filter((relative) => !relative.includes('/') || relative === 'nested/')
-      .map((relative) => relative.replace(/\/$/, ''))
-      .sort()
-      .join('|')
-  const known = new Set(versions.map(top))
-  await client.upload(await directory(t, 'site', spec(1, 8)))
+  const paths = ['a.bin', 'nested/b.bin', 'c.bin']
+  // Long enough that a torn read of one file could not be mistaken for a whole version.
+  const body = (version: number, name: string): string => `${name}:${version}:`.repeat(2_000)
+  const tree = (version: number): TreeSpec => ({
+    'a.bin': body(version, 'a'),
+    'nested/': '',
+    'nested/b.bin': body(version, 'b'),
+    'c.bin': body(version, 'c')
+  })
+  const known = new Map(
+    paths.map((relative) => [
+      relative,
+      new Set(versions.map((version) => filesOf(tree(version))[relative]))
+    ])
+  )
+  await client.upload(await directory(t, 'site', tree(1)))
 
+  // Files are published one at a time, so a reader may see some files of a newer upload next to
+  // older ones. What it never sees is the folder or a file missing, or a file in between.
   const violations: string[] = []
   const state = { stop: false, reads: 0 }
-  const site = path.join(storage, 'site')
+  const folder = path.join(storage, 'site')
   const reader = (async () => {
     while (!state.stop) {
-      try {
-        const seen = (await fs.promises.readdir(site)).sort().join('|')
-        await fs.promises.lstat(site)
-        state.reads++
-        if (!known.has(seen)) violations.push(seen)
-      } catch (error: unknown) {
-        violations.push(`missing: ${String((error as { code?: unknown }).code)}`)
+      for (const relative of paths) {
+        try {
+          const content = await fs.promises.readFile(path.join(folder, relative), 'utf8')
+          state.reads++
+          if (!known.get(relative)?.has(content)) violations.push(`${relative}: unknown content`)
+        } catch (error: unknown) {
+          violations.push(`${relative}: ${String((error as { code?: unknown }).code)}`)
+        }
       }
       await sleep(0)
     }
   })()
   for (const version of versions.slice(1)) {
-    t.is((await client.upload(await directory(t, 'site', spec(version, 8)))).status, 'COMMITTED')
+    t.is((await client.upload(await directory(t, 'site', tree(version)))).status, 'COMMITTED')
   }
   state.stop = true
   await reader
-  t.alike(violations, [], 'no read saw the name missing or a mix of two trees')
-  t.ok(state.reads > 0, 'the reader ran while directories were exchanged')
-  t.alike(await snapshot(site), shape(spec(5, 8)))
+  t.alike(violations, [], 'every read saw a whole file of some version')
+  t.ok(state.reads > 0, 'the reader ran while files were replaced')
+  t.alike(await snapshot(folder), shape(tree(5)))
+  t.alike(await histories(storage), [])
 })
 
 test('an awaited hook keeps its artifact in place until it is done, then the replacement goes through', async (t) => {
@@ -326,26 +452,26 @@ test('an awaited hook keeps its artifact in place until it is done, then the rep
     hookModes: { afterCommit: 'response' }
   })
   const other = connect()
-  const first = client.upload(await directory(t, 'site', spec(1)))
+  const first = client.upload(await directory(t, 'site', site(1)))
   await entered.promise
 
-  await t.exception(other.upload(await directory(t, 'site', spec(2))), {
+  await t.exception(other.upload(await directory(t, 'site', site(2))), {
     code: ERRORS.FILE_BUSY
   })
   t.is(
-    (await other.upload(await directory(t, 'unrelated', spec(1)))).status,
+    (await other.upload(await directory(t, 'unrelated', site(1)))).status,
     'COMMITTED',
     'another name is unaffected'
   )
   t.alike(
     await snapshot(path.join(storage, 'site')),
-    shape(spec(1)),
+    shape(site(1)),
     'nothing moved under the hook'
   )
   gate.resolve()
   t.is((await first).status, 'COMMITTED')
-  t.is((await other.upload(await directory(t, 'site', spec(2)))).status, 'COMMITTED')
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(2)))
+  t.is((await other.upload(await directory(t, 'site', site(2)))).status, 'COMMITTED')
+  t.alike(await snapshot(path.join(storage, 'site')), shape(site(2)))
 })
 
 test('a queued or running detached hook keeps its artifact in place until it ends', async (t) => {
@@ -362,16 +488,16 @@ test('a queued or running detached hook keeps its artifact in place until it end
     }
   })
   const other = connect()
-  t.is((await client.upload(await directory(t, 'site', spec(1)))).status, 'COMMITTED')
+  t.is((await client.upload(await directory(t, 'site', site(1)))).status, 'COMMITTED')
   await entered.promise
-  await t.exception(other.upload(await directory(t, 'site', spec(2))), {
+  await t.exception(other.upload(await directory(t, 'site', site(2))), {
     code: ERRORS.FILE_BUSY
   })
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(1)))
+  t.alike(await snapshot(path.join(storage, 'site')), shape(site(1)))
   gate.resolve()
-  const result = await retryWhileBusy(async () => other.upload(await directory(t, 'site', spec(2))))
+  const result = await retryWhileBusy(async () => other.upload(await directory(t, 'site', site(2))))
   t.is(result.status, 'COMMITTED')
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(2)))
+  t.alike(await snapshot(path.join(storage, 'site')), shape(site(2)))
 })
 
 test('an explicit link request keeps its target in place under either failure policy', async (t) => {
@@ -390,23 +516,23 @@ test('an explicit link request keeps its target in place under either failure po
       hookModes: { afterLink: 'response' }
     })
     const other = connect()
-    await client.upload(await directory(t, 'site', spec(1)))
+    await client.upload(await directory(t, 'site', site(1)))
     const linking = client.link('site', 'current', { hookFailure })
     await entered.promise
     await t.exception(
-      other.upload(await directory(t, 'site', spec(2))),
+      other.upload(await directory(t, 'site', site(2))),
       { code: ERRORS.FILE_BUSY },
       hookFailure
     )
-    t.alike(await snapshot(path.join(storage, 'site')), shape(spec(1)), hookFailure)
+    t.alike(await snapshot(path.join(storage, 'site')), shape(site(1)), hookFailure)
     gate.resolve()
     t.is((await linking).status, 'LINKED', hookFailure)
     const result = await retryWhileBusy(async () =>
-      other.upload(await directory(t, 'site', spec(2)))
+      other.upload(await directory(t, 'site', site(2)))
     )
     t.is(result.status, 'COMMITTED', hookFailure)
     t.is(await fs.promises.readlink(path.join(storage, 'current')), 'site')
-    t.alike(await snapshot(path.join(storage, 'site')), shape(spec(2)), hookFailure)
+    t.alike(await snapshot(path.join(storage, 'site')), shape(site(2)), hookFailure)
   }
 })
 
@@ -422,24 +548,35 @@ test('links follow a replaced name and run afterLink again for the new bytes', a
     },
     hookModes: { afterLink: 'response' }
   })
-  const first = await client.upload(await directory(t, 'site', spec(1)))
+  // The artifact's identity in a hook is that of the files it owns, not of the upload that wrote them.
+  const firstId = publishedAs('site', filesOf(site(1))).transferId
+  const secondId = publishedAs('site', filesOf(site(2))).transferId
+  const first = await client.upload(await directory(t, 'site', site(1)))
   t.alike(
     contexts.map((context) => [context.link.name, context.status, context.artifact.transferId]),
-    [['latest', 'LINKED', idOf(first)]]
+    [['latest', 'LINKED', firstId]]
   )
+  t.not(idOf(first), firstId)
   t.is((await client.link('site', 'current')).status, 'LINKED')
 
-  const second = await client.upload(await directory(t, 'site', spec(2)))
+  await client.upload(await directory(t, 'site', site(2)))
   const automatic = contexts.filter((context) => context.link.name === 'latest')
   t.is(automatic.length, 2, 'the automatic link hook ran for the replacement')
   t.is(automatic[1].status, 'LINKED')
-  t.is(automatic[1].artifact.transferId, idOf(second), 'with the new artifact')
+  t.is(automatic[1].artifact.transferId, secondId, 'with the new artifact')
   t.is(await fs.promises.readlink(path.join(storage, 'latest')), 'site')
   t.is(
     await fs.promises.readlink(path.join(storage, 'current')),
     'site',
     'the manual link is intact'
   )
+
+  const retried = await client.upload(await directory(t, 'site', site(2)))
+  t.is(retried.status, 'ALREADY_COMMITTED')
+  const retryHook = contexts[contexts.length - 1]
+  t.is(retryHook.link.name, 'latest', 'an exact retry still runs the automatic link hook')
+  t.is(retryHook.status, 'UNCHANGED')
+  t.is(retryHook.artifact.transferId, secondId, 'the retry uses the committed group snapshot')
 
   // Publishing again runs the hook again for the bytes that are there now.
   const before = contexts.length
@@ -450,7 +587,7 @@ test('links follow a replaced name and run afterLink again for the new bytes', a
   t.is(last.link.name, 'current')
   t.is(last.trigger, 'request')
   t.is(last.status, 'UNCHANGED')
-  t.is(last.artifact.transferId, idOf(second))
+  t.is(last.artifact.transferId, secondId)
 })
 
 test('a slow commit outlives an impatient client and an exact retry finds it committed', async (t) => {
@@ -484,23 +621,23 @@ test('a slow commit outlives an impatient client and an exact retry finds it com
 })
 
 // Opt-in: point this at an installed `swarm-deploy` 0.7.x package directory to start the real
-// older release on a state directory a directory replacement has marked.
+// older release on a state directory a file-level merge has marked.
 const OLD_SERVER = process.env?.SWARM_DEPLOY_OLD_SERVER ?? ''
 
-test('a 0.7 server refuses the state directory of a replaced directory before it reads anything', async (t) => {
+test('a 0.7 server refuses the state directory of a merged directory before it reads anything', async (t) => {
   if (OLD_SERVER === '') {
     t.pass('skipped: SWARM_DEPLOY_OLD_SERVER is not set, so no real 0.7 server was started')
     return
   }
   const { server, storage, client, testnet } = await setup(t, { allowReplace: true })
-  const first = await client.upload(await directory(t, 'site', spec(1)))
-  await client.upload(await directory(t, 'site', spec(2)))
+  await client.upload(await directory(t, 'site', site(1)))
+  await client.upload(await directory(t, 'site', site(2)))
   await client.close()
   await server.close()
 
   const state = stateDirFor(path.resolve(storage))
   const before = {
-    commits: (await fs.promises.readdir(path.join(state, 'commits'))).sort(),
+    catalogs: (await fs.promises.readdir(path.join(state, 'catalogs'))).sort(),
     record: await fs.promises.readFile(path.join(state, '.swarm-deploy-state.json'), 'utf8')
   }
   const { Server: Earlier } = require(path.join(OLD_SERVER, 'dist', 'index.js')) as {
@@ -519,26 +656,21 @@ test('a 0.7 server refuses the state directory of a replaced directory before it
   })
   await t.exception(() => older.listen(), { message: /Malformed state directory record/ })
 
-  t.alike((await fs.promises.readdir(path.join(state, 'commits'))).sort(), before.commits)
+  t.alike((await fs.promises.readdir(path.join(state, 'catalogs'))).sort(), before.catalogs)
   t.is(
     await fs.promises.readFile(path.join(state, '.swarm-deploy-state.json'), 'utf8'),
     before.record
   )
-  t.alike(
-    await snapshot(path.join(storage, historyName(idOf(first)))),
-    shape(spec(1)),
-    'nothing was touched'
-  )
-  t.alike(await snapshot(path.join(storage, 'site')), shape(spec(2)))
+  t.alike(await snapshot(path.join(storage, 'site')), shape(site(2)), 'nothing was touched')
 })
 
 // Opt-in compatibility with earlier clients: a comma-separated list of installed `swarm-deploy`
-// package directories (for example 0.3.0 and 0.6.3), each of which uploads, and replaces, both a
-// file and a directory against this server. They share the server's local test network, because
-// separate local networks cannot find each other.
+// package directories (for example 0.3.0 and 0.6.3), each of which uploads, and replaces, a file
+// and uploads a directory that merges into the folder of this server. They share the server's local
+// test network, because separate local networks cannot find each other.
 const OLD_CLIENTS = (process.env?.SWARM_DEPLOY_OLD_CLIENTS ?? '').split(',').filter(Boolean)
 
-test('earlier clients replace managed files and directories against a server that allows it', async (t) => {
+test('earlier clients replace managed files and merge directories against a server that allows it', async (t) => {
   if (OLD_CLIENTS.length === 0) {
     t.pass('skipped: SWARM_DEPLOY_OLD_CLIENTS is not set, so no earlier client was run')
     return
@@ -561,9 +693,9 @@ test('earlier clients replace managed files and directories against a server tha
     t.is((await earlier.upload(await file(t, name, 'one'))).status, 'COMMITTED', label)
     t.is((await earlier.upload(await file(t, name, 'two'))).status, 'COMMITTED', label)
     t.is(await fs.promises.readFile(path.join(storage, name), 'utf8'), 'two', label)
-    const site = `earlier-${index}-site`
-    t.is((await earlier.upload(await directory(t, site, spec(1)))).status, 'COMMITTED', label)
-    t.is((await earlier.upload(await directory(t, site, spec(2)))).status, 'COMMITTED', label)
-    t.alike(await snapshot(path.join(storage, site)), shape(spec(2)), label)
+    const folder = `earlier-${index}-site`
+    t.is((await earlier.upload(await directory(t, folder, site(1)))).status, 'COMMITTED', label)
+    t.is((await earlier.upload(await directory(t, folder, site(2)))).status, 'COMMITTED', label)
+    t.alike(await snapshot(path.join(storage, folder)), shape(site(2)), label)
   }
 })

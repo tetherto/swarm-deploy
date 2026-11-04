@@ -107,6 +107,8 @@ export interface StorageLayout {
   links: string
   /** Private destination a managed directory is renamed into before deletion. */
   trash: string
+  /** Private per-file ownership catalogs, one per directory artifact (`file-catalog-v1`). */
+  catalogs: string
   lock: string
 }
 

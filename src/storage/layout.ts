@@ -94,7 +94,8 @@ export const METADATA_DIRECTORY_NAMES = [
   'journals',
   'publications',
   'links',
-  'trash'
+  'trash',
+  'catalogs'
 ] as const
 
 const MAX_STATE_ROOT_BYTES = 4 * 1024
@@ -147,6 +148,7 @@ export function resolveLayout(storageDir: string, stateDir: string): StorageLayo
     publications: path.join(internal, 'publications'),
     links: path.join(internal, 'links'),
     trash: path.join(internal, 'trash'),
+    catalogs: path.join(internal, 'catalogs'),
     lock: path.join(internal, 'lock')
   }
 }
@@ -930,7 +932,8 @@ export function protectedDirectories(layout: StorageLayout): string[] {
     layout.journals,
     layout.publications,
     layout.links,
-    layout.trash
+    layout.trash,
+    layout.catalogs
   ]
 }
 
