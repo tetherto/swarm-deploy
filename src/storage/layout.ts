@@ -480,9 +480,16 @@ function boundElsewhereError(
  * directory's root record, in a shape older releases refuse (see {@link requireStateFeature}).
  */
 export const STATE_FEATURE_DIRECTORY_REPLACEMENT = 'directory-replacement-v1'
-export type StateFeature = typeof STATE_FEATURE_DIRECTORY_REPLACEMENT
+/**
+ * The state directory holds per-file ownership catalogs (`storage/file-catalog.ts`). Prepared here
+ * so a catalog is never written before the barrier is durable; nothing requires it yet.
+ */
+export const STATE_FEATURE_FILE_CATALOG = 'file-catalog-v1'
+export type StateFeature =
+  typeof STATE_FEATURE_DIRECTORY_REPLACEMENT | typeof STATE_FEATURE_FILE_CATALOG
 const KNOWN_STATE_FEATURES: ReadonlySet<string> = new Set<string>([
-  STATE_FEATURE_DIRECTORY_REPLACEMENT
+  STATE_FEATURE_DIRECTORY_REPLACEMENT,
+  STATE_FEATURE_FILE_CATALOG
 ])
 const STATE_FEATURE_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/
 

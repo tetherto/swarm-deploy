@@ -39,6 +39,8 @@
     "test/unit/commit-recovery.test.ts",
     "test/unit/replace-policy.test.ts",
     "test/unit/directory-replacement.test.ts",
+    "test/unit/file-catalog.test.ts",
+    "test/unit/file-merge.test.ts",
     "test/integration/direct-upload.test.ts",
     "test/integration/source-parent-optout.test.ts",
     "test/integration/behavior-observability.test.ts",

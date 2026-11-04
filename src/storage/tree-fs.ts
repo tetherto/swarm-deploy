@@ -53,11 +53,25 @@ const PUBLISHED_FILE_MODE = 0o644
 
 export type TreePathState = 'MISSING' | 'DIRECTORY' | 'UNMANAGED'
 
+/** The verified content digest of one regular file of a tree. */
+export interface TreeFileDigest {
+  /** Relative POSIX path inside the tree. */
+  path: string
+  size: number
+  sha256: Buffer
+}
+
 export interface TreeDigestResult {
   entries: TreeEntry[]
   entryCount: number
   payloadBytes: number
   treeSha256: Buffer
+  /**
+   * Every regular file with the digest this call just computed from its bytes, in canonical path
+   * order (directories carry no digest). They are the very values `treeSha256` is built from, so a
+   * caller that needs per-file facts gets them from the same verified read, not from a second one.
+   */
+  files: TreeFileDigest[]
 }
 
 /** Optional exact protection: pass the layout to forbid every protected directory by identity. */
@@ -826,11 +840,19 @@ export async function digestTree(
     path: entryPath,
     size
   }))
+  const files: TreeFileDigest[] = []
+  for (const { entry, sha256 } of digests) {
+    // Every file entry above was digested, so a file without a digest cannot reach here.
+    if (entry.kind === 'file' && sha256 !== undefined) {
+      files.push({ path: entry.path, size: entry.size, sha256: b4a.from(sha256) })
+    }
+  }
   return {
     entries,
     entryCount: entries.length,
     payloadBytes,
-    treeSha256: treeDigest(digests)
+    treeSha256: treeDigest(digests),
+    files
   }
 }
 
