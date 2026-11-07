@@ -150,7 +150,14 @@ async function createHarness(
   const sessions = new TarSessionStore({ layout, maxStagingBytes: 1024 * 1024, storage })
   await sessions.init()
   t.teardown(() => sessions.close())
-  const commits = new CommitStore({ layout, storage, logger: { warn() {} } })
+  // This file covers the recovery of journals and records of earlier builds, so a directory is
+  // committed here as those builds did. The file-level merge has its own tests (file-merge-commit).
+  const commits = new CommitStore({
+    layout,
+    storage,
+    logger: { warn() {} },
+    legacyDirectoryTrees: true
+  })
 
   async function stage(
     content: Buffer,
@@ -981,7 +988,11 @@ test('create-path journal recovery preserves release coordinates through real se
     const raw = JSON.parse(await fs.promises.readFile(crash.journal, 'utf8'))
     t.alike(raw.record.release, RELEASE, `${boundary} durable journal release`)
     const parsed = await readCommitJournal(crash.id, crash.harness.layout, createStorage())
-    t.alike(parsed?.record.release, RELEASE, `${boundary} parsed journal release`)
+    t.alike(
+      (parsed as { record: CommitRecord } | null)?.record.release,
+      RELEASE,
+      `${boundary} parsed journal release`
+    )
     t.alike(serializeJournal(parsed as AnyCommitJournal), raw, `${boundary} serialize round trip`)
 
     const { sessions, commits, recover } = await recoverCreate(crash)

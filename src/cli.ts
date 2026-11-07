@@ -1347,7 +1347,7 @@ function formatResetReport(report: StorageResetReport): string[] {
   lines.push(`fresh start: ${report.freshStart ? 'yes' : 'no'}`)
   if (payloads.length > 0) {
     lines.push(
-      'note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually'
+      'note: remaining payloads are unmanaged; existing files cannot be replaced, but directory uploads may add missing files and leave identical files unchanged'
     )
   }
   if (symlinks.length > 0) {

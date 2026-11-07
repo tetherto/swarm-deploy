@@ -6,7 +6,7 @@ import { ERRORS, SwarmDeployError } from '../errors.js'
 import { historyName, isReservedHistoryName, validateBasename } from '../files.js'
 import { parseStrictVersion } from '../semver.js'
 import { assertSafeUint } from '../validation.js'
-import { MAX_TREE_ENTRIES } from '../tar-protocol/tree.js'
+import { MAX_TREE_ENTRIES, assertTreeEntryPath } from '../tar-protocol/tree.js'
 import { MetadataFormatError, readJson } from './atomic-file.js'
 import { assertSafeFile } from './layout.js'
 import type { StorageAdapter, StorageLayout, StorageStat } from './types.js'
@@ -120,6 +120,13 @@ export interface CommitRecord {
   transferId: string
   release?: CommitRelease
   replaces?: CommitReplacement
+  /**
+   * Set only on the aggregate view of a per-file ownership catalog (`file-catalog.ts`), which is
+   * built in memory and never persisted: `transferId` is then the published snapshot ID, `size` the
+   * owned bytes, `entryCount` the owned files. It is the artifact retention, links and hooks see,
+   * and it is never a directory to remove as a whole.
+   */
+  group?: true
 }
 
 /** Newest first: descending commit time, then transfer ID and name for determinism. */
@@ -330,8 +337,87 @@ export interface DirectoryReplacementJournal {
   record: CommitRecord
 }
 
+/** The journal of one file-level merge of an uploaded directory (`file-catalog-v1`). */
+const FILE_MERGE_JOURNAL_VERSION = 5
+/**
+ * Bound of a merge journal: it lists every action of an upload of up to 10 000 entries, so it is
+ * larger than the 16 KiB of the older, fixed-size journals, and just as strictly bounded.
+ */
+const MAX_FILE_JOURNAL_BYTES = 16 * 1024 * 1024
+
+/**
+ * Ordered boundaries of a merge. `journaled`: every action and the identity of what it will touch
+ * are durable, nothing public has changed. `prepared`: private preimages and links exist and the
+ * missing directories are created (their identities recorded). `installed`: every file is in place.
+ * `cleanup`: the catalog is durable and what remains is private residue. The phase is only the trail
+ * of intent: whether the merge happened is decided by the durable catalog, never by the phase.
+ */
+export const FILE_MERGE_PHASES = ['journaled', 'prepared', 'installed', 'cleanup'] as const
+export type FileMergePhase = (typeof FILE_MERGE_PHASES)[number]
+
+/** One planned change to one public file, with the inodes that make it provable. */
+export interface FileMergeAction {
+  op: 'add' | 'replace'
+  /** Canonical relative path inside the artifact. */
+  path: string
+  size: number
+  sha256: string
+  /** The staged inode that is installed. */
+  staged: FileIdentity
+  /** For a replacement: the owned inode that is replaced, kept privately until the commit is durable. */
+  previous?: FileIdentity
+}
+
+export interface FileMergeDirectory {
+  path: string
+  /**
+   * Set once this merge made the directory and recorded it. `null` while it is only planned (the
+   * directory was missing when planned): rollback removes it only if it is still empty.
+   */
+  identity: FileIdentity | null
+}
+
+/**
+ * The transaction of one directory upload merged into a (possibly shared) container. The journal
+ * is keyed by the source session's transfer ID. The published snapshot ID is a different identity:
+ * it names the owned set afterwards.
+ */
+export interface FileMergeJournal {
+  version: typeof FILE_MERGE_JOURNAL_VERSION
+  intent: 'merge-files'
+  state: 'committing' | 'aborting'
+  phase: FileMergePhase
+  /** The source transfer ID: the upload's session, staged tree and journal name. */
+  transferId: string
+  attemptId: string
+  name: string
+  /** The generation the catalog on disk must have (0: none yet), and the one this merge writes. */
+  baseGeneration: number
+  generation: number
+  /** The snapshot ID of the owned set this merge publishes. */
+  snapshotId: string
+  /** The one it replaces (none for a first merge): both stay pinned while the journal is open. */
+  previousSnapshotId: string | null
+  uploader: string
+  committedAt: number
+  release?: CommitRelease
+  stagingTreeIdentity: FileIdentity
+  actions: FileMergeAction[]
+  directories: FileMergeDirectory[]
+  /** Legacy whole-tree records this merge supersedes; retired once the catalog is durable. */
+  legacyRecords: string[]
+}
+
 export type AnyCommitJournal =
-  CommitJournal | ReplacementJournal | DirectoryCommitJournal | DirectoryReplacementJournal
+  | CommitJournal
+  | ReplacementJournal
+  | DirectoryCommitJournal
+  | DirectoryReplacementJournal
+  | FileMergeJournal
+
+export function isFileMergeJournal(journal: AnyCommitJournal | null): journal is FileMergeJournal {
+  return journal !== null && journal.version === FILE_MERGE_JOURNAL_VERSION
+}
 
 export function isDirectoryReplacementJournal(
   journal: AnyCommitJournal | null
@@ -562,8 +648,177 @@ function parseDirectoryReplacementJournal(
   }
 }
 
+const FILE_MERGE_KEYS = [
+  'version',
+  'intent',
+  'state',
+  'phase',
+  'transferId',
+  'attemptId',
+  'name',
+  'baseGeneration',
+  'generation',
+  'snapshotId',
+  'previousSnapshotId',
+  'uploader',
+  'committedAt',
+  'release',
+  'stagingTreeIdentity',
+  'actions',
+  'directories',
+  'legacyRecords'
+]
+
+function journalUint(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new CorruptJournalError('Invalid file merge journal')
+  }
+  return value
+}
+
+function parseFileMergeJournal(id: string, journal: Record<string, unknown>): FileMergeJournal {
+  const bad = (): CorruptJournalError => new CorruptJournalError('Invalid file merge journal')
+  if (
+    Object.keys(journal).some((key) => !FILE_MERGE_KEYS.includes(key)) ||
+    journal.intent !== 'merge-files' ||
+    (journal.state !== 'committing' && journal.state !== 'aborting') ||
+    !FILE_MERGE_PHASES.includes(journal.phase as FileMergePhase) ||
+    !sameTransferId(journal.transferId as string, id) ||
+    !isHex(journal.attemptId) ||
+    !isHex(journal.snapshotId) ||
+    (journal.previousSnapshotId !== null && !isHex(journal.previousSnapshotId)) ||
+    !isHex(journal.uploader) ||
+    typeof journal.name !== 'string'
+  ) {
+    throw bad()
+  }
+  let name: string
+  try {
+    name = validateBasename(journal.name)
+    if (isReservedHistoryName(name)) throw storageError('Reserved merge name')
+  } catch (error: unknown) {
+    throw new CorruptJournalError('Invalid file merge journal name', error)
+  }
+  const baseGeneration = journalUint(journal.baseGeneration)
+  const generation = journalUint(journal.generation)
+  if (generation < baseGeneration + 1) throw bad()
+  let release: CommitRelease | undefined
+  if (journal.release !== undefined) {
+    try {
+      assertCommitRelease(journal.release)
+    } catch (error: unknown) {
+      throw new CorruptJournalError('Invalid file merge journal release', error)
+    }
+    const source = journal.release as CommitRelease
+    release = {
+      series: source.series,
+      ...(source.version === undefined ? {} : { version: source.version })
+    }
+  }
+  if (!Array.isArray(journal.actions) || journal.actions.length > MAX_TREE_ENTRIES) throw bad()
+  if (!Array.isArray(journal.directories) || journal.directories.length > MAX_TREE_ENTRIES) {
+    throw bad()
+  }
+  if (!Array.isArray(journal.legacyRecords) || journal.legacyRecords.length > 8) throw bad()
+  const paths = new Set<string>()
+  const actions = journal.actions.map((entry: unknown): FileMergeAction => {
+    if (!isRecordLike(entry)) throw bad()
+    const keys = Object.keys(entry)
+    if (keys.some((key) => !['op', 'path', 'size', 'sha256', 'staged', 'previous'].includes(key))) {
+      throw bad()
+    }
+    if (entry.op !== 'add' && entry.op !== 'replace') throw bad()
+    if (typeof entry.path !== 'string' || paths.has(entry.path)) throw bad()
+    try {
+      assertTreeEntryPath(entry.path, 'file')
+    } catch (error: unknown) {
+      throw new CorruptJournalError('Invalid file merge journal path', error)
+    }
+    paths.add(entry.path)
+    if (!isHex(entry.sha256)) throw bad()
+    if ((entry.op === 'replace') !== (entry.previous !== undefined)) throw bad()
+    return {
+      op: entry.op,
+      path: entry.path,
+      size: journalUint(entry.size),
+      sha256: entry.sha256,
+      staged: parseIdentity(entry.staged),
+      ...(entry.previous === undefined ? {} : { previous: parseIdentity(entry.previous) })
+    }
+  })
+  const directoryPaths = new Set<string>()
+  const directories = journal.directories.map((entry: unknown): FileMergeDirectory => {
+    if (!isRecordLike(entry)) throw bad()
+    const keys = Object.keys(entry)
+    if (keys.some((key) => key !== 'path' && key !== 'identity')) throw bad()
+    if (typeof entry.path !== 'string' || directoryPaths.has(entry.path)) throw bad()
+    // Relative to the output root: the artifact's own name, then the upload's path below it.
+    const components = entry.path.split('/')
+    if (components.length > 33 || b4a.from(entry.path).byteLength > 400) throw bad()
+    try {
+      for (const component of components) {
+        validateBasename(component)
+        if (isReservedHistoryName(component)) throw storageError('Reserved merge path')
+      }
+    } catch (error: unknown) {
+      throw new CorruptJournalError('Invalid file merge journal path', error)
+    }
+    directoryPaths.add(entry.path)
+    return {
+      path: entry.path,
+      identity: entry.identity === null ? null : parseIdentity(entry.identity)
+    }
+  })
+  const legacyRecords = journal.legacyRecords.map((value: unknown): string => {
+    if (!isHex(value)) throw bad()
+    return value
+  })
+  return {
+    version: FILE_MERGE_JOURNAL_VERSION,
+    intent: 'merge-files',
+    state: journal.state,
+    phase: journal.phase as FileMergePhase,
+    transferId: id,
+    attemptId: journal.attemptId,
+    name,
+    baseGeneration,
+    generation,
+    snapshotId: journal.snapshotId,
+    previousSnapshotId: journal.previousSnapshotId as string | null,
+    uploader: journal.uploader,
+    committedAt: journalUint(journal.committedAt),
+    ...(release === undefined ? {} : { release }),
+    stagingTreeIdentity: parseIdentity(journal.stagingTreeIdentity),
+    actions,
+    directories,
+    legacyRecords
+  }
+}
+
 /** The exact durable shape of a journal, for creation and phase transitions. */
 export function serializeJournal(journal: AnyCommitJournal): Record<string, unknown> {
+  if (journal.version === FILE_MERGE_JOURNAL_VERSION) {
+    return {
+      version: FILE_MERGE_JOURNAL_VERSION,
+      intent: journal.intent,
+      state: journal.state,
+      phase: journal.phase,
+      transferId: journal.transferId,
+      attemptId: journal.attemptId,
+      name: journal.name,
+      baseGeneration: journal.baseGeneration,
+      generation: journal.generation,
+      snapshotId: journal.snapshotId,
+      previousSnapshotId: journal.previousSnapshotId,
+      uploader: journal.uploader,
+      committedAt: journal.committedAt,
+      ...(journal.release === undefined ? {} : { release: journal.release }),
+      stagingTreeIdentity: journal.stagingTreeIdentity,
+      actions: journal.actions,
+      directories: journal.directories,
+      legacyRecords: journal.legacyRecords
+    }
+  }
   if (journal.version === DIRECTORY_REPLACEMENT_JOURNAL_VERSION) {
     return {
       version: DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
@@ -643,7 +898,12 @@ export async function readCommitJournal(
       if (isMissing(err)) return null
       throw err
     }
-    journal = await readJson(journalPath, storage, MAX_COMMIT_METADATA_BYTES)
+    journal = await readJson(journalPath, storage, MAX_FILE_JOURNAL_BYTES)
+    if (journal.version === FILE_MERGE_JOURNAL_VERSION) return parseFileMergeJournal(id, journal)
+    // Every older journal is a fixed-size record: the larger bound is only for a merge journal.
+    if (JSON.stringify(journal).length > MAX_COMMIT_METADATA_BYTES) {
+      throw new CorruptJournalError('Commit journal exceeds its size limit')
+    }
     if (journal.version === DIRECTORY_JOURNAL_VERSION) return parseDirectoryJournal(id, journal)
     if (journal.version === DIRECTORY_REPLACEMENT_JOURNAL_VERSION) {
       return parseDirectoryReplacementJournal(id, journal)
@@ -689,5 +949,7 @@ export {
   REPLACEMENT_JOURNAL_VERSION,
   DIRECTORY_JOURNAL_VERSION,
   DIRECTORY_REPLACEMENT_JOURNAL_VERSION,
-  MAX_COMMIT_METADATA_BYTES
+  FILE_MERGE_JOURNAL_VERSION,
+  MAX_COMMIT_METADATA_BYTES,
+  MAX_FILE_JOURNAL_BYTES
 }

@@ -82,8 +82,8 @@ paths, or hook output; the log is where to look for those).
 | `DISK_RESERVE`                         | Less free space than the reserve plus the upload needs (default reserve 1 GiB), measured where the private state's staging is; or, from 0.6.3, an upload write that failed with a raw `ENOSPC`/`EDQUOT` the server did not wrap.                                                                                                                                                                                                                                                              |
 | `STAGING_LIMIT`                        | Staged data would exceed `--max-staging-bytes`.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `FILE_TOO_LARGE`                       | The artifact exceeds `--max-file-bytes`.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `FILE_EXISTS`                          | The name already holds different content and is not a `--replace-name`.                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `ACTIVE_UPLOAD_LIMIT`, `FILE_BUSY`     | The server is at its upload limit, or the same transfer is already running; retry later.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `FILE_EXISTS`                          | An occupied standalone name, a differing untracked/edited leaf, a kind/case conflict, or replacement not permitted by `--allow-replace`/`--replace-name`.                                                                                                                                                                                                                                                                                                                                     |
+| `ACTIVE_UPLOAD_LIMIT`, `FILE_BUSY`     | The server is at its upload limit, a transfer or artifact is in use by another operation/hook, or earlier commit cleanup needs retry/recovery.                                                                                                                                                                                                                                                                                                                                                |
 | `HOOK_FAILED`                          | A deployment hook failed; the log has the reason, and the artifact may already be committed.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `COMMIT_FAILED`, `UNSUPPORTED_STORAGE` | The server could not write or commit. For an upload, a raw errno the server did not wrap maps here: permissions (`EACCES`, `EPERM`), a read-only volume (`EROFS`), an I/O error (`EIO`), or storage that cannot do the operation (`EXDEV`, `ENOSYS`, `ENOTSUP`, as `UNSUPPORTED_STORAGE`). The log names the errno as `systemCode`. The same errno inside a storage guard shows as `PROTOCOL_INVALID` instead.                                                                                |
 | `SERVER_ERROR`                         | An upload hit a raw error the server did not expect and did not wrap (0.6.3 or newer). The log has `reason: SERVER_ERROR` and the `phase`. Link requests do not use it.                                                                                                                                                                                                                                                                                                                       |
@@ -197,146 +197,102 @@ state directory (default `~/.swarm-deploy/<id>`, or `--state-dir`; see
 the server is running. Its `archive/` directory holds the archives written by
 [`reset-storage`](#resetting-storage-with-reset-storage); the server ignores it.
 
-Names are create-only by default:
+Standalone file names are create-only by default: a new name is committed,
+identical managed content returns `ALREADY_COMMITTED`, and a differing occupied
+name returns `FILE_EXISTS`. Opt-in file replacement preserves the old managed
+file as `history-<full-old-transfer-id>`.
 
-- New content for an unused name is committed atomically.
-- Identical managed content returns `ALREADY_COMMITTED`.
-- Different content for an occupied create-only name returns `FILE_EXISTS`.
-- Unmanaged files and paths are never overwritten or deleted. Files an operator
-  placed there, or artifacts whose metadata was removed, are legitimate: the
-  retention scan notes each one with an `Ignoring unknown committed path`
-  warning when it first appears (and again only if it went away and came
-  back), not on every scan. At most 32 names are listed per scan; any beyond that
-  are counted once in `Ignoring more unknown committed paths`. Only the log is
-  quieter: invalid managed state and failed scans or operations are still
-  reported each time they happen, and nothing unmanaged is adopted or removed.
+Directory uploads merge files into a container named after the input basename.
+For example, uploading `beta-0.21.0/flatpak/app.flatpak` and later uploading
+`beta-0.21.0/QV.AC.snap` keeps both files. Files omitted from a later upload stay.
+The containing directory need not have been created by Swarm. Empty directory
+entries create nothing; zero-byte files are real files.
 
-Names configured with `--replace-name` or `ServerOptions.replaceNames` are
-mutable, and from 0.8.0 so are the names `--allow-replace` /
-`ServerOptions.allowReplace` select (see
-[Replacing managed artifacts](#replacing-managed-artifacts)):
-
-- Different verified content atomically becomes current.
-- The prior managed inode and record are preserved as
-  `history-<full-old-transfer-id>`.
-- The current mutable name of `--replace-name` is pinned against age and quota
-  retention (the legacy, standing pin). `--allow-replace` pins nothing.
-- Historical versions remain eligible for retention.
-
-Commit journals and inode checks recover interrupted create and replacement
-operations. Recovery rolls back mutations before the durable new current
-sidecar and rolls forward operations after that linearization point.
+Unknown files are never adopted or removed. The scan logs an unknown top-level
+name once when it appears (again if it goes away and returns), at most 32 names
+per scan, with the rest counted. Invalid state and failed operations remain
+reported each time.
 
 ### Replacing managed artifacts
 
-Off by default. `--allow-replace` (repeatable, `ServerOptions.allowReplace`) lets
-an upload replace the Swarm-managed artifact that already holds its name, file or
-whole directory:
+Off by default, `--allow-replace` (`ServerOptions.allowReplace`) permits changed
+Swarm-managed files under selected artifact names:
 
 ```sh
 swarm-deploy server ... --allow-replace                     # every managed name
 swarm-deploy server ... --allow-replace beta-{version}      # a template
 swarm-deploy server ... --allow-replace latest.json --allow-replace 0.18.1
-swarm-deploy server ... --allow-replace '{version}'         # SemVer-named artifacts only
+swarm-deploy server ... --allow-replace '{version}'         # SemVer names only
 ```
 
-- **Only managed artifacts, whatever the setting.** A path nobody uploaded, a
-  managed artifact whose content no longer matches its record (a directory with a
-  child added, changed or removed, an empty directory included), a symlink, and a
-  file where a directory is (or the reverse) are all left exactly as they are and
-  the upload gets `FILE_EXISTS`. Names are matched exactly; a case variant on a
-  case-insensitive volume is not the managed name and is refused too.
-- **Selectors** are an exact artifact name, or a release template in the grammar of
-  `--artifact-pattern` matched against the final basename (`beta-{version}`,
-  `{series}-nightly`, a bare `{version}` for the names that are SemVer versions).
-  A `/` is refused: a source parent is asserted by the client and is not stored
-  with the artifact, so a permission could not be judged again from what is on
-  disk. A bare `--allow-replace` allows every managed name and wins over listed
-  selectors, which are still validated.
-- **Retention is unchanged.** Allowing replacement pins nothing against age,
-  count, version or quota retention, and does not stop scoped retention. Only the
-  legacy `--replace-name` keeps its standing pin. The artifact being replaced is
-  held, and a replaced artifact kept as history is an ordinary record again once the
-  replacement is done.
-- **A directory is replaced by an atomic exchange**, so the public path is never
-  absent and never half published: the new tree is parked at a private path, one
-  exchange puts it at the name, and the old tree becomes
-  `history-<old-transfer-id>`. It needs a storage adapter whose `atomicSwap`
-  provides the exchange. The default adapter does on Linux and macOS (it loads the
-  native `fs-native-extensions` addon the first time a directory is actually
-  replaced, never for a client or for file-only use). Windows has no atomic
-  exchange: a directory replacement is refused with `UNSUPPORTED_STORAGE` before
-  anything published changes, and so is a filesystem that cannot exchange. The
-  server tests the exchange once per storage layout, on scratch directories in the
-  private state. Replacing files needs none of this.
-- **A busy artifact is retried, not replaced.** While an awaited upload hook or an
-  explicit link request is using an artifact's public path, and while a queued or
-  running detached hook or an open link rollback journal names it, a replacement of
-  that name is refused with the retryable `FILE_BUSY`, so a hook never reads a path
-  whose content changes under it. A hook that already failed, or a link that
-  settled, holds nothing. This applies to files and directories, and to `--replace-name`
-  too.
-- **History and A, B, A.** The replaced artifact is kept as
-  `history-<its transfer id>`. When the returning content already has a history copy,
-  that copy is parked privately and restored exactly if the replacement does not
-  complete, and removed only once the new current record is durable, so the content
-  ends as the single current copy. A file's returning history copy is handled the
-  same way (0.8.0; before, it and its record were deleted before the new current
-  record was durable, so an interrupted A, B, A lost them): its file and its record
-  stay exactly as they are until the new current record replaces the history record
-  in one atomic step, and the duplicate file is removed only afterwards, once proven
-  to be a copy of the returning content. The returning copy is looked for after the
-  commit's own retention pass, so a pass that legitimately evicted it (quota, age,
-  count) leaves an ordinary replacement. No journal or record format changed, and a
-  journal an earlier release left still recovers. Only 0.8 finishes or undoes an
-  interrupted A, B, A: see the rollback note under
-  [Directory replacement and the state barrier](#directory-replacement-and-the-state-barrier-080).
-- **Links.** A managed symlink names the artifact by its path, so it keeps working
-  and serves the new bytes. An automatic link runs its `afterLink` hook again for
-  the replacement (`LINKED`); a manual link's ledger is untouched until it is
-  published again, and an explicit `link` request for the same target runs
-  `afterLink` (`UNCHANGED`) for the bytes that are there now.
-- **Downgrade barrier.** The first directory replacement durably rewrites the
-  state directory's record (`.swarm-deploy-state.json`) in a strict form that
-  0.7.x and older refuse as malformed at startup, before they read any journal,
-  record or session. Once a directory has been replaced the state needs this
-  release; to go back, restore the state directory from a backup taken before. The
-  barrier is written only when a directory replacement actually begins, and never
-  removed automatically. `reset-storage` keeps it. Before that, going back to 0.7.x
-  still needs one clean 0.8 start and stop, so that no unfinished replacement journal
-  is left for 0.7.x to refuse (see the rollback note under
-  [Directory replacement and the state barrier](#directory-replacement-and-the-state-barrier-080)).
+- Missing leaves can be added without replacement permission. A differing leaf
+  is replaced only when Swarm owns it and its current bytes match its record.
+  Identical content needs no physical rewrite; identical untracked content stays
+  untracked. A differing untracked or edited file, symlink, case alias or kind
+  conflict rejects the entire input before public changes.
+- Selectors match the top-level artifact basename, not individual member paths.
+  Each is an exact name or a release template in the artifact-pattern grammar;
+  `/` is refused. A bare flag permits every name and still validates listed
+  selectors. Legacy `--replace-name` names are also replacement permissions and
+  keep their standing retention pin; `--allow-replace` adds no pin.
+- An active awaited hook, queued/running detached hook, explicit link operation
+  or open link rollback journal keeps the artifact busy (`FILE_BUSY`). New
+  directory merges cannot change files under those users.
+- Links still name the artifact's container. Automatic reconciliation runs after
+  commit; explicit publication is a separate `link` request. Hooks on links see
+  the committed owned-file aggregate, while upload results describe the input.
+  A failed publishing hook applies the existing link rollback/keep policy and
+  does not undo committed upload files.
 
-Optional retention applies to managed artifacts only:
+#### Commit boundary and recovery
 
-- `maxAge`/`--max-age-days` removes eligible artifacts by age.
-- `maxStorageBytes`/`--max-storage-bytes` removes the oldest eligible artifacts
-  until under quota.
-- `maxCount`/`--max-count` and `maxVersions`/`--max-versions` rotate released
-  artifacts by series; see
-  [Artifact patterns and rotation](artifact-patterns.md).
-- `retentionScopes`/`--retention-scope` (0.7.0, off by default) bounds one family
-  of committed names such as `beta-{version}` by newest count and age without
-  requiring artifact patterns. It never removes anything a link, a rollback
-  journal, a replace-name, or a detached hook pins, and never touches production
-  names it does not match or files that were not uploaded. The first pass after a
-  restart removes every unpinned artifact it selects and there is no dry run, so
-  check what a pattern matches first; see
-  [Scoped retention](artifact-patterns.md#scoped-retention).
-- A directory is created by default and replaced only where replacement is allowed
-  (`--replace-name` or `--allow-replace`, from 0.8.0, above). A file-to-directory
-  or directory-to-file kind change is always rejected.
-- Committed artifacts, including directories, are immutable on disk. Do not write
-  into a committed directory after publish: hooks must not run `npm ci`, create
-  `.cache`, dotfiles, or extra symlinks inside the tree. If the tree changes,
-  startup hash scrub drops the sidecar while leaving the bytes in place, the
-  name stays occupied (`FILE_EXISTS`), the tree falls outside quota and rotation,
-  and a managed `latest` link can move to an older release.
-- Managed directories are deleted by renaming into the state directory's `trash`
-  before recursive removal. Startup sweeps proven trash residue.
-- Startup recovery re-hashes managed files and recursively verifies directory
-  tree digests. Scheduled and pre-commit passes validate type, sidecar, and root
-  identity without re-hashing entire trees on every tick.
+The server receives and verifies the complete input in private staging, then
+checks the complete file merge plan. Only then does it durably journal the
+planned changes and retain private preimages of replaced files. The containing
+directory is never exchanged or recursively overwritten. New files are installed
+and existing files replaced individually; a replaced path holds a complete old
+or new file throughout. Concurrent HTTP readers can nevertheless see a mixture
+of old and new files until the commit finishes. This is recoverable whole-commit
+rollback, not an instantaneous multi-file namespace switch.
+
+The durable owned-file catalog is the commit point. Failure before it restores
+all files changed by the input; failure after it preserves the committed files
+and retries cleanup. Interrupted operations are resolved on startup before the
+server listens. A cleanup failure keeps the journal and retention pins. A later
+merge of that name must finish the cleanup first; if it cannot, it returns
+`FILE_BUSY` without advancing the catalog. Routine scrub also leaves a pending
+catalog unchanged, so a restart cannot mistake earlier committed data for an
+unfinished upload.
+
+Directory merges keep no new public history tree. Their rollback preimages are
+private and removed after commit. Standalone file history and recovery of earlier
+whole-tree records/journals remain supported. The optional native directory
+exchange capability is needed only for earlier whole-tree replacement recovery,
+not for new merges.
+
+#### Ownership and retention
+
+One private catalog per artifact name records each owned leaf, digest and writer;
+it does not own the container. The combined owned set is limited to 10,000 files,
+with a bounded catalog and recent-transfer receipt list. An exact retry may be
+recognized at admission; a subset retry can be received and verified again and
+then perform no writes. Upload identity and committed owned-set identity differ.
+
+Retention still selects artifact/version groups by age, count, versions, quota
+and scoped selectors. It removes only owned files whose bytes still match their
+records and prunes only empty containers, preserving foreign siblings. Thus a
+collected version directory can remain if unrelated content still lives there.
+Linked targets, active hooks and unresolved journals can keep more than the
+configured count. Production names remain unaffected by beta/edge-only scopes.
+Startup hashes owned leaves. Missing or edited leaves lose ownership without
+being deleted; scheduled scans check existence/type/size without hashing every
+byte. Other owned leaves in the same container remain managed. Do not edit owned
+files while the server is running.
+
+Earlier whole-tree ownership imports only after the entire old tree matches its
+record. If it does not, its unknown files remain untouched; missing new leaves
+can still be added without adopting that old content. Deleting metadata is not a
+way to authorize replacement of unmanaged files. See the state barrier below.
 
 Runtime defaults:
 
@@ -387,7 +343,7 @@ archives: 0
 remaining payloads: 1 (app-2.4.1.tar.gz)
 remaining symlinks: 1 (latest)
 fresh start: no
-note: remaining payloads keep their names occupied; uploading the same name returns FILE_EXISTS until you remove them manually
+note: remaining payloads are unmanaged; existing files cannot be replaced, but directory uploads may add missing files and leave identical files unchanged
 note: remaining symlinks have no ownership record after the reset; an automatic --symlink rule for that name fails closed with LINK_CONFLICT until you remove them manually, while an explicit link request replaces them
 result: preview only, nothing changed; re-run with --apply to archive this metadata
 ```
@@ -401,9 +357,9 @@ belongs to another storage root makes the command exit `2` without changing
 anything.
 
 With `--apply` the command takes the storage lock, moves the state directory's
-`staging`, `sessions`, `commits`, `journals`, `publications`, `links`, and
+`staging`, `sessions`, `commits`, `catalogs`, `journals`, `publications`, `links`, and
 `trash` plus retired or abandoned lock directories into
-`<state>/archive/reset-<timestamp>-<random>/`, recreates the seven
+`<state>/archive/reset-<timestamp>-<random>/`, recreates the eight
 directories empty, writes a `reset.json` marker with `status: "completed"`,
 releases the lock, and prints the same report followed by `archive: <path>`.
 Every move is a rename inside the state directory, so nothing is copied, nothing
@@ -415,8 +371,10 @@ everything visible in the root are left untouched.
 What the reset does not do, and the report says so:
 
 - It never removes visible payloads, `history-*` files, directories, or
-  symlinks from the root. A remaining payload keeps its name occupied, so a
-  fresh upload of that name returns `FILE_EXISTS`. A remaining symlink loses
+  symlinks from the root. Remaining payloads become unmanaged: standalone files
+  cannot be replaced, but directory uploads may add missing leaves and leave
+  identical untracked files unchanged. Differing untracked files remain protected.
+  A remaining symlink loses
   its ownership record, so an automatic `--symlink` rule for that name fails
   closed with `LINK_CONFLICT`, while an explicit `link` request replaces it
   (see [Managed symlinks](managed-links.md)). `fresh start: yes` is
@@ -462,7 +420,7 @@ is the archive itself, and the marker keeps only a summary of it:
 - `version`: `2`. Version 1 markers stay readable.
 - `status`, `root`, `completedAt`, and the first attempt's `startedAt` and
   `pid`.
-- `moved`: the metadata directories the archive holds, at most seven names.
+- `moved`: the metadata directories the archive holds, at most eight names.
 - `locks`: `count` and `sha256` for the retired and abandoned lock directories
   in the archive's `locks/` directory. The names stay there; the digest is
   over each sorted name followed by a newline, so
@@ -542,38 +500,29 @@ into conforming folders.
 
 ### Directory replacement and the state barrier (0.8.0)
 
-Nothing changes until `--allow-replace` (or `--replace-name` for a directory) is
-used to replace a directory, and an older client works unchanged: no wire field or
-version changed. The first directory replacement durably rewrites the state
-directory's record, `.swarm-deploy-state.json`, from
-`{ "version": 1, "root": "<root>" }` to
-`{ "version": 2, "root": { "path": "<root>", "requires": ["directory-replacement-v1"] } }`
-before it writes any version 4 journal or history record. Releases through 0.7
-read `root` as a string and stop at startup with `Malformed state directory
-record`, before they read a journal, a record or a session, so they cannot
-quarantine the new journal as corrupt or delete the new history records as invalid.
-This release reads both shapes, `reset-storage` keeps the record, and nothing
-removes it.
+The first new file catalog durably changes `.swarm-deploy-state.json` to require
+`file-catalog-v1` before writing a new journal or catalog. Its form is:
 
-To roll back to 0.7.x after a directory was replaced, stop the server, restore the
-state directory and the output root together, from one backup taken before the first
-directory replacement (so records and published files stay consistent), and start
-0.7.x. Do not edit the record by hand: the version 4 history directories and records
-would then be handled by a release that cannot read them.
+```json
+{ "version": 2, "root": { "path": "<root>", "requires": ["file-catalog-v1"] } }
+```
 
-If no directory was ever replaced, the record is untouched and 0.7.x reads it, so
-no restore is needed. But stop the 0.8 server cleanly first: let it finish
-starting (it recovers every unfinished journal before it listens), stop it, check
-that `<state>/journals` holds no journal, and only then start 0.7.x. A 0.8 file
-replacement that returns earlier content (A, B, A) and is interrupted before its new
-current record is durable leaves a version 2 journal that 0.7.x parses but cannot
-finish: it refuses to start with `Commit sidecar does not match journal`, before it
-changes anything, until 0.8 has recovered that journal. 0.7.x never recovers it. If
-0.8 itself refuses to start, resolve that first; do not start 0.7.x on the state.
+Existing required features are preserved. Older servers stop before processing
+these journals, catalogs or sessions. This barrier can be written by adding a
+file through a directory upload, even without replacement permission.
+`reset-storage` preserves it and archives catalogs along with other live state.
+Never remove or edit it to force a downgrade. To go back, stop the server and
+restore the public root and private state together from a backup made before the
+first new-format commit.
 
-To stop replacing directories without rolling back, remove `--allow-replace` /
-`--replace-name`; history directories already created stay and age out through
-ordinary retention.
+Earlier whole-directory replacement journals (version 4,
+`directory-replacement-v1`) still recover using their original exchange and
+history rules. New directory uploads use version 5 merge journals and private
+per-file catalogs instead. Standalone file records/journals retain their prior
+formats. If no new state feature has been written, let this server finish startup
+recovery and stop cleanly with no pending journals before running an earlier
+release; an interrupted returning-content file replacement (A, B, A) still needs
+this release to recover it first.
 
 ### Private state moved out of the storage root (0.6.1)
 

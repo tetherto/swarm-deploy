@@ -22,6 +22,7 @@ import { atomicWriteRenamed, MetadataFormatError, readJson, writeAtomic } from '
 import {
   isDirectoryJournal,
   isDirectoryReplacementJournal,
+  isFileMergeJournal,
   readCommitJournal,
   type AnyCommitJournal
 } from './commit-journal.js'
@@ -122,7 +123,13 @@ export interface TarSessionStoreOptions {
  * explained by the journal, and recovery (not this store) decides what becomes of it.
  */
 function ownsDirectoryTree(journal: AnyCommitJournal | null): boolean {
-  return isDirectoryJournal(journal) || isDirectoryReplacementJournal(journal)
+  // A file merge keeps the staged tree until its catalog is durable, then removes it before it
+  // discards the journal, so its absence while the journal exists is explained too.
+  return (
+    isDirectoryJournal(journal) ||
+    isDirectoryReplacementJournal(journal) ||
+    isFileMergeJournal(journal)
+  )
 }
 
 function problem(message: string, cause: unknown = null): SwarmDeployError {

@@ -581,7 +581,7 @@ match the journal: let 0.8 recover, and stop it cleanly, before rolling back.
 The output root (`storageDir`) holds published artifacts, replacement history
 artifacts, and managed public links only. Every other piece of server state is
 private and lives in the state directory `<state>`: `staging`, `sessions`,
-`commits`, `journals`, `publications`, `links`, `trash`, the `lock` directory
+`commits`, `catalogs`, `journals`, `publications`, `links`, `trash`, the `lock` directory
 and its retired or abandoned residue, `archive` (written by `reset-storage`),
 `reset-pending.json`, and `.swarm-deploy-state.json`. Nothing private is stored
 anywhere inside the output root, so a web server may serve the root. The state
@@ -683,113 +683,72 @@ account for every current and historical artifact exactly once.
 
 ## Commit, replacement, and recovery
 
-Commit records for directories use version 3. Directory journals use version 3
-with phases `journaled → renamed → sidecar → cleanup`. A directory publishes by
-renaming its verified staging tree under the name and root leases. Recovery
-handles crashes before rename, after rename, after the sidecar, and during
-symlink reconciliation. A directory is created by default and replaced only where
-replacement is allowed (below); file-to-directory and directory-to-file offers are
-always rejected.
-Committed artifacts, including directories, are immutable on disk: hooks and
-operators must not write into a published directory (`npm ci`, `.cache`,
-dotfiles, or extra symlinks). If a committed tree changes, startup hash scrub
-drops the sidecar while leaving bytes in place, the name stays occupied
-(`FILE_EXISTS`), the tree falls outside quota and rotation, and a managed
-`latest` link can repoint to an older release.
-Deletion renames a managed directory into `<state>/trash/<transfer-id>.tree`
-before recursive removal without following symlinks; startup sweeps proven trash.
+### File-level directory commits (0.8.0)
 
-The existing create-only commit behavior and retained replacement/history
-model remain for files:
+A file or directory input remains one commit. A directory is a container, not an
+owned deletion unit. Receive and verify the entire deterministic TAR privately,
+then plan every incoming file and required parent before any public write. Add
+missing leaves in an existing real container, preserve omitted/foreign siblings,
+and skip physical writes for identical bytes without adopting untracked files.
+Ignore empty directory entries; retain zero-byte regular files. A differing
+untracked or externally modified file, kind or path conflict rejects the entire
+plan. Differing intact owned leaves require `allowReplace` or `replaceNames`
+matched against the top-level artifact name. A file cannot replace a directory
+or the reverse.
 
-- names are create-only unless present in the configured `replaceNames`;
-- identical managed content returns `ALREADY_COMMITTED`;
-- different content for a replaceable name atomically becomes current;
-- the prior managed inode is retained as
-  `history-<full-old-transfer-id>`;
-- unmanaged destination and history paths are never overwritten or deleted;
-- current replaceable artifacts are pinned against age/quota retention, while
-  create-only and history artifacts participate in normal retention.
+Persist one version 1 file catalog per artifact name in `<state>/catalogs`,
+keyed by the name's group hash. It records canonical relative file paths,
+lengths, SHA-256, authenticated writer identity/time and optional release
+coordinates. It owns no directory or unrelated sibling. Bound the combined set
+to 10,000 files and its serialized catalog to 8 MiB, retaining at most 16 recent
+transfer receipts. Incoming transfer/subset identity and the published owned-set
+snapshot ID are distinct. Links, retention and link hooks use the latter;
+upload results and upload hook metadata still describe the incoming input.
+An admission shortcut needs proof of the exact current content. Otherwise receive
+and verify a retry again before deciding that no physical write is needed.
 
-The v2 journal remains the crash-recovery authority for replacement. It
-records the expected old record and inode, history destination, verified new
-staging inode, new record, and phase before visible mutation. Before the
-durable new current sidecar, rollback restores the old current and preserves a
-valid verified new session. After that sidecar is durable, recovery finishes
-the new current/history state and cleanup without rolling back committed
-content.
+A version 5 `merge-files` journal records the entire plan, affected inode
+identities, base/new catalog generations, snapshot IDs, created containers and
+legacy records before publication. Staged bytes and rollback preimages stay in
+private state. Per-file installation never removes the old path before its
+replacement is ready. No containing-directory exchange and no new public history
+tree are used. Concurrent readers can observe a mixture of complete old/new files;
+there is no single-instant multi-file namespace switch.
 
-### Directory replacement (0.8.0)
+The durable catalog write is the commit linearization point. Before it, failure
+or restart restores every affected leaf and removes only empty containers created
+by this attempt. After it, recovery keeps committed files and finishes cleanup.
+Revoking an owner cannot undo a completed commit. Preserve an unresolved journal
+and its artifact pins. Before a later same-name merge, finish older committed
+cleanup; if it still fails or requires startup recovery, return `FILE_BUSY`
+without advancing the catalog. Scrub must not rewrite or remove that catalog
+while its journal remains. The bounded receipt list is not indefinite proof of
+an old journal's success.
 
-Replacement is permitted by `replaceNames` (exact names; the current artifact stays
-pinned against retention) or by `allowReplace` (`true`, or selectors: an exact name
-or a release template matched against the final basename; no `/`; no pin). Whatever
-is permitted, only a managed artifact of the same kind whose content is proven
-against its record is replaced; an unmanaged path, a modified tree (any child
-added, changed or removed, an empty directory included), a symlink, or the other
-kind is left untouched and the offer is `FILE_EXISTS`. A replacement is refused with
-the retryable `FILE_BUSY`, before any change, while an awaited upload hook or
-explicit link request holds the artifact's path, a queued or running detached call
-pins it, or a link rollback journal names it (asked at admission and again under
-the root lease). It needs `StorageAdapter.atomicSwap`, an atomic exchange of two
-paths on one filesystem (Linux `renameat2(RENAME_EXCHANGE)`, macOS `renamex_np(RENAME_SWAP)`
-through `fs-native-extensions`); a storage without it, or a filesystem that refuses
-it (probed once per layout on scratch directories), gives `UNSUPPORTED_STORAGE`
-before anything changes. There is no emulation by renames.
+Retention selects name/version groups but deletes only unchanged owned leaves,
+then prunes empty containers non-recursively. Missing/edited leaves lose ownership
+without deletion. Preserve foreign siblings, link/hook pins and pending journals.
+Import old directory ownership only when the whole legacy tree exactly matches
+its record; otherwise keep unknown content unowned while permitting missing new
+leaves. New catalogs supersede legacy whole-tree records without granting
+ownership of unrelated files. Reset archives the catalogs and journal state.
 
-Records and journals. The current directory record stays version 3 (no
-`replaces`). A replaced directory's record becomes a version 4 directory record
-named `history-<its transfer ID>`, the only directory record allowed to carry a
-history name. The journal is version 4, `intent: replace-directory`, naming the
-visible name, the history name, the publication path `publications/<attempt>.tree`,
-a parked duplicate `publications/<attempt>.dedup` when any, the inode identity of
-the new tree, of the old tree and of the parked copy, the old, new and parked
-records, and the phase (`journaled`, `dedup-moved`, `moved`, `swapped`,
-`current-sidecar`, `history-moved`, `history-sidecar`, `cleanup`).
+Before the first new journal/catalog, durably mark the private root record with
+`file-catalog-v1` in its strict feature-list form. Older readers must refuse it
+before reading or scrubbing state. Preserve any existing required features.
+Returning to an earlier server requires a consistent backup of public files and
+private state from before the feature was used; never edit away the barrier.
 
-Transaction. After the plan (the visible tree proven against its record and an
-identity snapshot taken) and the commit's own retention pass (which holds the
-replaced name), and before any change: the busy and capability answers are taken
-and the state directory is durably marked (below). Then: the journal is made
-durable; a history copy of the returning content (A, B, A) is moved, proven by its
-inode, to its private dedup path; the new tree is moved from staging to its
-publication path; the exchange puts it at the visible name and the old tree at the
-publication path; the old tree is checked against its snapshot (a changed tree
-repeats the exchange and fails with `FILE_BUSY`); the new current record is made
-durable by one atomic file replacement, which is the linearization point (for
-returning content this replaces the history record under the same transfer ID in
-one step); the old tree moves to its history name; its record becomes the version 4
-history record; the parked duplicate is removed; the session and TAR part are
-retired; the journal is discarded. Every move is preceded by a proof of the inode
-being moved and of the destination being free, on the verified identity of both
-parent directories.
-
-Recovery trusts what is observed, not the phase. A durable new current record means
-the replacement is completed. Otherwise it is undone exactly: the exchange is
-repeated if it happened, the new tree returns to staging (so the session resumes),
-and a parked history copy returns to its name with its record exactly as it was.
-Any path that holds an unexpected inode, kind or link is not touched and recovery
-fails closed with the journal kept. A revoked owner or an `aborting` journal aborts
-an unfinished replacement and cannot undo a finished one. Retention neither deletes
-nor scrubs a record an unfinished journal owns.
-
-State barrier. Releases through 0.7 would quarantine a version 4 journal as corrupt
-and delete a version 4 record as invalid, and they read only the string `root` of
-the state directory's record. So before the first journal or record of version 4,
-the state directory's record is durably rewritten (a synced private file renamed
-over the old one, then the directory synced) from
-`{ "version": 1, "root": "<root>" }` to
-`{ "version": 2, "root": { "path": "<root>", "requires": ["directory-replacement-v1"] } }`.
-A reader that expects a string rejects that as malformed at startup, before it reads
-a journal, sidecar or session. This release reads both shapes and refuses a record
-that requires a feature it does not know. Nothing writes the strict form unless a
-directory replacement begins, and nothing removes it.
-
-Startup recovers journals before listening, validates journal-owned identities
-before mutation, re-hashes managed committed files, removes invalid managed
-records, reports unknown paths, restores valid direct-TAR sessions, then runs
-retention. Recovery and retention preserve the create/replace/history
-linearization and fail closed on corruption.
+Standalone file uploads retain create-only defaults, opt-in replacement and
+public `history-<transfer-id>` copies. Their version 2 journal decides recovery
+from the durable current sidecar: before it restore the prior file/history;
+after it complete cleanup. Legacy whole-directory version 3/4 records and
+journals remain readable and recover using their original rename/exchange
+semantics and the existing `directory-replacement-v1` barrier. The optional
+`StorageAdapter.atomicSwap` remains for that recovery, not new file merges.
+Startup resolves all journals before session sweeping, scrub, retention and
+listening. Explicit links remain separate completed-commit operations; link hook
+failure follows the existing rollback/keep policy without undoing artifacts.
 
 ## Managed symlinks
 

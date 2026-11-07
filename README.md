@@ -30,10 +30,10 @@ protocol for stored artifacts.
   the client verifies the stored prefix.
 - **Verified:** files and directories are sent as deterministic TAR and checked
   with SHA-256 before an explicit terminal `COMMITTED` result.
-- **Safe storage:** names are create-only by default, managed files and whole
-  directories can opt in to replacement with history (`--allow-replace`,
-  `--replace-name`; a directory is exchanged atomically, 0.8.0), and unmanaged
-  files and paths are never overwritten or deleted.
+- **File merges:** directory uploads add files recursively, preserving omitted
+  files and other platforms. Replacing changed, Swarm-managed files requires
+  `--allow-replace` or `--replace-name`. Untracked files are never overwritten.
+  The whole input is verified privately before a recoverable commit begins.
 - **Retention and rotation:** age and storage-quota limits, plus count and
   SemVer rotation driven by artifact patterns.
 - **Managed symlinks:** automatic newest-match aliases and explicit client

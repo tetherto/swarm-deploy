@@ -108,30 +108,27 @@ Optional options:
 - `--max-storage-bytes`: maximum total managed committed storage. Oldest
   eligible artifacts are removed first.
 - `--max-age-days`: remove eligible committed artifacts at or beyond this age.
-- `--replace-name`: permit replacement of this exact basename, a file or (from
-  0.8.0) a managed directory. Repeat for multiple mutable names. The current
-  artifact of each name is pinned against retention (the legacy, standing pin).
-- `--allow-replace [<selector>]` (0.8.0, off by default, repeatable): permit an
-  upload to replace the Swarm-managed artifact that holds its name. With no value
-  it allows every managed name; with a value it allows one exact artifact name or
-  one release template in the grammar of `--artifact-pattern`, matched against the
-  final basename (`beta-{version}`, a bare `{version}` for SemVer-named artifacts
-  only, `{series}-nightly`). The value is optional because no name begins with `-`:
-  an argument that does is the next option. A `/` is refused, every value is
-  validated even beside a bare flag, and a bad one is a usage error (exit `2`) that
-  never echoes it. Whatever is allowed, only a managed artifact of the same kind
-  whose content still matches its record is replaced (an unmanaged path, a
-  modified directory, a symlink, or the other kind of artifact is left untouched
-  and the upload gets `FILE_EXISTS`); the replaced artifact stays as
-  `history-<old-transfer-id>`; and nothing is pinned against retention. A
-  directory is replaced by an atomic exchange, on Linux and macOS; where that is
-  unavailable the upload is refused with `UNSUPPORTED_STORAGE` before anything
-  changes. While a hook or link request is using the artifact's path the upload
-  gets the retryable `FILE_BUSY`. The first directory replacement makes the state
-  directory refuse 0.7.x and older (restore a backup to go back). See
-  [Replacing managed artifacts](operations.md#replacing-managed-artifacts). A
-  selector that is 64 lowercase hexadecimal characters is refused like any secret
-  passed as a positional argument.
+- `--replace-name`: allow replacement of managed files under this exact artifact
+  basename, including files inside a directory upload (0.8.0). Repeat for
+  multiple names. The current artifact stays pinned against retention (legacy
+  standing pin).
+- `--allow-replace [<selector>]` (0.8.0, off by default, repeatable): allow
+  replacement of intact Swarm-managed files under matching artifact names.
+  With no value, permit every name; with a value, permit one exact basename or
+  release template (`beta-{version}`, `{version}`, `{series}-nightly`). Selectors
+  match the top-level artifact name, not member paths. A `/`, reserved history
+  name, duplicate or invalid selector is refused, even beside a bare flag; a
+  bad CLI value is a usage error (exit `2`) without echoing it. A selector of
+  64 lowercase hexadecimal characters is also refused by the secret guard.
+  Missing files in an existing directory need no replacement flag. Differing
+  untracked or externally edited files, symlinks and kind conflicts reject the
+  whole input with `FILE_EXISTS`. Directory merges preserve omitted siblings
+  and keep rollback data privately; standalone file replacements retain public
+  `history-<old-transfer-id>` copies. This flag adds no retention pin. A busy
+  hook, link request or pending commit cleanup returns retryable `FILE_BUSY`.
+  The first file catalog marks state as requiring this release; older servers
+  must not be started on it. See
+  [Replacing managed artifacts](operations.md#replacing-managed-artifacts).
 - `--artifact-pattern <template>`: identify releases and make matching
   mandatory. Repeat for multiple templates; declaration order is match order.
   See [Artifact patterns and rotation](artifact-patterns.md).
@@ -247,11 +244,14 @@ seed inline.
 - `--no-source-parent` takes no value and suppresses that metadata for every
   file in the run. The upload then keeps the legacy transfer identity and
   cannot match a server pattern with a parent segment.
-- A directory input commits exactly one recursive managed directory artifact
-  named after the input basename. Every member must be a safe regular file or
-  directory; symlinks, hard links, devices, sockets, FIFOs, unsafe names,
-  over-depth, over-count, or over-length members reject the whole upload.
-  Nothing is silently skipped.
+- A directory input is one commit named after the input basename. Its files
+  merge recursively into that container after the whole input is received,
+  verified and checked for conflicts. Omitted files remain. Empty directory
+  entries create no public resources; zero-byte files are retained. Every
+  member must be a safe regular file or directory; symlinks, hard links,
+  devices, sockets, FIFOs, unsafe names and input limits reject the whole upload.
+  A failed commit restores its changed files, with journaled restart recovery;
+  this does not promise an instantaneous multi-file switch for HTTP readers.
 - On success the CLI prints one line: `<name> <kind> <status>` (for example
   `0.18.1 directory COMMITTED`).
 - `--json` takes no value. It asks the server for the data its `response`

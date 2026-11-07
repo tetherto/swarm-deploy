@@ -59,6 +59,8 @@ export interface DetachedJob<Context extends object> {
   turn: HookTurn | null
   /** The artifact's transfer ID, pinned against retention from now until the call ends. */
   pin: string | null
+  /** The public container held by the call, even when a no-op upload owns no files. */
+  artifactName?: string
   /** Non-secret fields for the log line when the run did not complete. */
   fields: Readonly<Record<string, unknown>>
 }
@@ -74,6 +76,7 @@ export class DetachedHooks {
   private readonly report: (problem: DetachedProblem, info: DetachedInfo) => void
   private readonly jobs = new Set<Promise<void>>()
   private readonly pinned = new Map<string, number>()
+  private readonly named = new Map<string, number>()
   /**
    * While the server is closing: the artifacts that were pinned when `hold()` was
    * called, and those pinned since, kept in `pins()` after their calls ended.
@@ -102,6 +105,11 @@ export class DetachedHooks {
   pins(): Iterable<string> {
     if (this.held === null) return this.pinned.keys()
     return new Set([...this.pinned.keys(), ...this.held])
+  }
+
+  /** Public names used by queued or running callbacks, independently of file ownership. */
+  names(): Iterable<string> {
+    return this.named.keys()
   }
 
   /**
@@ -139,6 +147,9 @@ export class DetachedHooks {
       this.pinned.set(job.pin, (this.pinned.get(job.pin) ?? 0) + 1)
       // A call registered while the server closes ends at once, but retention may still run.
       this.held?.add(job.pin)
+    }
+    if (job.artifactName !== undefined) {
+      this.named.set(job.artifactName, (this.named.get(job.artifactName) ?? 0) + 1)
     }
     const run = this.run(job)
     this.jobs.add(run)
@@ -212,6 +223,11 @@ export class DetachedHooks {
     } finally {
       job.turn?.release()
       this.unpin(job.pin)
+      if (job.artifactName !== undefined) {
+        const count = (this.named.get(job.artifactName) ?? 0) - 1
+        if (count > 0) this.named.set(job.artifactName, count)
+        else this.named.delete(job.artifactName)
+      }
     }
   }
 }

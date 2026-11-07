@@ -47,7 +47,7 @@ interface SessionStore {
 interface CommitStore {
   storage?: StorageAdapter
   list(): Promise<CommitRecord[]>
-  scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }>
+  scrubRecords(options?: { hash?: boolean }): Promise<{ records: CommitRecord[]; deleted: number }>
   delete(record: CommitRecord): Promise<boolean>
   purge(
     record: CommitRecord,
@@ -662,7 +662,7 @@ class RetentionManager {
     }
     let scanned
     try {
-      scanned = await this.commitStore.scrubRecords()
+      scanned = await this.commitStore.scrubRecords({ hash })
     } catch (err) {
       throw cleanupError('Unable to scrub managed commit metadata', err)
     }
@@ -679,6 +679,12 @@ class RetentionManager {
     let deleted = scanned.deleted
     let owned: ReadonlySet<string> | null = null
     for (const record of records) {
+      // The aggregate of a per-file catalog was reconciled file by file in `scrubRecords`: it
+      // is not a tree to prove against a digest, and it owns no directory.
+      if (record.group === true) {
+        valid.push(record)
+        continue
+      }
       const status = await inspectManagedFinal(record, {
         layout: this.layout,
         storage: this.storage,

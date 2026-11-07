@@ -3,7 +3,7 @@ import { errorCode, isMissing } from '../error-code.js'
 import fs from '#fs'
 import path from '#path'
 import sodium from 'sodium-native'
-import { ERRORS, SwarmDeployError } from '../errors.js'
+import { ERRORS, SwarmDeployError, systemCodeOf } from '../errors.js'
 import type { ReleaseCoordinates } from '../release.js'
 import {
   historyName,
@@ -17,6 +17,7 @@ import { assertTreeMetadataTransferId } from '../tar-protocol/tree-manifest.js'
 import { assertFixed32, assertSafeUint } from '../validation.js'
 import {
   STATE_FEATURE_DIRECTORY_REPLACEMENT,
+  STATE_FEATURE_FILE_CATALOG,
   assertSafeDirectory,
   assertSafeFile,
   openSafeRegularFile,
@@ -24,9 +25,10 @@ import {
   requireStateFeature,
   withSafeDirectoryIdentity
 } from './layout.js'
-import { MetadataFormatError, readJson, writeAtomic } from './atomic-file.js'
+import { MetadataFormatError, atomicWriteRenamed, readJson, writeAtomic } from './atomic-file.js'
 import {
   CorruptJournalError,
+  FILE_MERGE_JOURNAL_VERSION,
   JOURNAL_VERSION,
   COMMIT_VERSION,
   DIRECTORY_COMMIT_VERSION,
@@ -40,6 +42,7 @@ import {
   assertCommitRecord as assertRecord,
   isDirectoryJournal,
   isDirectoryReplacementJournal,
+  isFileMergeJournal,
   isReplacementJournal,
   readCommitJournal,
   serializeJournal,
@@ -47,6 +50,28 @@ import {
   fileIdentity,
   identitiesEqual
 } from './commit-journal.js'
+import {
+  catalogView,
+  commitFileCatalog,
+  emptyFileCatalog,
+  fileCatalogPath,
+  importLegacyDirectory,
+  listFileCatalogs,
+  readFileCatalog,
+  removeFileCatalog,
+  subsetDigest,
+  type CatalogView,
+  type FileCatalog
+} from './file-catalog.js'
+import {
+  incomingFromDigest,
+  observationPaths,
+  planFileMerge,
+  planOwnedCleanup,
+  type MergeConflict,
+  type MergeOutcome,
+  type Observation
+} from './file-merge.js'
 import { withNameLease, withRootLease } from './root-coordinator.js'
 import type {
   AnyCommitJournal,
@@ -58,6 +83,9 @@ import type {
   DirectoryPhase,
   DirectoryReplacementJournal,
   DirectoryReplacementPhase,
+  FileMergeAction,
+  FileMergeJournal,
+  FileMergePhase,
   ReplacementJournal,
   ReplacementPhase
 } from './commit-journal.js'
@@ -68,6 +96,7 @@ import {
   normalizeTreePublicationModes,
   removeTree,
   treeMatchesSnapshot,
+  type TreeDigestResult,
   type TreeIdentitySnapshot,
   type TreePathState
 } from './tree-fs.js'
@@ -129,6 +158,8 @@ interface CommitStoreOptions {
   clock?: { now(): number }
   storage?: StorageAdapter
   logger?: Logger | null
+  /** Test-only: commit a directory as a whole tree, as earlier builds did. */
+  legacyDirectoryTrees?: boolean
 }
 
 /**
@@ -228,6 +259,75 @@ function commitError(message: string, cause: unknown | null = null): SwarmDeploy
 
 function existsError(message: string): SwarmDeployError {
   return new SwarmDeployError(ERRORS.FILE_EXISTS, message)
+}
+
+/** The most names one container may list before a merge into it is refused rather than guessed. */
+const MAX_CONTAINER_NAMES = 100_000
+
+/**
+ * What an interrupted journal or catalog write leaves beside its target: `.<id>.<attempt>.tmp` for
+ * a journal and `.<id>.json.<random>.tmp` for an atomic file write. Both are written under a name
+ * only this store makes, and renamed into place only once complete.
+ */
+const WRITE_TEMPORARY = /^\.[0-9a-f]{64}\.(?:json\.[0-9a-f]{32}|[0-9a-f]{64})\.tmp$/
+
+/**
+ * A failure of one step of a merge, as the stable code that names it and a message that carries
+ * only the upload's own relative path and an errno name, never a state or public path. A coded
+ * failure other than the storage layer's own `PROTOCOL_INVALID` guard keeps its code.
+ */
+function mergeFailure(action: string, relative: string, error: unknown): SwarmDeployError {
+  if (error instanceof SwarmDeployError && error.code !== ERRORS.PROTOCOL_INVALID) return error
+  const errno = systemCodeOf(error)
+  const code =
+    errno === 'ENOSPC' || errno === 'EDQUOT'
+      ? ERRORS.DISK_RESERVE
+      : errno === 'EXDEV' || errno === 'ENOSYS' || errno === 'ENOTSUP'
+        ? ERRORS.UNSUPPORTED_STORAGE
+        : errno === 'EEXIST' ||
+            errno === 'ENOTEMPTY' ||
+            errno === 'EISDIR' ||
+            errno === 'ENOTDIR' ||
+            errno === 'ELOOP'
+          ? ERRORS.FILE_EXISTS
+          : ERRORS.COMMIT_FAILED
+  const detail = errno === null ? '' : ` (${errno})`
+  return new SwarmDeployError(code, `Cannot ${action} ${relative}${detail}`, error)
+}
+
+/** The refusal of a whole upload: the first conflict's relative path and reason, and how many more. */
+function conflictError(conflicts: readonly MergeConflict[], total: number): SwarmDeployError {
+  const first = conflicts[0]
+  const where = first.path === '' ? 'the upload' : first.path
+  const more = total > 1 ? ` and ${total - 1} more` : ''
+  const code =
+    first.reason === 'TOO_LARGE' || first.reason === 'TOO_MANY_FILES'
+      ? ERRORS.FILE_TOO_LARGE
+      : first.reason === 'INVALID_INCOMING'
+        ? ERRORS.PROTOCOL_INVALID
+        : ERRORS.FILE_EXISTS
+  return new SwarmDeployError(code, `Merge refused: ${first.reason} at ${where}${more}`)
+}
+
+/** The artifact retention, links and hooks see for a catalog: never persisted, never a directory to remove. */
+function groupRecord(view: CatalogView): CommitRecord {
+  return {
+    version: DIRECTORY_COMMIT_VERSION,
+    kind: 'directory',
+    name: view.name,
+    size: view.size,
+    sha256: view.sha256,
+    entryCount: view.entryCount,
+    committedAt: view.committedAt,
+    uploaderFingerprint: view.uploaderFingerprint,
+    transferId: view.transferId,
+    ...(view.release === undefined ? {} : { release: view.release }),
+    group: true
+  }
+}
+
+function stringIdentity(value: { dev: number | bigint; ino: number | bigint }): FileIdentity {
+  return { dev: String(value.dev), ino: String(value.ino) }
 }
 
 /** Scratch directories of the atomic-exchange probe; a valid basename, so a tree helper accepts it. */
@@ -494,8 +594,20 @@ class CommitStore {
    * negative answer for one filesystem is never reused for another.
    */
   swapSupport: Promise<boolean> | null = null
+  /**
+   * Whether a directory commit is the whole-tree commit of earlier builds (rename into place or
+   * exchange) instead of the file-level merge. Only tests set it, to write the journals and records
+   * an earlier build left so their recovery stays covered; no server path does.
+   */
+  legacyDirectoryTrees: boolean
 
-  constructor({ layout, clock = Date, storage = fs.promises, logger = null }: CommitStoreOptions) {
+  constructor({
+    layout,
+    clock = Date,
+    storage = fs.promises,
+    logger = null,
+    legacyDirectoryTrees = false
+  }: CommitStoreOptions) {
     if (!layout || typeof layout !== 'object') throw storageError('Invalid storage layout')
     if (!clock || typeof clock.now !== 'function') throw storageError('Invalid clock')
     if (!storage || typeof storage !== 'object') throw storageError('Invalid storage adapter')
@@ -505,6 +617,7 @@ class CommitStore {
     this.storage = storage
     this.logger = logger
     this.journalAttempts = new Map()
+    this.legacyDirectoryTrees = legacyDirectoryTrees === true
   }
 
   _stagingPath(id: string): string {
@@ -737,7 +850,8 @@ class CommitStore {
 
   /** A replacement or directory commit always starts a fresh attempt; leftovers belong to recovery. */
   async _writeFreshJournal(
-    journal: ReplacementJournal | DirectoryCommitJournal | DirectoryReplacementJournal
+    journal:
+      ReplacementJournal | DirectoryCommitJournal | DirectoryReplacementJournal | FileMergeJournal
   ): Promise<void> {
     const id = journal.transferId
     if (await this._safeFileOrAbsent(this._journalPath(id), this.layout.journals)) {
@@ -1093,6 +1207,74 @@ class CommitStore {
     rules: ReplaceRules,
     release: CommitRelease | undefined
   ): Promise<InspectResult> {
+    if (this.legacyDirectoryTrees) return this._inspectDirectoryTree(name, offer, rules, release)
+    const state = await this._rootTreeState(name)
+    if (state === 'MISSING') {
+      const occupied = await this._safeFileOrAbsent(this._finalPath(name), this.layout.root)
+      return occupied ? { status: 'FILE_EXISTS' } : { status: 'AVAILABLE' }
+    }
+    // Something that is not a real directory (a file, a link) is never merged into.
+    if (state === 'UNMANAGED') return { status: 'FILE_EXISTS' }
+    // This very upload may already be committed here (a retry after a failure that came later).
+    const committed = await this._committedUpload(name, offer, release)
+    if (committed !== null) return { status: 'ALREADY_COMMITTED', record: committed }
+    // A directory is a container. Whether this upload fits it (and whether a file it would change
+    // may be replaced) depends on the files it carries, which are known only once all of them are
+    // received and verified: that whole-upload decision is made at commit, before anything public
+    // changes. Here only the artifact that already lives in it can say it is in use.
+    const current = (await this._scanRecords()).find((record) => record.name === name)
+    if (current !== undefined && (await rules.busy(current))) return { status: 'BUSY' }
+    return { status: 'AVAILABLE' }
+  }
+
+  /**
+   * The group record, if the upload `offer` describes is provably the committed content of the
+   * artifact: the catalog holds a receipt for this very transfer, its owned files are exactly the
+   * files that upload carried, and every one of them is still on disk as it was written. Anything
+   * short of that proof is not an answer, and the upload goes on to the commit, which decides file
+   * by file (an upload that changes nothing is a no-op there).
+   */
+  async _committedUpload(
+    name: string,
+    offer: CommitOffer,
+    release: CommitRelease | undefined
+  ): Promise<CommitRecord | null> {
+    const catalog = await readFileCatalog(this.layout.catalogs, name, this.storage)
+    if (catalog === null) return null
+    const view = catalogView(catalog)
+    if (view === null || !releasesEqual(catalog.release, release)) return null
+    const id = toHex(offer.transferId)
+    const receipt = catalog.receipts.find((candidate) => candidate.transferId === id)
+    if (
+      receipt === undefined ||
+      receipt.bytes !== offer.size ||
+      receipt.files !== catalog.files.length ||
+      receipt.subset !== subsetDigest(catalog.files)
+    ) {
+      return null
+    }
+    const { observed } = await this._observeOwned(catalog, true)
+    for (const file of catalog.files) {
+      const seen = observed.get(file.path)
+      if (
+        seen === undefined ||
+        seen.kind !== 'file' ||
+        seen.size !== file.size ||
+        seen.sha256 !== file.sha256
+      ) {
+        return null
+      }
+    }
+    return groupRecord(view)
+  }
+
+  /** The admission decision of the whole-tree directory commit of earlier builds (see `_commitDirectoryTree`). */
+  async _inspectDirectoryTree(
+    name: string,
+    offer: CommitOffer,
+    rules: ReplaceRules,
+    release: CommitRelease | undefined
+  ): Promise<InspectResult> {
     if ((await this._rootTreeState(name)) === 'MISSING') {
       const occupied = await this._safeFileOrAbsent(this._finalPath(name), this.layout.root)
       return occupied ? { status: 'FILE_EXISTS' } : { status: 'AVAILABLE' }
@@ -1203,6 +1385,8 @@ class CommitStore {
     if (matches.length === 0) return null
     if (matches.length > 1) throw storageError('Duplicate managed commit filename')
     const record = matches[0]
+    // A catalog's aggregate is not a whole tree that can be proven against a digest.
+    if (record.group === true) return null
     if (record.kind !== 'directory' || record.version !== DIRECTORY_COMMIT_VERSION) return null
     const proven = await this._provenDirectoryTree(name, record)
     return proven === null ? null : { record, ...proven }
@@ -1334,6 +1518,9 @@ class CommitStore {
         deferPostCommitRetention
       )
     }
+    if (await rules.busy(record)) {
+      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Artifact is in use by a hook or a link request')
+    }
     const stagingPath = this._stagingPath(record.transferId)
     const finalPath = this._finalPath(record.name)
 
@@ -1445,13 +1632,7 @@ class CommitStore {
     }
   }
 
-  /**
-   * Publishes one verified staging tree by rename. An unoccupied name is created. An occupied one
-   * is replaced only when the name may be replaced (`rules`), the occupant is a managed directory
-   * whose tree is proven against its record, and the storage can exchange directories atomically;
-   * anything else (an unmanaged path, a modified tree, another kind of artifact) is an
-   * existing-name conflict and is left exactly as it is.
-   */
+  /** Verifies the complete staged input before merging its files as one recoverable commit. */
   async _commitDirectory(
     record: CommitRecord,
     retentionManager: RetentionManager | null,
@@ -1460,7 +1641,6 @@ class CommitStore {
     deferPostCommitRetention = false
   ): Promise<CommitRecord> {
     const treePath = this._treeStagingPath(record.transferId)
-    const finalPath = this._finalPath(record.name)
     if ((await inspectTreePath(treePath, this.layout.staging, this.storage)) !== 'DIRECTORY') {
       throw new SwarmDeployError(ERRORS.CHECKSUM_MISMATCH, 'Verified staging tree is missing')
     }
@@ -1478,8 +1658,52 @@ class CommitStore {
         this.storage.lstat(treePath)
       )
     )
+    if (this.legacyDirectoryTrees) {
+      return this._commitDirectoryTree(
+        record,
+        treePath,
+        normalizedIdentities,
+        stagingTreeIdentity,
+        retentionManager,
+        signal,
+        rules,
+        deferPostCommitRetention
+      )
+    }
+    // A directory upload is a set of files for a container, never a tree that replaces one: the
+    // container, empty or shared with files Swarm does not own, is merged into (see `_commitMerge`).
+    return this._commitMerge(
+      record,
+      digested,
+      normalizedIdentities,
+      stagingTreeIdentity,
+      retentionManager,
+      signal,
+      rules,
+      deferPostCommitRetention
+    )
+  }
+
+  /**
+   * The whole-tree directory commit of earlier builds: a tree is published by renaming it into
+   * place, or replaces the one there by exchange. No server path reaches it, because a directory
+   * upload is merged file by file (`_commitMerge`). It is kept, behind an option only tests set, so
+   * the journals and records an earlier build wrote can still be produced here and their startup
+   * recovery stays tested.
+   */
+  async _commitDirectoryTree(
+    record: CommitRecord,
+    treePath: string,
+    normalizedIdentities: TreeIdentitySnapshot,
+    stagingTreeIdentity: FileIdentity,
+    retentionManager: RetentionManager | null,
+    signal: AbortSignalLike | null,
+    rules: ReplaceRules,
+    deferPostCommitRetention: boolean
+  ): Promise<CommitRecord> {
+    const finalPath = this._finalPath(record.name)
     const occupied =
-      (await this._scanRecords()).some((existing) => existing.name === record.name) ||
+      (await this._scanStoredRecords()).some((existing) => existing.name === record.name) ||
       (await this._rootTreeState(record.name)) !== 'MISSING'
     if (occupied) {
       if (!rules.permits(record.name)) throw existsError('Destination already exists')
@@ -1594,6 +1818,943 @@ class CommitStore {
     )
     await this._syncRoot()
     await this._discardJournal(journal.transferId, journal.attemptId)
+  }
+
+  // -------------------------------------------------------------------------
+  // File-level merge of a directory upload
+  //
+  // A directory upload is a COMMIT of a set of files for a container. The whole upload was received
+  // and verified in private staging before this runs; the whole merge is planned (every target
+  // observed, every conflict found) before anything public changes; every action and the inode it
+  // touches is journaled before the first write; and the upload is installed, or undone, as one
+  // unit. Publishing is per file, by link or by rename over the file, so no path is ever absent and
+  // no foreign file is touched, copied or moved. What a concurrent reader can see while it runs is
+  // therefore some of the files of the upload and none of the others; it is never a half-written
+  // file, and it is never anything that is not either the old file or the new one. The durable
+  // catalog is the single linearization point: before it the merge is rolled back, after it only
+  // private residue is cleaned up.
+  // -------------------------------------------------------------------------
+
+  /** A public path from the output root (`name/sub/dir`), or the artifact's own, from its relative path. */
+  _publicPath(name: string, relative: string): string {
+    return relative === ''
+      ? this._finalPath(name)
+      : path.join(this._finalPath(name), ...relative.split('/'))
+  }
+
+  /** A public directory path, given relative to the output root. */
+  _rootRelativePath(relative: string): string {
+    return path.join(this.layout.root, ...relative.split('/'))
+  }
+
+  /** The private directory one merge keeps its preimages and staged links in. */
+  _mergeScratch(attempt: string): string {
+    return path.join(this.layout.publications, `${attempt}.merge`)
+  }
+
+  async _lstatOrMissing(target: string): Promise<StorageStat | null> {
+    try {
+      return await this.storage.lstat(target)
+    } catch (err) {
+      if (isMissing(err) || errorCode(err) === 'ENOTDIR') return null
+      throw err
+    }
+  }
+
+  /** Whether every container above `relative` inside the artifact is a real directory. */
+  async _containersAreDirectories(
+    name: string,
+    relative: string,
+    verified: Set<string>
+  ): Promise<boolean> {
+    const components = relative.split('/')
+    let prefix = ''
+    for (let index = 0; index < components.length - 1; index++) {
+      prefix = index === 0 ? components[0] : `${prefix}/${components[index]}`
+      if (verified.has(prefix)) continue
+      const stat = await this._lstatOrMissing(this._publicPath(name, prefix))
+      if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) return false
+      verified.add(prefix)
+    }
+    return true
+  }
+
+  /**
+   * One public file, without following links: what it is, and for a regular file its digest. A
+   * file with other hard links is not one Swarm can vouch for. `assume` stands in for the digest of
+   * an owned file when only its size is being checked.
+   */
+  async _observeFile(
+    name: string,
+    relative: string,
+    assume: { size: number; sha256: string } | null
+  ): Promise<{ observation: Observation; identity: FileIdentity | null }> {
+    const target = this._publicPath(name, relative)
+    const stat = await this._lstatOrMissing(target)
+    if (stat === null) return { observation: { kind: 'missing' }, identity: null }
+    if (stat.isSymbolicLink()) return { observation: { kind: 'symlink' }, identity: null }
+    if (stat.isDirectory()) return { observation: { kind: 'directory' }, identity: null }
+    if (!stat.isFile() || (typeof stat.nlink === 'number' && stat.nlink > 1)) {
+      return { observation: { kind: 'special' }, identity: null }
+    }
+    let sha256: string
+    if (assume !== null) {
+      sha256 = stat.size === assume.size ? assume.sha256 : '0'.repeat(64)
+    } else {
+      let digested: { digest: Buffer; identity: FileIdentity } | null
+      try {
+        digested = await digestExactFile(target, stat.size, this.storage)
+      } catch (error) {
+        throw mergeFailure('read', relative, error)
+      }
+      if (digested === null || !identitiesEqual(digested.identity, fileIdentity(stat))) {
+        throw new SwarmDeployError(ERRORS.FILE_BUSY, `Changed while it was read: ${relative}`)
+      }
+      sha256 = toHex(digested.digest)
+    }
+    return {
+      observation: { kind: 'file', size: stat.size, sha256 },
+      identity: fileIdentity(stat)
+    }
+  }
+
+  /** The files a catalog owns, as they are now (all missing when the artifact folder is not there). */
+  async _observeOwned(
+    catalog: FileCatalog,
+    hash: boolean
+  ): Promise<{ observed: Map<string, Observation>; identities: Map<string, FileIdentity> }> {
+    const observed = new Map<string, Observation>()
+    const identities = new Map<string, FileIdentity>()
+    const state = await this._rootTreeState(catalog.name)
+    const verified = new Set<string>()
+    for (const file of catalog.files) {
+      if (
+        state !== 'DIRECTORY' ||
+        !(await this._containersAreDirectories(catalog.name, file.path, verified))
+      ) {
+        observed.set(file.path, { kind: state === 'DIRECTORY' ? 'special' : 'missing' })
+        continue
+      }
+      const seen = await this._observeFile(catalog.name, file.path, hash ? null : file)
+      observed.set(file.path, seen.observation)
+      if (seen.identity !== null) identities.set(file.path, seen.identity)
+    }
+    return { observed, identities }
+  }
+
+  /**
+   * What the container holds at every path a merge needs to know about: each uploaded file and each
+   * container above it, and, beside each, the names that differ from it only in case. Parents come
+   * first, so nothing below a missing or non-directory parent is looked at.
+   */
+  async _observeMerge(
+    name: string,
+    paths: readonly string[]
+  ): Promise<{ observed: Map<string, Observation>; identities: Map<string, FileIdentity> }> {
+    const observed = new Map<string, Observation>()
+    const identities = new Map<string, FileIdentity>()
+    const listings = new Map<string, string[]>()
+    const listing = async (parent: string): Promise<string[]> => {
+      let names = listings.get(parent)
+      if (names === undefined) {
+        const directory = this._publicPath(name, parent)
+        names = await withSafeDirectoryIdentity(directory, this.storage, () =>
+          this.storage.readdir(directory)
+        )
+        if (names.length > MAX_CONTAINER_NAMES) {
+          throw existsError('A folder is too large to merge into safely')
+        }
+        listings.set(parent, names)
+      }
+      return names
+    }
+    for (const relative of paths) {
+      const components = relative.split('/')
+      const base = components[components.length - 1]
+      const parent = components.slice(0, -1).join('/')
+      const parentSeen = parent === '' ? undefined : observed.get(parent)
+      if (parent !== '' && (parentSeen === undefined || parentSeen.kind !== 'directory')) {
+        observed.set(relative, { kind: 'missing' })
+        continue
+      }
+      let seen: { observation: Observation; identity: FileIdentity | null }
+      try {
+        const names = await listing(parent)
+        const variants = names
+          .filter((other) => other !== base && other.toLowerCase() === base.toLowerCase())
+          .map((other) => (parent === '' ? other : `${parent}/${other}`))
+        // Hashing is only needed for a file an upload names; a container is only a kind.
+        seen = await this._observeFile(name, relative, null)
+        if (variants.length > 0) {
+          seen = { ...seen, observation: { ...seen.observation, caseVariants: variants } }
+        }
+      } catch (error) {
+        throw mergeFailure('inspect', relative, error)
+      }
+      observed.set(relative, seen.observation)
+      if (seen.identity !== null) identities.set(relative, seen.identity)
+    }
+    return { observed, identities }
+  }
+
+  /**
+   * What owns the files under `name` before this merge: the catalog on disk, or, for an artifact an
+   * earlier release published as a whole tree, that record's files after an exact proof (`DIRTY`
+   * roots are not adopted: they start from nothing and keep their unknown files untouched). A legacy
+   * record is always retired once a catalog stands in its place.
+   */
+  async _baseOwnership(
+    name: string,
+    state: TreePathState
+  ): Promise<{
+    catalog: FileCatalog
+    expected: number
+    persisted: boolean
+    legacy: CommitRecord[]
+  }> {
+    const stored = await readFileCatalog(this.layout.catalogs, name, this.storage)
+    const legacy = (await this._scanStoredRecords()).filter(
+      (record) => record.name === name && this._isLegacyDirectoryRecord(record)
+    )
+    if (stored !== null) {
+      return { catalog: stored, expected: stored.generation, persisted: true, legacy }
+    }
+    if (legacy.length > 0 && state === 'DIRECTORY') {
+      let digested: TreeDigestResult | null = null
+      try {
+        digested = await digestTree(this._finalPath(name), this.storage)
+      } catch (err) {
+        if (err instanceof SwarmDeployError && err.code === ERRORS.ABORTED) throw err
+      }
+      if (digested !== null) {
+        const imported = importLegacyDirectory(
+          { ...legacy[0], entryCount: legacy[0].entryCount ?? 0 },
+          digested
+        )
+        if (imported.ok) {
+          return { catalog: imported.catalog, expected: 0, persisted: false, legacy }
+        }
+      }
+    }
+    return { catalog: emptyFileCatalog(name), expected: 0, persisted: false, legacy }
+  }
+
+  /** Reads, observes and plans, from the state of the container right now. */
+  async _planMerge(
+    record: CommitRecord,
+    digested: TreeDigestResult,
+    rules: ReplaceRules
+  ): Promise<{
+    base: Awaited<ReturnType<CommitStore['_baseOwnership']>>
+    outcome: Extract<MergeOutcome, { ok: true }>
+    seen: { observed: Map<string, Observation>; identities: Map<string, FileIdentity> }
+    state: TreePathState
+  }> {
+    const name = record.name
+    const state = await this._rootTreeState(name)
+    if (state === 'UNMANAGED') throw existsError('The destination exists and is not a directory')
+    const base = await this._baseOwnership(name, state)
+    const incoming = incomingFromDigest(digested)
+    const needed = observationPaths(incoming)
+    const seen =
+      state === 'MISSING'
+        ? {
+            observed: new Map(
+              needed.map((entry): [string, Observation] => [entry, { kind: 'missing' }])
+            ),
+            identities: new Map<string, FileIdentity>()
+          }
+        : await this._observeMerge(name, needed)
+    const outcome = planFileMerge({
+      catalog: base.catalog,
+      incoming,
+      observed: seen.observed,
+      allowReplace: rules.permits(name),
+      writer: {
+        transferId: record.transferId,
+        uploader: record.uploaderFingerprint,
+        committedAt: record.committedAt
+      },
+      ...(record.release === undefined ? {} : { release: record.release })
+    })
+    if (!outcome.ok) throw conflictError(outcome.conflicts, outcome.totalConflicts)
+    return { base, outcome, seen, state }
+  }
+
+  /**
+   * Merges a verified directory upload into its container as one transaction. Returns the artifact
+   * as it now is: the aggregate of every file Swarm owns under the name (or, for an upload that
+   * changes nothing and leaves nothing owned, the upload's own record).
+   */
+  async _commitMerge(
+    record: CommitRecord,
+    digested: TreeDigestResult,
+    identities: TreeIdentitySnapshot,
+    stagingTreeIdentity: FileIdentity,
+    retentionManager: RetentionManager | null,
+    signal: AbortSignalLike | null,
+    rules: ReplaceRules,
+    deferPostCommitRetention: boolean
+  ): Promise<CommitRecord> {
+    const name = record.name
+    const treePath = this._treeStagingPath(record.transferId)
+    const settled = await this._settlePendingMerges(name)
+    if (settled.has(record.transferId)) {
+      // An exact retry may have restaged the same transfer. Finishing its earlier committed
+      // journal retires that staging too; return its durable result rather than using it again.
+      const catalog = await readFileCatalog(this.layout.catalogs, name, this.storage)
+      const view = catalog === null ? null : catalogView(catalog)
+      if (view === null) throw storageError('A committed merge has no owned files')
+      return groupRecord(view)
+    }
+    let planned = await this._planMerge(record, digested, rules)
+
+    const standing = async (): Promise<CommitRecord | null> =>
+      (await this._scanRecords()).find((entry) => entry.name === name) ?? null
+    const current = await standing()
+    if (await rules.busy(current ?? record)) {
+      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Artifact is in use by a hook or a link request')
+    }
+    if (!planned.outcome.changed) {
+      await this._retireUpload(record.transferId)
+      return (await standing()) ?? record
+    }
+
+    const reserveGrowth = async (): Promise<void> => {
+      if (!retentionManager) return
+      // The current group is already counted and remains pinned. Skipped bytes and the old
+      // bytes of replaced leaves must not be reserved again: merges keep no public history.
+      await retentionManager._runUnlocked({
+        incomingBytes: Math.max(0, planned.outcome.result.bytes - planned.outcome.previous.bytes),
+        trigger: 'commit',
+        pinNames: [name]
+      })
+    }
+    if (retentionManager) {
+      await reserveGrowth()
+    }
+    assertNotAborted(signal)
+    const afterPass = await readFileCatalog(this.layout.catalogs, name, this.storage)
+    if ((afterPass === null ? 0 : afterPass.generation) !== planned.base.expected) {
+      // The pass ended ownership of a file that had vanished: plan again from what is there.
+      planned = await this._planMerge(record, digested, rules)
+      if (!planned.outcome.changed) {
+        await this._retireUpload(record.transferId)
+        return (await standing()) ?? record
+      }
+      // Scrub may have released missing/edited leaves. Recheck capacity against that new
+      // ownership baseline before recreating them; an earlier credit must not survive scrub.
+      await reserveGrowth()
+    }
+    if (!(await treeMatchesSnapshot(treePath, this.storage, identities))) {
+      throw new SwarmDeployError(ERRORS.FILE_BUSY, 'Staging tree changed before publication')
+    }
+
+    const { base, outcome, seen, state } = planned
+    const stagedIdentities = new Map<string, FileIdentity>()
+    for (const entry of identities.entries) {
+      if (entry.kind === 'file') stagedIdentities.set(entry.path, stringIdentity(entry.identity))
+    }
+    const actions: FileMergeAction[] = []
+    for (const action of outcome.actions) {
+      if (action.op === 'skip') continue
+      const staged = stagedIdentities.get(action.path)
+      if (staged === undefined) {
+        throw storageError('A staged file is missing from the verified tree')
+      }
+      if (action.op === 'add') {
+        actions.push({
+          op: 'add',
+          path: action.path,
+          size: action.size,
+          sha256: action.sha256,
+          staged
+        })
+        continue
+      }
+      const previous = seen.identities.get(action.path)
+      if (previous === undefined) throw storageError('A replaced file has no identity')
+      actions.push({
+        op: 'replace',
+        path: action.path,
+        size: action.size,
+        sha256: action.sha256,
+        staged,
+        previous
+      })
+    }
+    const directories = [
+      ...(state === 'MISSING' ? [name] : []),
+      ...outcome.directories.map((directory) => `${name}/${directory}`)
+    ].map((directory) => ({ path: directory, identity: null }))
+
+    // Durable before the first byte of any new metadata: an older release must refuse this state.
+    requireStateFeature(this.layout, STATE_FEATURE_FILE_CATALOG)
+
+    const attempt = attemptId()
+    let journal: FileMergeJournal = {
+      version: FILE_MERGE_JOURNAL_VERSION,
+      intent: 'merge-files',
+      state: 'committing',
+      phase: 'journaled',
+      transferId: record.transferId,
+      attemptId: attempt,
+      name,
+      baseGeneration: base.expected,
+      generation: outcome.next.generation,
+      snapshotId: outcome.result.snapshotId,
+      previousSnapshotId: current === null ? null : current.transferId,
+      uploader: record.uploaderFingerprint,
+      committedAt: record.committedAt,
+      ...(record.release === undefined ? {} : { release: record.release }),
+      stagingTreeIdentity,
+      actions,
+      directories,
+      legacyRecords: base.legacy.map((entry) => entry.transferId)
+    }
+    await this._writeFreshJournal(journal)
+
+    let linearized = false
+    try {
+      assertNotAborted(signal)
+      journal = await this._prepareMerge(journal, treePath, signal)
+      journal = await this._installMerge(journal, treePath, signal)
+      assertNotAborted(signal)
+      try {
+        await commitFileCatalog(this.layout.catalogs, outcome.next, this.storage, base.expected)
+        linearized = true
+      } catch (writeError) {
+        // A failure after the rename may still have published it: only the catalog can say.
+        if (atomicWriteRenamed(writeError) && (await this._mergeLinearized(journal))) {
+          linearized = true
+        } else {
+          throw writeError
+        }
+      }
+    } catch (err) {
+      if (!linearized) {
+        const aborted = errorCode(err) === ERRORS.ABORTED
+        try {
+          if (aborted) await this._markAttemptAborting(record.transferId, attempt)
+          await this._rollbackMerge(journal)
+          await this._discardJournal(record.transferId, attempt)
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [err, cleanupError],
+            aborted ? 'Unable to clean up aborted merge' : 'Unable to roll back failed merge'
+          )
+        }
+        throw err
+      }
+    }
+
+    const view = catalogView(outcome.next)
+    const published = view === null ? record : groupRecord(view)
+    try {
+      await this._finishMerge(journal)
+      if (retentionManager && !deferPostCommitRetention) {
+        await retentionManager._afterCommitUnlocked()
+      }
+    } catch (err) {
+      this._reportCleanupPending(published, err)
+    }
+    return published
+  }
+
+  /** Removes what an upload left in private staging: its tree, session and archive part. */
+  async _retireUpload(id: string): Promise<void> {
+    await removeTree(this._treeStagingPath(id), this.layout.staging, this.storage, {
+      layout: this.layout
+    })
+    await this._removeFile(this._sessionPath(id), this.layout.sessions)
+    await this._removeFile(this._tarStagingPath(id), this.layout.staging)
+  }
+
+  async _setMergePhase(
+    journal: FileMergeJournal,
+    phase: FileMergePhase
+  ): Promise<FileMergeJournal> {
+    const next: FileMergeJournal = { ...journal, phase }
+    await writeAtomic(
+      this._journalPath(journal.transferId),
+      b4a.from(JSON.stringify(serializeJournal(next))),
+      this.storage
+    )
+    return next
+  }
+
+  /** The file at `target`, proven a regular file with exactly this inode, or `FILE_BUSY`. */
+  async _expectIdentity(target: string, identity: FileIdentity, message: string): Promise<void> {
+    const stat = await this._lstatOrMissing(target)
+    if (
+      stat === null ||
+      stat.isSymbolicLink() ||
+      !stat.isFile() ||
+      !identitiesEqual(fileIdentity(stat), identity)
+    ) {
+      throw new SwarmDeployError(ERRORS.FILE_BUSY, message)
+    }
+  }
+
+  /** Whether `target` currently is a regular file with exactly this inode. */
+  async _isInode(target: string, identity: FileIdentity): Promise<boolean> {
+    const stat = await this._lstatOrMissing(target)
+    return (
+      stat !== null &&
+      !stat.isSymbolicLink() &&
+      stat.isFile() &&
+      identitiesEqual(fileIdentity(stat), identity)
+    )
+  }
+
+  async _syncPaths(directories: Iterable<string>): Promise<void> {
+    for (const directory of [...new Set(directories)].sort()) {
+      await withSafeDirectoryIdentity(directory, this.storage, () =>
+        syncDirectory(directory, this.storage)
+      )
+    }
+  }
+
+  /** Creates one missing container (mode 0755), and says whether this merge is the one that made it. */
+  async _createContainer(directory: {
+    path: string
+    identity: FileIdentity | null
+  }): Promise<{ path: string; identity: FileIdentity | null }> {
+    const target = this._rootRelativePath(directory.path)
+    let created = false
+    await withSafeDirectoryIdentity(path.dirname(target), this.storage, async () => {
+      try {
+        await this.storage.mkdir(target, { mode: 0o755 })
+        created = true
+      } catch (err) {
+        if (errorCode(err) !== 'EEXIST') throw err
+      }
+    })
+    const stat = await this.storage.lstat(target)
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw existsError('A folder this upload needs is not a directory')
+    }
+    if (created) {
+      const handle = await this.storage.open(target, 'r')
+      try {
+        if (typeof handle.chmod === 'function') await handle.chmod(0o755)
+      } finally {
+        await handle.close()
+      }
+    }
+    return { path: directory.path, identity: created ? fileIdentity(stat) : null }
+  }
+
+  /**
+   * Everything that can be done privately: the scratch directory, a private link to the inode of
+   * every file about to be replaced (so the old bytes are never unreferenced), a private link to
+   * every replacement, and the missing containers. Nothing visible has changed when this returns.
+   */
+  async _prepareMerge(
+    journal: FileMergeJournal,
+    treePath: string,
+    signal: AbortSignalLike | null
+  ): Promise<FileMergeJournal> {
+    const scratch = this._mergeScratch(journal.attemptId)
+    await withSafeDirectoryIdentity(this.layout.publications, this.storage, async () => {
+      await this.storage.mkdir(scratch, { mode: 0o700 })
+    })
+    await this._syncPaths([this.layout.publications])
+    for (const [index, action] of journal.actions.entries()) {
+      assertNotAborted(signal)
+      try {
+        const staged = path.join(treePath, ...action.path.split('/'))
+        await this._expectIdentity(
+          staged,
+          action.staged,
+          'A staged file changed before publication'
+        )
+        if (action.op !== 'replace' || action.previous === undefined) continue
+        const target = this._publicPath(journal.name, action.path)
+        const preimage = path.join(scratch, `p${index}`)
+        await withSafeDirectoryIdentity(path.dirname(target), this.storage, async () => {
+          await this.storage.link(target, preimage)
+        })
+        await this._expectIdentity(
+          preimage,
+          action.previous,
+          'An owned file changed before replacement'
+        )
+        await this._expectIdentity(
+          target,
+          action.previous,
+          'An owned file changed before replacement'
+        )
+        await this.storage.link(staged, path.join(scratch, `n${index}`))
+      } catch (error) {
+        throw mergeFailure('prepare', action.path, error)
+      }
+    }
+    // From here on the journal lists only folders this merge made, each with its identity. A folder
+    // that appeared since the plan was made by someone else and is not listed, so never removed.
+    const directories = []
+    for (const directory of journal.directories) {
+      assertNotAborted(signal)
+      try {
+        const made = await this._createContainer(directory)
+        if (made.identity !== null) directories.push(made)
+      } catch (error) {
+        throw mergeFailure('create folder', directory.path, error)
+      }
+    }
+    await this._syncPaths([
+      scratch,
+      ...directories.map((directory) => path.dirname(this._rootRelativePath(directory.path))),
+      ...directories.map((directory) => this._rootRelativePath(directory.path))
+    ])
+    return this._setMergePhase({ ...journal, directories }, 'prepared')
+  }
+
+  /**
+   * Puts every file in place. A new file is linked (which fails rather than overwrite a file that
+   * appeared since); a replacement is renamed over the owned file, so the name is never absent.
+   * Each step first proves the inode it is about to act on.
+   */
+  async _installMerge(
+    journal: FileMergeJournal,
+    treePath: string,
+    signal: AbortSignalLike | null
+  ): Promise<FileMergeJournal> {
+    const scratch = this._mergeScratch(journal.attemptId)
+    const verified = new Set<string>()
+    const touched = new Set<string>()
+    for (const [index, action] of journal.actions.entries()) {
+      assertNotAborted(signal)
+      const target = this._publicPath(journal.name, action.path)
+      const parent = path.dirname(target)
+      try {
+        if (!(await this._containersAreDirectories(journal.name, action.path, verified))) {
+          throw existsError('A folder changed during the commit')
+        }
+        if (action.op === 'add') {
+          const staged = path.join(treePath, ...action.path.split('/'))
+          await withSafeDirectoryIdentity(parent, this.storage, async () => {
+            await this.storage.link(staged, target)
+          })
+        } else {
+          if (action.previous === undefined) throw storageError('A replacement has no preimage')
+          await this._expectIdentity(
+            target,
+            action.previous,
+            'An owned file changed before replacement'
+          )
+          await withSafeDirectoryIdentity(parent, this.storage, async () => {
+            await this.storage.rename(path.join(scratch, `n${index}`), target)
+          })
+        }
+        await this._expectIdentity(target, action.staged, 'An installed file is not the staged one')
+      } catch (error) {
+        throw mergeFailure('install', action.path, error)
+      }
+      touched.add(parent)
+    }
+    await this._syncPaths(touched)
+    return this._setMergePhase(journal, 'installed')
+  }
+
+  /**
+   * Whether the merge happened: the durable catalog is at the journal's generation and carries
+   * this upload's receipt for it. Nothing else (no phase, no file) decides it.
+   */
+  async _mergeLinearized(journal: FileMergeJournal): Promise<boolean> {
+    const catalog = await readFileCatalog(this.layout.catalogs, journal.name, this.storage)
+    return (
+      catalog !== null &&
+      catalog.generation === journal.generation &&
+      catalog.receipts.some(
+        (receipt) =>
+          receipt.transferId === journal.transferId && receipt.generation === journal.generation
+      )
+    )
+  }
+
+  /**
+   * After the catalog is durable: removes the private preimages and links (freeing the old bytes),
+   * retires the legacy whole-tree record the catalog replaced, removes the upload's staged tree,
+   * session and archive part, and discards the journal. Idempotent, so recovery repeats it.
+   */
+  async _finishMerge(journal: FileMergeJournal): Promise<void> {
+    let current = journal
+    if (journal.phase !== 'cleanup') current = await this._setMergePhase(journal, 'cleanup')
+    await removeTree(
+      this._mergeScratch(current.attemptId),
+      this.layout.publications,
+      this.storage,
+      {
+        layout: this.layout
+      }
+    )
+    for (const id of current.legacyRecords) {
+      const stored = await this._readRecordOrAbsent(this._recordPath(id))
+      if (
+        stored !== null &&
+        this._isLegacyDirectoryRecord(stored) &&
+        stored.name === current.name
+      ) {
+        await this._removeFile(this._recordPath(id), this.layout.commits)
+      }
+    }
+    await this._retireUpload(current.transferId)
+    await this._discardJournal(current.transferId, current.attemptId)
+  }
+
+  /**
+   * Undoes a merge that did not reach its catalog, from what is observed. Only inodes this merge
+   * installed are removed or restored, each after proving it is that inode; a path that holds
+   * anything else is left exactly as it is and the rollback fails closed with the journal kept.
+   * Containers are removed only if this merge created them, and only while empty.
+   */
+  async _rollbackMerge(journal: FileMergeJournal): Promise<void> {
+    const scratch = this._mergeScratch(journal.attemptId)
+    const touched = new Set<string>()
+    for (const [index, action] of [...journal.actions.entries()].reverse()) {
+      const target = this._publicPath(journal.name, action.path)
+      const parent = path.dirname(target)
+      if (action.op === 'add') {
+        if (await this._isInode(target, action.staged)) {
+          await withSafeDirectoryIdentity(parent, this.storage, async () => {
+            await this.storage.unlink(target)
+          })
+          touched.add(parent)
+        }
+        continue
+      }
+      if (action.previous === undefined) continue
+      const preimage = path.join(scratch, `p${index}`)
+      if (await this._isInode(target, action.previous)) continue
+      if (await this._isInode(target, action.staged)) {
+        if (!(await this._isInode(preimage, action.previous))) {
+          throw storageError('A replaced file cannot be restored')
+        }
+        await withSafeDirectoryIdentity(parent, this.storage, async () => {
+          await this.storage.rename(preimage, target)
+        })
+        touched.add(parent)
+        continue
+      }
+      if (
+        (await this._lstatOrMissing(target)) === null &&
+        (await this._isInode(preimage, action.previous))
+      ) {
+        await withSafeDirectoryIdentity(parent, this.storage, async () => {
+          await this.storage.rename(preimage, target)
+        })
+        touched.add(parent)
+        continue
+      }
+      throw storageError('A foreign file stands where a file was replaced')
+    }
+    for (const directory of [...journal.directories].reverse()) {
+      const target = this._rootRelativePath(directory.path)
+      const stat = await this._lstatOrMissing(target)
+      // A listed folder without an identity was planned but never confirmed: the stop came between
+      // its creation and the journal write that records it. It was missing when planned, so a real
+      // directory there that is still empty (`rmdir` removes nothing else) is the one this merge
+      // made, and holds nothing to lose.
+      if (
+        stat === null ||
+        stat.isSymbolicLink() ||
+        !stat.isDirectory() ||
+        (directory.identity !== null && !identitiesEqual(fileIdentity(stat), directory.identity))
+      ) {
+        continue
+      }
+      try {
+        await withSafeDirectoryIdentity(path.dirname(target), this.storage, async () => {
+          await this.storage.rmdir(target)
+        })
+        touched.add(path.dirname(target))
+      } catch (err) {
+        if (!['ENOTEMPTY', 'EEXIST', 'ENOENT'].includes(errorCode(err) ?? '')) throw err
+      }
+    }
+    await removeTree(scratch, this.layout.publications, this.storage, { layout: this.layout })
+    const surviving = [...touched]
+    const existing = []
+    for (const directory of surviving) {
+      if ((await this._lstatOrMissing(directory)) !== null) existing.push(directory)
+    }
+    await this._syncPaths(existing)
+  }
+
+  /**
+   * Startup recovery of one merge. A durable catalog at the journal's generation means the merge
+   * happened and only cleanup remains; otherwise it is undone exactly. An owner revoked since, or a
+   * journal already marked aborting, aborts an unfinished merge instead of resuming it.
+   */
+  async _recoverFileMerge(
+    id: string,
+    journal: FileMergeJournal,
+    sessionStore: SessionStore | null,
+    isAuthorized: ((ownerKey: Uint8Array) => boolean) | null
+  ): Promise<{ status: 'COMMITTED' | 'ABORTED' | 'RESUMABLE'; record?: CommitRecord }> {
+    if (await this._mergeLinearized(journal)) {
+      await this._finishMerge(journal)
+      const catalog = await readFileCatalog(this.layout.catalogs, journal.name, this.storage)
+      const view = catalog === null ? null : catalogView(catalog)
+      return view === null
+        ? { status: 'COMMITTED' }
+        : { status: 'COMMITTED', record: groupRecord(view) }
+    }
+    let marked = journal
+    if (marked.state === 'committing' && isAuthorized) {
+      if (!sessionStore || !(sessionStore.sessions instanceof Map)) {
+        throw storageError('Session store cannot validate commit journal')
+      }
+      const session = sessionStore.sessions.get(id)
+      if (session && !isAuthorized(session.ownerKey)) {
+        const next = await this._markAttemptAborting(id, journal.attemptId)
+        if (!isFileMergeJournal(next)) throw storageError('Commit journal changed before abort')
+        marked = next
+      }
+    }
+    await this._rollbackMerge(marked)
+    await this._discardJournal(id, marked.attemptId)
+    return { status: marked.state === 'aborting' ? 'ABORTED' : 'RESUMABLE' }
+  }
+
+  /** The journals of merges that are not finished. */
+  async _pendingMerges(): Promise<FileMergeJournal[]> {
+    const names = await withSafeDirectoryIdentity(this.layout.journals, this.storage, () =>
+      this.storage.readdir(this.layout.journals)
+    )
+    const pending: FileMergeJournal[] = []
+    for (const filename of names.filter(isCommitRecordName).sort()) {
+      let journal: AnyCommitJournal | null
+      try {
+        journal = await this._readJournal(filename.slice(0, -'.json'.length))
+      } catch (err) {
+        if (err instanceof CorruptJournalError) continue
+        throw err
+      }
+      if (isFileMergeJournal(journal)) pending.push(journal)
+    }
+    return pending
+  }
+
+  /**
+   * Do not advance a catalog while an older journal still needs its exact generation as commit
+   * proof. Finish committed cleanup first; an unfinished attempt or cleanup that still fails
+   * keeps the name busy until retry or startup recovery. Callers hold the root writer lease.
+   */
+  async _settlePendingMerges(name: string): Promise<ReadonlySet<string>> {
+    const pending = (await this._pendingMerges()).filter((journal) => journal.name === name)
+    const settled = new Set<string>()
+    for (const journal of pending) {
+      try {
+        if (!(await this._mergeLinearized(journal))) {
+          throw storageError('An earlier merge needs startup recovery')
+        }
+        await this._finishMerge(journal)
+        settled.add(journal.transferId)
+      } catch (cause) {
+        throw new SwarmDeployError(
+          ERRORS.FILE_BUSY,
+          'Previous commit cleanup is pending; retry or restart the server for recovery',
+          cause
+        )
+      }
+    }
+    return settled
+  }
+
+  /**
+   * Removes the private residue of interrupted merges: the scratch directories no open journal
+   * owns (private links, never data) and the temporary files of a journal or catalog write that was
+   * stopped before it was renamed into place. Nothing else is touched.
+   */
+  async sweepMergeScratch(): Promise<number> {
+    await this._assertLayout()
+    const owned = new Set(
+      (await this._pendingMerges()).map((journal) => `${journal.attemptId}.merge`)
+    )
+    const names = await withSafeDirectoryIdentity(this.layout.publications, this.storage, () =>
+      this.storage.readdir(this.layout.publications)
+    )
+    let removed = 0
+    for (const name of names.sort()) {
+      if (!/^[0-9a-f]{64}\.merge$/.test(name) || owned.has(name)) continue
+      const scratch = path.join(this.layout.publications, name)
+      if (
+        await removeTree(scratch, this.layout.publications, this.storage, { layout: this.layout })
+      ) {
+        removed++
+      }
+    }
+    for (const directory of [this.layout.journals, this.layout.catalogs]) {
+      const entries = await withSafeDirectoryIdentity(directory, this.storage, () =>
+        this.storage.readdir(directory)
+      )
+      for (const entry of entries.sort()) {
+        if (!WRITE_TEMPORARY.test(entry)) continue
+        await this._removeFile(path.join(directory, entry), directory)
+        removed++
+      }
+    }
+    return removed
+  }
+
+  /**
+   * Removes a catalog's owned files that are still exactly what Swarm wrote, and nothing else: a
+   * file that changed, vanished or became another kind of thing ends its ownership and is left
+   * alone, as is every file Swarm does not own. The emptied containers above are removed without
+   * recursion, so one that still holds anything stays. The catalog is rewritten last, so a crash
+   * leaves at worst owned files that are still listed.
+   */
+  async _deleteGroup(record: CommitRecord): Promise<boolean> {
+    await this._settlePendingMerges(record.name)
+    const catalog = await readFileCatalog(this.layout.catalogs, record.name, this.storage)
+    if (catalog === null) return false
+    const view = catalogView(catalog)
+    if (view === null || view.transferId !== record.transferId) {
+      throw storageError('Commit record changed before deletion')
+    }
+    const { observed, identities } = await this._observeOwned(catalog, true)
+    const plan = planOwnedCleanup(catalog, observed)
+    const touched = new Set<string>()
+    for (const relative of plan.remove) {
+      const target = this._publicPath(catalog.name, relative)
+      const parent = path.dirname(target)
+      await withSafeDirectoryIdentity(parent, this.storage, async () => {
+        const expected = identities.get(relative)
+        if (expected === undefined || !(await this._isInode(target, expected))) return
+        await this.storage.unlink(target)
+        touched.add(parent)
+      })
+    }
+    for (const directory of plan.prune) await this._pruneContainer(catalog.name, directory)
+    if (plan.remove.length > 0) await this._pruneContainer(catalog.name, '')
+    const existing = []
+    for (const directory of touched) {
+      if ((await this._lstatOrMissing(directory)) !== null) existing.push(directory)
+    }
+    await this._syncPaths(existing)
+    if (plan.next.files.length === 0) {
+      await removeFileCatalog(this.layout.catalogs, catalog.name, catalog.generation, this.storage)
+    } else {
+      await commitFileCatalog(this.layout.catalogs, plan.next, this.storage)
+    }
+    return true
+  }
+
+  /** Removes one container if it is empty. Never recursive, never the output root. */
+  async _pruneContainer(name: string, relative: string): Promise<void> {
+    const target = this._publicPath(name, relative)
+    if (target === this.layout.root) return
+    const stat = await this._lstatOrMissing(target)
+    if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) return
+    try {
+      await withSafeDirectoryIdentity(path.dirname(target), this.storage, async () => {
+        await this.storage.rmdir(target)
+      })
+    } catch (err) {
+      if (!['ENOTEMPTY', 'EEXIST', 'ENOENT', 'ENOTDIR'].includes(errorCode(err) ?? '')) throw err
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -2611,6 +3772,11 @@ class CommitStore {
       pins.add(journal.record.transferId)
       pins.add(journal.oldRecord.transferId)
     }
+    // An open merge keeps both the artifact it replaces and the one it publishes.
+    for (const journal of await this._pendingMerges()) {
+      pins.add(journal.snapshotId)
+      if (journal.previousSnapshotId !== null) pins.add(journal.previousSnapshotId)
+    }
     return pins
   }
 
@@ -2846,6 +4012,11 @@ class CommitStore {
     }
     const journal = await this._readJournal(id)
     if (!journal) return { status: 'MISSING' }
+    if (isFileMergeJournal(journal)) {
+      return withNameLease(this.layout.root, journal.name, () =>
+        this._recoverFileMerge(id, journal, sessionStore, isAuthorized)
+      )
+    }
     if (isDirectoryJournal(journal)) {
       return withNameLease(this.layout.root, journal.name, () =>
         this._recoverDirectoryJournal(id, journal, sessionStore, isAuthorized)
@@ -2974,7 +4145,8 @@ class CommitStore {
     return { status: 'RESUMABLE', record }
   }
 
-  async _scanRecords(): Promise<CommitRecord[]> {
+  /** The persisted commit records, exactly as stored. */
+  async _scanStoredRecords(): Promise<CommitRecord[]> {
     const names = await withSafeDirectoryIdentity(this.layout.commits, this.storage, () =>
       this.storage.readdir(this.layout.commits)
     )
@@ -2989,7 +4161,35 @@ class CommitStore {
     return records
   }
 
-  async scrubRecords(): Promise<{ records: CommitRecord[]; deleted: number }> {
+  /** A legacy whole-tree record: the only kind of persisted record a catalog can supersede. */
+  _isLegacyDirectoryRecord(record: CommitRecord): boolean {
+    return record.kind === 'directory' && record.version === DIRECTORY_COMMIT_VERSION
+  }
+
+  /**
+   * Every managed artifact: the persisted records, and one aggregate view per catalog that owns
+   * files. A legacy whole-tree record whose name a catalog has taken over is stale and is not
+   * reported, so two owners can never claim one root; `scrubRecords` removes it.
+   */
+  async _scanRecords(): Promise<CommitRecord[]> {
+    const stored = await this._scanStoredRecords()
+    const { catalogs } = await listFileCatalogs(this.layout.catalogs, this.storage)
+    const views = catalogs
+      .map((catalog) => catalogView(catalog))
+      .filter((view): view is CatalogView => view !== null)
+    const taken = new Set(views.map((view) => view.name))
+    return [
+      ...stored.filter(
+        (record) => !(this._isLegacyDirectoryRecord(record) && taken.has(record.name))
+      ),
+      ...views.map(groupRecord)
+    ]
+  }
+
+  async scrubRecords({ hash = false }: { hash?: boolean } = {}): Promise<{
+    records: CommitRecord[]
+    deleted: number
+  }> {
     await this._assertLayout()
     const names = await withSafeDirectoryIdentity(this.layout.commits, this.storage, () =>
       this.storage.readdir(this.layout.commits)
@@ -3021,7 +4221,97 @@ class CommitStore {
       if (!record) throw storageError('Commit record disappeared during scrub')
       records.push(record)
     }
-    return { records: await this._resolveRecords(records), deleted }
+
+    // Per-file catalogs: one that cannot be read is set aside (its files become nobody's and are
+    // never deleted); the rest are reconciled with what is on disk.
+    const pendingNames = new Set((await this._pendingMerges()).map((journal) => journal.name))
+    const pendingPaths = new Set(
+      [...pendingNames].map((name) => path.basename(fileCatalogPath(this.layout.catalogs, name)))
+    )
+    const listed = await listFileCatalogs(this.layout.catalogs, this.storage)
+    for (const filename of listed.corrupt) {
+      if (pendingPaths.has(filename)) continue
+      await this._quarantineCatalog(filename)
+      deleted++
+    }
+    const owned = new Set<string>()
+    const views: CommitRecord[] = []
+    for (const catalog of listed.catalogs) {
+      // Even an ownership-only scrub would advance the generation and invalidate the old
+      // journal's commit proof. Its pinned catalog stays unchanged until cleanup converges.
+      const reconciled = pendingNames.has(catalog.name)
+        ? catalog
+        : await this._reconcileCatalog(catalog, hash)
+      if (reconciled === null) {
+        // Nothing is owned any more: the catalog went, as a record whose artifact is gone would.
+        deleted++
+        continue
+      }
+      const view = catalogView(reconciled)
+      if (view === null) continue
+      owned.add(view.name)
+      views.push(groupRecord(view))
+    }
+    // A legacy whole-tree record superseded by a catalog is stale; only the record goes.
+    const current: CommitRecord[] = []
+    for (const record of records) {
+      if (this._isLegacyDirectoryRecord(record) && owned.has(record.name)) {
+        await this._removeFile(this._recordPath(record.transferId), this.layout.commits)
+        deleted++
+        continue
+      }
+      current.push(record)
+    }
+    return { records: await this._resolveRecords([...current, ...views]), deleted }
+  }
+
+  /** Sets aside a catalog file that does not parse as a catalog under its own name. */
+  async _quarantineCatalog(filename: string): Promise<void> {
+    const source = path.join(this.layout.catalogs, filename)
+    const quarantine = path.join(this.layout.catalogs, `.${filename}.corrupt-${attemptId()}`)
+    await withSafeDirectoryIdentity(this.layout.catalogs, this.storage, async () => {
+      await this.storage.rename(source, quarantine)
+    })
+    await withSafeDirectoryIdentity(this.layout.catalogs, this.storage, () =>
+      syncDirectory(this.layout.catalogs, this.storage)
+    )
+  }
+
+  /**
+   * Looks at the owned files of a catalog as they are now, and ends ownership of those that are
+   * gone, are another kind of thing, or no longer hold what was written. It never touches a file.
+   * Without `hash`, only existence and size are looked at; with it, every owned file is re-read.
+   * Returns the catalog as it stands afterwards, or `null` when it owns nothing any more.
+   */
+  async _reconcileCatalog(catalog: FileCatalog, hash: boolean): Promise<FileCatalog | null> {
+    const observed = await this._observeOwned(catalog, hash)
+    const dropped = new Set<string>()
+    for (const file of catalog.files) {
+      const seen = observed.observed.get(file.path)
+      if (
+        seen === undefined ||
+        seen.kind !== 'file' ||
+        seen.size !== file.size ||
+        seen.sha256 !== file.sha256
+      ) {
+        dropped.add(file.path)
+      }
+    }
+    if (dropped.size === 0) return catalog
+    const next: FileCatalog = {
+      version: catalog.version,
+      name: catalog.name,
+      generation: catalog.generation + 1,
+      ...(catalog.release === undefined ? {} : { release: catalog.release }),
+      files: catalog.files.filter((file) => !dropped.has(file.path)),
+      receipts: catalog.receipts
+    }
+    if (next.files.length === 0) {
+      await removeFileCatalog(this.layout.catalogs, catalog.name, catalog.generation, this.storage)
+      return null
+    }
+    await commitFileCatalog(this.layout.catalogs, next, this.storage)
+    return next
   }
 
   async _resolveRecords(records: CommitRecord[]): Promise<CommitRecord[]> {
@@ -3135,6 +4425,7 @@ class CommitStore {
 
   async delete(record: CommitRecord): Promise<boolean> {
     await this._assertLayout()
+    if (record.group === true) return this._deleteGroup(record)
     assertRecord(record)
     if (!(await this._storedRecordFor(record))) return false
 
@@ -3162,6 +4453,14 @@ class CommitStore {
     { preservePath = false }: { preservePath?: boolean } = {}
   ): Promise<false | { purged: true; preservedPath: boolean }> {
     await this._assertLayout()
+    if (record.group === true) {
+      // An invalid group ends its ownership and nothing else: no file is ever removed here.
+      await this._settlePendingMerges(record.name)
+      const catalog = await readFileCatalog(this.layout.catalogs, record.name, this.storage)
+      if (catalog === null) return false
+      await removeFileCatalog(this.layout.catalogs, record.name, catalog.generation, this.storage)
+      return { purged: true, preservedPath: true }
+    }
     assertRecord(record)
     if (!(await this._storedRecordFor(record))) return false
 

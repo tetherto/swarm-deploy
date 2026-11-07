@@ -94,7 +94,8 @@ export const METADATA_DIRECTORY_NAMES = [
   'journals',
   'publications',
   'links',
-  'trash'
+  'trash',
+  'catalogs'
 ] as const
 
 const MAX_STATE_ROOT_BYTES = 4 * 1024
@@ -147,6 +148,7 @@ export function resolveLayout(storageDir: string, stateDir: string): StorageLayo
     publications: path.join(internal, 'publications'),
     links: path.join(internal, 'links'),
     trash: path.join(internal, 'trash'),
+    catalogs: path.join(internal, 'catalogs'),
     lock: path.join(internal, 'lock')
   }
 }
@@ -480,9 +482,16 @@ function boundElsewhereError(
  * directory's root record, in a shape older releases refuse (see {@link requireStateFeature}).
  */
 export const STATE_FEATURE_DIRECTORY_REPLACEMENT = 'directory-replacement-v1'
-export type StateFeature = typeof STATE_FEATURE_DIRECTORY_REPLACEMENT
+/**
+ * The state directory holds per-file ownership catalogs (`storage/file-catalog.ts`). Prepared here
+ * so a catalog is never written before the barrier is durable; nothing requires it yet.
+ */
+export const STATE_FEATURE_FILE_CATALOG = 'file-catalog-v1'
+export type StateFeature =
+  typeof STATE_FEATURE_DIRECTORY_REPLACEMENT | typeof STATE_FEATURE_FILE_CATALOG
 const KNOWN_STATE_FEATURES: ReadonlySet<string> = new Set<string>([
-  STATE_FEATURE_DIRECTORY_REPLACEMENT
+  STATE_FEATURE_DIRECTORY_REPLACEMENT,
+  STATE_FEATURE_FILE_CATALOG
 ])
 const STATE_FEATURE_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/
 
@@ -923,7 +932,8 @@ export function protectedDirectories(layout: StorageLayout): string[] {
     layout.journals,
     layout.publications,
     layout.links,
-    layout.trash
+    layout.trash,
+    layout.catalogs
   ]
 }
 

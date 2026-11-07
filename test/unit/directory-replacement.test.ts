@@ -87,7 +87,15 @@ async function createHarness(
   const sessions = new TarSessionStore({ layout, maxStagingBytes: 4 * 1024 * 1024, storage })
   await sessions.init()
   t.teardown(() => sessions.close())
-  const commits = new CommitStore({ layout, storage, logger: { warn() {} } })
+  // This file covers the whole-tree replacement transaction of earlier builds and its recovery, so
+  // a directory is committed here as those builds did. A directory upload is now merged file by
+  // file; that has its own tests (file-merge-commit).
+  const commits = new CommitStore({
+    layout,
+    storage,
+    logger: { warn() {} },
+    legacyDirectoryTrees: true
+  })
 
   // A fixed parent folder, so the same content under the same name is the same transfer.
   async function sourceManifest(name: string, spec: TreeSpec) {
@@ -201,7 +209,12 @@ async function recover(
   options: { isAuthorized?: (owner: Uint8Array) => boolean } = {}
 ) {
   const sessions = await restart(layout)
-  const commits = new CommitStore({ layout, storage: createStorage(), logger: { warn() {} } })
+  const commits = new CommitStore({
+    layout,
+    storage: createStorage(),
+    logger: { warn() {} },
+    legacyDirectoryTrees: true
+  })
   try {
     const results = await recoverStorage({
       layout,
@@ -1064,7 +1077,12 @@ test('a recovery that is itself interrupted converges on the next attempt', asyn
     }
   })
   const sessions = await restart(crash.layout)
-  const commits = new CommitStore({ layout: crash.layout, storage, logger: { warn() {} } })
+  const commits = new CommitStore({
+    layout: crash.layout,
+    storage,
+    logger: { warn() {} },
+    legacyDirectoryTrees: true
+  })
   await t.exception(() =>
     recoverStorage({
       layout: crash.layout,
@@ -1155,7 +1173,13 @@ test('a replacement keeps the replaced name through its own retention pass, and 
   const layoutRoot = await createTempDir(t)
   const storage = createStorage()
   const harness = await createHarness(t, storage, layoutRoot)
-  const commits = new CommitStore({ layout: harness.layout, storage, clock, logger: { warn() {} } })
+  const commits = new CommitStore({
+    layout: harness.layout,
+    storage,
+    clock,
+    logger: { warn() {} },
+    legacyDirectoryTrees: true
+  })
   const retention = new RetentionManager({
     layout: harness.layout,
     sessionStore: harness.sessions as never,
@@ -1201,7 +1225,12 @@ test('retention neither deletes nor purges what an unfinished replacement owns',
   const { layout, oldRecord, nextId } = crash
   const clock = { time: Date.now() + 10_000, now: () => clock.time }
   const sessions = await restart(layout)
-  const commits = new CommitStore({ layout, clock, logger: { warn() {} } })
+  const commits = new CommitStore({
+    layout,
+    clock,
+    logger: { warn() {} },
+    legacyDirectoryTrees: true
+  })
   const retention = new RetentionManager({
     layout,
     sessionStore: sessions as never,

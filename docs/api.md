@@ -140,26 +140,24 @@ Optional operational limits and policies:
   peak of a fresh upload, which still needs its TAR and its extracted payload
   at once; `maxStagingBytes` and the reservations themselves are unchanged.
 - `maxAge`, `maxStorageBytes`
-- `replaceNames?: Iterable<string>`: exact names an upload may replace, files and
-  (from 0.8.0) managed directories. The current artifact of each name is pinned
-  against every retention stage (the legacy, standing pin). Readable as
-  `server.replaceNames`.
+- `replaceNames?: Iterable<string>`: exact artifact names under which an upload
+  may replace managed files, including files within directory inputs (0.8.0).
+  The current artifact of each name is pinned against retention (the legacy,
+  standing pin). Readable as `server.replaceNames`.
 - `allowReplace?: boolean | Iterable<string>` (0.8.0, off by default; readable as
-  `server.allowReplace`: `false`, `true`, or a frozen copy of the selectors): the
-  opt-in permission to replace Swarm-managed artifacts. `true` allows every managed
-  name; a list holds selectors, each an exact name or a release template in the
-  grammar of `artifactPatterns` (`beta-{version}`, a bare `{version}` for
-  SemVer-named artifacts only) matched against the final basename; a `/`, a
-  `history-` name, a duplicate, more than 64 selectors or anything that is not a
-  string throws `PROTOCOL_INVALID` ("Invalid allowReplace"). Only a managed artifact
-  of the same kind whose content still matches its record is ever replaced: an
-  unmanaged path, a modified directory, a symlink or the other kind of artifact is
-  left untouched (`FILE_EXISTS`). It pins nothing against retention. A directory is
-  replaced by an atomic exchange and needs a storage adapter whose `atomicSwap`
-  provides one (below); without it the replacement is refused with
-  `UNSUPPORTED_STORAGE` before anything published changes. While a hook or link
-  request is using the artifact's path the upload is refused with the retryable
-  `FILE_BUSY`. See [Replacing managed artifacts](operations.md#replacing-managed-artifacts).
+  `server.allowReplace`: `false`, `true`, or a frozen selector list): `true`
+  permits replacement under every artifact name. Each selector is an exact name
+  or a release template in the grammar of `artifactPatterns`, matched against
+  the final basename (`beta-{version}`, a bare `{version}` for SemVer names).
+  A `/`, `history-` name, duplicate, more than 64 selectors or a non-string
+  throws `PROTOCOL_INVALID` ("Invalid allowReplace"). Within an existing
+  directory, missing files can be added without this permission; omitted files
+  remain. A differing file is replaced only if Swarm owns it and its current
+  bytes still match its record. A differing untracked or edited file, a symlink
+  or a kind conflict rejects the whole input with `FILE_EXISTS` before
+  publication. It pins nothing against retention. Active hooks, link requests
+  and unresolved commit cleanup can return retryable `FILE_BUSY`. See
+  [Replacing managed artifacts](operations.md#replacing-managed-artifacts).
 - `artifactPatterns?: Iterable<string>`, `maxCount?: number`,
   `maxVersions?: number`, and `versionGranularity?: 'major' | 'minor'`; see
   [Artifact patterns and rotation](artifact-patterns.md).
@@ -185,20 +183,18 @@ Optional operational limits and policies:
   [Response and detached hooks](hooks.md#response-and-detached-hooks).
 
 `ServerOptions.storage` replaces the runtime filesystem with a `StorageAdapter`.
-From 0.8.0 an adapter may offer one optional capability, `atomicSwap(first, second)`:
-exchange two existing paths on one filesystem in a single atomic step, so that
-afterwards each name designates the other's former inode with every entry intact
-and no observer ever sees either name missing or half populated. An adapter must do
-exactly that or throw having changed nothing; a copy, or several renames, is not an
-exchange and must not be offered under this name. A server only calls it to replace
-a managed directory (and once per layout, on scratch directories, to learn whether
-the filesystem supports it); an adapter without it, or one that reports
-`ENOTSUP`/`EINVAL`, makes a directory replacement fail with `UNSUPPORTED_STORAGE`
-before anything published changes, and file replacement is unaffected. The default
-adapter provides it on Linux and macOS from `fs-native-extensions`, loaded only when
-a directory is first replaced: importing the package, a `Client`, or a server that
-never replaces a directory does not load the native addon. Windows has no atomic
-exchange, so the default adapter offers none there.
+Directory uploads use private staging, a whole-commit journal and per-file
+installation, without exchanging the containing directory. The entire input is
+verified and planned before public changes; failure rolls back the commit, and
+startup resolves interrupted commits. Concurrent readers can see a mixture of
+old and new files during installation; there is no instantaneous multi-file
+namespace switch. Each replaced file remains a complete old or new file. See
+[File-level directory commits](operations.md#replacing-managed-artifacts).
+
+The optional `atomicSwap(first, second)` capability remains for recovery of older
+whole-directory replacement journals. It must exchange two existing paths in one
+atomic step or throw without changing them. The default implementation uses
+`fs-native-extensions` on Linux and macOS; new file merges do not require it.
 
 The root package exports the `ServerHooks`, `HookModes`, `HookResponse`,
 `OperationOutcome`, `FailedOutcome`, `BeforeCommitContext`,
@@ -384,9 +380,11 @@ interface UploadHookResult {
 }
 ```
 
-Files and directories share the same result shape. For a directory, `size` is
-aggregate payload bytes and `entryCount` counts stored entries (files and
-directories).
+Files and directories share the same result shape. For a directory upload,
+`size`, `entryCount`, digest and transfer ID describe its input (files and
+directory entries), not everything already in the destination. Links and their
+hooks use the committed aggregate of owned files instead: its own snapshot ID,
+owned bytes and file count. Untracked siblings are excluded from that aggregate.
 
 `Client.upload(path, { hookResult: true })` asks the server to send back the data
 its `response`-declared hooks returned: `afterCommit`'s object and one `afterLink`

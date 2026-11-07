@@ -836,10 +836,12 @@ test('replacement reclaims space in its own pre-commit pass, not the deferred on
   t.is(await fs.promises.readFile(path.join(harness.layout.root, MUTABLE), 'utf8'), 'new')
 })
 
-test('deleting a directory artifact renames it into private trash first', async (t) => {
+test('deleting a directory artifact unlinks its owned files and prunes what that empties, with no trash', async (t) => {
+  const unlinks: string[] = []
   const renames: Array<[string, string]> = []
   const storage = createStorage({
     afterOperation: (name, target, ...rest) => {
+      if (name === 'unlink') unlinks.push(target)
       if (name === 'rename') renames.push([target, String(rest[0])])
     }
   })
@@ -847,14 +849,39 @@ test('deleting a directory artifact renames it into private trash first', async 
   const record = await harness.publishTree('0.18.1', { 'a/b.bin': 'bb' })
   const finalPath = path.join(harness.layout.root, '0.18.1')
   t.ok((await fs.promises.lstat(finalPath)).isDirectory())
+  t.is(record.group, true, 'a directory is a group of owned files, not a tree')
 
   t.is(await harness.commits.delete(record), true)
-  t.is(await exists(finalPath), false)
-  t.is(await exists(path.join(harness.layout.trash, `${record.transferId}.tree`)), false)
-  t.ok(
-    renames.some(
-      ([from, to]) => from === finalPath && to.includes(path.join('.swarm-deploy', 'trash'))
-    )
+  t.is(await exists(finalPath), false, 'the emptied containers are pruned')
+  t.ok(unlinks.includes(path.join(finalPath, 'a', 'b.bin')), 'the owned file itself is unlinked')
+  t.is(
+    renames.some(([, to]) => to.includes(path.join('.swarm-deploy', 'trash'))),
+    false,
+    'nothing is moved into the trash'
+  )
+  t.alike(await fs.promises.readdir(harness.layout.trash), [])
+  t.alike(await fs.promises.readdir(harness.layout.catalogs), [])
+  t.alike(await harness.commits.list(), [])
+})
+
+test('deleting a directory artifact leaves foreign files and the folders that hold them', async (t) => {
+  const harness = await createHarness(t)
+  const record = await harness.publishTree('0.18.1', { 'a/b.bin': 'bb', 'c.bin': 'cc' })
+  const root = path.join(harness.layout.root, '0.18.1')
+  await fs.promises.writeFile(path.join(root, 'a', 'foreign.txt'), 'not ours')
+  await fs.promises.writeFile(path.join(root, 'c.bin'), 'zz')
+
+  t.is(await harness.commits.delete(record), true)
+  t.is(await exists(path.join(root, 'a', 'b.bin')), false, 'the unchanged owned file is removed')
+  t.is(
+    await fs.promises.readFile(path.join(root, 'a', 'foreign.txt'), 'utf8'),
+    'not ours',
+    'a foreign file stays, and so does its folder'
+  )
+  t.is(
+    await fs.promises.readFile(path.join(root, 'c.bin'), 'utf8'),
+    'zz',
+    'an owned file that was changed afterwards is no longer owned and stays'
   )
   t.alike(await harness.commits.list(), [])
 })
@@ -891,22 +918,38 @@ test('storage recovery sweeps trash residue and reports it once', async (t) => {
   )
 })
 
-test('scrub validates a directory artifact by type cheaply and by digest at startup', async (t) => {
+test('scrub validates a directory artifact file by file, cheaply by size and by digest at startup', async (t) => {
   const harness = await createHarness(t)
-  const record = await harness.publishTree('0.18.1', { 'a.bin': 'aaa' })
+  await harness.publishTree('0.18.1', { 'a.bin': 'aaa', 'b.bin': 'bbb' })
+  const root = path.join(harness.layout.root, '0.18.1')
   const manager = harness.manager()
   t.is((await manager.scrubCommitted({ hash: false })).records.length, 1)
   t.is((await manager.scrubCommitted({ hash: true })).records.length, 1)
 
-  await fs.promises.writeFile(path.join(harness.layout.root, '0.18.1', 'a.bin'), 'mutated')
+  // Same size, other content: only the digest pass notices, and only that file leaves ownership.
+  await fs.promises.writeFile(path.join(root, 'a.bin'), 'xxx')
   const cheap = await manager.scrubCommitted({ hash: false })
   t.is(cheap.records.length, 1)
+  t.is(cheap.records[0].size, 6, 'the cheap pass still counts both files')
   const hashed = await manager.scrubCommitted({ hash: true })
-  t.is(hashed.records.length, 0)
-  t.is(hashed.deleted, 1)
-  t.ok(hashed.unknown.includes('0.18.1'))
-  t.ok((await fs.promises.lstat(path.join(harness.layout.root, '0.18.1'))).isDirectory())
-  t.is(await exists(path.join(harness.layout.commits, `${record.transferId}.json`)), false)
+  t.is(hashed.records.length, 1)
+  t.is(hashed.records[0].size, 3, 'the changed file is no longer owned, the other one is')
+  t.is(hashed.deleted, 0)
+  t.is(await fs.promises.readFile(path.join(root, 'a.bin'), 'utf8'), 'xxx', 'and is never touched')
+
+  // Another size: the cheap pass sees it, and with nothing owned any more the catalog goes.
+  await fs.promises.writeFile(path.join(root, 'b.bin'), 'mutated')
+  const gone = await manager.scrubCommitted({ hash: false })
+  t.is(gone.records.length, 0)
+  t.is(gone.deleted, 1)
+  t.ok(gone.unknown.includes('0.18.1'))
+  t.ok(
+    (await fs.promises.lstat(root)).isDirectory(),
+    'the folder and its files are left as they are'
+  )
+  t.is(await fs.promises.readFile(path.join(root, 'b.bin'), 'utf8'), 'mutated')
+  t.alike(await fs.promises.readdir(harness.layout.catalogs), [])
+  t.alike(await harness.commits.list(), [])
 })
 
 test('age, count, version, and quota retention delete directory artifacts', async (t) => {
